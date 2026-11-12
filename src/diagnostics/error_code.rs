@@ -1,4 +1,5 @@
 use compact_str::{CompactString, format_compact};
+use litemap::LiteMap;
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::OnceLock;
@@ -22,6 +23,7 @@ static CODE_INDEX: [u16; CODE_INDEX_SLOTS] = build_code_index();
 const _: () = assert!(CODE_TABLE.len() < u16::MAX as usize);
 
 /// Slot for a code matching the registry's `^[EW]\d{3}$` shape, or `None`.
+#[inline]
 const fn code_slot(code: &str) -> Option<usize> {
     let b = code.as_bytes();
     if b.len() != 4 {
@@ -50,12 +52,68 @@ const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
     let mut i = 0;
     while i < CODE_TABLE.len() {
         if let Some(slot) = code_slot(CODE_TABLE[i].code) {
+            // A duplicate code would otherwise silently shadow the first
+            // entry and make it unreachable through `lookup`, while
+            // `direct_address_index_matches_table` still passed (last wins).
+            // Fail the build instead of corrupting the registry.
+            assert!(idx[slot] == u16::MAX, "duplicate code in CODE_TABLE");
             idx[slot] = i as u16;
         }
         i += 1;
     }
     idx
 }
+
+/// Per-slot memoization map shared by [`ErrCode::url`] / [`ErrCode::url_ansi`]
+/// (one `SlotCache` static per (port-set, doc-URL) × (plain, ANSI) quadrant).
+///
+/// Shape matches `category_siblings_of`'s `SIBLING_CACHE`: a lazily-built
+/// `RwLock<FxHashMap<slot, Arc<str>>>` instead of an eagerly-allocated
+/// `CODE_INDEX_SLOTS`-sized array of `OnceLock` shells — a process that only
+/// renders a handful of distinct codes pays for those codes, not ~256 KB of
+/// shells across the four caches.  The hit path is one map lookup + a
+/// refcount bump (`Arc<str>`, not a deep string clone: the OSC 8 form is
+/// 40–80+ heap bytes, and `write_header` calls `url_ansi()` per diagnostic,
+/// so a 1 000-diagnostic batch sharing one code would otherwise pay 1 000
+/// identical allocations); `build` never runs while a lock is held on
+/// `cache` (it may re-enter another `SlotCache`), so there is no
+/// lock-ordering hazard.
+type SlotCache = OnceLock<std::sync::RwLock<rustc_hash::FxHashMap<u16, std::sync::Arc<str>>>>;
+
+fn cached_slot_string(
+    cache: &SlotCache,
+    slot: u16,
+    build: impl FnOnce() -> CompactString,
+) -> std::sync::Arc<str> {
+    // One `OnceLock` load, then the map read: the ordinary hit path costs no
+    // extra work, and a losing racer no longer pays the full `build()` before
+    // discovering the winner's entry.  (The double-checked insert below still
+    // guarantees exactly one stored value per slot.)
+    let m = cache.get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashMap::default()));
+    // Poison recovery: the guarded value is only `Arc<str>` built by a pure
+    // function, so a poisoned map is still valid.  Silently bypassing the
+    // cache on poison would turn every later call into a rebuild.
+    {
+        let r = m.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = r.get(&slot) {
+            return std::sync::Arc::clone(v);
+        }
+    }
+    let built: std::sync::Arc<str> = build().into();
+    {
+        let mut w = m.write().unwrap_or_else(|e| e.into_inner());
+        // Double-checked insert: a racing caller may have built and inserted
+        // the same `(slot)` value first.  Its value is identical (both are
+        // pure functions of the slot), so returning the winner's copy skips
+        // a redundant build and keeps exactly one entry per slot.
+        if let Some(v) = w.get(&slot) {
+            return std::sync::Arc::clone(v);
+        }
+        w.insert(slot, std::sync::Arc::clone(&built));
+    }
+    built
+}
+
 /// Set the port for the local explain server.  Called by the CLI before
 /// displaying error code URLs.
 ///
@@ -63,6 +121,10 @@ const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
 /// observe that its value was ignored instead of silently assuming it took
 /// effect.  Callers that intentionally re-set the port (e.g. tests) should
 /// discard the result explicitly with `let _ = …`.
+///
+/// Port `0` is accepted as-is: a caller that intends to listen validates its
+/// own bind (the CLI binds before calling this), and rejecting `0` here would
+/// need a second error channel without preventing a bad URL on its own.
 pub fn set_explain_port(port: u16) -> Result<(), u16> {
     EXPLAIN_PORT
         .set(port)
@@ -93,10 +155,14 @@ fn explain_url(code: &str) -> CompactString {
 /// This is the pure, testable core of `explain_url`; callers that need the
 /// process-global port (the production path) pass `EXPLAIN_PORT.get().copied()`.
 ///
-/// No memoization: the only production caller is the explain server, which
-/// builds one URL per served page, so a process-global mutex + hash + clone
-/// would cost more than the `format!` it caches (and the port is read on
-/// every call, so a later [`set_explain_port`] can never return a stale URL).
+/// This function itself does not memoize — the per-call cost is one
+/// `format_compact!`.  The hot-path caller [`ErrCode::url_ansi`] (invoked per
+/// diagnostic in `write_header` when hyperlinks are active) caches its full
+/// OSC 8 result in a [`SlotCache`] (a lazily-built `FxHashMap` keyed by
+/// [`code_slot`]), gated on the explain port being set, so a batch of *N*
+/// diagnostics sharing a code builds the link once and clones the `Arc<str>`
+/// thereafter.  The cold-path caller (the explain server, one URL per served
+/// page) bypasses that cache.
 pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> CompactString {
     if let Some(port) = port {
         explain_server_url(port, code)
@@ -104,10 +170,16 @@ pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> CompactStr
         // We will register this domain and set up a proper documentation
         // website in the future.  For now, the local explain server is the
         // primary way to view error explanations in a browser.
-        format_compact!(
-            "https://doc.posita-lang.org/error_codes/{}.html",
-            encode_url_path_segment(code)
-        )
+        const DOC_URL_PREFIX: &str = "https://doc.posita-lang.org/error_codes/";
+        const DOC_URL_SUFFIX: &str = ".html";
+        let encoded = encode_url_path_segment(code);
+        let mut out = CompactString::with_capacity(
+            DOC_URL_PREFIX.len() + encoded.len() + DOC_URL_SUFFIX.len(),
+        );
+        out.push_str(DOC_URL_PREFIX);
+        out.push_str(encoded.as_ref());
+        out.push_str(DOC_URL_SUFFIX);
+        out
     }
 }
 
@@ -128,22 +200,23 @@ pub(crate) fn explain_server_url(port: u16, code: &str) -> CompactString {
 /// is *one* segment, and a raw `\x1b` here would terminate the enclosing
 /// OSC 8 hyperlink early.
 fn encode_url_path_segment(s: &str) -> Cow<'_, str> {
-    use std::fmt::Write as _;
+    use crate::diagnostics::renderers::fmt::HEX_UPPER;
+    /// RFC 3986 unreserved set: `ALPHA / DIGIT / "-" / "." / "_" / "~"`.
+    const fn is_unreserved(b: u8) -> bool {
+        matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~')
+    }
     // Fast path: unreserved ASCII chars pass through byte-for-byte.
-    if s.bytes()
-        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'))
-    {
+    if s.bytes().all(is_unreserved) {
         return Cow::Borrowed(s);
     }
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                let _ = write!(out, "%{b:02X}");
-            }
+    let mut out = String::with_capacity(s.len().saturating_mul(3));
+    for &b in s.as_bytes() {
+        if is_unreserved(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX_UPPER[(b >> 4) as usize] as char);
+            out.push(HEX_UPPER[(b & 0xF) as usize] as char);
         }
     }
     Cow::Owned(out)
@@ -165,6 +238,27 @@ pub enum ErrorCategory {
 impl ErrorCategory {
     /// Stable machine-readable key (JSON `"category"` field).  Never
     /// localized — consumers depend on a fixed vocabulary.
+    ///
+    /// This is the same vocabulary as the CLI `--only-category` values
+    /// (`parse`, `resolution`, …), not the human display string from
+    /// [`as_str`](Self::as_str).  JSON consumers that used to see
+    /// `"Parse Error"` must read `"parse"`; the display renderers keep
+    /// using `as_str`.
+    pub fn key(&self) -> &'static str {
+        match self {
+            ErrorCategory::Parse => "parse",
+            ErrorCategory::Resolution => "resolution",
+            ErrorCategory::Type => "type",
+            ErrorCategory::Contract => "contract",
+            ErrorCategory::Trait => "trait",
+            ErrorCategory::Inference => "inference",
+            ErrorCategory::Internal => "internal",
+            ErrorCategory::Generic => "generic",
+        }
+    }
+
+    /// Stable machine-readable key (JSON `"category"` field).  Never
+    /// localized — consumers depend on a fixed vocabulary.
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCategory::Parse => "Parse Error",
@@ -182,9 +276,22 @@ impl ErrorCategory {
     /// human-readable category follows the active
     /// [`Lang`](super::i18n::Lang).
     pub fn label(&self) -> std::borrow::Cow<'static, str> {
+        // Explicit variant → index mapping: `*self as usize` would silently
+        // swap labels if the enum were ever reordered; a match arms the
+        // reorder into a non-exhaustive compile error instead.
+        let idx = match self {
+            ErrorCategory::Parse => 0,
+            ErrorCategory::Resolution => 1,
+            ErrorCategory::Type => 2,
+            ErrorCategory::Contract => 3,
+            ErrorCategory::Trait => 4,
+            ErrorCategory::Inference => 5,
+            ErrorCategory::Internal => 6,
+            ErrorCategory::Generic => 7,
+        };
         crate::diagnostics::i18n::cached_label! {
             n = 8,
-            variant = *self as usize,
+            variant = idx,
             init = [
                 crate::diagnostics::i18n::fluent::category_parse().into_owned(),
                 crate::diagnostics::i18n::fluent::category_resolution().into_owned(),
@@ -239,7 +346,24 @@ enum ErrCodeRepr {
     /// Resolved table entry — a `'static` pointer, no copy.
     Known(&'static CodeEntry),
     /// Unresolved code, stored verbatim (inline for short codes).
-    Other(CompactString),
+    ///
+    /// Boxed so `ErrCode` itself stays two words: every diagnostic carries
+    /// one, and the unresolved case is rare, so the indirection costs an
+    /// allocation only where the old inline `CompactString` bloated the
+    /// enum for *all* codes.  `canonical` caches the case-insensitive
+    /// registry resolution at construction so `PartialEq`/`Hash` never
+    /// re-run `resolve` — a `HashSet<ErrCode>` in a large batch used to pay
+    /// a slot shape check + `CODE_INDEX` read per comparison/hash.  `None`
+    /// means the code is genuinely unregistered (both `new` and `unknown`
+    /// resolve before storing).
+    Other(Box<OtherCode>),
+}
+
+/// Boxed payload of [`ErrCodeRepr::Other`].
+#[derive(Clone)]
+struct OtherCode {
+    raw: CompactString,
+    canonical: Option<&'static CodeEntry>,
 }
 
 impl fmt::Debug for ErrCode {
@@ -248,12 +372,25 @@ impl fmt::Debug for ErrCode {
     }
 }
 
-/// Compare the code strings, not the storage form: `ErrCode::new("E030")`
-/// and `ErrCode::unknown("E030")` must stay equal (they did when both were
-/// backed by the same `CompactString`).
+/// Renders the code string (e.g. `E030`), so `format!("code {code}")` sites
+/// stay uniform and the explain server's error paths can use it directly.
+impl fmt::Display for ErrCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+/// Compare the *canonical* code strings, not the storage form.
+///
+/// `code()` echoes the stored spelling verbatim for untrusted input, but
+/// identity must follow the same case-insensitive resolution as
+/// `new`/`try_new`/`entry`: `ErrCode::new("e030")` and
+/// `ErrCode::unknown("e030")` are the same logical code and must be equal.
+/// Hashing uses the identical canonical view, so the two stay consistent as
+/// `HashMap`/`HashSet` keys.
 impl PartialEq for ErrCode {
     fn eq(&self, other: &Self) -> bool {
-        self.code() == other.code()
+        self.canonical() == other.canonical()
     }
 }
 
@@ -261,7 +398,7 @@ impl Eq for ErrCode {}
 
 impl std::hash::Hash for ErrCode {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(self.code(), state);
+        std::hash::Hash::hash(self.canonical(), state);
     }
 }
 
@@ -325,8 +462,12 @@ impl ErrCode {
             return ErrCode(ErrCodeRepr::Known(e));
         }
         // Unknown: stored verbatim — never invent case for arbitrary
-        // strings that are not error codes.
-        ErrCode(ErrCodeRepr::Other(CompactString::from(code)))
+        // strings that are not error codes.  Both lookups above already
+        // failed, so the cached canonical resolution is `None`.
+        ErrCode(ErrCodeRepr::Other(Box::new(OtherCode {
+            raw: CompactString::from(code),
+            canonical: None,
+        })))
     }
 
     /// Validate that `code` exists in the lookup table, returning
@@ -339,7 +480,7 @@ impl ErrCode {
         // Same case-insensitive resolution as [`Self::new`]: a known code
         // in any case is accepted and stored canonically; the error keeps
         // the input verbatim so the user sees what they typed.
-        match lookup(code).or_else(|| lookup_uppercased(code)) {
+        match resolve(code) {
             Some(e) => Ok(ErrCode(ErrCodeRepr::Known(e))),
             None => Err(UnknownCode(Cow::Borrowed(code))),
         }
@@ -353,14 +494,38 @@ impl ErrCode {
     /// This is the escape hatch for callers that may receive untrusted or
     /// dynamically-constructed code strings (e.g. `Diagnostic::with_code_str`).
     pub(crate) fn unknown(code: impl Into<CompactString>) -> Self {
-        ErrCode(ErrCodeRepr::Other(code.into()))
+        let raw = code.into();
+        // Resolve once here instead of on every `eq`/`hash`: an untrusted
+        // spelling such as `e030` must still compare/hash as `E030`, but the
+        // table walk is a construction cost, not a per-comparison one.
+        let canonical = resolve(&raw);
+        ErrCode(ErrCodeRepr::Other(Box::new(OtherCode { raw, canonical })))
     }
 
     /// The code string, e.g. "E030" or "W113".
+    ///
+    /// For [`Unknown`](Self::unknown) codes this is the stored spelling
+    /// verbatim (untrusted echo semantics); use [`canonical`](Self::canonical)
+    /// for identity.
     pub fn code(&self) -> &str {
         match &self.0 {
             ErrCodeRepr::Known(e) => e.code,
-            ErrCodeRepr::Other(s) => s.as_str(),
+            ErrCodeRepr::Other(o) => o.raw.as_str(),
+        }
+    }
+
+    /// The canonical spelling used by `Eq`/`Hash`: table entries resolve to
+    /// their registered code, so case spellings of one code compare equal.
+    /// Unknown codes with no entry fall back to their verbatim string, which
+    /// keeps distinct junk codes distinct (`unknown("junk1") !=
+    /// unknown("junk2")`).
+    pub(crate) fn canonical(&self) -> &str {
+        match &self.0 {
+            ErrCodeRepr::Known(e) => e.code,
+            ErrCodeRepr::Other(o) => o
+                .canonical
+                .map(|e| e.code)
+                .unwrap_or(o.raw.as_str()),
         }
     }
 
@@ -368,14 +533,14 @@ impl ErrCode {
     ///
     /// Callers that need multiple fields (`title`, `category`, `explain`)
     /// should use this once and derive each from the returned entry, avoiding
-    /// repeated hash lookups.
+    /// repeated lookups (a shape check + one array read on `CODE_INDEX`).
     pub fn entry(&self) -> Option<&'static CodeEntry> {
         match &self.0 {
             ErrCodeRepr::Known(e) => Some(*e),
             // Preserve the old behaviour for `unknown` codes that happen to
             // name a real entry: they still resolve their metadata, matching
             // the case-insensitive resolution in `new`/`try_new`.
-            ErrCodeRepr::Other(s) => lookup(s).or_else(|| lookup_uppercased(s)),
+            ErrCodeRepr::Other(o) => o.canonical,
         }
     }
 
@@ -386,9 +551,7 @@ impl ErrCode {
     pub(crate) fn entry_or_unknown(&self) -> &'static CodeEntry {
         match &self.0 {
             ErrCodeRepr::Known(e) => e,
-            ErrCodeRepr::Other(s) => lookup(s)
-                .or_else(|| lookup_uppercased(s))
-                .unwrap_or(&UNKNOWN_CODE_ENTRY),
+            ErrCodeRepr::Other(o) => o.canonical.unwrap_or(&UNKNOWN_CODE_ENTRY),
         }
     }
 
@@ -412,8 +575,44 @@ impl ErrCode {
     /// [`explain_url`] percent-encodes the code as a single path segment, so an
     /// unknown code holding arbitrary bytes (see [`Self::unknown`]) cannot
     /// escape the segment or the enclosing link.
-    pub fn url(&self) -> CompactString {
-        explain_url(self.code())
+    ///
+    /// **Memoization:** once the explain port is fixed ([`set_explain_port`] is
+    /// set-once), the result depends only on the code string.  Codes matching
+    /// the registry's `^[EW]\d{3}$` shape are cached per [`code_slot`] in a
+    /// lazily-populated map (the same lock-per-key shape
+    /// `category_siblings_of`'s `SIBLING_CACHE` uses) — a process that only
+    /// ever prints a handful of codes never allocates a
+    /// `CODE_INDEX_SLOTS`-sized table of `OnceLock` shells eagerly.  A batch
+    /// of *N* diagnostics sharing a code builds the URL once and clones
+    /// thereafter.  Unknown codes (arbitrary bytes, no slot) bypass the
+    /// cache and rebuild every call.
+    ///
+    /// Returns an `Arc<str>`: a cache hit is a refcount bump, not a heap
+    /// allocation + copy of an immutable 40–80+ byte URL.
+    pub fn url(&self) -> std::sync::Arc<str> {
+        // Canonical spelling, not the verbatim echo: `unknown("e030")` resolves
+        // to the E030 entry (title/category/explain all do), so its URL must be
+        // the registered `/E030` — not a `/e030` the doc site 404s — and it
+        // must hit the per-slot cache like any other spelling of that code.
+        let code = self.canonical();
+        let Some(slot) = code_slot(code) else {
+            return explain_url(code).into();
+        };
+        if EXPLAIN_PORT.get().is_some() {
+            // Two disjoint caches (port set / port unset) mirror `url_ansi`'s
+            // split so a later `set_explain_port` can never observe a stale
+            // doc-URL host.
+            static URL_CACHE: SlotCache = SlotCache::new();
+            cached_slot_string(&URL_CACHE, slot as u16, || explain_url(code))
+        } else {
+            // No explain server: the doc URL depends only on the code.
+            // Disjoint from the port cache (this branch is taken only while
+            // the port is unset, and the port is set-once).
+            static DOC_URL_CACHE: SlotCache = SlotCache::new();
+            cached_slot_string(&DOC_URL_CACHE, slot as u16, || {
+                explain_url_with_port(code, None)
+            })
+        }
     }
 
     /// The diagnostic URL, formatted as an ANSI hyperlink if the terminal supports it.
@@ -421,12 +620,49 @@ impl ErrCode {
     /// The visible text is sanitized (control characters become U+FFFD) so an
     /// untrusted code cannot terminate the OSC 8 link early and inject further
     /// terminal escapes.
-    pub fn url_ansi(&self) -> CompactString {
-        format_compact!(
-            "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
-            self.url(),
-            super::sanitize_for_terminal(self.code()),
-        )
+    ///
+    /// **Memoization:** once the explain port is fixed ([`set_explain_port`] is
+    /// set-once), the result depends only on the code string.  Codes matching
+    /// the registry's `^[EW]\d{3}$` shape are cached per [`code_slot`] in the
+    /// same lazily-populated map shape [`url`](Self::url) uses (see the
+    /// `SlotCache` note there), so a batch of *N* diagnostics sharing a code
+    /// builds the OSC 8 hyperlink once and clones thereafter.  Unknown codes
+    /// (arbitrary bytes, no slot) bypass the cache and rebuild every call.
+    pub fn url_ansi(&self) -> std::sync::Arc<str> {
+        let Some(slot) = code_slot(self.canonical()) else {
+            return self.url_ansi_build().into();
+        };
+        if EXPLAIN_PORT.get().is_some() {
+            static URL_ANSI_CACHE: SlotCache = SlotCache::new();
+            cached_slot_string(&URL_ANSI_CACHE, slot as u16, || self.url_ansi_build())
+        } else {
+            // No explain server: memoize the OSC 8 form of the doc URL, the
+            // same way the doc URL itself is memoized in `url`.  Disjoint
+            // from the port cache, so a later `set_explain_port` cannot
+            // return a stale doc host.
+            static DOC_URL_ANSI_CACHE: SlotCache = SlotCache::new();
+            cached_slot_string(&DOC_URL_ANSI_CACHE, slot as u16, || self.url_ansi_build())
+        }
+    }
+
+    /// Uncached core of [`url_ansi`](Self::url_ansi): build the OSC 8 hyperlink
+    /// from the (uncached) [`url`](Self::url) and the sanitized code.  Separated
+    /// so the cache path can `set` without holding a borrow across the build.
+    fn url_ansi_build(&self) -> CompactString {
+        // E6: build the URL exactly once. The old `format_compact!(self.url())`
+        // allocated an `Arc<str>` for unknown codes (no registry slot → no
+        // cache) only to format it again; assemble straight into the result.
+        let mut out = CompactString::default();
+        out.push_str("\x1b]8;;");
+        if code_slot(self.canonical()).is_some() {
+            out.push_str(&self.url());
+        } else {
+            out.push_str(&explain_url(self.canonical()));
+        }
+        out.push_str("\x1b\\");
+        out.push_str(&super::sanitize_for_terminal(self.code()));
+        out.push_str("\x1b]8;;\x1b\\");
+        out
     }
 }
 
@@ -440,7 +676,54 @@ pub(crate) struct CodeEntry {
 
 include!(concat!(env!("OUT_DIR"), "/error_codes_gen.rs"));
 
+/// The direct-address index (`CODE_INDEX_SLOTS`) and `suggest_top3_direct`'s
+/// 4-deletion enumeration both assume every code is exactly 4 bytes.  Fail the
+/// build — not a lookup / a silently wrong suggestion — if the registry grows
+/// a 5-char code.
+const _: () = {
+    let mut i = 0;
+    while i < CODE_TABLE.len() {
+        let b = CODE_TABLE[i].code.as_bytes();
+        // Assert the full `^[EW]\d{3}$` shape, not just the length:
+        // `build_code_index` silently skips an entry whose `code_slot` is
+        // `None`, so `"EX30"`/`"E03a"` would compile, miss `CODE_INDEX`, and
+        // be unreachable through `lookup`.  Fail the build instead.
+        assert!(b.len() == 4);
+        assert!(b[0] == b'E' || b[0] == b'W');
+        assert!(b[1].is_ascii_digit());
+        assert!(b[2].is_ascii_digit());
+        assert!(b[3].is_ascii_digit());
+        i += 1;
+    }
+};
+
+/// Number of direct-address slots in [`CODE_INDEX`]. Callers that want a
+/// lock-free, per-code table (the explain server's page cache) size their
+/// array with this.
+pub(crate) const DIRECT_ADDRESS_SLOTS: usize = CODE_INDEX_SLOTS;
+
+/// Direct-address slot (`0..DIRECT_ADDRESS_SLOTS`) for a registry code.
+///
+/// Returns `None` for a string that does not match the `^[EW]\d{3}$` shape;
+/// a shape-valid but unregistered code still yields a slot, but its
+/// [`lookup`] entry is empty, so callers should resolve through
+/// [`ErrCode::try_new`] first.
+#[inline]
+pub(crate) fn direct_slot(code: &str) -> Option<usize> {
+    code_slot(code)
+}
+
+/// Case-insensitive registry resolution: canonical [`lookup`] first, then
+/// [`lookup_uppercased`]. One choke point for the pattern that was copied
+/// verbatim into `new`/`try_new`/`canonical`/`entry`/`entry_or_unknown`/
+/// `related_codes_of` (E5).
+#[inline]
+pub(crate) fn resolve(code: &str) -> Option<&'static CodeEntry> {
+    lookup(code).or_else(|| lookup_uppercased(code))
+}
+
 /// Look up a code string in the table.
+#[inline]
 pub(crate) fn lookup(code: &str) -> Option<&'static CodeEntry> {
     let slot = code_slot(code)?;
     let idx = CODE_INDEX[slot];
@@ -450,24 +733,22 @@ pub(crate) fn lookup(code: &str) -> Option<&'static CodeEntry> {
     CODE_TABLE.get(idx as usize)
 }
 
-/// [`lookup`] on the ASCII-uppercased form of `code`, without allocating for
-/// the common short-code case (`e030` → `E030`).
+/// [`lookup`] on the ASCII-uppercased form of `code`, without allocating.
 ///
-/// Table codes are at most a few bytes, so a stack buffer covers every real
-/// retry; only longer inputs fall back to a temporary `String`.
-fn lookup_uppercased(code: &str) -> Option<&'static CodeEntry> {
-    const STACK: usize = 8;
-    let bytes = code.as_bytes();
-    if bytes.len() > STACK {
-        return lookup(&code.to_ascii_uppercase());
+/// Every table code is `^[EW]\d{3}$` — exactly four bytes, with only byte 0
+/// able to differ by case (bytes 1..3 are digits, on which
+/// `to_ascii_uppercase` is the identity).  The build-time `len == 4`
+/// assertion in [`CODE_TABLE`]'s shape check enforces that premise, so this
+/// needs no stack buffer, no heap fallback, and no `unsafe` UTF-8
+/// round-trip.
+#[inline]
+pub(crate) fn lookup_uppercased(code: &str) -> Option<&'static CodeEntry> {
+    let b = code.as_bytes();
+    if b.len() != 4 {
+        return None;
     }
-    let mut buf = [0u8; STACK];
-    for (dst, src) in buf.iter_mut().zip(bytes) {
-        *dst = src.to_ascii_uppercase();
-    }
-    // ASCII case folding preserves UTF-8 structure.
-    let upper = std::str::from_utf8(&buf[..bytes.len()]).ok()?;
-    lookup(upper)
+    let buf = [b[0].to_ascii_uppercase(), b[1], b[2], b[3]];
+    lookup(std::str::from_utf8(&buf).ok()?)
 }
 
 impl fmt::Display for ErrorCategory {
@@ -506,13 +787,19 @@ pub(crate) fn code_entries_by_category() -> &'static [(ErrorCategory, Vec<&'stat
 }
 
 pub fn related_codes_of(code: &str) -> &'static [&'static str] {
-    const PAIRS: &[(&str, &[&str])] = &[
-        ("E030", &["E031", "E032"]),
-        ("E031", &["E030"]),
-        ("E032", &["E030"]),
-    ];
-    for (src, rel) in PAIRS {
-        if *src == code {
+    // `RELATED_CODES` is generated by build.rs from
+    // `error_codes/codes.toml`'s `related` fields, so the "see also"
+    // graph cannot drift from the registry the way the old hand-written
+    // `PAIRS` slice could.
+    // Resolve case-insensitively, exactly like `new`/`entry`/
+    // `category_siblings_of`: `related_codes_of("e030")` used to return `&[]`
+    // while the sibling list worked, because `lookup` demands canonical
+    // `^[EW]\d{3}$` input.
+    let Some(entry) = resolve(code) else {
+        return &[];
+    };
+    for (src, rel) in RELATED_CODES {
+        if *src == entry.code {
             return rel;
         }
     }
@@ -520,10 +807,21 @@ pub fn related_codes_of(code: &str) -> &'static [&'static str] {
 }
 
 pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4]> {
-    let Some(entry) = lookup(code) else {
+    // Resolve through the same case-insensitive path as `ErrCode::new`/
+    // `entry` (`lookup` alone demands canonical `^[EW]\d{3}$`, so a
+    // lowercase `e030` used to return an empty sibling list).  From here on
+    // `code` is the CANONICAL table code, so the cache key can't fragment
+    // across case spellings of the same code.
+    let Some(entry) = lookup_uppercased(code) else {
         return SmallVec::new();
     };
-    // Codes grouped by category, built once.  CODE_TABLE is static so the
+    // `lookup_uppercased` only ever returns table entries, and every table
+    // entry passed the `^[EW]\d{3}$` build assertion — so a slot exists.  The
+    // old `else { … }` fallback here was unreachable dead code duplicating
+    // `build_siblings`' filtering.
+    let slot = code_slot(entry.code)
+        .expect("every CODE_TABLE entry has a direct-address slot") as u16;
+    // Codes grouped by category, built once. CODE_TABLE is static so the
     // grouping is invariant; caching it turns the per-call O(table) scan into
     // O(category) — a real win on the terminal renderer's per-diagnostic
     // "see also" path, which calls this for every diagnostic without explicit
@@ -539,13 +837,57 @@ pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4
         }
         map
     });
+    // The per-code *answer* is memoised per `(slot, max)`: `max` is a
+    // call-site constant in the renderers today, but the function is `pub`
+    // and nothing enforces a single `max` — keying the cache by the slot
+    // alone made a caller asking for `max = 2` after `max = 4` silently get
+    // the four-entry list.  The slots live in a lazily-populated flat map —
+    // a `LiteMap`, a sorted flat vector with O(log n) lookup and no
+    // hash-table shell — rather than a fixed `CODE_INDEX_SLOTS`-sized
+    // array, so a process that touches a handful of codes pays only for
+    // those codes; the per-slot `OnceLock` keeps the hit path lock-free.
+    static SIBLING_CACHE: std::sync::OnceLock<
+        std::sync::RwLock<LiteMap<(u16, usize), std::sync::OnceLock<SmallVec<[&'static str; 4]>>>>,
+    > = std::sync::OnceLock::new();
+    let cache = SIBLING_CACHE
+        .get_or_init(|| std::sync::RwLock::new(LiteMap::new()));
+    let slot_hit = || -> Option<SmallVec<[&'static str; 4]>> {
+        let m = cache.read().ok()?;
+        m.get(&(slot, max)).and_then(OnceLock::get).cloned()
+    };
+    if let Some(cached) = slot_hit() {
+        return cached;
+    }
+    // Build *before* taking the write lock: `build_siblings` walks the
+    // category list and allocates, and holding the global lock across it
+    // would serialize unrelated codes' "see also" lookups under parallel
+    // rendering.  A race loses only the duplicate build; the winner's
+    // per-slot `OnceLock` wins and both callers return the same answer.
+    //
+    // `build_siblings` is a pure function of `(entry.category, max)`, so the
+    // value we built is byte-identical to whatever won the race — return it
+    // directly instead of re-acquiring the read lock and cloning the winner.
+    let built = build_siblings(by_category, &entry, max);
+    if let Ok(mut m) = cache.write() {
+        let _ = m.entry((slot, max)).or_default().set(built.clone());
+    }
+    built
+}
+
+/// The per-category sibling list filtered to `max` entries, excluding the
+/// code itself — the value `SIBLING_CACHE` memoises per slot.
+fn build_siblings(
+    by_category: &rustc_hash::FxHashMap<ErrorCategory, Vec<&'static str>>,
+    entry: &CodeEntry,
+    max: usize,
+) -> SmallVec<[&'static str; 4]> {
     let siblings: &[&'static str] = by_category
         .get(&entry.category)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     siblings
         .iter()
-        .filter(|c| **c != code)
+        .filter(|c| **c != entry.code)
         .take(max)
         .copied()
         .collect()
@@ -557,11 +899,32 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// A second `set_explain_port` must be observable rather than silently
+    /// Lowercase input must resolve like `ErrCode::new`/`entry` do: the
+    /// sibling list is computed from the canonical entry, not returned empty
+    /// because `lookup` demands `^[EW]\d{3}$`.
+    #[test]
+    fn category_siblings_accepts_lowercase_code() {
+        let upper = category_siblings_of("E030", 4);
+        let lower = category_siblings_of("e030", 4);
+        assert!(!upper.is_empty(), "E030 has category siblings");
+        assert_eq!(lower, upper, "lowercase input returned a different (empty) list");
+        // And the case spellings share one cache entry (canonical key).
+        assert_eq!(category_siblings_of("E030", 2).len(), 2);
+        assert_eq!(category_siblings_of("e030", 2).len(), 2);
+    }
+
+    /// E3: `EXPLAIN_PORT` is process-global, and Cargo runs tests in parallel
+/// threads within one binary. Serialize every test that mutates it or reads a
+/// URL derived from it, so a future explicit host assertion cannot flake on
+/// test ordering.
+static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A second `set_explain_port` must be observable rather than silently
     /// discarded.  `EXPLAIN_PORT` is a process-global `OnceLock`, so this test
     /// deliberately owns it (no other test sets it).
     #[test]
     fn set_explain_port_reports_second_set() {
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(set_explain_port(12345).is_ok());
         assert_eq!(set_explain_port(54321), Err(12345));
     }
@@ -574,6 +937,7 @@ mod tests {
     /// regardless of whether `EXPLAIN_PORT` was set by another test.
     #[test]
     fn url_ansi_cannot_inject_osc() {
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ec = ErrCode::unknown("E0\x1b]8;;evil\x07");
         let out = ec.url_ansi();
         assert_eq!(out.matches('\x1b').count(), 4, "extra ESC in {out:?}");
@@ -591,6 +955,7 @@ mod tests {
     /// so assert on the encoded segment rather than the whole URL.
     #[test]
     fn url_percent_encodes_unknown_codes() {
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ec = ErrCode::unknown("E030\n../admin");
         let u = ec.url();
         assert!(u.contains("E030%0A..%2Fadmin"), "got: {u}");
@@ -601,10 +966,27 @@ mod tests {
     /// Regression guard: encoding must not alter canonical codes.
     #[test]
     fn known_codes_are_unchanged() {
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ec = ErrCode::new(ErrCode::E030);
         assert!(ec.url().contains("/E030"), "got: {}", ec.url());
         assert!(!ec.url().contains('%'), "got: {}", ec.url());
         assert!(ec.url_ansi().contains("E030"));
+    }
+
+    /// The sibling cache is keyed by `(slot, max)`: a caller asking for a
+    /// smaller `max` after a larger one must get the truncated list, not the
+    /// first caller's cached answer (the cache is process-global).
+    #[test]
+    fn category_siblings_respects_per_max_cache_key() {
+        let wide = category_siblings_of("E030", 4);
+        let narrow = category_siblings_of("E030", 2);
+        assert_eq!(narrow.len(), wide.len().min(2), "narrow max must truncate");
+        for (n, w) in narrow.iter().zip(wide.iter()) {
+            assert_eq!(n, w, "narrow list must be a prefix of the wide list");
+        }
+        // Asking again for the wide `max` must not be poisoned by the narrow
+        // call that preceded it.
+        assert_eq!(category_siblings_of("E030", 4).len(), wide.len());
     }
 
     /// The table-entry and verbatim storage forms must be interchangeable:
@@ -628,6 +1010,18 @@ mod tests {
             h.finish()
         };
         assert_eq!(hash(&known), hash(&verbatim));
+
+        // Case spellings resolve to the same canonical identity: an unknown
+        // verbatim lowercase code must equal the canonical table form, or a
+        // `HashSet<ErrCode>` would hold two entries for one logical code.
+        let lower_verbatim = ErrCode::unknown("e030");
+        let lower_known = ErrCode::new("e030");
+        assert_eq!(known, lower_verbatim);
+        assert_eq!(lower_known, lower_verbatim);
+        assert_eq!(hash(&known), hash(&lower_verbatim));
+        // Unknown junk stays distinct (no false collapse through the empty
+        // `UNKNOWN_CODE_ENTRY` fallback).
+        assert_ne!(ErrCode::unknown("junk1"), ErrCode::unknown("junk2"));
     }
 
     /// Pin the single-segment RFC 3986 contract now that the CLI builds its
@@ -678,9 +1072,14 @@ mod tests {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // `file_type()` does not follow symlinks, so a cyclic symlink
+            // under `src/` cannot make this walk recurse forever.
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
                 rs_files(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
                 out.push(path);
             }
         }
@@ -688,11 +1087,63 @@ mod tests {
 
     /// Return the argument text of the parenthesised call whose `(` is at
     /// `open_idx`, skipping nested parens, string literals, and comments.
+    /// Skip a raw string starting at the `r` of `r#"…"#` (or `br#"…"#`),
+/// returning the index just past the closing delimiter (or `len`).
+    fn skip_raw_string(bytes: &[u8], r: usize) -> Option<usize> {
+        let mut h = r + 1;
+        while h < bytes.len() && bytes[h] == b'#' {
+            h += 1;
+        }
+        if h >= bytes.len() || bytes[h] != b'"' {
+            return None;
+        }
+        let hashes = h - (r + 1);
+        let mut j = h + 1;
+        while j < bytes.len() {
+            if bytes[j] == b'"' {
+                let mut k = j + 1;
+                let mut cnt = 0;
+                while cnt < hashes && k < bytes.len() && bytes[k] == b'#' {
+                    k += 1;
+                    cnt += 1;
+                }
+                if cnt == hashes {
+                    return Some(k);
+                }
+            }
+            j += 1;
+        }
+        Some(bytes.len())
+    }
+
+    /// Skip a char literal starting at the opening `'`, honouring `'\''` and
+    /// `'\u{…}'`, returning the index just past the closing quote (or `len`).
+    fn skip_char_literal(bytes: &[u8], i: usize) -> usize {
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j] != b'\'' {
+            if bytes[j] == b'\\' {
+                j += 1;
+            }
+            j += 1;
+        }
+        (j + 1).min(bytes.len())
+    }
+
     fn argument_span(source: &str, open_idx: usize) -> Option<&str> {
         let bytes = source.as_bytes();
         let mut depth = 0i32;
         let mut i = open_idx;
         while i < bytes.len() {
+            // Raw strings (r"…", r#"…"#, br#"…"#) may contain parens/quotes
+            // that must not affect the scan (E2).
+            if bytes[i] == b'r' || (bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r')
+            {
+                let r = if bytes[i] == b'r' { i } else { i + 1 };
+                if let Some(end) = skip_raw_string(bytes, r) {
+                    i = end;
+                    continue;
+                }
+            }
             match bytes[i] {
                 b'(' => depth += 1,
                 b')' => {
@@ -700,6 +1151,12 @@ mod tests {
                     if depth == 0 {
                         return Some(&source[open_idx + 1..i]);
                     }
+                }
+                // Char literals: `'('` must not change paren depth, `'"'` must
+                // not flip the scanner into string mode (E2).
+                b'\'' => {
+                    i = skip_char_literal(bytes, i);
+                    continue;
                 }
                 b'"' => {
                     i += 1;
@@ -739,7 +1196,22 @@ mod tests {
         let mut out = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
+            // Raw strings are not code literals and may contain quotes that
+            // would desynchronise the scan (E2).
+            if bytes[i] == b'r' || (bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r')
+            {
+                let r = if bytes[i] == b'r' { i } else { i + 1 };
+                if let Some(end) = skip_raw_string(bytes, r) {
+                    i = end;
+                    continue;
+                }
+            }
             match bytes[i] {
+                // A char literal such as `'"'` would otherwise flip the
+                // scanner into string mode (E2).
+                b'\'' => {
+                    i = skip_char_literal(bytes, i);
+                }
                 b'"' => {
                     let start = i + 1;
                     let mut j = start;
@@ -986,6 +1458,34 @@ mod tests {
             found,
             vec!["E001", "E030", "E067", "E109", "E110", "E112"],
             "scanner missed or over-matched literals"
+        );
+    }
+
+    #[test]
+    fn scanner_handles_char_and_raw_literals() {
+        // E2: a `'('` char literal must not change paren depth, a `'"'` must
+        // not flip the scanner into string mode, and a raw string must not be
+        // scanned as a code literal.
+        fn codes_after<'a>(src: &'a str, callee: &str) -> Vec<&'a str> {
+            let after = match src.find(callee) {
+                Some(p) => p + callee.len(),
+                None => return vec![],
+            };
+            let tail = &src[after..];
+            let ws = tail.len() - tail.trim_start().len();
+            let open = after + ws;
+            argument_span(src, open)
+                .map(code_literals)
+                .unwrap_or_default()
+        }
+        let paren = r#"let a = ErrCode::new(if c == '(' { "E030" } else { "E031" });"#;
+        let mut got = codes_after(paren, "ErrCode::new");
+        got.sort_unstable();
+        assert_eq!(got, vec!["E030", "E031"], "char '(' broke the scan");
+        // A code-shaped body inside a raw string is not a literal.
+        assert!(
+            codes_after(r##"let b = ErrCode::new(r#"x"E998""#);"##, "ErrCode::new").is_empty(),
+            "raw string body scanned as a code literal"
         );
     }
 

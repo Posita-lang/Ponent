@@ -138,15 +138,95 @@ fn u3_clear_untracked_drops_memo_next_get_recomputes() {
     );
 }
 
+/// d19's untracked twin (P1): an in-flight `get_untracked` compute that
+/// started BEFORE `clear::<Q>` must NOT resurrect the cleared memo entry
+/// on its way out.  `get_untracked` takes no quiesce read pin — "nothing
+/// to quiesce" holds for the compute's inputs, but the memo is
+/// served-world state — so pre-fix, the insert landed after the map was
+/// wiped with no generation check, and the next get HIT the pre-clear
+/// value: the exact "next get recomputes" contract `clear` promises
+/// (already enforced for the tracked path by the d19 family).  The
+/// memo-generation stamp makes the insert-time validation discard the
+/// stale result; only the rare race wastes the compute.
+#[test]
+fn u8_untracked_clear_races_in_flight_compute_recomputes() {
+    static COMPUTES: AtomicUsize = AtomicUsize::new(0);
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    COMPUTES.store(0, Ordering::SeqCst);
+    ENTERED.store(false, Ordering::SeqCst);
+    RELEASE.store(false, Ordering::SeqCst);
+
+    struct U8Q;
+    impl<'q, 'src: 'q> Query<'q, 'src> for U8Q {
+        type Storage = Owned;
+        type Key = DKey;
+        type Value = DValue;
+        type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("u8", "untracked clear-race query").with_untracked(true)
+        }
+        fn compute<S: Scheduler>(key: &DKey, _: &dyn QueryProvider<'q, 'src, S>) -> DValue {
+            COMPUTES.fetch_add(1, Ordering::SeqCst);
+            ENTERED.store(true, Ordering::SeqCst);
+            // Bounded park (the d9/d10/d18/d24 deadline discipline): if a
+            // regression ever makes `clear` deadlock instead of racing, the
+            // test must FAIL LOUDLY after 2 s instead of wedging the whole
+            // `cargo test` process — `RELEASE` may simply never come.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !RELEASE.load(Ordering::SeqCst) {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            DValue::new(key.0 as u64)
+        }
+    }
+
+    let system = leak_system();
+    let provider = leak_provider(system);
+
+    // 1) Start a compute that parks inside `compute` (no quiesce pin —
+    //    the untracked path takes none).
+    let h = std::thread::spawn(move || system.get_shared::<U8Q>(DKey(7), provider));
+    while !ENTERED.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+
+    // 2) Clear WHILE the compute is parked — the exact race.
+    system.clear::<U8Q>();
+
+    // 3) Release: the compute finishes and tries to insert; the
+    //    generation check must discard the pre-clear result.
+    RELEASE.store(true, Ordering::SeqCst);
+    let _ = h.join().expect("compute thread must not panic");
+
+    // 4) The next get must RECOMPUTE — the in-flight compute's insert
+    //    must not have resurrected the memo entry (d19-class violation,
+    //    untracked edition).
+    let _ = system
+        .get_shared::<U8Q>(DKey(7), provider)
+        .expect("post-clear get");
+    assert_eq!(
+        COMPUTES.load(Ordering::SeqCst),
+        2,
+        "the post-clear get must recompute — the in-flight compute's \
+         insert must be discarded by the memo generation check"
+    );
+}
+
 /// Regression: untracked memo overflow must evict ONE entry, not clear
 /// the whole map (the working-set cliff: at capacity, a wholesale clear
 /// makes every refill cycle wipe the window and re-reads of earlier keys
 /// recompute).
-/// With cap = 2, after overflowing with a third key the map retains ONE
-/// of the two original survivors — so re-reading both costs exactly ONE
-/// recompute.  The old wholesale clear would cost TWO.  (Which key
-/// survived is FxHashMap-arbitrary, so the assertion counts, it doesn't
-/// name.)
+/// With cap = 2, after overflowing with a third key the map retains the
+/// FIFO survivor (key 2 — eviction is by FIRST insertion via the
+/// `VecDeque` queue beside the memo map) — so re-reading the survivor is
+/// a HIT, and re-reading the evicted key costs exactly ONE recompute.
+/// The old wholesale clear would cost TWO; the pre-FIFO bucket-arbitrary
+/// victim made the survivor unnameable and the count
+/// layout-dependent (a different FxHashMap build could flip it).
 #[test]
 fn u4_untracked_evict_one_keeps_a_survivor() {
     static COMPUTES: AtomicUsize = AtomicUsize::new(0);
@@ -179,18 +259,28 @@ fn u4_untracked_evict_one_keeps_a_survivor() {
         .expect("overflow 3");
     assert_eq!(COMPUTES.load(Ordering::SeqCst), 3, "no key read twice yet");
 
-    // Exactly one of {1, 2} survived the evict-one overflow.
+    // FIFO eviction evicted the FIRST-inserted key (1); key 2 is the
+    // named survivor.  The survivor's re-read must be a HIT (no
+    // recompute), then the evicted key's re-read costs exactly ONE
+    // recompute (and itself becomes the next FIFO victim).
     let base = COMPUTES.load(Ordering::SeqCst);
     let _ = system
-        .get_shared::<U4Q>(DKey(1), provider)
-        .expect("re-read 1");
-    let _ = system
         .get_shared::<U4Q>(DKey(2), provider)
-        .expect("re-read 2");
+        .expect("re-read the FIFO survivor");
+    assert_eq!(
+        COMPUTES.load(Ordering::SeqCst),
+        base,
+        "the FIFO survivor must still be memoized (a wholesale clear or \
+         bucket-order victim would recompute here)"
+    );
+    let _ = system
+        .get_shared::<U4Q>(DKey(1), provider)
+        .expect("re-read the evicted key");
     assert_eq!(
         COMPUTES.load(Ordering::SeqCst),
         base + 1,
-        "evict-one keeps ONE survivor; a wholesale clear would recompute BOTH ({base} -> {})",
+        "exactly ONE recompute for the evicted key (a wholesale clear would \
+         cost one per re-read: {base} -> {})",
         COMPUTES.load(Ordering::SeqCst)
     );
 }
@@ -346,9 +436,58 @@ fn u6_note_input_digest_rejects_untracked_query() {
 
     let system = leak_system();
     let provider = leak_provider(system);
-    // Register the vtable — the assert only fires when find_vtable is Some.
+    // Pre-register the vtable (historically the assert only fired when
+    // find_vtable was Some — see u5b for the never-driven path).
     let _ = system
         .get_shared::<U6Q>(DKey(1), provider)
         .expect("register the untracked vtable");
     system.note_input_digest::<U6Q>(&DKey(1), 42);
+}
+
+/// u5's gap (P1): the descriptor-based check must reject an untracked
+/// query even when NO vtable has ever been registered.  The old
+/// registry-based assert left this path silent — `find_vtable` returned
+/// `None`, the assert passed, and the gate returned a confident `false`
+/// ("content unchanged") for a query it had nothing to look at.
+/// Deliberately NOT `get_shared`ing first: the assert must fire from
+/// `Q::descriptor()` alone.
+#[test]
+#[should_panic(expected = "invalidate_if_changed on untracked query")]
+fn u5b_digest_gate_rejects_never_driven_untracked_query() {
+    struct U5bQ;
+    impl<'q, 'src: 'q> Query<'q, 'src> for U5bQ {
+        type Storage = Owned;
+        type Key = DKey;
+        type Value = DValue;
+        type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("u5b", "untracked, never driven").with_untracked(true)
+        }
+        fn compute<S: Scheduler>(key: &DKey, _: &dyn QueryProvider<'q, 'src, S>) -> DValue {
+            DValue::new(key.0 as u64)
+        }
+    }
+    let system = leak_system();
+    let _ = system.invalidate_if_changed::<U5bQ>(&DKey(1), 42);
+}
+
+/// u6's gap: same never-driven shape for the recording API.
+#[test]
+#[should_panic(expected = "note_input_digest on untracked query")]
+fn u6b_note_input_digest_rejects_never_driven_untracked_query() {
+    struct U6bQ;
+    impl<'q, 'src: 'q> Query<'q, 'src> for U6bQ {
+        type Storage = Owned;
+        type Key = DKey;
+        type Value = DValue;
+        type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("u6b", "untracked, never driven").with_untracked(true)
+        }
+        fn compute<S: Scheduler>(key: &DKey, _: &dyn QueryProvider<'q, 'src, S>) -> DValue {
+            DValue::new(key.0 as u64)
+        }
+    }
+    let system = leak_system();
+    system.note_input_digest::<U6bQ>(&DKey(1), 42);
 }

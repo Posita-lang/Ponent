@@ -55,6 +55,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -148,16 +149,24 @@ struct Styles {
     /// get `\x1b[48;5;236m` (dark gray); 16-colour terminals get `\x1b[7m`
     /// (reverse — universally available, visually distinct).
     highlight_bg: &'static str,
+    /// The reset that *pairs* with [`Self::highlight_bg`].  256-colour /
+    /// truecolour spans end with `\x1b[49m` (default background); a 16-colour
+    /// span is SGR 7 (reverse video), which SGR 49 does **not** clear — the
+    /// correct reset is SGR 27 (`\x1b[27m`).  Using the background reset on
+    /// 16-colour terminals leaked reverse video across the rest of the row
+    /// and every later row drawn with the same escape.
+    highlight_reset: &'static str,
 }
 
 impl Styles {
     const fn new(use_color: bool, color_depth: super::term::ColorDepth) -> Self {
         if use_color {
-            let highlight_bg = match color_depth {
+            let (highlight_bg, highlight_reset) = match color_depth {
                 super::term::ColorDepth::TwoFiftySix | super::term::ColorDepth::TrueColor => {
-                    "\x1b[48;5;236m"
+                    ("\x1b[48;5;236m", "\x1b[49m")
                 }
-                super::term::ColorDepth::Sixteen => "\x1b[7m",
+                // Reverse video pairs with SGR 27, not the background reset.
+                super::term::ColorDepth::Sixteen => ("\x1b[7m", "\x1b[27m"),
             };
             Styles {
                 use_color: true,
@@ -173,6 +182,7 @@ impl Styles {
                 diff_del: "\x1b[91m",
                 diff_add: "\x1b[92m",
                 highlight_bg,
+                highlight_reset,
             }
         } else {
             Styles {
@@ -189,6 +199,7 @@ impl Styles {
                 diff_del: "",
                 diff_add: "",
                 highlight_bg: "",
+                highlight_reset: "",
             }
         }
     }
@@ -218,12 +229,26 @@ impl Styles {
 
 // ── GlyphRenderer ───────────────────────────────────────────────
 
+/// What a source section actually drew (1.2). `drew_rows` means the section
+/// emitted anything; `drew_primary` means the primary span's start line was
+/// inside the drawn window — the only case in which the location is visible
+/// and the caller may suppress its fallback note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SectionOutcome {
+    drew_rows: bool,
+    drew_primary: bool,
+}
+
 /// Renders diagnostics in the Rust-inspired box-drawing format.
 pub struct GlyphRenderer {
     use_color: bool,
     context_lines: usize,
     max_width: usize,
     bc: &'static BoxChars,
+    /// Whether the Unicode box charset is active. Gates glyphs whose
+    /// East-Asian-Ambiguous width (`√`, U+221A) can break CJK-terminal
+    /// alignment (C10).
+    use_unicode: bool,
     s: Styles,
     /// Visible width of the `│  = ` prefix plus the trailing `: ` — i.e.
     /// everything in the `│  = <label>: ` child/note/help gutter except the
@@ -246,7 +271,7 @@ pub struct GlyphRenderer {
 /// [`GlyphRenderer::write_source_section`] so a diagnostic with K primary-span
 /// clusters pays ~13 allocations once, not ~13·K.
 ///
-/// The three `String` fields (`rendered`, `row_buf`, `connector`) are
+/// The `String` fields (`connector`, `hl_buf`) are
 /// `mem::take`-n into owned locals at the top of `write_source_section` and
 /// restored on exit (including the `source.is_empty()` early return), so
 /// format macros can use them by value.  The remaining fields are used via
@@ -257,7 +282,8 @@ pub(crate) struct SectionScratch {
     pub extra_lines: SmallVec<[(usize, usize); 4]>,
     pub all_label_lines: SmallVec<[(usize, usize); 4]>,
     // ── Row-loop scratch (reused across rows within a section) ─
-    pub rendered: String,
+    // `row_buf` is used by the HTML renderer; the glyph path appends rows
+    // directly to its output (P4) and no longer copies through it.
     pub row_buf: String,
     pub connector: String,
     pub lanes: UnderlineLanes,
@@ -267,6 +293,46 @@ pub(crate) struct SectionScratch {
     pub order_buf: Vec<usize>,
     pub done_buf: Vec<bool>,
     pub active_buf: BinaryHeap<Reverse<(usize, usize)>>,
+    /// Indent string for the source section's line-number gutter — cleared and
+    /// refilled once per section, capacity reused across sections instead of a
+    /// fresh `" ".repeat(line_num_width + 1)` allocation per section.
+    pub indent: String,
+    /// Per-foreign-file suggestion line ranges — cleared and resized to
+    /// `diag.suggestions.len()` per diagnostic; capacity survives across the
+    /// batch.  `Vec` (not `SmallVec`) because it is indexed by suggestion
+    /// number and must cover every suggestion even when most are `None`.
+    pub suggestion_lines_buf: Vec<Option<(usize, usize)>>,
+    /// Scratch for the highlighter's `_into` entry points where the
+    /// highlighted text must be assembled *before* it can be pushed between
+    /// gutter pieces (the connector re-colouring pass scans the highlighted
+    /// text for reset escapes).  `mem::take`-n per section, restored on exit.
+    pub hl_buf: String,
+    /// `(start_line, end_line)` per anchor label, cleared and refilled per
+    /// diagnostic; capacity reused across the batch.
+    pub section_label_lines: SmallVec<[(usize, usize); 4]>,
+    /// Index into `merged_labels` per anchor label, same reuse pattern.
+    pub section_label_sources: SmallVec<[usize; 4]>,
+    /// Start-line-sorted permutation of `section_label_lines`, shared across
+    /// every section of one diagnostic; capacity reused across the batch.
+    pub section_label_order: SmallVec<[usize; 4]>,
+    /// Precomputed `span_lines` per suggestion whose span belongs to the
+    /// anchor file (`None` for foreign files); capacity reused.
+    pub anchor_suggestion_lines: SmallVec<[Option<(usize, usize)>; 4]>,
+    /// Reusable [`LabelWindow`] scratch, threaded through
+    /// [`GlyphRenderer::write_source_section`] so a diagnostic with K source
+    /// sections pays one set of `SmallVec` / `BinaryHeap` capacities, not K.
+    /// `LabelWindow::new` takes it by value and `LabelWindow::into_scratch`
+    /// hands it back after the section renders.
+    pub label_window: LabelWindowScratch,
+    /// Per-row underline records, `(display_col, width, char, label_idx)`.
+    /// The message payload was split out (resolved at use sites from the
+    /// caller's `all_labels` slice via `label_idx`) exactly so this buffer —
+    /// and `meta_buf` below — carries no borrow into the per-section label
+    /// list and can be reused across the batch.
+    pub underlines_buf: SmallVec<[(usize, usize, char, Option<usize>); 8]>,
+    /// Per-row annotation metadata, `(underline_char, label_idx)`; see
+    /// [`underlines_buf`](Self::underlines_buf).
+    pub meta_buf: SmallVec<[(char, Option<usize>); 8]>,
 }
 
 impl SectionScratch {
@@ -275,7 +341,6 @@ impl SectionScratch {
             ranges: SmallVec::new(),
             extra_lines: SmallVec::new(),
             all_label_lines: SmallVec::new(),
-            rendered: String::with_capacity(256),
             row_buf: String::new(),
             connector: String::new(),
             lanes: UnderlineLanes::new(),
@@ -285,8 +350,33 @@ impl SectionScratch {
             order_buf: Vec::new(),
             done_buf: Vec::new(),
             active_buf: BinaryHeap::new(),
+            indent: String::new(),
+            hl_buf: String::new(),
+            suggestion_lines_buf: Vec::new(),
+            section_label_lines: SmallVec::new(),
+            section_label_sources: SmallVec::new(),
+            section_label_order: SmallVec::new(),
+            anchor_suggestion_lines: SmallVec::new(),
+            label_window: LabelWindowScratch::new(),
+            underlines_buf: SmallVec::new(),
+            meta_buf: SmallVec::new(),
         }
     }
+}
+
+/// Re-apply `color` after every `\x1b[22m\x1b[39m` pair injected by the
+/// code highlighter, writing straight into `out` (B3).  Shared by the inline
+/// and connector label-message paths so the two cannot drift.
+fn push_recologored(out: &mut String, text: &str, color: &str) {
+    const PAT: &str = "\x1b[22m\x1b[39m";
+    let mut rest = text;
+    while let Some(p) = rest.find(PAT) {
+        out.push_str(&rest[..p]);
+        out.push_str(PAT);
+        out.push_str(color);
+        rest = &rest[p + PAT.len()..];
+    }
+    out.push_str(rest);
 }
 
 impl GlyphRenderer {
@@ -333,9 +423,17 @@ impl GlyphRenderer {
             ),
         };
         // Clamp, don't panic: `max_width` can come from a user CLI flag
-        // (`--width 15`) or a mis-detecting terminal, and a diagnostics
-        // renderer must never abort the compiler over its own width.
-        let max_width = max_width.max(Self::MIN_WIDTH);
+        // (`--width 15`, or an absurd `--width 1e19`) or a mis-detecting
+        // terminal, and a diagnostics renderer must never abort the compiler
+        // over its own width.  The *upper* clamp matters too: past
+        // `usize::MAX / 4` the fitness-class arithmetic would need widening,
+        // and `intrinsic_badness`'s `as f64` loses precision — no real
+        // terminal is wider than this bound.
+        const MAX_RENDER_WIDTH: usize = 8 * super::DEFAULT_MAX_WIDTH;
+        let max_width = max_width.max(Self::MIN_WIDTH).min(MAX_RENDER_WIDTH);
+        // `context_lines` is a user CLI knob too — clamp it so the
+        // `sp_last + context_lines` window arithmetic cannot overflow.
+        let context_lines = context_lines.min(Self::MAX_CONTEXT_LINES);
         // Charset: options carry an explicit `use_unicode`; a bare
         // `use_color` renderer has no charset knob and keeps the legacy
         // coupling (colour-capable ⇒ Unicode).
@@ -351,12 +449,17 @@ impl GlyphRenderer {
             Some(o) => o.color_depth,
             None => crate::diagnostics::term::ColorDepth::TwoFiftySix,
         };
+        // A user CLI `--tab-width 0` would divide by zero in
+        // `grapheme_width_cached`'s `tab_width - (col % tab_width)`; clamp to
+        // 1 the same way `max_width` is clamped to `MIN_WIDTH`.  One cell per
+        // tab is degenerate but sound.
         let tab_width = match opts {
-            Some(o) => o.tab_width,
+            Some(o) => o.tab_width.max(1),
             None => DEFAULT_TAB_WIDTH,
         };
         GlyphRenderer {
             use_color,
+            use_unicode,
             context_lines,
             max_width,
             bc,
@@ -371,13 +474,23 @@ impl GlyphRenderer {
 
     /// Visible width of the `│  = <label>: ` gutter that precedes child /
     /// note / help messages, for a given level. The box char and fixed
-    /// separators are folded into `prefix_base`; only the label length varies.
+    /// separators are folded into `prefix_base`; only the label width varies.
+    /// `visible_width`, not `.len()`: `label()` is localized (ru/zh labels are
+    /// multi-byte), and byte length ≠ display cells — using bytes inflated
+    /// the gutter and misaligned wrapped continuation lines in non-English
+    /// locales.
     fn prefix_cols(&self, level: DiagnosticLevel) -> usize {
-        self.prefix_base + level.label().len()
+        self.prefix_base + visible_width(level.label().as_ref())
     }
 
+    /// Upper bound for `context_lines`.  A CLI `--context 1e19` parses as
+/// `usize::MAX`; the window computations add it to a line number, which
+/// would overflow (panic in debug, wrap in release → wrong window).  No
+/// real render wants more than this many context rows.
+    const MAX_CONTEXT_LINES: usize = 1 << 16;
+
     pub fn with_context_lines(mut self, n: usize) -> Self {
-        self.context_lines = n;
+        self.context_lines = n.min(Self::MAX_CONTEXT_LINES);
         self
     }
 
@@ -402,6 +515,13 @@ impl GlyphRenderer {
     /// the caller *per segment*, so every wrapped line gets a full
     /// open/reset pair and no SGR run is ever cut in half.  The [`SmallVec`]
     /// return keeps the common 1–2-line case inline (no heap allocation).
+    ///
+    /// (A caller-supplied-buffer `wrap_msg_into` was tried and removed: the
+    /// drop check on `SmallVec<Cow<'a>>` pins the buffer's scope to each
+    /// wrapped message's lifetime — the per-message sources here are
+    /// loop-locals — so cross-message reuse is impossible without turning
+    /// every segment owned.  The inline `SmallVec` already keeps the common
+    /// case allocation-free.)
     fn wrap_msg<'a>(&self, msg: &'a str, prefix_cols: usize) -> SmallVec<[Cow<'a, str>; 4]> {
         if self.no_wrap {
             return msg.split('\n').map(Cow::Borrowed).collect();
@@ -497,7 +617,19 @@ impl GlyphRenderer {
             for rel in &diag.related_errors {
                 if let Some(rel_span) = rel.span {
                     let label_text = match rel.code.as_ref() {
-                        Some(code) => format!("{} [{}]", rel.message, code.code()).into(),
+                        Some(code) => {
+                            // Manual pushes, not `format!`: skips the
+                            // `core::fmt` machinery per related error with a
+                            // code (common in merged multi-error diagnostics).
+                            let mut s = String::with_capacity(
+                                rel.message.len() + code.code().len() + 4,
+                            );
+                            s.push_str(&rel.message);
+                            s.push_str(" [");
+                            s.push_str(code.code());
+                            s.push(']');
+                            s.into()
+                        }
                         None => rel.message.clone(),
                     };
                     synthetic.push(Label::secondary(rel_span, label_text));
@@ -513,8 +645,47 @@ impl GlyphRenderer {
             let mut extras_labels: SmallVec<[Label<'src>; 2]> = SmallVec::new();
             // Per-section scratch buffers, reused across all sections of this
             // render (anchor-file and foreign) instead of reallocated per
-            // section.  See [`SectionScratch`] for the field layout.
-            let mut section_scratch = SectionScratch::new();
+            // section.  When a `RenderCtx` is supplied, its `scratch` cell
+            // amortises the 13 buffers across the whole batch (grown once on
+            // the first section, reused by every later diagnostic); the no-ctx
+            // path (`render_diagnostic` / `render_diagnostic_with_index`)
+            // falls back to a fresh local.  See [`SectionScratch`] for the
+            // field layout.
+            let mut local_scratch: SectionScratch;
+            let mut scratch_guard = cx.map(|c| c.scratch.borrow_mut());
+            let section_scratch: &mut SectionScratch = match scratch_guard.as_deref_mut() {
+                Some(s) => s,
+                None => {
+                    local_scratch = SectionScratch::new();
+                    &mut local_scratch
+                }
+            };
+            // Hoist the pure-value scratch fields that `write_source_section`
+            // receives by `&` while we also pass `&mut section_scratch`.
+            // `mem::take` moves the (already-allocated) container into a local
+            // and leaves an empty `Default` in the scratch; the local's
+            // capacity is moved back at the end of this `if let Some(source)`
+            // block.  No allocation happens on take or restore.
+            //
+            // `synthetic` / `merged_labels` / `section_labels` are NOT moved
+            // here: `merged_labels` borrows `synthetic`, so co-locating them
+            // in one struct would be self-referential (a field borrowing a
+            // sibling), which safe Rust cannot express; and `section_labels`
+            // borrows `synthetic`, so `&section_labels` and
+            // `&mut section_scratch` would alias the same struct.  Both are
+            // small `SmallVec`s (≤2 / ≤4 inline), so the common case has no
+            // heap allocation to amortise anyway.
+            // `suggestion_lines_buf` is taken inside the foreign gate below —
+            // it is only read on the multi-file path, so the common
+            // single-file case skips the take/restore entirely.
+            let mut section_label_lines =
+                std::mem::take(&mut section_scratch.section_label_lines);
+            let mut section_label_sources =
+                std::mem::take(&mut section_scratch.section_label_sources);
+            let mut section_label_order =
+                std::mem::take(&mut section_scratch.section_label_order);
+            let mut anchor_suggestion_lines =
+                std::mem::take(&mut section_scratch.anchor_suggestion_lines);
             // `merged_labels` borrows from both `diag.labels` and
             // `synthetic`; declaring `synthetic` first keeps its drop after
             // `merged_labels`.
@@ -525,11 +696,26 @@ impl GlyphRenderer {
             // Sort spans by position, then merge overlapping context windows into
             // a single source section so the output reads top-to-bottom without
             // redundant line ranges (e.g. lines 1-3 and 3-6 → 1-6).
-            let sorted_spans = diag.spans.primary();
-            debug_assert!(
-                sorted_spans.windows(2).all(|w| w[0] <= w[1]),
-                "MultiSpan::primary must be sorted by (file, start)",
-            );
+            let sorted_spans = diag.spans.primary_ref();
+            // Defense in depth: `primary_ref` sorts only on the *dirty* path,
+            // so a producer that mutated the primary list into an unsorted
+            // state without setting the dirty flag would silently corrupt the
+            // merge predicate, fold counts and `group[0]` selection in release
+            // builds.  Sorting a (typically ≤2-element) slice is cheap; do it
+            // whenever the borrowed view is not already ordered.
+            let sorted_spans: Cow<'_, [Span]> =
+                if sorted_spans.windows(2).all(|w| w[0] <= w[1]) {
+                    sorted_spans
+                } else {
+                    debug_assert!(
+                        false,
+                        "MultiSpan::primary must be sorted by (file, start)"
+                    );
+                    let mut out: SmallVec<[Span; 2]> = sorted_spans.iter().copied().collect();
+                    out.sort_unstable();
+                    out.dedup();
+                    Cow::Owned(out.into_vec())
+                };
 
             // Line index shared by every conversion in this render: each
             // lookup is O(log n) instead of rescanning the file.  The batch
@@ -543,13 +729,6 @@ impl GlyphRenderer {
                     &owned
                 }
             };
-            // Each merged label's (start_line, end_line), converted once
-            // per render and shared by every source section below.
-            let merged_label_lines: SmallVec<[(usize, usize); 4]> = merged_labels
-                .iter()
-                .map(|lbl| idx.span_lines(lbl.span))
-                .collect();
-
             // ── Multi-file guard ───────────────────────────────────
             // Source sections can only locate spans inside `diag.source`;
             // the emitter contract is that the source belongs to the first
@@ -559,6 +738,24 @@ impl GlyphRenderer {
             // render in sections; the rest stay visible as byte-range
             // notes after the sections.
             let anchor_file = sorted_spans.first().map(|sp| sp.file);
+            // Each merged label's (start_line, end_line), converted once
+            // per render and shared by every source section below.
+            // Foreign-file labels are skipped here: their `span_lines`
+            // result is never read (the filter below drops them, and the
+            // foreign-file section loop recomputes its own `f_label_lines`
+            // against that file's index), so computing them was pure
+            // O(#foreign · log n) waste on multi-file diagnostics.
+            let merged_label_lines: SmallVec<[(usize, usize); 4]> = merged_labels
+                .iter()
+                .map(|lbl| {
+                    if anchor_file.is_none_or(|anchor| lbl.span.file == anchor) {
+                        idx.span_lines(lbl.span)
+                    } else {
+                        (0, 0) // filtered out below; never read
+                    }
+                })
+                .collect();
+
             let foreign_spans: SmallVec<[Span; 2]> = sorted_spans
                 .iter()
                 .copied()
@@ -569,8 +766,8 @@ impl GlyphRenderer {
             // mark exactly the label it rendered even when earlier labels
             // were filtered out.
             let mut section_labels: SmallVec<[&Label<'src>; 4]> = SmallVec::new();
-            let mut section_label_lines: SmallVec<[(usize, usize); 4]> = SmallVec::new();
-            let mut section_label_sources: SmallVec<[usize; 4]> = SmallVec::new();
+            section_label_lines.clear();
+            section_label_sources.clear();
             for (i, lbl) in merged_labels.iter().enumerate() {
                 if anchor_file.is_none_or(|anchor| lbl.span.file == anchor) {
                     section_labels.push(lbl);
@@ -583,40 +780,44 @@ impl GlyphRenderer {
             // per-section extras into a pre-sorted order instead of re-sorting
             // the whole union per section — removing the `K·L·log L` term
             // from a diagnostic with K sections and L shared labels.
-            let mut section_label_order: SmallVec<[usize; 4]> =
-                (0..section_label_lines.len()).collect();
+            section_label_order.clear();
+            section_label_order.extend(0..section_label_lines.len());
             section_label_order.sort_by_key(|&i| section_label_lines[i].0);
             // Per-suggestion `(sug_first, sug_last)` against the anchor file's
             // index, precomputed once so each anchor-file section's suggestion
             // loop is a cheap range test instead of an `O(log n)` `span_lines`
             // per section per suggestion — removing the `K·S·log n` term.
-            let anchor_suggestion_lines: SmallVec<[Option<(usize, usize)>; 4]> = diag
-                .suggestions
-                .iter()
-                .map(|s| match s.span {
-                    Some(span) if anchor_file.is_none_or(|a| span.file == a) => {
-                        Some(idx.span_lines(span))
-                    }
-                    _ => None,
-                })
-                .collect();
+            anchor_suggestion_lines.clear();
+            anchor_suggestion_lines.extend(diag.suggestions.iter().map(|s| match s.span {
+                Some(span) if anchor_file.is_none_or(|a| span.file == a) => {
+                    Some(idx.span_lines(span))
+                }
+                _ => None,
+            }));
 
             // Build (line_range, span) pairs for merging. The line count
             // comes from the shared index (`str::lines`-equivalent) so the
             // whole file is never materialized as a `Vec<&str>` just to take
             // its length.
             let last_text_line = idx.text_line_count().saturating_sub(1);
-            let ranges: SmallVec<[((usize, usize), (SourcePos, SourcePos), Span); 2]> =
+            let ranges: SmallVec<[((usize, usize), SourcePos, Span); 2]> =
                 sorted_spans
                     .iter()
                     .filter(|sp| anchor_file.is_none_or(|anchor| sp.file == anchor))
                     .map(|&sp| {
                         let start_pos = idx.to_linecol(sp.start_as_usize());
-                        let end_pos = idx.to_linecol(sp.end_as_usize());
                         let first = start_pos.line.saturating_sub(self.context_lines);
-                        let last =
-                            std::cmp::min(end_pos.line + 1 + self.context_lines, last_text_line);
-                        ((first, last), (start_pos, end_pos), sp)
+                        // The window must end at the span's *last covered
+                        // line* plus `context_lines` — not at the exclusive
+                        // end offset's line plus one.  `span_lines` applies
+                        // the "end on a line start belongs to the previous
+                        // line" rule, so a span ending exactly at a newline
+                        // no longer drags one phantom row of context in
+                        // (with `context_lines = 0` the window previously
+                        // still showed one line below the span).
+                        let (_, sp_last) = idx.span_lines(sp);
+                        let last = std::cmp::min(sp_last + self.context_lines, last_text_line);
+                        ((first, last), start_pos, sp)
                     })
                     .collect();
 
@@ -628,7 +829,7 @@ impl GlyphRenderer {
             // `SmallVec<[Span; 2]>`: a merged group almost always has ≤2
             // spans, so the common case stays inline.
             let mut merged: SmallVec<
-                [((usize, usize), (SourcePos, SourcePos), SmallVec<[Span; 2]>); 2],
+                [((usize, usize), SourcePos, SmallVec<[Span; 2]>); 2],
             > = SmallVec::with_capacity(ranges.len());
             for (range, pos, sp) in &ranges {
                 if let Some(last) = merged.last_mut() {
@@ -649,7 +850,7 @@ impl GlyphRenderer {
             // by every section (previously each section sized its own
             // column from its local window, and wide context lines drifted
             // the gutters of neighbouring sections out of alignment).
-            let line_num_width = last_text_line.checked_ilog10().unwrap_or(0) as usize + 1;
+            let line_num_width = idx.text_line_count().checked_ilog10().unwrap_or(0) as usize + 1;
 
             // Per-label "rendered inline somewhere" flags, indexed like
             // `merged_labels` (and therefore `diag.labels`), set by the
@@ -700,7 +901,7 @@ impl GlyphRenderer {
             // The structure is kept here so a future *coupled* cost (e.g.
             // "one big fold beats two small ones") can slot in without
             // touching the call site.
-            for (i, (_, (start_pos, end_pos), group)) in merged.iter().enumerate() {
+            for (i, (_, start_pos, group)) in merged.iter().enumerate() {
                 // The group's earliest span is the section primary (caret +
                 // location header); the other real primaries are passed as
                 // extra `^` annotations, and `write_source_section` extends
@@ -709,10 +910,11 @@ impl GlyphRenderer {
                 // lines between the real spans get no caret.
                 extras_labels.clear();
                 extras_labels.extend(group[1..].iter().map(|&sp| Label::new(sp, "")));
-                // Fold-marker gap: lines hidden between the previous
-                // section's window end and this section's window start
-                // (0 when the sections are contiguous — no fold is
-                // drawn).
+                // Lines hidden between the previous section's window end and this
+        // section's window start. `None` (first section) draws no marker;
+        // `Some(n)` always has `n >= 1` — contiguous sections are merged by
+        // the predicate above, so the old "0 draws a bare `...`" state was
+        // unreachable (C8).
                 let folded_lines = i
                     .checked_sub(1)
                     .and_then(|prev_i| merged.get(prev_i))
@@ -723,14 +925,13 @@ impl GlyphRenderer {
                     idx,
                     group[0],
                     *start_pos,
-                    *end_pos,
                     anchor_file_url.as_deref(),
                     &section_labels,
                     &section_label_lines,
                     &section_label_order,
                     &section_label_sources,
                     &extras_labels,
-                    &mut section_scratch,
+                    section_scratch,
                     anchor_sanitized.as_ref(),
                     diag.level,
                     folded_lines,
@@ -741,6 +942,10 @@ impl GlyphRenderer {
                     &anchor_suggestion_lines,
                     &mut suggestion_rendered,
                 );
+                // The return value is deliberately ignored for the anchor
+                // file: unlike a foreign file, the anchor never registers in
+                // `foreign_rendered_files`, and an empty anchor source still
+                // falls through to the label-fallback loop below.
             }
 
             // ── Pre-group foreign-file data ───────────────────────
@@ -748,46 +953,64 @@ impl GlyphRenderer {
             // foreign file's section does not re-scan the full
             // `sorted_spans` / `merged_labels` / `suggestions` lists.
             // Turns the foreign loop from O(F·(S+L+U)) into O(S+L+U+F).
-            let mut foreign_spans_by_file: rustc_hash::FxHashMap<FileId, SmallVec<[Span; 2]>> =
-                rustc_hash::FxHashMap::default();
+            // The whole partition is dead work when there are no foreign
+            // sources (the overwhelmingly common single-file case), so it is
+            // gated below together with the foreign-section loop itself.
+            // `LiteMap` (a sorted flat vector) instead of the hash maps:
+            // the key set is a handful of `FileId`s, so O(log n) binary
+            // search with no hash-table shell is cheaper than Fx's SipHash
+            // setup, and the flat storage is cache-friendlier for the F
+            // foreign-file loop that reads every key once.
+            let mut foreign_rendered_files: litemap::LiteMap<FileId, ()> = litemap::LiteMap::new();
+            if let Some(foreign) = diag.foreign_sources.as_deref() {
+            let mut suggestion_lines_buf = std::mem::take(&mut section_scratch.suggestion_lines_buf);
+            let mut foreign_spans_by_file: litemap::LiteMap<FileId, SmallVec<[Span; 2]>> =
+                litemap::LiteMap::new();
             for &sp in sorted_spans.iter() {
                 if Some(sp.file) != anchor_file {
-                    foreign_spans_by_file.entry(sp.file).or_default().push(sp);
+                    foreign_spans_by_file
+                        .entry(sp.file)
+                        .or_insert_with(SmallVec::new)
+                        .push(sp);
                 }
             }
-            let mut foreign_labels_by_file: rustc_hash::FxHashMap<
+            let mut foreign_labels_by_file: litemap::LiteMap<
                 FileId,
                 (SmallVec<[&Label<'src>; 4]>, SmallVec<[usize; 4]>),
-            > = rustc_hash::FxHashMap::default();
+            > = litemap::LiteMap::new();
             for (i, lbl) in merged_labels.iter().enumerate() {
                 if Some(lbl.span.file) != anchor_file {
-                    let entry = foreign_labels_by_file.entry(lbl.span.file).or_default();
+                    let entry = foreign_labels_by_file
+                        .entry(lbl.span.file)
+                        .or_insert_with(|| (SmallVec::new(), SmallVec::new()));
                     entry.0.push(lbl);
                     entry.1.push(i);
                 }
             }
-            let mut foreign_suggestions_by_file: rustc_hash::FxHashMap<
+            let mut foreign_suggestions_by_file: litemap::LiteMap<
                 FileId,
                 SmallVec<[(usize, Span); 4]>,
-            > = rustc_hash::FxHashMap::default();
+            > = litemap::LiteMap::new();
             for (i, sug) in diag.suggestions.iter().enumerate() {
                 if let Some(span) = sug.span {
                     if Some(span.file) != anchor_file {
                         foreign_suggestions_by_file
                             .entry(span.file)
-                            .or_default()
+                            .or_insert_with(SmallVec::new)
                             .push((i, span));
                     }
                 }
             }
             // Reusable buffer for per-foreign-file suggestion line ranges.
             // Entries are set for the current file and reset to None after the
-            // call, so no O(S) work happens per foreign file.
-            let mut suggestion_lines_buf: Vec<Option<(usize, usize)>> =
-                vec![None; diag.suggestions.len()];
+            // call, so no O(S) work happens per foreign file.  Capacity is
+            // taken from `section_scratch` and restored at the end of this
+            // block, so a batch of diagnostics sharing a suggestion count pays
+            // one allocation, not one per diagnostic.
+            suggestion_lines_buf.clear();
+            suggestion_lines_buf.resize(diag.suggestions.len(), None);
 
-            let mut foreign_rendered_files: rustc_hash::FxHashSet<FileId> = Default::default();
-            if let Some(foreign) = diag.foreign_sources.as_deref() {
+            {
                 for (fid, fname, fsource) in foreign.iter() {
                     if Some(*fid) == anchor_file {
                         continue;
@@ -816,7 +1039,6 @@ impl GlyphRenderer {
                         None => LineIndex::new(fsource),
                     };
                     let f_start_pos = f_idx.to_linecol(section_primary.start_as_usize());
-                    let f_end_pos = f_idx.to_linecol(section_primary.end_as_usize());
                     let f_fname: &str = fname.as_ref();
                     let f_sanitized = super::sanitize_filename(f_fname);
                     let f_file_url: Option<Arc<str>> =
@@ -851,20 +1073,19 @@ impl GlyphRenderer {
                         .checked_ilog10()
                         .unwrap_or(0) as usize
                         + 1;
-                    self.write_source_section(
+                    let section_rendered = self.write_source_section(
                         out,
                         fsource,
                         &f_idx,
                         section_primary,
                         f_start_pos,
-                        f_end_pos,
                         f_file_url.as_deref(),
                         f_labels,
                         &f_label_lines,
                         &[],
                         f_label_sources,
                         &extras,
-                        &mut section_scratch,
+                        section_scratch,
                         f_sanitized.as_ref(),
                         diag.level,
                         None,
@@ -878,10 +1099,21 @@ impl GlyphRenderer {
                     for i in set_indices {
                         suggestion_lines_buf[i] = None;
                     }
-                    foreign_rendered_files.insert(*fid);
+                    // Only a section that actually drew the primary span
+                    // counts as "rendered" (1.2): an empty foreign source or
+                    // a primary past EOF must fall through to the
+                    // location-note fallbacks below, or its spans and labels
+                    // would be silently suppressed.
+                    if section_rendered.drew_primary {
+                        foreign_rendered_files.insert(*fid, ());
+                    }
                 }
             }
-
+            // Restore the buffer while it is still in scope: both the take
+            // and the restore live inside the foreign gate.
+            section_scratch.suggestion_lines_buf = suggestion_lines_buf;
+            } // foreign_sources gate
+            section_scratch.section_label_lines = section_label_lines;
             // ── Fallback: render labels not shown in any source section ──
             // A label may fall outside every rendered line range (e.g. a
             // "previous definition here" on a different function), in which
@@ -892,65 +1124,38 @@ impl GlyphRenderer {
             // Every fallback label shares the same `│  = note: ` gutter, so
             // compute its width once instead of per label.
             let fallback_prefix_cols = self.prefix_cols(DiagnosticLevel::Note);
+            debug_assert!(
+                label_rendered.len() >= diag.labels.len(),
+                "label_rendered bookkeeping drift: {} < {}",
+                label_rendered.len(),
+                diag.labels.len()
+            );
             for (i, lbl) in diag.labels.iter().enumerate() {
-                if label_rendered.get(i).copied().unwrap_or(true) {
+                // Fail *visible*: an out-of-bookkeeping index (should be
+                // impossible) must render the note rather than silently drop
+                // the label.
+                if label_rendered.get(i).copied().unwrap_or(false) {
                     continue;
                 }
                 // Multi-file guard: a label from another file cannot be
                 // located in this buffer; keep it visible via its byte
-                // range instead of a bogus line:col.
-                let foreign = anchor_file.is_some_and(|anchor| lbl.span.file != anchor);
+                // range instead of a bogus line:col.  A missing anchor (no
+                // primary span) means we do *not* know the attached source
+                // belongs to any label's file, so treat every label as
+                // foreign rather than resolving its offsets against a buffer
+                // that may be unrelated.
+                let foreign = anchor_file
+                    .is_none_or(|anchor| lbl.span.file != anchor);
                 let pos = (!foreign).then(|| idx.to_linecol(lbl.span.start_as_usize()));
-                let sanitized = super::sanitize_for_terminal_multiline(&lbl.message);
-                let segs = self.wrap_msg(&sanitized, fallback_prefix_cols);
-                let last = segs.len().saturating_sub(1);
-                for (i, seg) in segs.iter().enumerate() {
-                    // Keep the `at line:col` locator attached to the final
-                    // line — written inline so no `suffix` buffer per line.
-                    if i == last {
-                        if let Some(pos) = pos {
-                            out.push_str(self.s.dim);
-                            out.push_str(self.bc.v);
-                            out.push_str(self.s.reset);
-                            out.push_str("  ");
-                            out.push_str(self.s.help);
-                            out.push_str("= ");
-                            out.push_str(self.s.bold);
-                            out.push_str("note");
-                            out.push_str(self.s.reset);
-                            out.push_str(": ");
-                            out.push_str(seg.as_ref());
-                            out.push_str(" at ");
-                            push_uint(out, pos.line as u64 + 1);
-                            out.push(':');
-                            push_uint(out, pos.col as u64 + 1);
-                            out.push('\n');
-                        } else {
-                            let _ = writeln!(
-                                out,
-                                "{dim}{v}{reset}  {cyan}= {bold}note{reset}: {msg} at {span}",
-                                dim = self.s.dim,
-                                v = self.bc.v,
-                                reset = self.s.reset,
-                                cyan = self.s.help,
-                                bold = self.s.bold,
-                                msg = seg,
-                                span = lbl.span,
-                            );
-                        }
-                    } else {
-                        let _ = writeln!(
-                            out,
-                            "{dim}{v}{reset}  {cyan}= {bold}note{reset}: {msg}",
-                            dim = self.s.dim,
-                            v = self.bc.v,
-                            reset = self.s.reset,
-                            cyan = self.s.help,
-                            bold = self.s.bold,
-                            msg = seg,
-                        );
-                    }
-                }
+                // B4: one canonical note path.  A locatable label gets
+                // `line:col`; a foreign/unlocatable one gets its byte range so
+                // it stays identifiable.  `write_note_line_with` owns the
+                // gutter, wrapping, note color, and continuation padding.
+                let suffix = match pos {
+                    Some(pos) => format!("{}:{}", pos.line + 1, pos.col + 1),
+                    None => lbl.span.to_string(),
+                };
+                self.write_note_line_with(out, lbl.message.as_ref(), Some(&suffix));
             }
 
             // Multi-file guard: primary spans from other files cannot be
@@ -961,46 +1166,71 @@ impl GlyphRenderer {
             let fname = diag.file_name();
             let has_fname = !fname.is_empty() && fname != "<input>";
             for sp in &foreign_spans {
-                if foreign_rendered_files.contains(&sp.file) {
+                if foreign_rendered_files.contains_key(&sp.file) {
                     continue;
                 }
-                let loc = if has_fname {
-                    format!("{fname} {sp}")
-                } else {
-                    sp.to_string()
+                // A foreign span must be labelled with *its own* file name,
+                // never the anchor's — the anchor name would send the user
+                // to the wrong file.  `file_name_for` resolves the owner's
+                // name; only prefix when it is a real filename.
+                let loc = match diag.file_name_for(sp.file) {
+                    Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {sp}"),
+                    _ => sp.to_string(),
                 };
-                let _ = writeln!(
-                    out,
-                    "{dim}{v}{reset}  {cyan}= {bold}note{reset}: at {loc}",
-                    dim = self.s.dim,
-                    v = self.bc.v,
-                    reset = self.s.reset,
-                    cyan = self.s.help,
-                    bold = self.s.bold,
-                    loc = loc,
-                );
+                // C7: route through the wrapping note writer so a long location
+                // cannot overflow `max_width` on the no-source path, and the
+                // continuation gutter matches every other note.
+                self.write_note_line(out, &format!("at {loc}"));
             }
+            // Restore the taken scratch fields so their capacity survives
+            // into the next diagnostic's render.  `suggestion_lines_buf` was
+            // restored inside the foreign gate (its take is gated too), and
+            // `section_label_lines` was restored immediately after that gate.
+            section_scratch.section_label_sources = section_label_sources;
+            section_scratch.section_label_order = section_label_order;
+            section_scratch.anchor_suggestion_lines = anchor_suggestion_lines;
         } else {
             // No source attached: surface the byte ranges of the primary
             // spans so the diagnostic's location is not silently lost.
-            // Prefix with the filename when it is a real file.
-            let fname = diag.file_name();
-            let has_fname = !fname.is_empty() && fname != "<input>";
-            for sp in diag.spans.primary() {
-                let loc = if has_fname {
-                    format!("{fname} {sp}")
-                } else {
-                    sp.to_string()
+            // Prefix with the span's own filename when it is a real file —
+            // with no source there is no anchor buffer, but the spans can
+            // still belong to different files, and each must keep its name.
+            for sp in diag.spans.primary_ref().iter() {
+                let loc = match diag.file_name_for(sp.file) {
+                    Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {sp}"),
+                    _ => sp.to_string(),
                 };
-                let _ = writeln!(
+                // C7: route through the wrapping note writer so a long location
+                // cannot overflow `max_width` on the no-source path, and the
+                // continuation gutter matches every other note.
+                self.write_note_line(out, &format!("at {loc}"));
+            }
+            // Labels must not vanish when no source is attached — a
+            // "previous definition here" annotation is the whole point of
+            // some diagnostics.  Surface each as `= note: <message> at
+            // <span>`, using the same sanitizer and gutter conventions as
+            // the source-attached fallback loop.  Empty messages carry
+            // nothing to say (the merged-group extras use them) — skip.
+            // No dedupe against related errors is needed here: with no
+            // source attached, related errors render nowhere else in this
+            // branch, so a label can never be shown twice.
+            for lbl in diag.labels.iter() {
+                if lbl.message.is_empty() {
+                    continue;
+                }
+                let sanitized = super::sanitize_for_terminal_multiline(&lbl.message);
+                // Per-label file name: with no source attached, labels can
+                // come from several files, and each must keep its own name.
+                let loc = match diag.file_name_for(lbl.span.file) {
+                    Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {}", lbl.span),
+                    _ => lbl.span.to_string(),
+                };
+                // C7: wrap the whole `message at location` through the shared
+                // note writer (localized label + pad-only continuations) so a
+                // long label cannot break the width contract on this path.
+                self.write_note_line(
                     out,
-                    "{dim}{v}{reset}  {cyan}= {bold}note{reset}: at {loc}",
-                    dim = self.s.dim,
-                    v = self.bc.v,
-                    reset = self.s.reset,
-                    cyan = self.s.help,
-                    bold = self.s.bold,
-                    loc = loc,
+                    &format!("{} at {}", sanitized, loc),
                 );
             }
         }
@@ -1157,11 +1387,38 @@ impl GlyphRenderer {
                 if let Some(c) = diag.code.as_ref() {
                     codes.push(c);
                 }
+                // Dedup by code *string* without the O(R²) `codes.iter().any`
+                // scan: R ≤ 4 stays on an inline linear scan (the common
+                // one-or-two-related-errors shape pays no hash setup), and a
+                // diagnostic aggregating many related errors spills to a
+                // hash set — O(R) total instead of O(R²) string compares.
+                let mut seen: SmallVec<[&str; 4]> = SmallVec::new();
+                if let Some(c) = diag.code.as_ref() {
+                    seen.push(c.code());
+                }
+                let mut spill: Option<rustc_hash::FxHashSet<&str>> = None;
                 for rel in &diag.related_errors {
-                    if let Some(c) = rel.code.as_ref()
-                        && !codes.iter().any(|k| k.code() == c.code())
-                    {
+                    let Some(c) = rel.code.as_ref() else {
+                        continue;
+                    };
+                    let code = c.code();
+                    let dup = match &mut spill {
+                        Some(s) => !s.insert(code),
+                        None => seen.iter().any(|k| *k == code),
+                    };
+                    if !dup {
                         codes.push(c);
+                        // Stop maintaining `seen` once the hash set has
+                        // spilled: from here the set alone answers the
+                        // dup test, and pushing into the (full) inline
+                        // buffer for every remaining unique code is pure
+                        // waste.
+                        if spill.is_none() {
+                            seen.push(code);
+                            if seen.len() == 4 {
+                                spill = Some(seen.iter().copied().collect());
+                            }
+                        }
                     }
                 }
                 if codes.is_empty() {
@@ -1169,43 +1426,32 @@ impl GlyphRenderer {
                 }
                 codes
             };
-        // Visible comma-joined form, used for the width of the fixed
-        // `┌─ error[E030]: ` prefix (sanitization can inject U+FFFD).
-        let all_codes_visible: Cow<'_, str> = if all_codes.len() == 1 {
-            super::sanitize_for_terminal(all_codes[0].code())
-        } else {
-            let mut joined = String::new();
-            for (i, c) in all_codes.iter().enumerate() {
+        // Sanitize each code once into an inline buffer (≤2 codes stay on
+        // the stack), so the visible width and the comma-joined display form
+        // can be derived without re-sanitizing and without building the
+        // joined `String` when the hyperlink branch will discard it.
+        let sanitized_codes: SmallVec<[Cow<'_, str>; 2]> = all_codes
+            .iter()
+            .map(|c| super::sanitize_for_terminal(c.code()))
+            .collect();
+        // Visible width of the comma-joined codes, computed from parts
+        // (sanitization can inject U+FFFD, so each piece goes through
+        // `visible_width`) without materialising the joined `String`.
+        let all_codes_width = {
+            let mut w = 0usize;
+            for (i, s) in sanitized_codes.iter().enumerate() {
                 if i > 0 {
-                    joined.push(',');
+                    w += 1; // comma
                 }
-                joined.push_str(&super::sanitize_for_terminal(c.code()));
+                w += visible_width(s);
             }
-            Cow::Owned(joined)
-        };
-        // OSC 8 hyperlink form of the code list, used only when the terminal
-        // supports hyperlinks and color is on — each code becomes its own
-        // `url_ansi` link so Ctrl+click opens the matching `--explain` page.
-        let all_codes_display = if self.s.use_color
-            && super::term::supports_hyperlinks()
-            && crate::diagnostics::error_code::is_explain_server_running()
-        {
-            let mut s = String::new();
-            for (i, c) in all_codes.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push_str(&c.url_ansi());
-            }
-            Cow::Owned(s)
-        } else {
-            all_codes_visible.clone()
+            w
         };
         // Visible width of the fixed `┌─ error[E030]: ` prefix, computed
         // directly from its parts (layout: `{tl}{h} {level}[{codes}]: `)
         // instead of building the string only to measure it.  Box chars are
-        // one cell each; the level label is ASCII; `all_codes` goes through
-        // `visible_width` because sanitization can inject U+FFFD.
+        // one cell each; the level label is ASCII; `all_codes_width` carries
+        // the codes' contribution because sanitization can inject U+FFFD.
         //
         // With related errors the primary is item `1.`; its continuation
         // lines reserve the same gutter but leave the number off so it does
@@ -1214,10 +1460,10 @@ impl GlyphRenderer {
         let header_cols = self.bc.tl.chars().count() // ┌
             + self.bc.h.chars().count()              // ─
             + 1                                      // space
-            + level_label.len()                      // error
+            + visible_width(level_label.as_ref())    // error — display cells, not bytes (localized labels are multi-byte)
             + 1                                      // [
-            + visible_width(&all_codes_visible)      // E030
-            + "]: ".len()                            // ]: 
+            + all_codes_width                        // E030
+            + "]: ".len()                            // ]:
             + if numbered { 3 } else { 0 };
         // Continuation gutter for wrapped header segments: the `│` replaces
         // the `┌`, and the spaces fill the rest of the prefix so the segment
@@ -1226,6 +1472,24 @@ impl GlyphRenderer {
         // is `header_cols - (if numbered { 3 } else { 0 })`.
         let prefix_no_num = header_cols - usize::from(numbered) * 3;
         let cont_number = if numbered { "   " } else { "" };
+        // B5: the continuation reserves the same 3-column numbered slot as
+        // the first line; pin the invariant so a future literal edit fails
+        // loudly instead of silently shifting wrapped header messages.
+        debug_assert_eq!(
+            prefix_no_num + cont_number.len(),
+            header_cols,
+            "numbered-header continuation must occupy the full number slot"
+        );
+        // OSC 8 hyperlink form of the code list, used only when the terminal
+        // supports hyperlinks and color is on — each code becomes its own
+        // `url_ansi` link so Ctrl+click opens the matching `--explain` page.
+        // The codes are written straight into `out` at the render site below;
+        // no intermediate comma-joined `String` (nor a per-diagnostic
+        // `url_ansi().to_string()`) is built.  `all_codes_width` already
+        // measured the visible form from `sanitized_codes`.
+        let use_hyperlink_codes = self.s.use_color
+            && super::term::supports_hyperlinks()
+            && crate::diagnostics::error_code::is_explain_server_running();
         let msg_src: Cow<'_, str> = if diag.message.trim().is_empty() {
             // Empty message: fall back to the code's title when a code
             // exists, otherwise a neutral placeholder.  Without this
@@ -1253,32 +1517,46 @@ impl GlyphRenderer {
                 out.push(' ');
                 out.push_str(level_color);
                 out.push_str(self.s.bold);
-                out.push_str(&level_label);
+                out.push_str(level_label);
                 out.push_str(self.s.reset);
                 out.push('[');
                 out.push_str(self.s.bold);
-                out.push_str(&all_codes_display);
+                if use_hyperlink_codes {
+                    for (i, c) in all_codes.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(&c.url_ansi());
+                    }
+                } else {
+                    for (i, s) in sanitized_codes.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(s.as_ref());
+                    }
+                }
                 out.push_str(self.s.reset);
                 out.push_str("]: ");
                 let lead = if numbered { "1. " } else { "" };
                 out.push_str(lead);
-                let hl = crate::diagnostics::glyph::highlight_code(seg, self.s.use_color);
-                out.push_str(hl.as_ref());
+                if !highlight_code_into(seg, self.s.use_color, out) {
+                    out.push_str(seg.as_ref());
+                }
                 out.push('\n');
             } else {
                 // Continuation: `│` + padding so the segment starts at the
-                // same column as the first line's message.  Allocated here,
-                // only on the wrap path — the overwhelmingly common header
-                // does not wrap, so this avoids a per-diagnostic `String`
-                // that would be built and immediately dropped.
-                let cont_pad = " ".repeat(prefix_no_num - 1);
+                // same column as the first line's message.  `push_spaces`
+                // writes straight into `out` — the wrap path allocates no
+                // throwaway pad `String` at all.
                 out.push_str(self.s.dim);
                 out.push_str(self.bc.v);
                 out.push_str(self.s.reset);
-                out.push_str(&cont_pad);
+                push_spaces(out, prefix_no_num - 1);
                 out.push_str(cont_number);
-                let hl = crate::diagnostics::glyph::highlight_code(seg, self.s.use_color);
-                out.push_str(hl.as_ref());
+                if !highlight_code_into(seg, self.s.use_color, out) {
+                    out.push_str(seg.as_ref());
+                }
                 out.push('\n');
             }
         }
@@ -1291,11 +1569,26 @@ impl GlyphRenderer {
             // with the "1." on the header line:
             //   ┌─ error[E019,E030]: 1. duplicate definition of `i`
             //   │                    2. type mismatch
-            let indent = " ".repeat(header_cols - 1);
+            //
+            // `header_cols` is invariant per diagnostic, so the indent width
+            // is hoisted once; the spaces are pushed straight into `out` per
+            // row instead of materializing a `" ".repeat` String that is
+            // measured and copied then dropped.
+            // Align under the header's `1.`, which starts at `prefix_no_num`
+            // (`header_cols` minus the number slot) — not at `header_cols -
+            // 1`, which put `2.` under the message text *after* `1. ` and
+            // shifted the whole list three columns right.
+            let indent_cols = prefix_no_num.saturating_sub(1);
             for (i, rel) in diag.related_errors.iter().enumerate() {
                 let num = i + 2;
-                let item_prefix = format!("{}{}{}. ", self.bc.v, indent, num);
-                let item_cols = visible_width(&item_prefix);
+                // Width from parts: `│` (1 cell in both charsets) + the
+                // indent (ASCII spaces) + `<digits>. ` — one `dec_digits`
+                // call and three adds, versus a `format!` allocating a
+                // `String` per related error that was immediately measured
+                // and dropped.
+                let num_width =
+                    crate::diagnostics::renderers::fmt::dec_digits(num as u64);
+                let item_cols = BOX_VERT_WIDTH + indent_cols + num_width + 2;
                 let rel_msg = super::sanitize_for_terminal_multiline(&rel.message);
                 for (j, seg) in self.wrap_msg(&rel_msg, item_cols).iter().enumerate() {
                     // Gutter pieces written straight into `out`; the continuation
@@ -1304,18 +1597,20 @@ impl GlyphRenderer {
                     out.push_str(self.s.dim);
                     out.push_str(self.bc.v);
                     out.push_str(self.s.reset);
-                    out.push_str(&indent);
+                    push_spaces(out, indent_cols);
                     if j == 0 {
                         push_uint(out, num as u64);
                         out.push_str(". ");
                     } else {
-                        out.push_str("   ");
+                        // Continuation reserves the same `<num>. ` slot the
+                        // first line used: `num_width` cells plus `". "`.
+                        // The old hardcoded 3 spaces shifted the wrapped
+                        // text one column left once `num` reached 10.
+                        push_spaces(out, num_width + 2);
                     }
-                    let hl = crate::diagnostics::glyph::highlight_code_with_backticks(
-                        seg,
-                        self.s.use_color,
-                    );
-                    out.push_str(hl.as_ref());
+                    if !highlight_code_with_backticks_into(seg, self.s.use_color, out) {
+                        out.push_str(seg.as_ref());
+                    }
                     out.push('\n');
                 }
             }
@@ -1334,7 +1629,6 @@ impl GlyphRenderer {
         // already computes these for the merge window, so threading them in
         // avoids two O(log n) lookups per section.
         start_pos: SourcePos,
-        end_pos: SourcePos,
         // Pre-canonicalized `file://` URL for `filename`, or `None` when
         // hyperlinks are disabled / `filename` is a synthetic placeholder.
         // Threaded in so a batch of M diagnostics over one file pays one
@@ -1387,12 +1681,22 @@ impl GlyphRenderer {
         // lookup per section per suggestion.
         suggestion_lines: &[Option<(usize, usize)>],
         suggestion_rendered: &mut [bool],
-    ) {
+    ) -> SectionOutcome {
         // Empty source has no rows to draw. `text_line_count()` reports 1
         // for `""` (str::lines-style), so guard on the source itself rather
         // than materializing every line just to test for emptiness.
+        // Returns whether anything was rendered: the caller must not mark
+        // the file as "already shown" when nothing was drawn, or the
+        // fallback loops would silently drop that file's annotations.
+        // `drew_primary` distinguishes "drew context rows" from "drew the
+        // primary span the caller asked about": a foreign primary past EOF
+        // draws only context, and registering the file on `drew_rows` would
+        // silently swallow that span.
         if source.is_empty() {
-            return;
+            return SectionOutcome {
+                drew_rows: false,
+                drew_primary: false,
+            };
         }
         // Shared line index (built once per render); the per-line
         // underline helpers index into it instead of rescanning.
@@ -1427,11 +1731,20 @@ impl GlyphRenderer {
         // Determine the line range to display (with context)
         let first_line = start_pos.line.saturating_sub(self.context_lines);
         let text_last = idx.text_line_count().saturating_sub(1);
-        let mut last_line = std::cmp::min(end_pos.line + 1 + self.context_lines, text_last);
+        // `end_pos.line` is the line of the span's *exclusive* end offset;
+        // the last line the span actually covers is `span_lines(..).1`
+        // (an end sitting on a line start belongs to the previous line).
+        // Adding `context_lines` — without the extra +1 — keeps the shown
+        // window at exactly `context_lines` rows below the covered lines.
+        let mut last_line = std::cmp::min(
+            idx.span_lines(primary_span).1 + self.context_lines,
+            text_last,
+        );
         // Extras come after `primary_span` (spans are sorted by start), so
-        // only the window's end needs extending.
+        // only the window's end needs extending.  `extra_end` is already the
+        // last covered line of the extra span, so no +1 here either.
         for &(_, extra_end) in extras_lines {
-            last_line = last_line.max(std::cmp::min(extra_end + 1 + self.context_lines, text_last));
+            last_line = last_line.max(std::cmp::min(extra_end + self.context_lines, text_last));
         }
 
         // Width of the line number column: the max of this section's local
@@ -1439,8 +1752,12 @@ impl GlyphRenderer {
         // aligned (computed by the caller from the file's last text line).
         let local_line_num_width = (last_line + 1).checked_ilog10().unwrap_or(0) as usize + 1;
         let line_num_width = std::cmp::max(local_line_num_width, global_line_num_width);
-        // Indent for lines that don't have a line number (location header, spacing, explanation, fold marker)
-        let indent = " ".repeat(line_num_width + 1);
+        // Indent for lines that don't have a line number (location header, spacing, explanation, fold marker).
+        // Reuse `scratch.indent`'s capacity across sections instead of a fresh
+        // `" ".repeat(line_num_width + 1)` allocation per section.
+        scratch.indent.clear();
+        push_spaces(&mut scratch.indent, line_num_width + 1);
+        let indent = scratch.indent.as_str();
         // The blank line-number gutter is emitted as `{:>width$}` on the diff
         // rows below (width = `line_num_width`), so no per-section `String`
         // is built for a fill only the suggestion block uses.
@@ -1454,15 +1771,12 @@ impl GlyphRenderer {
         // the gap count makes the omission concrete
         // (`... (37 lines omitted)`).
         if let Some(gap) = folded_lines {
-            let marker = if gap > 0 {
-                Cow::Owned(format!("... ({gap} lines omitted)"))
-            } else {
-                Cow::Borrowed("...")
-            };
+            // The marker text is shared with the HTML renderer (correct
+            // singular/plural, one source of truth).
             out.push_str(self.s.dim);
             out.push_str(self.bc.v);
             out.push_str(&indent);
-            out.push_str(marker.as_ref());
+            crate::diagnostics::renderers::fmt::push_fold_marker(out, gap);
             out.push_str(self.s.reset);
             out.push('\n');
         }
@@ -1474,35 +1788,12 @@ impl GlyphRenderer {
         // foreign name once per file), so the terminal cannot forge links,
         // change the title, or clear the screen via the displayed path.  The
         // URL is separately percent-encoded below.
-        let location_str = if show_filename {
-            format!(
-                "{filename}:{line}:{col}",
-                filename = filename_display,
-                line = start_pos.line + 1,
-                col = start_pos.col + 1,
-            )
-        } else {
-            format!(
-                ":{line}:{col}",
-                line = start_pos.line + 1,
-                col = start_pos.col + 1,
-            )
-        };
-        let location_display = match file_url {
-            // OSC 8 hyperlink — Ctrl+click opens the file in the editor.
-            // The URL is pre-canonicalized and percent-encoded by the caller
-            // (cached per batch in `RenderCtx`), so control characters in a
-            // filename cannot terminate the sequence early or inject further
-            // terminal escapes.
-            Some(url) if show_filename => {
-                format!("\x1b]8;;{url}\x1b\\{location_str}\x1b]8;;\x1b\\")
-            }
-            _ => location_str,
-        };
-        // Compact mode drops the sub-box header's `┌─ ` prefix and the
-        // spacing row: the location line sits directly above the first
-        // source row.  `sub_tl_h` is a compile-time constant, so this borrows
-        // instead of `format!`-ing a 2-char `String` per section.
+        //
+        // Assembled straight into `out` between the SGR runs — two
+        // `format!`-built `String`s per section that were copied into `out`
+        // and dropped is exactly the pattern the rest of this file
+        // (`write_header`, the gutter, `chain.rs`) eliminated with
+        // `push_uint`/`push_spaces`.
         let sub_box_prefix: &str = if self.compact { "" } else { self.bc.sub_tl_h };
         out.push_str(self.s.dim);
         out.push_str(self.bc.v);
@@ -1511,7 +1802,29 @@ impl GlyphRenderer {
         out.push_str(self.s.reset);
         out.push(' ');
         out.push_str(self.s.help);
-        out.push_str(&location_display);
+        // OSC 8 hyperlink — Ctrl+click opens the file in the editor.  The
+        // URL is pre-canonicalized and percent-encoded by the caller (cached
+        // per batch in `RenderCtx`), so control characters in a filename
+        // cannot terminate the sequence early or inject further terminal
+        // escapes.
+        let hyperlink = matches!(file_url, Some(_) if show_filename);
+        if hyperlink
+            && let Some(url) = file_url
+        {
+            out.push_str("\x1b]8;;");
+            out.push_str(url);
+            out.push_str("\x1b\\");
+        }
+        if show_filename && !filename_display.is_empty() {
+            out.push_str(filename_display);
+            out.push(':');
+        }
+        push_uint(out, start_pos.line as u64 + 1);
+        out.push(':');
+        push_uint(out, start_pos.col as u64 + 1);
+        if hyperlink {
+            out.push_str("\x1b]8;;\x1b\\");
+        }
         out.push_str(self.s.reset);
         out.push('\n');
         // Spacing line (skipped in compact mode)
@@ -1540,18 +1853,16 @@ impl GlyphRenderer {
         scratch.ranges.extend_from_slice(all_label_lines);
         let label_line_ranges: &[(usize, usize)] = &scratch.ranges;
 
-        // Display-column-aware source line rendering loop.  The three `String`
+        // Display-column-aware source line rendering loop.  The `String`
         // scratch buffers are `mem::take`-n into owned locals so format macros
         // can use them by value; they are restored into `scratch` at function
         // exit.  The remaining scratch fields are used via `&mut` references —
         // their `clear()`/`push()` methods preserve capacity across sections.
-        let mut rendered = std::mem::take(&mut scratch.rendered);
+        // (`rendered` is no longer taken: source rows render straight into
+        // `out` in append form, so there is no per-row scratch copy.)
         // Underline lane allocator — owns the interval-graph colouring scratch
         // (heap, order, column buffer) so the row loop reuses it across lines.
         let lanes = &mut scratch.lanes;
-        // Reused across the row loop: `UnderlineLanes::row` clears it first,
-        // so one allocation covers every row of every lane in this section.
-        let mut row_buf = std::mem::take(&mut scratch.row_buf);
         // `multiline_flags` holds only `(display_col, part)` — the two fields
         // read back below — so no per-line `String` is cloned out of
         // `underlines_buf`, and the flags outlive that reused buffer.
@@ -1559,14 +1870,20 @@ impl GlyphRenderer {
         // per-row heap allocation.
         let multiline_flags = &mut scratch.multiline_flags;
         let mut connector = std::mem::take(&mut scratch.connector);
-        // `underlines_buf` and `meta_buf` hold `&'a str` from per-section label
-        // messages, so they cannot be threaded across sections — keep them as
-        // per-section locals (see `SectionScratch` doc comment).
-        let mut underlines_buf: SmallVec<[(usize, usize, char, &'a str, Option<usize>); 8]> =
-            SmallVec::with_capacity(all_labels.len() + 1);
+        // `underlines_buf` and `meta_buf` used to hold `&'a str` from
+        // per-section label messages and could not be threaded across
+        // sections.  The payload is now split — messages resolve at use
+        // sites from `all_labels` via `label_idx` — so both live in
+        // `SectionScratch` like every other buffer and their capacity
+        // survives across the batch.
+        let mut underlines_buf = std::mem::take(&mut scratch.underlines_buf);
+        // Highlighter scratch: the `_into` highlighter entry points need a
+        // buffer to assemble into when the highlighted text must be scanned
+        // (connector re-colouring) or when gutter pieces interleave the
+        // pushes.  Capacity reused across the batch.
+        let mut hl_buf = std::mem::take(&mut scratch.hl_buf);
         let ranges_buf = &mut scratch.ranges_buf;
-        let mut meta_buf: SmallVec<[(char, &'a str, Option<usize>); 8]> =
-            SmallVec::with_capacity(all_labels.len() + 1);
+        let mut meta_buf = std::mem::take(&mut scratch.meta_buf);
         let display_buf = &mut scratch.display_buf;
         let order_buf = &mut scratch.order_buf;
         let done_buf = &mut scratch.done_buf;
@@ -1575,12 +1892,16 @@ impl GlyphRenderer {
         // each row then only visits the labels that can cover it, not all
         // of them.  `label_order` pre-sorts the anchor-label prefix (shared
         // across sections); only the per-section extras are merged in here.
-        let mut label_window = LabelWindow::new(all_label_lines, label_order);
+        let window_scratch = std::mem::take(&mut scratch.label_window);
+        let mut label_window = LabelWindow::new(all_label_lines, label_order, window_scratch);
         // Row-invariant: the primary-highlight escapes depend only on
         // `use_color` and `color_depth`, so resolve them once instead of per
         // source row.
         let highlight_on = self.s.highlight_bg;
-        let highlight_off = if self.s.use_color { "\x1b[49m" } else { "" };
+        // Depth-aware reset: `\x1b[49m` clears a background colour but NOT
+        // SGR 7 (reverse video) — the 16-colour `highlight_bg` pairs with
+        // `\x1b[27m` (see `Styles::highlight_reset`).
+        let highlight_off = if self.s.use_color { self.s.highlight_reset } else { "" };
 
         for line_idx in first_line..=last_line {
             // O(1) slice via the shared index instead of indexing a
@@ -1589,30 +1910,10 @@ impl GlyphRenderer {
             // One grapheme walk converts this row's byte ranges to display
             // columns, measures the line's width, and emits the highlighted
             // source text — replacing the three separate passes over the
-            // line the row used to run.
-            let display_width = compute_line_underlines_and_render(
-                primary_span,
-                &all_labels,
-                &mut label_window,
-                source,
-                line,
-                line_idx,
-                starts,
-                &mut underlines_buf,
-                &mut rendered,
-                highlight_on,
-                highlight_off,
-                ranges_buf,
-                &mut meta_buf,
-                display_buf,
-                order_buf,
-                done_buf,
-                active_buf,
-                self.tab_width,
-            );
-            let underlines = &underlines_buf;
-
-            // Line number + source
+            // line the row used to run.  Append form: the gutter is pushed
+            // first and the render writes *straight into* `out`, so a plain
+            // row is no longer copied twice (render scratch → out).
+            // Gutter: `│ <num> │ `
             out.push_str(self.s.dim);
             out.push_str(self.bc.v);
             out.push_str(self.s.reset);
@@ -1624,7 +1925,34 @@ impl GlyphRenderer {
             out.push_str(self.bc.sub_v);
             out.push_str(self.s.reset);
             out.push(' ');
-            out.push_str(&rendered);
+            let display_width = compute_line_underlines_and_render(
+                primary_span,
+                &all_labels,
+                &mut label_window,
+                source,
+                line,
+                line_idx,
+                starts,
+                &mut underlines_buf,
+                out,
+                highlight_on,
+                highlight_off,
+                ranges_buf,
+                &mut meta_buf,
+                display_buf,
+                order_buf,
+                done_buf,
+                active_buf,
+                self.tab_width,
+                // Gutter width: `│ <num> │ ` — the terminal column the
+                // source text starts at, so tab stops advance from the
+                // absolute cursor column.
+                BOX_VERT_WIDTH + line_num_width + 1 + BOX_VERT_WIDTH + 1,
+                true,
+            );
+            let underlines = &underlines_buf;
+
+            // Line number + source
             out.push('\n');
 
             // ── Detect multi-line labels ───────────────────────────
@@ -1643,11 +1971,12 @@ impl GlyphRenderer {
             multiline_flags.clear();
             let mut visible_msgs = 0usize;
             let mut force_connector = false;
-            for &(col, _ulen, ch, msg, label_idx) in underlines {
+            for &(col, _ulen, ch, label_idx) in underlines {
                 let Some(i) = label_idx else {
                     continue;
                 };
                 let (start, end) = label_line_ranges[i + 1];
+                let msg_empty = all_labels[i].message.is_empty();
                 // A label counts as shown once something for it is actually
                 // emitted: its message (message loop below, on the final
                 // covered line) or — for a single-line or message-less label
@@ -1655,13 +1984,13 @@ impl GlyphRenderer {
                 // only from the message loop: an underline-only tail (end
                 // line outside the shown window) still deserves the fallback
                 // note rather than being counted as fully shown.
-                if (msg.is_empty() || start == end)
+                if (msg_empty || start == end)
                     && let Some(&src_idx) = label_sources.get(i)
                     && let Some(flag) = label_rendered.get_mut(src_idx)
                 {
                     *flag = true;
                 }
-                if msg.is_empty() {
+                if msg_empty {
                     continue;
                 }
                 let part = if line_idx == start {
@@ -1685,12 +2014,37 @@ impl GlyphRenderer {
             }
             let needs_connector = force_connector || visible_msgs > 1;
 
+            // The shared range policy suppresses middle-line underlines, so
+            // those rows no longer appear in `underlines`.  Derive their
+            // connector geometry from the label span directly: a middle row
+            // gets a bare `|` at the label's start column (start/end rows
+            // keep their underline segments).
+            if !label_window.active().is_empty() {
+                let line_start = starts.get(line_idx).map_or(source.len(), |&s| s as usize);
+                let line_end = line_start + line.len();
+                for &i in label_window.active() {
+                    let (start, end) = label_line_ranges[i + 1];
+                    if line_idx <= start
+                        || line_idx >= end
+                        || all_labels[i].message.is_empty()
+                    {
+                        continue;
+                    }
+                    let span_start = all_labels[i].span.start_as_usize();
+                    let off = span_start.clamp(line_start, line_end) - line_start;
+                    let col = byte_offset_to_display(line, off, self.tab_width);
+                    multiline_flags.push((col, "middle"));
+                }
+            }
+
             let annotation_style = Self::level_style(level);
             // Per-character colours: `^` uses the diagnostic's level colour,
-            // `~` (secondary) uses blue, ` ` (help) uses the help colour,
-            // `-` and blank padding use dim.
+            // `~` (secondary) uses the note colour (bright green — the
+            // palette's secondary-underline colour; the `Style::Note`/`Green`
+            // entry in `Styles`, not the blue `help` style), ` ` (help) uses
+            // the help colour, `-` and blank padding use dim.
             let level_color = self.s.get(annotation_style);
-            let blue = self.s.get(Style::Note);
+            let note_color = self.s.get(Style::Note);
             let dim_c = self.s.dim;
             let help_color = self.s.help;
             let connector_color = level_color;
@@ -1699,28 +2053,33 @@ impl GlyphRenderer {
             if !underlines.is_empty() {
                 let lane_count = lanes.assign(underlines);
                 for lane_idx in 0..lane_count {
-                    let visible = lanes.row(
+                    // P4: emit the gutter first, then append the underline
+                    // cells straight into `out`; roll the gutter back if the
+                    // lane turned out invisible (all entries clipped).
+                    let mark = out.len();
+                    out.push_str(self.s.dim);
+                    out.push_str(self.bc.v);
+                    out.push_str(&indent);
+                    out.push_str(self.bc.sub_v);
+                    out.push_str(self.s.reset);
+                    out.push(' ');
+                    let visible = lanes.row_append(
                         underlines,
                         lane_idx,
                         display_width,
-                        &mut row_buf,
+                        out,
                         |ch| match ch {
                             '^' => level_color,
-                            '~' => blue,
+                            '~' => note_color,
                             ' ' => help_color,
                             _ => dim_c,
                         },
                         self.s.reset,
                     );
                     if visible {
-                        out.push_str(self.s.dim);
-                        out.push_str(self.bc.v);
-                        out.push_str(&indent);
-                        out.push_str(self.bc.sub_v);
-                        out.push_str(self.s.reset);
-                        out.push(' ');
-                        out.push_str(&row_buf);
                         out.push('\n');
+                    } else {
+                        out.truncate(mark);
                     }
                 }
 
@@ -1729,10 +2088,20 @@ impl GlyphRenderer {
                 // connector row is needed when a message would otherwise be
                 // visually ambiguous: a help-style annotation, a multi-line
                 // label, or more than one message sharing the row.
-                for (col, _ulen, ch, msg, label_idx) in underlines
+                for (col, _ulen, ch, label_idx) in underlines
                     .iter()
-                    .filter(|(_, _, _, msg, _)| !msg.is_empty())
+                    .copied()
+                    // The payload carries only the label index; the message
+                    // resolves from the section's own `all_labels` (the
+                    // synthetic primary has `None` and an empty message).
+                    .filter(|(_, _, _, li)| {
+                        li.is_some_and(|i| !all_labels[i].message.is_empty())
+                    })
                 {
+                    let msg: &str = match label_idx {
+                        Some(i) => all_labels[i].message.as_ref(),
+                        None => "",
+                    };
                     // For a multi-line label, render its message only on the
                     // final covered line; earlier lines get the connector
                     // below, so the same text is not repeated on every row.
@@ -1742,7 +2111,7 @@ impl GlyphRenderer {
                         continue;
                     }
                     if let Some(i) = label_idx
-                        && let Some(&src_idx) = label_sources.get(*i)
+                        && let Some(&src_idx) = label_sources.get(i)
                         && let Some(flag) = label_rendered.get_mut(src_idx)
                     {
                         // This message is the label's rendering; block the
@@ -1751,10 +2120,8 @@ impl GlyphRenderer {
                     }
                     // `col` is a display column; pad with spaces to align.
                     connector.clear();
-                    connector.reserve(*col + 1);
-                    for _ in 0..*col {
-                        connector.push(' ');
-                    }
+                    connector.reserve(col + 1);
+                    push_spaces(&mut connector, col);
                     connector.push('|');
                     // Visible width of the `│<indent>│ <spaces>| ` prefix the
                     // message text follows.  Summed from its parts (the same
@@ -1762,12 +2129,17 @@ impl GlyphRenderer {
                     // string only to measure it — one `format!` per label
                     // otherwise.  A help label prepends `help: ` on its first
                     // line only, so reserve that gutter too.
+                    // A help label prepends the localized `help: ` gutter on its first
+                    // line only, so reserve its display width — not the ASCII
+                    // literal's 6 cells (C6: `ru` was over-reserving).
+                    let help_label = crate::diagnostics::DiagnosticLevel::Help.label();
+                    let help_cols = visible_width(help_label.as_ref()) + 2;
                     let prefix_cols = BOX_VERT_WIDTH
                         + indent.len() // ASCII spaces
                         + BOX_VERT_WIDTH
                         + 2 // the spaces around the connector
                         + connector.len() // ASCII spaces + `|`
-                        + if *ch == ' ' { "help: ".len() } else { 0 };
+                        + if ch == ' ' { help_cols } else { 0 };
                     if !needs_connector {
                         // Inline: `^^^^ message` on the underline row's
                         // gutter — no separate connector line.  The
@@ -1780,11 +2152,21 @@ impl GlyphRenderer {
                         let msg_prefix = BOX_VERT_WIDTH + indent.len() + BOX_VERT_WIDTH + 1;
                         let segments = self.wrap_msg(&sanitized_msg, msg_prefix);
                         for seg in segments.iter() {
-                            let highlighted =
-                                crate::diagnostics::glyph::highlight_code_with_backticks(
+                            // Highlight straight into the section scratch, then
+                            // copy once — the gutter pieces below interleave, so
+                            // the highlighted text must be assembled first.
+                            let highlighted = {
+                                hl_buf.clear();
+                                if highlight_code_with_backticks_into(
                                     seg,
                                     self.s.use_color,
-                                );
+                                    &mut hl_buf,
+                                ) {
+                                    hl_buf.as_str()
+                                } else {
+                                    seg.as_ref()
+                                }
+                            };
                             out.push_str(self.s.dim);
                             out.push_str(self.bc.v);
                             out.push_str(self.s.reset);
@@ -1794,7 +2176,7 @@ impl GlyphRenderer {
                             out.push_str(self.s.reset);
                             out.push(' ');
                             out.push_str(level_color);
-                            out.push_str(highlighted.as_ref());
+                            push_recologored(out, highlighted.as_ref(), level_color);
                             out.push_str(self.s.reset);
                             out.push('\n');
                         }
@@ -1816,6 +2198,13 @@ impl GlyphRenderer {
                     out.push('\n');
                     let sanitized_msg = super::sanitize_for_terminal_multiline(msg);
                     let segments = self.wrap_msg(&sanitized_msg, prefix_cols);
+                    // Localized label for an inline help annotation.  Compute
+                    // the prefix once (label + ":" + " ") and derive both the
+                    // first-line write and the continuation gutter from it so
+                    // a non-English label keeps its wrapped continuation
+                    // aligned.
+                    let help_label = crate::diagnostics::DiagnosticLevel::Help.label();
+                    let help_cols = visible_width(help_label.as_ref()) + 2;
                     for (i, seg) in segments.iter().enumerate() {
                         // Fixed gutter first, written straight into `out`
                         // (reusing its capacity); the segment text follows.
@@ -1831,23 +2220,39 @@ impl GlyphRenderer {
                         out.push_str(&connector);
                         out.push(' ');
                         out.push_str(connector_reset);
-                        if *ch == ' ' {
+                        if ch == ' ' {
                             if i == 0 {
                                 out.push_str(self.s.help);
-                                out.push_str("help:");
+                                out.push_str(help_label.as_ref());
+                                out.push(':');
                                 out.push_str(self.s.reset);
                                 out.push(' ');
+                            } else {
+                                // Continuation lines must reserve the same
+                                // `help: ` gutter the first line used, or the
+                                // wrapped text starts left of the first line's
+                                // message.
+                                out.push_str(self.s.help);
+                                push_spaces(out, help_cols);
+                                out.push_str(self.s.reset);
                             }
                             out.push_str(self.s.help);
                             out.push_str(seg.as_ref());
                             out.push_str(self.s.reset);
                             out.push('\n');
                         } else {
-                            let highlighted =
-                                crate::diagnostics::glyph::highlight_code_with_backticks(
+                            let highlighted = {
+                                hl_buf.clear();
+                                if highlight_code_with_backticks_into(
                                     seg,
                                     self.s.use_color,
-                                );
+                                    &mut hl_buf,
+                                ) {
+                                    hl_buf.as_str()
+                                } else {
+                                    seg.as_ref()
+                                }
+                            };
                             // Re-apply the connector color after the reset
                             // pair `highlight` injects.  The pieces are written
                             // straight into `out`; the old `replace` allocated
@@ -1855,15 +2260,7 @@ impl GlyphRenderer {
                             // opening color and the trailing reset stay
                             // outside the loop so the byte layout matches.
                             out.push_str(connector_color);
-                            let pat = "\x1b[22m\x1b[39m";
-                            let mut rest: &str = highlighted.as_ref();
-                            while let Some(p) = rest.find(pat) {
-                                out.push_str(&rest[..p]);
-                                out.push_str(pat);
-                                out.push_str(connector_color);
-                                rest = &rest[p + pat.len()..];
-                            }
-                            out.push_str(rest);
+                            push_recologored(out, highlighted.as_ref(), connector_color);
                             out.push_str(connector_reset);
                             out.push('\n');
                         }
@@ -1872,13 +2269,16 @@ impl GlyphRenderer {
             }
 
             // ── Multi-line label connectors ─────────────────────────
+            // Only *middle* rows get a bare connector row here: on the
+            // final covered line the message loop above already emits the
+            // connector + message row, so drawing an `end` connector again
+            // produced a stray duplicate `|` row.  ("start" stays skipped —
+            // the label's first line carries its underline instead.)
             for (col, part) in multiline_flags.iter() {
-                if *part == "middle" || *part == "end" {
+                if *part == "middle" {
                     connector.clear();
                     connector.reserve(*col + 1);
-                    for _ in 0..*col {
-                        connector.push(' ');
-                    }
+                    push_spaces(&mut connector, *col);
                     connector.push('|');
                     out.push_str(self.s.dim);
                     out.push_str(self.bc.v);
@@ -1914,13 +2314,17 @@ impl GlyphRenderer {
         // the `-`/`+` anchor line (rustc-style: the whole context
         // window is shown first, then the diff).
         debug_assert_eq!(suggestions.len(), suggestion_rendered.len());
+        // A caller that under-populates `suggestion_lines` would silently
+        // skip diff rendering for the tail suggestions (they still fall back
+        // to text, so nothing crashes — the drift would be invisible).
+        debug_assert_eq!(suggestions.len(), suggestion_lines.len());
         for (i, suggestion) in suggestions.iter().enumerate() {
-            let (Some(span), Some(replacement)) = (suggestion.span, &suggestion.replacement) else {
-                continue;
-            };
             if self.quiet {
                 continue;
             }
+            let (Some(span), Some(replacement)) = (suggestion.span, &suggestion.replacement) else {
+                continue;
+            };
             if matches!(
                 suggestion.style,
                 crate::diagnostics::SuggestionStyle::HideCodeAlways
@@ -1945,11 +2349,18 @@ impl GlyphRenderer {
             if sug_first != sug_last {
                 continue;
             }
+            // A single-line span can still carry a replacement *containing*
+            // a newline (e.g. "def\n"); splicing that into `new_line`
+            // produces a malformed multi-line row under the single-line
+            // diff layout, so fall back to the text-only path too.
+            if replacement.contains('\n') || replacement.contains('\r') {
+                continue;
+            }
             if sug_first < first_line || sug_first > last_line {
                 continue;
             }
             let old_line = idx.line(sug_first);
-            let line_start = starts[sug_first];
+            let line_start = starts[sug_first] as usize;
             let span_start_in_line = span
                 .start_as_usize()
                 .saturating_sub(line_start)
@@ -1966,12 +2377,12 @@ impl GlyphRenderer {
             {
                 continue;
             }
-            let new_line = format!(
-                "{}{}{}",
-                &old_line[..span_start_in_line],
-                replacement,
-                &old_line[span_end_in_line..]
+            let mut new_line = String::with_capacity(
+                old_line.len() + replacement.len() - (span_end_in_line - span_start_in_line),
             );
+            new_line.push_str(&old_line[..span_start_in_line]);
+            new_line.push_str(replacement);
+            new_line.push_str(&old_line[span_end_in_line..]);
             // Raw source and replacement text are external input: route
             // them through the same sanitizer the label-message loop uses
             // so control characters (ESC, C1) and bidi overrides cannot
@@ -1981,26 +2392,39 @@ impl GlyphRenderer {
 
             let applicability = suggestion.applicability;
             let glyph = match applicability {
-                crate::diagnostics::Applicability::MachineApplicable => "√",
+                // `√` is East-Asian-Ambiguous width; CJK terminals render it
+                // two cells wide, shifting the `-`/`+` payload. Use the
+                // unambiguous ASCII `+` in ASCII mode (C10).
+                crate::diagnostics::Applicability::MachineApplicable => {
+                    if self.use_unicode { "√" } else { ">" }
+                }
                 crate::diagnostics::Applicability::MaybeIncorrect => "?",
                 _ => "",
             };
             let label: &'static str = match applicability {
-                crate::diagnostics::Applicability::MachineApplicable => "help",
-                _ => "note",
+                crate::diagnostics::Applicability::MachineApplicable => {
+                    DiagnosticLevel::Help.label()
+                }
+                _ => DiagnosticLevel::Note.label(),
             };
             let label_color = match applicability {
                 crate::diagnostics::Applicability::MachineApplicable => self.s.help,
                 _ => self.s.note,
             };
-            let glyph_pad = if glyph.is_empty() {
-                String::new()
+            // The glyph slot always occupies one gutter column: an empty
+            // glyph (`Unspecified` / `HasPlaceholders`) emits a literal
+            // space so the `-`/`+` diff rows keep the same alignment as
+            // glyph-bearing suggestions instead of shifting one column left.
+            // Borrowed when the glyph is empty (the common no-style case) —
+            // the old `" ".to_string()` paid a heap round-trip for one space.
+            let glyph_pad: Cow<'_, str> = if glyph.is_empty() {
+                Cow::Borrowed(" ")
             } else {
-                format!(
+                Cow::Owned(format!(
                     "{dim}{glyph}{reset}",
                     dim = self.s.dim,
                     reset = self.s.reset
-                )
+                ))
             };
             // `Unspecified` / `HasPlaceholders` render no glyph at all, but
             // the pad still occupies 1 column in the gutter (a blank cell),
@@ -2011,6 +2435,22 @@ impl GlyphRenderer {
             } else {
                 visible_width(glyph)
             };
+            // The sanitizer keeps tabs as layout intent, but the main source
+            // rows expand them via the row printer — the diff rows must do
+            // the same, measured from the display column where the `- `/
+            // `+ ` payload actually starts (gutter `│` + line number + space
+            // + sub-bar `│` + space + glyph cell + the 2-column diff marker).
+            let diff_text_col = BOX_VERT_WIDTH
+                + line_num_width
+                + 1
+                + BOX_VERT_WIDTH
+                + 1
+                + glyph_rendered_width
+                + 2;
+            let old_display =
+                expand_tabs_from_col(old_display.as_ref(), self.tab_width, diff_text_col);
+            let new_display =
+                expand_tabs_from_col(new_display.as_ref(), self.tab_width, diff_text_col);
 
             let sanitized_msg = super::sanitize_for_terminal_multiline(&suggestion.message);
             let first_prefix = BOX_VERT_WIDTH
@@ -2018,7 +2458,7 @@ impl GlyphRenderer {
                 + BOX_VERT_WIDTH
                 + 1
                 + glyph_rendered_width
-                + label.len()
+                + visible_width(label)
                 + 2;
             let wrapped = self.wrap_msg(&sanitized_msg, first_prefix);
             let mut wrapped_iter = wrapped.iter();
@@ -2076,6 +2516,11 @@ impl GlyphRenderer {
                 out.push_str(self.s.reset);
                 out.push(' ');
                 out.push_str(&glyph_pad);
+                // Align continuation lines under the *message*, not under the
+                // glyph: the first line emits `glyph label: message`, so the
+                // continuations skip the same `label: ` gutter (one cell for
+                // the glyph pad + `label` + ": ").
+                push_spaces(out, label.len() + 2);
                 out.push_str(line.as_ref());
                 out.push('\n');
             }
@@ -2136,9 +2581,18 @@ impl GlyphRenderer {
 
         // Restore the `mem::take`-n `String` scratch buffers so the next
         // section reuses their capacity.
-        scratch.rendered = rendered;
-        scratch.row_buf = row_buf;
         scratch.connector = connector;
+        scratch.label_window = label_window.into_scratch();
+        scratch.underlines_buf = underlines_buf;
+        scratch.hl_buf = hl_buf;
+        scratch.meta_buf = meta_buf;
+        SectionOutcome {
+            drew_rows: true,
+            // The primary is visible only when its start line is inside the
+            // drawn window; an EOF primary with only context rows must not
+            // suppress the fallback location note.
+            drew_primary: (first_line..=last_line).contains(&start_pos.line),
+        }
     }
 
     // ── Children ─────────────────────────────────────────────────
@@ -2161,6 +2615,7 @@ impl GlyphRenderer {
     fn styled_segment<'a>(
         &self,
         parts: &[crate::diagnostics::StringPart<'_>],
+        cum: &[usize],
         plain: &str,
         seg: &'a str,
         search_from: usize,
@@ -2171,12 +2626,31 @@ impl GlyphRenderer {
         };
         let start = search_from + rel;
         let end = start + seg.len();
+        // Cumulative byte offsets of `parts` are built once per message by
+        // the caller (`write_child`) and passed in: this function runs once
+        // per *wrapped segment*, so building the table here — despite the
+        // comment above claiming otherwise — kept the per-message cost at
+        // O(P·S), exactly what it said it removed.  With the table hoisted,
+        // the per-message cost is O(P + S·log P + Σ overlap).
+        let acc = cum.last().map_or(0, |&off| off + parts[cum.len() - 1].content.len());
         let mut rendered = String::with_capacity(seg.len() + 16);
-        let mut pos = 0usize;
-        for part in parts {
+        let mut first = cum.partition_point(|&off| off < start);
+        // A part may *straddle* `start` (its offset is below `start` but its
+        // end is past it) — step back one so the binary search finds the
+        // first part that *overlaps*, not the first that begins inside.
+        if first > 0 && cum[first - 1] + parts[first - 1].content.len() > start {
+            first -= 1;
+        }
+        let mut pos = cum.get(first).copied().unwrap_or(acc);
+        for part in &parts[first..] {
             let pstart = pos;
             let pend = pos + part.content.len();
             pos = pend;
+            if pstart >= end {
+                // Parts are laid out in order: nothing after this one can
+                // overlap the segment.
+                break;
+            }
             let os = pstart.max(start);
             let oe = pend.min(end);
             if os >= oe {
@@ -2199,7 +2673,7 @@ impl GlyphRenderer {
     }
 
     fn write_child(&self, out: &mut String, child: &crate::diagnostics::Subdiag) {
-        let prefix: Cow<'_, str> = child.level.label();
+        let prefix: &'static str = child.level.label();
         let prefix_cols = self.prefix_cols(child.level);
         // Wrap the plain message; when a styled version is present, map each
         // wrapped segment back onto its parts so highlights survive per line.
@@ -2215,31 +2689,56 @@ impl GlyphRenderer {
         let message = child.plain_message();
         let sanitized = super::sanitize_for_terminal_multiline(message.as_ref());
         let plain = sanitized.as_ref();
-        // `plain` is the sanitized concatenation of the raw parts, and
-        // replacement strictly grows the text, so equal lengths mean the
-        // sanitization was a no-op and the raw parts can be used as-is.
-        let sanitized_parts: Vec<crate::diagnostics::StringPart<'_>>;
+        // `plain` is the sanitized concatenation of the raw parts.  Do NOT
+        // infer "sanitization was a no-op" from equal lengths: replacements
+        // grow C0/DEL by +2 and C1 by +1, while removing a bidi override
+        // shrinks by −3, so a balanced payload (+6 −6) keeps the total length
+        // *and* keeps the control bytes.  Sanitize every part unconditionally;
+        // sanitization is a per-char map, so it commutes with concatenation
+        // and `cum` over the sanitized parts stays aligned with `plain`.  The
+        // zero-allocation fast path is recovered by checking the resulting
+        // `Cow`s (a part is `Borrowed` only when it was unchanged).
+        let sanitized_parts: SmallVec<[crate::diagnostics::StringPart<'_>; 8]>;
+        // A `styled_message: Some(vec![])` alongside a non-empty plain
+        // message is a malformed-but-constructible child: styled mapping
+        // would emit nothing for every segment and the text would vanish,
+        // so an empty parts list falls back to the unstyled path.
         let styled_parts: Option<&[crate::diagnostics::StringPart<'_>]> = match child.styled_message
         {
-            Some(ref styled) => {
-                let total: usize = styled.0.iter().map(|p| p.content.len()).sum();
-                if total == plain.len() {
+            Some(ref styled) if !styled.0.is_empty() => {
+                sanitized_parts = styled
+                    .0
+                    .iter()
+                    .map(|p| crate::diagnostics::StringPart {
+                        content: super::sanitize_for_terminal_multiline(&p.content),
+                        style: p.style,
+                    })
+                    .collect();
+                let unchanged = sanitized_parts
+                    .iter()
+                    .all(|p| matches!(p.content, Cow::Borrowed(_)));
+                if unchanged {
                     Some(&styled.0)
                 } else {
-                    sanitized_parts = styled
-                        .0
-                        .iter()
-                        .map(|p| crate::diagnostics::StringPart {
-                            content: super::sanitize_for_terminal_multiline(&p.content),
-                            style: p.style,
-                        })
-                        .collect();
                     Some(&sanitized_parts)
                 }
             }
+            Some(_) => None, // empty styled parts: unstyled fallback above
             None => None,
         };
         let mut search_from = 0usize;
+        // Cumulative byte offsets of `styled_parts` — built once per message
+        // here, not once per wrapped segment inside `styled_segment` (which
+        // ran S times per message and kept the cost at O(P·S) despite its
+        // comment claiming O(P + S·log P)).
+        let mut cum: SmallVec<[usize; 8]> = SmallVec::new();
+        if let Some(parts) = styled_parts {
+            let mut acc = 0usize;
+            for p in parts {
+                cum.push(acc);
+                acc += p.content.len();
+            }
+        }
         for (i, seg) in self.wrap_msg(plain, prefix_cols).iter().enumerate() {
             // Keep the wrapped segment as a `Cow`: the unstyled path (no
             // `styled_message`) then borrows straight through, and the styled
@@ -2247,8 +2746,13 @@ impl GlyphRenderer {
             // old `into_owned()`/`to_string()` heap allocation.
             let msg: Cow<'_, str> = match styled_parts {
                 Some(parts) => {
-                    let (rendered, next) =
-                        self.styled_segment(parts, plain, seg.as_ref(), search_from);
+                    let (rendered, next) = self.styled_segment(
+                        parts,
+                        &cum,
+                        plain,
+                        seg.as_ref(),
+                        search_from,
+                    );
                     search_from = next;
                     rendered
                 }
@@ -2270,13 +2774,12 @@ impl GlyphRenderer {
             } else {
                 // Continuation: `│` + pad aligning the segment to column
                 // `prefix_cols` (where the first line's message started).
-                // Built only on the wrap path — a one-line child never wraps,
-                // so this avoids a per-child `String` built and dropped.
-                let cont_pad = " ".repeat(prefix_cols - 1);
+                // `push_spaces` writes straight into `out` — a one-line child
+                // never wraps, and a wrapped child allocates no throwaway pad.
                 out.push_str(self.s.dim);
                 out.push_str(self.bc.v);
                 out.push_str(self.s.reset);
-                out.push_str(&cont_pad);
+                push_spaces(out, prefix_cols - 1);
                 out.push_str(msg.as_ref());
                 out.push('\n');
             }
@@ -2284,10 +2787,20 @@ impl GlyphRenderer {
     }
 
     fn write_note_line(&self, out: &mut String, msg: &str) {
+        self.write_note_line_with(out, msg, None);
+    }
+
+    /// Canonical note emitter (B4).  `suffix` is appended to the final wrapped
+    /// segment as ` at <suffix>`; the fallback-label loop and the foreign-span
+    /// loop both route through this so coloring, continuation padding, and
+    /// locator placement cannot diverge.
+    fn write_note_line_with(&self, out: &mut String, msg: &str, suffix: Option<&str>) {
         let prefix_cols = self.prefix_cols(DiagnosticLevel::Note);
         let sanitized = super::sanitize_for_terminal_multiline(msg);
         let level_label = DiagnosticLevel::Note.label();
-        for (i, seg) in self.wrap_msg(&sanitized, prefix_cols).iter().enumerate() {
+        let segments = self.wrap_msg(&sanitized, prefix_cols);
+        let last = segments.len().saturating_sub(1);
+        for (i, seg) in segments.iter().enumerate() {
             if i == 0 {
                 out.push_str(self.s.dim);
                 out.push_str(self.bc.v);
@@ -2296,23 +2809,25 @@ impl GlyphRenderer {
                 out.push_str(self.s.help);
                 out.push_str("= ");
                 out.push_str(self.s.bold);
-                out.push_str(level_label.as_ref());
+                out.push_str(level_label);
                 out.push_str(self.s.reset);
                 out.push_str(": ");
                 out.push_str(self.s.note);
                 out.push_str(seg.as_ref());
                 out.push_str(self.s.reset);
-                out.push('\n');
             } else {
                 // Built only on the wrap path — a one-line note never wraps.
-                let cont_pad = " ".repeat(prefix_cols - 1);
                 out.push_str(self.s.dim);
                 out.push_str(self.bc.v);
                 out.push_str(self.s.reset);
-                out.push_str(&cont_pad);
+                push_spaces(out, prefix_cols - 1);
                 out.push_str(seg.as_ref());
-                out.push('\n');
             }
+            if i == last && let Some(suffix) = suffix {
+                out.push_str(" at ");
+                out.push_str(suffix);
+            }
+            out.push('\n');
         }
     }
 
@@ -2329,7 +2844,7 @@ impl GlyphRenderer {
                 out.push_str(self.s.help);
                 out.push_str("= ");
                 out.push_str(self.s.bold);
-                out.push_str(level_label.as_ref());
+                out.push_str(level_label);
                 out.push_str(self.s.reset);
                 out.push_str(": ");
                 out.push_str(self.s.help);
@@ -2338,11 +2853,10 @@ impl GlyphRenderer {
                 out.push('\n');
             } else {
                 // Built only on the wrap path — a one-line help never wraps.
-                let cont_pad = " ".repeat(prefix_cols - 1);
                 out.push_str(self.s.dim);
                 out.push_str(self.bc.v);
                 out.push_str(self.s.reset);
-                out.push_str(&cont_pad);
+                push_spaces(out, prefix_cols - 1);
                 out.push_str(seg.as_ref());
                 out.push('\n');
             }
@@ -2385,14 +2899,32 @@ pub(crate) fn span_line(span: Span, source: &str) -> usize {
 /// exactly like the label slice) and must outlive the window.
 pub(crate) struct LabelWindow<'a> {
     label_lines: &'a [(usize, usize)],
-    /// Label indices sorted by `start_line` (stable: ties keep original order).
-    /// Built once per section; when the caller pre-sorts the anchor labels
-    /// (shared across a diagnostic's K sections), only the per-section extras
-    /// are sorted and merged into this order — see [`LabelWindow::new`].
+    scratch: LabelWindowScratch,
+    /// Index into `scratch.order` of the first label not yet folded in.
+    cursor: usize,
+}
+
+/// Reusable scratch state for a [`LabelWindow`].
+///
+/// Hoisted into [`SectionScratch`] so a diagnostic with K source sections
+/// pays one set of `SmallVec` / `BinaryHeap` capacities instead of K:
+/// [`LabelWindow::new`] takes the scratch by value, and
+/// [`LabelWindow::into_scratch`] hands it back after the section renders.
+///
+/// The three per-row scratch vectors (`new_labels`, `expired`, `merged`) and
+/// the `order` / `active` vectors are all reused across `advance` calls within
+/// one window *and* across the K windows of one diagnostic.  `expiry` — the
+/// one always-heap-allocated field — is where the section-to-section win is
+/// largest.
+pub(crate) struct LabelWindowScratch {
+    /// Label indices sorted by `start_line` (stable: ties keep original
+    /// order).  Built once per section by [`LabelWindow::new`]; when the
+    /// caller pre-sorts the anchor labels (shared across a diagnostic's K
+    /// sections), only the per-section extras are sorted and merged into this
+    /// order — see [`LabelWindow::new`].
     ///
     /// `SmallVec<[usize; 16]>`: labels-per-diagnostic rarely exceeds 4, so the
-    /// common case stays inline — `LabelWindow` is then allocation-free apart
-    /// from the small `expiry` heap.
+    /// common case stays inline.
     order: SmallVec<[usize; 16]>,
     /// Labels covering the current row, keyed by original index so iteration
     /// yields the emission order.  Kept sorted by index via binary-search
@@ -2402,12 +2934,42 @@ pub(crate) struct LabelWindow<'a> {
     /// is pushed once when it enters and popped once when its `end_line` falls
     /// below the current row, so `advance` touches only the expired labels.
     expiry: BinaryHeap<Reverse<(usize, usize)>>,
-    /// Index into `order` of the first label not yet folded in.
-    cursor: usize,
+    // ── Per-`advance` scratch, hoisted so capacity survives across rows ──
+    /// Labels entering the window on the current row.  Inline for ≤8 (the
+    /// common case); capacity is reused across `advance` calls.
+    new_labels: SmallVec<[usize; 8]>,
+    /// Labels leaving the window on the current row.  Inline for ≤8.
+    expired: SmallVec<[usize; 8]>,
+    /// Merge buffer for the burst path (`new_labels.len() > 1 || expired.len() > 1`).
+    /// `active` and `merged` are swapped at the end of a burst so the buffer's
+    /// capacity is reused on the next burst instead of a fresh
+    /// `SmallVec::with_capacity`.
+    merged: SmallVec<[usize; 8]>,
+}
+
+impl LabelWindowScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            order: SmallVec::new(),
+            active: SmallVec::new(),
+            expiry: BinaryHeap::new(),
+            new_labels: SmallVec::new(),
+            expired: SmallVec::new(),
+            merged: SmallVec::new(),
+        }
+    }
+}
+
+impl Default for LabelWindowScratch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<'a> LabelWindow<'a> {
-    /// Build the start-line-sorted `order` for `label_lines`.
+    /// Build the start-line-sorted `order` for `label_lines`, reusing
+    /// `scratch`'s buffers (and taking ownership of it for the window's
+    /// lifetime).
     ///
     /// `sorted_prefix` is a start-line-sorted permutation of
     /// `label_lines[..sorted_prefix.len()]` (the anchor labels, pre-sorted
@@ -2418,9 +2980,23 @@ impl<'a> LabelWindow<'a> {
     /// plus `O(K · (L + E))` for the merges, instead of re-sorting the whole
     /// `O(K · (L + E) log(L + E))` union per section.  Pass `&[]` to sort
     /// everything (no pre-sort available, e.g. the HTML renderer).
-    pub(crate) fn new(label_lines: &'a [(usize, usize)], sorted_prefix: &[usize]) -> Self {
+    pub(crate) fn new(
+        label_lines: &'a [(usize, usize)],
+        sorted_prefix: &[usize],
+        mut scratch: LabelWindowScratch,
+    ) -> Self {
+        // Reset every field the previous section left behind.  `clear`
+        // preserves capacity — the point of threading a scratch through the
+        // caller's `SectionScratch`.
+        scratch.order.clear();
+        scratch.active.clear();
+        scratch.expiry.clear();
+        scratch.new_labels.clear();
+        scratch.expired.clear();
+        scratch.merged.clear();
+
         let n = label_lines.len();
-        let mut order: SmallVec<[usize; 16]> = SmallVec::with_capacity(n);
+        let order = &mut scratch.order;
         if sorted_prefix.is_empty() {
             order.extend(0..n);
             order.sort_by_key(|&i| label_lines[i].0);
@@ -2446,26 +3022,40 @@ impl<'a> LabelWindow<'a> {
                 order.extend_from_slice(&extras[b..]);
             }
         }
+
         Self {
             label_lines,
-            order,
-            active: SmallVec::new(),
-            expiry: BinaryHeap::new(),
+            scratch,
             cursor: 0,
         }
+    }
+
+    /// Consume the window and return its scratch buffers so the next
+    /// section of the same render can reuse their capacity.
+    pub(crate) fn into_scratch(self) -> LabelWindowScratch {
+        self.scratch
     }
 
     /// Fold `line_idx` into the window. Rows must be visited in ascending
     /// order (the renderers iterate `first_line..=last_line`).
     pub(crate) fn advance(&mut self, line_idx: usize) {
         let lines = self.label_lines;
+        let scratch = &mut self.scratch;
+
+        // Hoisted scratch — `take` out so the merge loop can borrow `scratch.active`
+        // while we write `merged`, then restore at the end so capacity survives.
+        // `clear()` handles any items left from the previous `advance` (the
+        // fast path returns the locals with 0–1 items still present).
+        let mut new_labels = std::mem::take(&mut scratch.new_labels);
+        new_labels.clear();
+        let mut expired = std::mem::take(&mut scratch.expired);
+        expired.clear();
 
         // Phase 1: fold in labels whose start line has arrived.
-        let mut new_labels: SmallVec<[usize; 8]> = SmallVec::new();
         let mut first_start: Option<usize> = None;
         let mut multi_start = false;
-        while self.cursor < self.order.len() {
-            let i = self.order[self.cursor];
+        while self.cursor < scratch.order.len() {
+            let i = scratch.order[self.cursor];
             let start = lines[i].0;
             if start > line_idx {
                 break;
@@ -2476,17 +3066,16 @@ impl<'a> LabelWindow<'a> {
                 _ => {}
             }
             new_labels.push(i);
-            self.expiry.push(Reverse((lines[i].1, i)));
+            scratch.expiry.push(Reverse((lines[i].1, i)));
             self.cursor += 1;
         }
 
         // Phase 2: collect expired.
-        let mut expired: SmallVec<[usize; 8]> = SmallVec::new();
-        while let Some(&Reverse((end, i))) = self.expiry.peek() {
+        while let Some(&Reverse((end, i))) = scratch.expiry.peek() {
             if end >= line_idx {
                 break;
             }
-            self.expiry.pop();
+            scratch.expiry.pop();
             expired.push(i);
         }
 
@@ -2495,14 +3084,44 @@ impl<'a> LabelWindow<'a> {
         // path.
         if new_labels.len() <= 1 && expired.len() <= 1 {
             if let Some(&i) = new_labels.first() {
-                self.active
-                    .insert(self.active.partition_point(|&x| x < i), i);
+                scratch
+                    .active
+                    .insert(scratch.active.partition_point(|&x| x < i), i);
             }
             if let Some(&i) = expired.first() {
-                if let Ok(pos) = self.active.binary_search(&i) {
-                    self.active.remove(pos);
+                if let Ok(pos) = scratch.active.binary_search(&i) {
+                    scratch.active.remove(pos);
                 }
             }
+            scratch.new_labels = new_labels;
+            scratch.expired = expired;
+            return;
+        }
+
+        // Mixed small case — at most one arrival plus one or two removals
+        // (the common "a few labels over a handful of rows" shape between
+        // the single-item fast path and a real burst).  `active` is
+        // index-sorted, so this is one binary-search insert plus at most two
+        // binary-searched `remove`s — no `reserve`, no full merge loop over
+        // the whole active set.
+        if new_labels.len() <= 1 && expired.len() <= 2 {
+            if let Some(&i) = new_labels.first() {
+                scratch
+                    .active
+                    .insert(scratch.active.partition_point(|&x| x < i), i);
+            }
+            // `expired` comes off the end-line heap, so index order is
+            // arbitrary — sort the (≤ 2) pair before removing.
+            if expired.len() == 2 && expired[0] > expired[1] {
+                expired.swap(0, 1);
+            }
+            for &i in &expired {
+                if let Ok(pos) = scratch.active.binary_search(&i) {
+                    scratch.active.remove(pos);
+                }
+            }
+            scratch.new_labels = new_labels;
+            scratch.expired = expired;
             return;
         }
 
@@ -2516,11 +3135,12 @@ impl<'a> LabelWindow<'a> {
             expired.sort_unstable();
         }
 
-        let mut merged: SmallVec<[usize; 8]> =
-            SmallVec::with_capacity(self.active.len() + new_labels.len());
+        let mut merged = std::mem::take(&mut scratch.merged);
+        merged.clear();
+        merged.reserve(scratch.active.len() + new_labels.len());
         let (mut ai, mut ni, mut ei) = (0, 0, 0);
         loop {
-            let next = match (self.active.get(ai), new_labels.get(ni)) {
+            let next = match (scratch.active.get(ai), new_labels.get(ni)) {
                 (Some(&a), Some(&n)) => {
                     if a <= n {
                         ai += 1;
@@ -2549,12 +3169,17 @@ impl<'a> LabelWindow<'a> {
             }
             merged.push(next);
         }
-        self.active = merged;
+        // Swap so `scratch.active` gets the freshly merged content and
+        // `merged` retains the old `active`'s capacity for the next burst.
+        core::mem::swap(&mut scratch.active, &mut merged);
+        scratch.merged = merged;
+        scratch.new_labels = new_labels;
+        scratch.expired = expired;
     }
 
     /// Label indices covering the current row, in original order.
     pub(crate) fn active(&self) -> &[usize] {
-        &self.active
+        &self.scratch.active
     }
 }
 
@@ -2585,6 +3210,14 @@ impl<'a> LabelWindow<'a> {
 /// index `i` in either always refers to the same annotation.  Pure
 /// span-to-line intersection — no grapheme walk — shared by the glyph and
 /// HTML renderers.
+///
+/// The meta payload carries only `(underline_char, label_idx)`: the message
+/// is always `labels[label_idx].message` (the synthetic primary has no
+/// label and an empty message), so callers resolve it at use sites from
+/// their own `labels` slice.  Dropping the `&str` from the payload is what
+/// frees `meta_buf` (and the `underlines` buffer derived from it) from the
+/// per-section borrow — they can then live in [`SectionScratch`] and be
+/// reused across the batch.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
     primary: Span,
@@ -2593,27 +3226,35 @@ pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
     source: &str,
     line: &str,
     line_idx: usize,
-    line_starts: &[usize],
+    line_starts: &[u32],
     ranges_buf: &mut Vec<(usize, usize)>,
-    meta_buf: &mut SmallVec<[(char, &'a str, Option<usize>); 8]>,
+    meta_buf: &mut SmallVec<[(char, Option<usize>); 8]>,
+    // `false` when the caller already advanced `window` to `line_idx` for this
+    // row (the HTML fast-skip branch peeks `active()` first); avoids a
+    // redundant expiry-heap pop / merge on those rows.
+    advance: bool,
 ) {
     ranges_buf.clear();
     meta_buf.clear();
 
-    let line_start = line_starts.get(line_idx).copied().unwrap_or(source.len());
+    let line_start = line_starts
+        .get(line_idx)
+        .map_or(source.len(), |&s| s as usize);
     let line_end = line_start + line.len();
 
     // Narrow the candidate labels to those whose line range covers this row.
-    window.advance(line_idx);
+    if advance {
+        window.advance(line_idx);
+    }
 
     // The synthetic primary's message is empty (`""`), matching the old
     // `Label { message: String::new(), kind: Primary, .. }` placeholder.
-    let primary_ann = (primary, AnnotationKind::Primary.underline_char(), "", None);
+    let primary_ann = (primary, AnnotationKind::Primary.underline_char(), None);
     let label_anns = window.active().iter().map(|&i| {
         let l = labels[i];
-        (l.span, l.underline_char(), l.message.as_ref(), Some(i))
+        (l.span, l.underline_char(), Some(i))
     });
-    for (span, underline_char, msg, label_idx) in std::iter::once(primary_ann).chain(label_anns) {
+    for (span, underline_char, label_idx) in std::iter::once(primary_ann).chain(label_anns) {
         let span_start = span.start_as_usize();
         let span_end = span.end_as_usize();
 
@@ -2630,6 +3271,33 @@ pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
             continue;
         }
 
+        let multi_line = span_start < line_start || span_end > line_end;
+        // Multi-line label policy (shared with HTML via this function):
+        // start line underlines its start segment, end line underlines its
+        // end segment, and middle lines draw *only* the connector row.  The
+        // previous full-line `^^^` on middle lines duplicated the connector
+        // and burned underline lanes without adding information.
+        if label_idx.is_some() && multi_line {
+            let is_start_line = span_start >= line_start;
+            let is_end_line = span_end <= line_end;
+            if !is_start_line && !is_end_line {
+                continue;
+            }
+            let start_offset = if is_start_line {
+                span_start - line_start
+            } else {
+                0
+            };
+            let end_offset = if is_end_line {
+                span_end - line_start
+            } else {
+                line.len()
+            };
+            ranges_buf.push((start_offset.min(line.len()), end_offset.min(line.len())));
+            meta_buf.push((underline_char, label_idx));
+            continue;
+        }
+
         let start_offset = span_start.saturating_sub(line_start);
         let end_offset = if span_end < line_end {
             span_end - line_start
@@ -2637,7 +3305,7 @@ pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
             line.len()
         };
         ranges_buf.push((start_offset, end_offset));
-        meta_buf.push((underline_char, msg, label_idx));
+        meta_buf.push((underline_char, label_idx));
     }
 }
 
@@ -2656,28 +3324,49 @@ pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
 /// reproduces the expansion for `start < gend`.
 fn merged_primary_ranges(
     ranges: &[(usize, usize)],
-    meta: &[(char, &str, Option<usize>)],
+    meta: &[(char, Option<usize>)],
     len: usize,
 ) -> SmallVec<[(usize, usize); 4]> {
-    let mut sorted: SmallVec<[(usize, usize); 4]> = ranges
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &(start, end))| {
-            (meta[i].0 == '^' && start <= len).then(|| (start, end.min(len)))
-        })
-        .collect();
-    sorted.sort_unstable();
-    let mut merged: SmallVec<[(usize, usize); 4]> = SmallVec::new();
-    for &(start, end) in sorted.iter() {
-        if let Some(last) = merged.last_mut()
-            && start <= last.1
-        {
-            last.1 = last.1.max(end);
-        } else {
-            merged.push((start, end));
+    // The overwhelmingly common case is 0 or 1 primary interval (the
+    // synthetic primary).  Count first instead of paying `collect`'s
+    // iterator machinery — closure call, `enumerate`, `SmallVec` growth —
+    // once per rendered source row; only multi-primary rows fall through to
+    // the sort + merge pass.
+    let mut first: Option<(usize, usize)> = None;
+    for (i, &(start, end)) in ranges.iter().enumerate() {
+        if meta[i].0 == '^' && start <= len {
+            match first {
+                None => first = Some((start, end.min(len))),
+                // Second interval: leave the buffer empty and let the
+                // original iterator below rebuild it in order.
+                Some(_) => {
+                    let mut sorted: SmallVec<[(usize, usize); 4]> = ranges
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &(start, end))| {
+                            (meta[i].0 == '^' && start <= len).then(|| (start, end.min(len)))
+                        })
+                        .collect();
+                    sorted.sort_unstable();
+                    let mut merged: SmallVec<[(usize, usize); 4]> = SmallVec::new();
+                    for &(start, end) in sorted.iter() {
+                        if let Some(last) = merged.last_mut()
+                            && start <= last.1
+                        {
+                            last.1 = last.1.max(end);
+                        } else {
+                            merged.push((start, end));
+                        }
+                    }
+                    return merged;
+                }
+            }
         }
     }
-    merged
+    match first {
+        None => SmallVec::new(),
+        Some(p) => smallvec![p],
+    }
 }
 
 /// Single-pass per-line render: converts byte ranges to display columns,
@@ -2699,11 +3388,82 @@ fn merged_primary_ranges(
 /// invoked once per contiguous same-highlight run on the ASCII fast path
 /// and once per grapheme otherwise, never per byte.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn render_line_merged_with<'a, F: FnMut(&mut String, &str)>(
+/// Exact byte-level predicate for the render path's sanitize gate: does
+/// `line` contain a control character other than tab (C0 \ {0x09}, DEL,
+/// C1 via `C2 80..9F`) or a bidi override/isolate?
+///
+/// Semantics match `line.bytes/chars().any(|c| (c.is_control() && c != '\t')
+/// || is_bidi_override(c))` precisely, but every stage is a byte scan: the
+/// C0/DEL stage is SWAR with a scalar rescan of dirty 8-byte chunks (the
+/// masks are existentially exact but not position-exact, so they only skip
+/// clean chunks), C1 uses `memchr(0xC2)` plus a one-byte follow check, and
+/// the bidi stage reuses the exact [`has_bidi_override_bytes`]
+/// (`E2 80 AA..AE` / `E2 81 A6..A9`).  No stage decodes characters, and
+/// there are no false positives — lines containing `°`, `§`, `±`, emoji, or
+/// math symbols (the common European/technical case) now return `false`
+/// without a single char decode.
+fn line_needs_sanitize(line: &str) -> bool {
+    let bytes = line.as_bytes();
+
+    // 1) C0 (excluding tab/newline) and DEL: reuse the shared scanner rather
+    // than maintaining a second, drift-prone copy of the same SWAR masks.
+    if super::scan_terminal_control_flags_multiline(bytes).1 {
+        return true;
+    }
+
+    // 3) C1 controls (U+0080..U+009F): `0xC2` is the *only* lead byte for
+    // the block, so a lead + continuation-range follow check is exact.
+    let mut j = 0;
+    while let Some(off) = memchr::memchr(0xC2, &bytes[j..]) {
+        let k = j + off;
+        if k + 1 < bytes.len() && (0x80..=0x9F).contains(&bytes[k + 1]) {
+            return true;
+        }
+        j = k + 1;
+    }
+
+    // 4) Bidi overrides / isolates — exact byte predicate from `mod.rs`.
+    super::has_bidi_override_bytes(bytes)
+}
+
+/// Emit bytes `[a, b)` of a printable-ASCII+tab line, splitting at tabs:
+/// non-tab runs go through `emit` verbatim, each tab expands to `push_spaces`
+/// with its precomputed stop width.  Part of `render_line_merged_with`'s
+/// tab-aware fast path; `tab_pos`/`tab_w` come from the caller's one-pass tab
+/// scan (sorted, parallel arrays).
+fn emit_tab_run<F: FnMut(&mut String, &str)>(
+    rendered: &mut String,
+    line: &str,
+    a: usize,
+    b: usize,
+    tab_pos: &[usize],
+    tab_w: &[usize],
+    emit: &mut F,
+) {
+    let mut a = a;
+    loop {
+        let k = tab_pos.partition_point(|&t| t < a);
+        if k < tab_pos.len() && tab_pos[k] < b {
+            let t = tab_pos[k];
+            if t > a {
+                emit(rendered, &line[a..t]);
+            }
+            push_spaces(rendered, tab_w[k]);
+            a = t + 1;
+        } else {
+            if b > a {
+                emit(rendered, &line[a..b]);
+            }
+            return;
+        }
+    }
+}
+
+pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
     line: &str,
     ranges: &[(usize, usize)],
-    meta: &[(char, &'a str, Option<usize>)],
-    out: &mut SmallVec<[(usize, usize, char, &'a str, Option<usize>); 8]>,
+    meta: &[(char, Option<usize>)],
+    out: &mut SmallVec<[(usize, usize, char, Option<usize>); 8]>,
     rendered: &mut String,
     highlight_on: &str,
     highlight_off: &str,
@@ -2712,9 +3472,24 @@ pub(crate) fn render_line_merged_with<'a, F: FnMut(&mut String, &str)>(
     done_buf: &mut Vec<bool>,
     active_buf: &mut BinaryHeap<Reverse<(usize, usize)>>,
     tab_width: usize,
+    // Terminal column the line's content starts at — the gutter width
+    // (`│ <num> │ `).  Tab stops advance from the *absolute* cursor column,
+    // so a tab's expansion width is computed from `content_start_col + col`;
+    // the annotation columns recorded in `out` stay content-relative, exactly
+    // as the underline rows that consume them expect.  Test oracles pass 0.
+    content_start_col: usize,
+    // When `false` (the default), `rendered` is cleared first — the
+    // caller reuses it as scratch.  When `true`, the caller passes the
+    // *destination* buffer directly (its existing content — the row's
+    // gutter — is preserved), and the per-row `push_str(&rendered)` copy
+    // disappears: on a plain printable-ASCII row with no primary
+    // annotations the old path copied the same bytes twice.
+    append: bool,
     mut emit: F,
 ) -> usize {
-    rendered.clear();
+    if !append {
+        rendered.clear();
+    }
     display_buf.clear();
     out.clear();
 
@@ -2728,26 +3503,38 @@ pub(crate) fn render_line_merged_with<'a, F: FnMut(&mut String, &str)>(
     let primary_ranges = merged_primary_ranges(ranges, meta, len);
 
     // ── ASCII fast path: byte offset ≡ display column ──
-    if crate::diagnostics::ascii::is_printable_ascii(line.as_bytes()) {
-        display_buf.reserve(ranges.len());
-        for &(start, end) in ranges {
-            let end_c = end.min(len);
-            display_buf.push(if end > start && start < len {
-                (start, end_c - start)
-            } else {
-                (end_c, 0)
-            });
-        }
+    // One classification pass feeds both byte-level branches below; testing
+    // `is_printable_ascii` and then `is_printable_ascii_or_tab` scanned a
+    // tab-indented row twice.
+    let ascii_class = crate::diagnostics::ascii::classify_ascii(line.as_bytes());
+    if ascii_class == crate::diagnostics::ascii::AsciiClass::Printable {
+        // `col`/`width` are a closed-form function of the range here (byte
+        // offset ≡ display column, nothing else writes `display_buf` before
+        // it is read), so the annotation records are computed straight into
+        // `out` at the point of consumption — no scratch round-trip.  The
+        // `display_buf` scratch remains for the non-ASCII grapheme walk
+        // below, which materialises intermediate `(start, end)` states.
+        let fill_out = |out: &mut SmallVec<[(usize, usize, char, Option<usize>); 8]>,
+                        ranges: &[(usize, usize)]| {
+            out.reserve(ranges.len());
+            for (&(start, end), &(ch, label_idx)) in ranges.iter().zip(meta.iter()) {
+                let end_c = end.min(len);
+                let (col, width) = if end > start && start < len {
+                    (start, end_c - start)
+                } else {
+                    (end_c, 0)
+                };
+                // Insertion points (`width == 0`) get a one-cell marker.
+                out.push((col, width.max(1), ch, label_idx));
+            }
+        };
 
         // No primary annotations: the interval walk below would emit one
         // unhighlighted segment, so skip it and emit once — the common case
         // for rows with only secondary or note labels.
         if primary_ranges.is_empty() {
             emit(rendered, line);
-            out.reserve(display_buf.len());
-            for (&(col, width), &(ch, msg, label_idx)) in display_buf.iter().zip(meta.iter()) {
-                out.push((col, width.max(1), ch, msg, label_idx));
-            }
+            fill_out(out, ranges);
             return len;
         }
 
@@ -2798,23 +3585,226 @@ pub(crate) fn render_line_merged_with<'a, F: FnMut(&mut String, &str)>(
             rendered.push_str(highlight_off);
         }
 
-        out.reserve(display_buf.len());
-        for (&(col, width), &(ch, msg, label_idx)) in display_buf.iter().zip(meta.iter()) {
-            // Insertion points (`width == 0`) get a one-cell marker.
-            out.push((col, width.max(1), ch, msg, label_idx));
-        }
+        fill_out(out, ranges);
         return len;
     }
 
+    // ── ASCII + tabs: byte-level fast path with tab expansion ──
+    // Source code is routinely tab-indented, and the pure-printable gate
+    // above rejects tab (`0x09 < 0x20`), pushing every tab-indented row into
+    // the grapheme walk.  Here the row stays byte-level: non-tab runs copy
+    // through `emit` verbatim, each tab expands to its next stop, and the
+    // annotation columns come from a byte→display-column map built from the
+    // tab list (`disp(b) = b + extra_before(b)`, O(ntabs) per endpoint) —
+    // O(len) with one compare per byte plus O(intervals) work, versus the
+    // branch-heavy per-grapheme walk below.
+    if ascii_class != crate::diagnostics::ascii::AsciiClass::Other {
+        // Tab expansion is column-dependent: a tab's stop is computed from
+        // the *absolute* cursor column (`content_start_col` + display col of
+        // the tab), exactly as `grapheme_width_cached` does for the walk.
+        // Guard the clamp here too so `% tab_width` cannot divide by zero.
+        let tab_width = tab_width.max(1);
+        let mut tab_pos: SmallVec<[usize; 8]> = SmallVec::new();
+        let mut tab_w: SmallVec<[usize; 8]> = SmallVec::new();
+        let mut tab_extra: SmallVec<[usize; 8]> = SmallVec::new(); // extra *after* each tab
+        let mut extra = 0usize; // extra_before of the tab being scanned
+        for (i, &b) in line.as_bytes().iter().enumerate() {
+            if b == b'\t' {
+                let w = tab_width - (content_start_col + i + extra) % tab_width;
+                extra += w - 1;
+                tab_pos.push(i);
+                tab_w.push(w);
+                tab_extra.push(extra);
+            }
+        }
+        // Display column of byte offset `b` (≤ len): byte index plus the
+        // cumulative expansion of every tab strictly before `b`.
+        let disp = |b: usize| -> usize {
+            let k = tab_pos.partition_point(|&t| t < b);
+            b + if k > 0 { tab_extra[k - 1] } else { 0 }
+        };
+
+        // Annotation records with display columns (byte ≢ display col when
+        // tabs are present — the same fill the grapheme walk produces).
+        out.reserve(ranges.len());
+        for (&(start, end), &(ch, label_idx)) in ranges.iter().zip(meta.iter()) {
+            let end_c = end.min(len);
+            let (col_r, width) = if end > start && start < len {
+                let s = disp(start);
+                (s, disp(end_c) - s)
+            } else {
+                (disp(end_c), 0)
+            };
+            // Insertion points (`width == 0`) get a one-cell marker.
+            out.push((col_r, width.max(1), ch, label_idx));
+        }
+
+        // Primary intervals: same O(intervals) walk as the pure-ASCII path,
+        // but each run splits at its tabs.  A row with only secondary/note
+        // annotations has no primary interval at all: emit it in one run and
+        // skip the empty interval walk entirely (the common shape for
+        // "previous definition here" rows in tab-indented source).
+        if primary_ranges.is_empty() {
+            emit_tab_run(rendered, line, 0, len, &tab_pos, &tab_w, &mut emit);
+            return disp(len);
+        }
+        let mut in_primary = false;
+        let mut cursor = 0usize;
+        for &(ps, pe) in primary_ranges.iter() {
+            let pe = pe.min(len);
+            if pe <= cursor {
+                continue; // zero-width or already passed
+            }
+            let ps = ps.max(cursor);
+            if ps > cursor {
+                if in_primary {
+                    rendered.push_str(highlight_off);
+                    in_primary = false;
+                }
+                emit_tab_run(rendered, line, cursor, ps, &tab_pos, &tab_w, &mut emit);
+            }
+            if ps < pe {
+                if !in_primary {
+                    rendered.push_str(highlight_on);
+                    in_primary = true;
+                }
+                emit_tab_run(rendered, line, ps, pe, &tab_pos, &tab_w, &mut emit);
+            }
+            cursor = pe;
+        }
+        if cursor < len {
+            if in_primary {
+                rendered.push_str(highlight_off);
+                in_primary = false;
+            }
+            emit_tab_run(rendered, line, cursor, len, &tab_pos, &tab_w, &mut emit);
+        }
+        if in_primary {
+            rendered.push_str(highlight_off);
+        }
+        return disp(len);
+    }
+
+    // ── Non-ASCII, annotation-free fast path ──
+    // A line with no annotations at all (a CJK context row, or a non-ASCII
+    // source row with no label here) needs only sanitize + emit + width per
+    // grapheme; the `single`/`small_k`/heap branch selection and the
+    // per-grapheme expiry/activation checks below are pure no-ops on this
+    // shape.  The emission arm is byte-identical to the full walk's arm (4),
+    // so the two cannot diverge.
+    if ranges.is_empty() && primary_ranges.is_empty() {
+        let needs_sanitize = line_needs_sanitize(line);
+        let mut col = 0usize;
+        if !needs_sanitize {
+            // Mixed ASCII/CJK fast path: the grapheme iterator still defines
+            // every cluster boundary (so a combining mark, ZWJ emoji or keycap
+            // sequence is never split), but consecutive printable single-byte
+            // ASCII graphemes — whose width is exactly one cell — are batched
+            // into one `emit` call instead of one call + one width-cache probe
+            // per grapheme.  This is the common i18n shape: CJK prose with
+            // embedded ASCII identifiers/punctuation.
+            let mut byte_idx = 0usize;
+            let mut run_start = 0usize;
+            let mut run_end = 0usize;
+            WIDTH_CACHE.with(|cell| {
+                let mut cache = cell.borrow_mut();
+                for g in line.graphemes(true) {
+                    let glen = g.len();
+                    let plain_ascii = glen == 1 && (0x20..0x7f).contains(&g.as_bytes()[0]);
+                    if plain_ascii {
+                        if run_end != byte_idx {
+                            if run_end > run_start {
+                                emit(rendered, &line[run_start..run_end]);
+                            }
+                            run_start = byte_idx;
+                        }
+                        run_end = byte_idx + 1;
+                        col += 1;
+                    } else {
+                        if run_end > run_start {
+                            emit(rendered, &line[run_start..run_end]);
+                        }
+                        run_start = byte_idx + glen;
+                        run_end = run_start;
+                        let w = grapheme_width_cached(
+                            g,
+                            content_start_col + col,
+                            tab_width,
+                            &mut cache,
+                        );
+                        if g == "\t" {
+                            push_spaces(rendered, w);
+                        } else {
+                            emit(rendered, g);
+                        }
+                        col += w;
+                    }
+                    byte_idx += glen;
+                }
+            });
+            if run_end > run_start {
+                emit(rendered, &line[run_start..run_end]);
+            }
+            return col;
+        }
+        WIDTH_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            for g in line.graphemes(true) {
+                let w = grapheme_width_cached(g, content_start_col + col, tab_width, &mut cache);
+                if g == "\t" {
+                    push_spaces(rendered, w);
+                } else if !needs_sanitize {
+                    emit(rendered, g);
+                } else if g.chars().any(|c| c.is_control()) {
+                    rendered.push('\u{FFFD}');
+                } else if g.chars().all(super::is_bidi_override) {
+                    // zero-width: no `col` advance, matching the full walk
+                } else {
+                    emit(rendered, g);
+                }
+                col += w;
+            }
+        });
+        return col;
+    }
+
     // ── Non-ASCII: single grapheme walk doing all three jobs ──
-    order_buf.clear();
-    order_buf.extend(0..ranges.len());
-    order_buf.sort_by_key(|&i| (ranges[i].0, ranges[i].1));
+    // Hoisted before the scratch setup: for the dominant single-range row the
+    // `clear` + `extend` + `sort_by_key` below are pure overhead (sorting
+    // `[0]` is a function call plus a closure invocation on a path whose
+    // other work is a handful of compares).
+    let single = ranges.len() == 1;
+    // k ≤ 3 stays off the `BinaryHeap`: a sorted-array scan over ≤ 3 active
+    // ranges is a few compares per grapheme vs the heap's push/pop sifts.
+    // k = 4 is the inflection point — the linear expiry scan's k(k−1)/2
+    // comparisons start matching the heap there — so k ≥ 4 stays on it.
+    let small_k = ranges.len() <= 3;
+    if !single {
+        order_buf.clear();
+        order_buf.extend(0..ranges.len());
+        order_buf.sort_by_key(|&i| (ranges[i].0, ranges[i].1));
+    }
 
     display_buf.resize(ranges.len(), (0, 0));
     done_buf.clear();
     done_buf.resize(ranges.len(), false);
     active_buf.clear();
+
+    // Single-range fast path: when exactly one annotation covers this row
+    // (the common case — primary only, no labels), track its activation in
+    // two scalars instead of pushing/popping a `Reverse<(usize, usize)>`
+    // through `active_buf`.  The heap's sift is more instructions than a
+    // direct compare at k == 1; k == 0 (no annotation) and k >= 2 stay on
+    // the heap path below.
+    let mut single_active = false;
+    let mut single_end = 0usize;
+    // k ∈ {2, 3} fast path: active ranges live in a fixed array of
+    // `(end_byte, range_idx)`, kept sorted by end.  Expiry is one forward
+    // compaction scan, activation one sorted insert — both O(k) ≤ 3
+    // compares, and both produce exactly the writes the heap path makes
+    // (close order is immaterial: every close records the same `col`).
+    let mut active_arr = [(0usize, 0usize); 3];
+    let mut n_active = 0usize;
 
     let mut col = 0usize;
     let mut byte_idx = 0usize;
@@ -2827,99 +3817,205 @@ pub(crate) fn render_line_merged_with<'a, F: FnMut(&mut String, &str)>(
     // and we skip the per-grapheme `chars().any`/`chars().all` checks.  The
     // dominant i18n case (pure CJK / combining-mark-heavy lines) is uniformly
     // free of both, so this halves the per-grapheme branch traffic there.
-    let needs_sanitize = line
-        .chars()
-        .any(|c| (c.is_control() && c != '\t') || super::is_bidi_override(c));
+    //
+    // Fully byte-level and *exact* (see `line_needs_sanitize`): the old
+    // two-stage filter (coarse byte precheck → per-char rescan) forced an
+    // O(chars) char-decode walk on any line containing `°`, `§`, an emoji, or
+    // any other math/symbol character — `0xC2` leads the whole Latin-1
+    // supplement and `0xE2` leads every U+2xxx/emoji block, not just C1
+    // controls and bidi overrides.  This predicate's true-positive set
+    // (C0 \ {tab}, DEL, C1, bidi) is identical, but it answers with SWAR +
+    // `memchr` byte scans only — no char decode, no false positives.
+    let needs_sanitize = line_needs_sanitize(line);
 
-    for g in line.graphemes(true) {
-        let glen = g.len();
-        let gend = byte_idx + glen;
+    WIDTH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        for g in line.graphemes(true) {
+            let glen = g.len();
+            let gend = byte_idx + glen;
 
-        // (1) Close active ranges ending at or before this grapheme's start.
-        // The heap is keyed by range end, so the earliest-ending active range
-        // is always on top: expiring is a peek + pops, not a linear scan.
-        while let Some(&Reverse((end, i))) = active_buf.peek() {
-            if end > byte_idx {
-                break;
-            }
-            active_buf.pop();
-            display_buf[i].1 = col;
-            done_buf[i] = true;
-        }
-
-        // (2) Activate ranges starting before this grapheme's end.
-        while next < order_buf.len() && ranges[order_buf[next]].0 < gend {
-            let i = order_buf[next];
-            next += 1;
-            if ranges[i].1 <= byte_idx {
-                display_buf[i] = (col, col);
-                done_buf[i] = true;
+            // (1) Close active ranges ending at or before this grapheme's start.
+            // The heap is keyed by range end, so the earliest-ending active range
+            // is always on top: expiring is a peek + pops, not a linear scan.
+            // The single-range fast path replaces the heap peek/pop with one
+            // scalar compare — the heap's `Reverse` sift is more instructions
+            // than a direct test at k == 1.
+            if single {
+                if single_active && single_end <= byte_idx {
+                    display_buf[0].1 = col;
+                    done_buf[0] = true;
+                    single_active = false;
+                }
+            } else if small_k {
+                // Array expiry: one compaction scan over ≤ 3 entries.
+                let mut w = 0usize;
+                for r in 0..n_active {
+                    let (end, i) = active_arr[r];
+                    if end <= byte_idx {
+                        display_buf[i].1 = col;
+                        done_buf[i] = true;
+                    } else {
+                        active_arr[w] = (end, i);
+                        w += 1;
+                    }
+                }
+                n_active = w;
             } else {
-                display_buf[i].0 = col;
-                active_buf.push(Reverse((ranges[i].1, i)));
+                while let Some(&Reverse((end, i))) = active_buf.peek() {
+                    if end > byte_idx {
+                        break;
+                    }
+                    active_buf.pop();
+                    display_buf[i].1 = col;
+                    done_buf[i] = true;
+                }
             }
-        }
 
-        // (3) Primary highlight — byte overlap via the merged cursor: skip
-        // intervals that ended at or before this grapheme, then test the
-        // first one that can still overlap.
-        while let Some(&(_, end)) = primary_ranges.get(primary_cursor) {
-            if end > byte_idx {
-                break;
-            }
-            primary_cursor += 1;
-        }
-        let is_primary = primary_ranges
-            .get(primary_cursor)
-            .is_some_and(|&(start, end)| gend > start && byte_idx < end);
-        if is_primary != in_primary {
-            rendered.push_str(if is_primary {
-                highlight_on
+            // (2) Activate ranges starting before this grapheme's end.
+            // `next == 0` is the single-range analogue of the heap path's
+            // `next < order_buf.len()` cursor guard: once the sole range has
+            // been considered (activated or marked done), `next` is 1 and it
+            // is never revisited, even after the range closes and
+            // `single_active` returns to false.
+            if single {
+                if next == 0 && ranges[0].0 < gend {
+                    next = 1;
+                    if ranges[0].1 <= byte_idx {
+                        display_buf[0] = (col, col);
+                        done_buf[0] = true;
+                    } else {
+                        display_buf[0].0 = col;
+                        single_end = ranges[0].1;
+                        single_active = true;
+                    }
+                }
+            } else if small_k {
+                while next < order_buf.len() && ranges[order_buf[next]].0 < gend {
+                    let i = order_buf[next];
+                    next += 1;
+                    if ranges[i].1 <= byte_idx {
+                        display_buf[i] = (col, col);
+                        done_buf[i] = true;
+                    } else {
+                        display_buf[i].0 = col;
+                        // Sorted insert by end byte keeps expiry order
+                        // identical to the heap's (both are total orders on
+                        // the end key); with ≤ 3 entries the shift is a
+                        // couple of moves.
+                        debug_assert!(
+                            n_active < active_arr.len(),
+                            "small_k active array overfull: ranges.len() must stay ≤ {}",
+                            active_arr.len(),
+                        );
+                        let mut p = n_active;
+                        while p > 0 && active_arr[p - 1].0 > ranges[i].1 {
+                            active_arr[p] = active_arr[p - 1];
+                            p -= 1;
+                        }
+                        active_arr[p] = (ranges[i].1, i);
+                        n_active += 1;
+                    }
+                }
             } else {
-                highlight_off
-            });
-            in_primary = is_primary;
-        }
-
-        // (4) Append the sanitized grapheme.
-        if g == "\t" {
-            let w = grapheme_width(g, col, tab_width);
-            for _ in 0..w {
-                rendered.push(' ');
+                while next < order_buf.len() && ranges[order_buf[next]].0 < gend {
+                    let i = order_buf[next];
+                    next += 1;
+                    if ranges[i].1 <= byte_idx {
+                        display_buf[i] = (col, col);
+                        done_buf[i] = true;
+                    } else {
+                        display_buf[i].0 = col;
+                        active_buf.push(Reverse((ranges[i].1, i)));
+                    }
+                }
             }
-        } else if !needs_sanitize {
-            // Fast arm: the hoisted scan proved no control (other than tab)
-            // and no bidi-override char exists in the line, so this grapheme
-            // needs neither FFFD replacement nor bidi removal.
-            emit(rendered, g);
-        } else if g.chars().any(|c| c.is_control()) {
-            // Source rows are untrusted text written between SGR runs: a
-            // control grapheme becomes U+FFFD (tab was expanded above) and
-            // the highlight escapes below are added by this function only.
-            rendered.push('\u{FFFD}');
-        } else if g.chars().all(super::is_bidi_override) {
-            // Bidi formatting characters (U+202A–U+202E, U+2066–U+2069) are
-            // invisible but reorder surrounding display text — a path like
-            // `evil.cod\u{202E}exe` can spoof the extension.  Remove them
-            // outright (like `sanitize_filename` does) instead of replacing
-            // with U+FFFD, which would inject noise.  They are zero-width,
-            // so `col` does not advance and the column arithmetic stays
-            // correct.
-        } else {
-            emit(rendered, g);
-        }
 
-        col += grapheme_width(g, col, tab_width);
-        byte_idx = gend;
-    }
+            // (3) Primary highlight — byte overlap via the merged cursor: skip
+            // intervals that ended at or before this grapheme, then test the
+            // first one that can still overlap.  A row with no primary span
+            // (only `~`/`-` annotations) skips the whole cursor probe.
+            if !primary_ranges.is_empty() {
+                while let Some(&(_, end)) = primary_ranges.get(primary_cursor) {
+                    if end > byte_idx {
+                        break;
+                    }
+                    primary_cursor += 1;
+                }
+                let is_primary = primary_ranges
+                    .get(primary_cursor)
+                    .is_some_and(|&(start, end)| gend > start && byte_idx < end);
+                if is_primary != in_primary {
+                    rendered.push_str(if is_primary {
+                        highlight_on
+                    } else {
+                        highlight_off
+                    });
+                    in_primary = is_primary;
+                }
+            }
+
+            // (4) Append the sanitized grapheme.
+            // Width is measured once per grapheme and reused by both the
+            // emit arm and the column advance — a tab previously paid a
+            // second `grapheme_width_cached` call for the identical answer.
+            // Tab stops advance from the absolute cursor column: only tabs
+            // read the current column (every other grapheme's width is
+            // fixed), so adding the gutter offset here is exact and leaves
+            // the recorded annotation columns content-relative.
+            let w = grapheme_width_cached(g, content_start_col + col, tab_width, &mut cache);
+            if g == "\t" {
+                push_spaces(rendered, w);
+            } else if !needs_sanitize {
+                // Fast arm: the hoisted scan proved no control (other than tab)
+                // and no bidi-override char exists in the line, so this grapheme
+                // needs neither FFFD replacement nor bidi removal.
+                emit(rendered, g);
+            } else if g.chars().any(|c| c.is_control()) {
+                // Source rows are untrusted text written between SGR runs: a
+                // control grapheme becomes U+FFFD (tab was expanded above) and
+                // the highlight escapes below are added by this function only.
+                rendered.push('\u{FFFD}');
+            } else if g.chars().all(super::is_bidi_override) {
+                // Bidi formatting characters (U+202A–U+202E, U+2066–U+2069) are
+                // invisible but reorder surrounding display text — a path like
+                // `evil.cod\u{202E}exe` can spoof the extension.  Remove them
+                // outright (like `sanitize_filename` does) instead of replacing
+                // with U+FFFD, which would inject noise.  They are zero-width,
+                // so `col` does not advance and the column arithmetic stays
+                // correct.
+            } else {
+                emit(rendered, g);
+            }
+
+            col += w;
+            byte_idx = gend;
+        }
+    });
     if in_primary {
         rendered.push_str(highlight_off);
     }
 
-    // Close remaining active ranges.
-    for &Reverse((_, i)) in active_buf.iter() {
-        display_buf[i].1 = col;
-        done_buf[i] = true;
+    // Close remaining active ranges.  The single-range fast path tracks
+    // activation in `single_active` instead of the heap, so a range still
+    // active at end-of-line must be closed here the same way the heap loop
+    // closes its entries — otherwise the "never activated" fallback below
+    // would reset it to `(col, col)` and drop its width.
+    if single {
+        if single_active {
+            display_buf[0].1 = col;
+            done_buf[0] = true;
+        }
+    } else if small_k {
+        for r in 0..n_active {
+            let (_, i) = active_arr[r];
+            display_buf[i].1 = col;
+            done_buf[i] = true;
+        }
+    } else {
+        for &Reverse((_, i)) in active_buf.iter() {
+            display_buf[i].1 = col;
+            done_buf[i] = true;
+        }
     }
     // Ranges that never activated: (total_col, 0).
     for (i, d) in done_buf.iter().enumerate() {
@@ -2933,9 +4029,9 @@ pub(crate) fn render_line_merged_with<'a, F: FnMut(&mut String, &str)>(
     }
 
     out.reserve(display_buf.len());
-    for (&(col, width), &(ch, msg, label_idx)) in display_buf.iter().zip(meta.iter()) {
+    for (&(col, width), &(ch, label_idx)) in display_buf.iter().zip(meta.iter()) {
         // Insertion points (`width == 0`) get a one-cell marker.
-        out.push((col, width.max(1), ch, msg, label_idx));
+        out.push((col, width.max(1), ch, label_idx));
     }
 
     col
@@ -2945,11 +4041,11 @@ pub(crate) fn render_line_merged_with<'a, F: FnMut(&mut String, &str)>(
 /// appended verbatim (the terminal escape codes a row needs are the highlight
 /// runs the core writes itself, nothing else).
 #[allow(clippy::too_many_arguments)]
-fn render_line_merged<'a>(
+fn render_line_merged(
     line: &str,
     ranges: &[(usize, usize)],
-    meta: &[(char, &'a str, Option<usize>)],
-    out: &mut SmallVec<[(usize, usize, char, &'a str, Option<usize>); 8]>,
+    meta: &[(char, Option<usize>)],
+    out: &mut SmallVec<[(usize, usize, char, Option<usize>); 8]>,
     rendered: &mut String,
     highlight_on: &str,
     highlight_off: &str,
@@ -2958,6 +4054,8 @@ fn render_line_merged<'a>(
     done_buf: &mut Vec<bool>,
     active_buf: &mut BinaryHeap<Reverse<(usize, usize)>>,
     tab_width: usize,
+    content_start_col: usize,
+    append: bool,
 ) -> usize {
     render_line_merged_with(
         line,
@@ -2972,6 +4070,8 @@ fn render_line_merged<'a>(
         done_buf,
         active_buf,
         tab_width,
+        content_start_col,
+        append,
         |out, s| out.push_str(s),
     )
 }
@@ -2988,18 +4088,20 @@ fn compute_line_underlines_and_render<'a, 'src>(
     source: &str,
     line: &str,
     line_idx: usize,
-    line_starts: &[usize],
-    out: &mut SmallVec<[(usize, usize, char, &'a str, Option<usize>); 8]>,
+    line_starts: &[u32],
+    out: &mut SmallVec<[(usize, usize, char, Option<usize>); 8]>,
     rendered: &mut String,
     highlight_on: &str,
     highlight_off: &str,
     ranges_buf: &mut Vec<(usize, usize)>,
-    meta_buf: &mut SmallVec<[(char, &'a str, Option<usize>); 8]>,
+    meta_buf: &mut SmallVec<[(char, Option<usize>); 8]>,
     display_buf: &mut Vec<(usize, usize)>,
     order_buf: &mut Vec<usize>,
     done_buf: &mut Vec<bool>,
     active_buf: &mut BinaryHeap<Reverse<(usize, usize)>>,
     tab_width: usize,
+    content_start_col: usize,
+    append: bool,
 ) -> usize {
     out.clear();
     compute_line_annotation_ranges(
@@ -3012,6 +4114,7 @@ fn compute_line_underlines_and_render<'a, 'src>(
         line_starts,
         ranges_buf,
         meta_buf,
+        true,
     );
     render_line_merged(
         line,
@@ -3026,6 +4129,8 @@ fn compute_line_underlines_and_render<'a, 'src>(
         done_buf,
         active_buf,
         tab_width,
+        content_start_col,
+        append,
     )
 }
 
@@ -3050,7 +4155,7 @@ pub(crate) fn line_start_byte(source: &str, line_idx: usize) -> usize {
 ///
 /// Thin alias for [`LineIndex::new`], which owns the scan; kept because
 /// the line-start shape is the only part this helper's callers need.
-pub(crate) fn line_starts(source: &str) -> Vec<usize> {
+pub(crate) fn line_starts(source: &str) -> Vec<u32> {
     LineIndex::new(source).starts().to_vec()
 }
 
@@ -3059,13 +4164,13 @@ pub(crate) fn line_starts(source: &str) -> Vec<usize> {
 /// oracle for the fused renderer's byte-overlap highlight rule.
 #[cfg(test)]
 pub(crate) fn compute_primary_cols(
-    underlines: &[(usize, usize, char, &str, Option<usize>)],
+    underlines: &[(usize, usize, char, Option<usize>)],
     display_width: usize,
     primary_cols: &mut Vec<bool>,
 ) {
     primary_cols.clear();
     primary_cols.resize(display_width, false);
-    for (col, ulen, underline_char, _msg, _label_idx) in underlines {
+    for (col, ulen, underline_char, _label_idx) in underlines {
         if *underline_char == '^' {
             let end = (*col + *ulen).min(display_width);
             for cell in primary_cols.iter_mut().take(end).skip(*col) {
@@ -3119,7 +4224,7 @@ impl UnderlineLanes {
     /// stacked lane.
     pub(crate) fn assign(
         &mut self,
-        underlines: &[(usize, usize, char, &str, Option<usize>)],
+        underlines: &[(usize, usize, char, Option<usize>)],
     ) -> usize {
         let Self {
             lanes,
@@ -3135,16 +4240,36 @@ impl UnderlineLanes {
             *count = 0;
             return 0;
         }
+        // Overwhelmingly common row: a single underline (one caret, no
+        // labels).  The interval-graph machinery below would produce exactly
+        // lane 0 = [0] and skip the relabel (n == 1), so short-circuit it.
+        if underlines.len() == 1 {
+            if lanes.is_empty() {
+                lanes.push(SmallVec::new());
+            }
+            lanes[0].push(0);
+            *count = 1;
+            return 1;
+        }
         order.clear();
         order.extend(0..underlines.len());
         // Unstable: the dedup below keys on `(start, ulen)` contiguity (which
         // any sort preserves for equal keys) and a `chars_seen` membership
         // set, so the relative order of equal-key entries does not matter.
         // `sort_unstable_by_key` avoids the merge buffer a stable sort pays.
-        order.sort_unstable_by_key(|&i| {
+        //
+        // The common row — the primary span first, then labels in source
+        // order — is already `(start, end)`-ordered, so an O(n) sortedness
+        // probe skips the sort entirely.
+        if !order.is_sorted_by_key(|&i| {
             let (col, ulen, ..) = underlines[i];
             (col, col + ulen)
-        });
+        }) {
+            order.sort_unstable_by_key(|&i| {
+                let (col, ulen, ..) = underlines[i];
+                (col, col + ulen)
+            });
+        }
 
         let mut n = 0usize;
         // Collapse duplicate annotations to a single lane entry: a later
@@ -3157,7 +4282,9 @@ impl UnderlineLanes {
         // in `underlines`, so its message (if any) is still emitted by the
         // caller's separate message loop.
         let mut last_span: Option<(usize, usize)> = None;
-        let mut chars_seen: SmallVec<[char; 4]> = SmallVec::new();
+        // `underline_char()` yields exactly four characters, so the per-span
+        // seen-set is a u8 bitmask instead of a SmallVec membership scan.
+        let mut chars_seen: u8 = 0;
         for &i in order.iter() {
             let (col, ulen, ch, ..) = underlines[i];
             let start = col;
@@ -3165,12 +4292,26 @@ impl UnderlineLanes {
             let span = (start, ulen);
             if last_span != Some(span) {
                 last_span = Some(span);
-                chars_seen.clear();
+                chars_seen = 0;
             }
-            if chars_seen.contains(&ch) {
+            // The dedup bitmask relies on `underline_char()` yielding exactly
+            // these four.  A fifth character would silently share bit 3 with
+            // `' '` (help) and dedup wrongly; assert the cross-module
+            // invariant instead of trusting it.
+            debug_assert!(
+                matches!(ch, '^' | '~' | '-' | ' '),
+                "unexpected underline char {ch:?}"
+            );
+            let bit = 1u8 << match ch {
+                '^' => 0,
+                '~' => 1,
+                '-' => 2,
+                _ => 3,
+            };
+            if chars_seen & bit != 0 {
                 continue;
             }
-            chars_seen.push(ch);
+            chars_seen |= bit;
             let lane = match active.peek() {
                 // Earliest-ending lane already past `start` → reuse it.
                 Some(&Reverse((lane_end, lane_idx))) if lane_end <= start => {
@@ -3190,6 +4331,66 @@ impl UnderlineLanes {
             lanes[lane].push(i);
             active.push(Reverse((end, lane)));
         }
+
+        // ── Why only relabel, not search all optimal colourings ─────
+        // Full-space WDS optimisation cannot ride a distributive-lattice
+        // structure: the optimal-colouring set of an interval graph is
+        // not a lattice in general, and for K₃ ⊔ K₃ admits no canonical
+        // lattice order at all (witnesses plus the C = ⊔_D C_D
+        // decomposition in
+        // research/underline-lanes/no-distributive-lattice.md). IGMRC is
+        // polynomial on interval graphs via min-cost flow, not via
+        // lattice structure, and not worth the machinery for the
+        // n ≤ ~50, χ ≤ ~5 rows here. Below we only relabel the greedy's
+        // single colouring — the rearrangement-inequality optimum on
+        // that subgraph.
+        // ── Relabel lanes by descending visual weight ─────────────────
+        // The greedy numbers lanes in opening order, which has nothing to
+        // do with the visual weight each lane carries.  Under the
+        // weighted-depth-sum objective — minimise Σ width(u) · lane(u) — a
+        // heavier lane should get a smaller row index (closer to the source
+        // line).  Sorting the lanes by descending total weight is the
+        // rearrangement-inequality optimum for the fixed interval→lane
+        // assignment the greedy produced: it never changes the lane count
+        // (the set of intervals sharing a row is untouched) and strictly
+        // reduces the weighted depth sum whenever a later-opened lane ends
+        // up heavier than an earlier one.
+        if n > 1 {
+            let mut weights: SmallVec<[(usize, usize); 8]> = (0..n)
+                .map(|l| {
+                    let w: usize = lanes[l]
+                        .iter()
+                        .map(|&i| {
+                            let (_, ulen, _, label_idx) = underlines[i];
+                            // Width dominates; a labelled underline also
+                            // carries a rendered message, giving it slightly
+                            // more visual weight than a bare synthetic one.
+                            ulen + usize::from(label_idx.is_some())
+                        })
+                        .sum();
+                    (w, l)
+                })
+                .collect();
+            // Descending weight → heaviest first.  Tie-break on the original
+            // lane index for deterministic output.
+            weights.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            // Permute the first `n` lanes in place: no `Vec` allocation, and
+            // stale lanes beyond `n` keep their relative position so their
+            // capacity survives for the next call.  `inv[old] = new`, then
+            // rotate each cycle with `swap`.
+            let mut inv: SmallVec<[usize; 8]> = (0..n).collect();
+            for (pos, &(_, old_l)) in weights.iter().enumerate() {
+                inv[old_l] = pos;
+            }
+            for i in 0..n {
+                while inv[i] != i {
+                    let j = inv[i];
+                    lanes.swap(i, j);
+                    inv.swap(i, j);
+                }
+            }
+        }
+
         *count = n;
         n
     }
@@ -3212,7 +4413,27 @@ impl UnderlineLanes {
     /// colour gaps.
     pub(crate) fn row<'a, F: FnMut(char) -> &'a str>(
         &mut self,
-        underlines: &[(usize, usize, char, &'a str, Option<usize>)],
+        underlines: &[(usize, usize, char, Option<usize>)],
+        index: usize,
+        display_width: usize,
+        out: &mut String,
+        color_for: F,
+        reset: &'a str,
+    ) -> bool {
+        // Callers that own only a scratch row buffer (the HTML renderer) get
+        // the historical clear-then-write contract; the glyph renderer appends
+        // straight to its output via `row_append` (P4).
+        out.clear();
+        self.row_append(underlines, index, display_width, out, color_for, reset)
+    }
+
+    /// Append lane `index`'s underline cells to `out` without clearing it.
+    ///
+    /// Returns `false` when every entry was clipped away; the caller must then
+    /// truncate any gutter it already emitted back to its saved mark.
+    pub(crate) fn row_append<'a, F: FnMut(char) -> &'a str>(
+        &mut self,
+        underlines: &[(usize, usize, char, Option<usize>)],
         index: usize,
         display_width: usize,
         out: &mut String,
@@ -3220,7 +4441,9 @@ impl UnderlineLanes {
         reset: &'a str,
     ) -> bool {
         let lane = &self.lanes[index];
-        out.clear();
+        // P4: append straight into the caller's buffer (no per-row scratch
+        // copy). The caller saves a mark, emits the gutter, and truncates
+        // back to it when this returns `false`.
         // First column not yet emitted.
         let mut cursor = 0usize;
         // `' '` is a real underline character (help-level annotations), so
@@ -3241,9 +4464,7 @@ impl UnderlineLanes {
             }
             let color = color_for(ch);
             out.push_str(color);
-            for _ in cursor..start {
-                out.push(' ');
-            }
+            push_spaces(out, start - cursor);
             for _ in start..end {
                 out.push(ch);
             }
@@ -3252,9 +4473,6 @@ impl UnderlineLanes {
                 visible = true;
             }
             cursor = end;
-        }
-        if !visible {
-            out.clear();
         }
         visible
     }
@@ -3286,6 +4504,12 @@ pub(crate) const DEFAULT_TAB_WIDTH: usize = 4;
 /// case.
 pub(crate) fn grapheme_width(g: &str, current_col: usize, tab_width: usize) -> usize {
     if g == "\t" {
+        // Defensive clamp: `GlyphRenderer::with_opts` and `wrap_optimal`
+        // clamp, but this helper is `pub(crate)` and called directly by
+        // `expand_tabs_from_col` / test oracles with a caller-supplied width.
+        // A modulo by zero would panic; a zero-width tab column is not a
+        // meaningful concept anyway.
+        let tab_width = tab_width.max(1);
         return tab_width - (current_col % tab_width);
     }
     // Fast path: an empty cluster is zero cells; any single-byte cluster is
@@ -3314,6 +4538,38 @@ pub(crate) fn grapheme_width(g: &str, current_col: usize, tab_width: usize) -> u
     })
 }
 
+/// [`grapheme_width`] with an explicit cache handle, so a loop over many
+/// graphemes can hoist the `WIDTH_CACHE` TLS access + `RefCell` borrow above
+/// the loop instead of paying it per grapheme.  The tab / single-byte fast
+/// paths skip the cache, so ASCII clusters are still one range check.
+#[inline]
+pub(crate) fn grapheme_width_cached(
+    g: &str,
+    current_col: usize,
+    tab_width: usize,
+    cache: &mut WidthCache,
+) -> usize {
+    if g == "\t" {
+        let tab_width = tab_width.max(1);
+        return tab_width - (current_col % tab_width);
+    }
+    if g.len() <= 1 {
+        return match g.as_bytes().first() {
+            Some(_) => 1,
+            None => 0,
+        };
+    }
+    if g.len() > WIDTH_CACHE_MAX_KEY {
+        return grapheme_width_uncached(g);
+    }
+    if let Some(w) = cache.get(g) {
+        return w;
+    }
+    let w = grapheme_width_uncached(g);
+    cache.put(g, w);
+    w
+}
+
 /// Uncached cluster width: `unicode-width` plus the RI-pair / ZWJ corrections.
 ///
 /// Kept separate so the cache in [`grapheme_width`] can be differential-tested
@@ -3323,21 +4579,37 @@ pub(crate) fn grapheme_width(g: &str, current_col: usize, tab_width: usize) -> u
 #[inline]
 fn grapheme_width_uncached(g: &str) -> usize {
     let mut w = g.width();
+    // One fused pass replaces the three separate scans (`it.all(is_ri)`,
+    // `contains(ZWJ)`, `chars().any(is_control)`): a single-char BMP cluster —
+    // the dominant non-ASCII shape — exits after one iteration; a ZWJ family
+    // emoji (up to 7 chars) after ≤7.
+    //
     // Regional Indicator pairs: unicode-width sums each RI (2 each),
     // but terminals render a flag (🇺🇸) as 2 cells — correct here.
-    let is_ri = |c: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
-    let mut it = g.chars();
-    if it.next().is_some_and(is_ri) && it.all(is_ri) {
+    let mut first_ri = false;
+    let mut all_ri = true;
+    let mut has_zwj = false;
+    let mut has_ctl = false;
+    for (i, c) in g.chars().enumerate() {
+        let ri = ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+        if i == 0 {
+            first_ri = ri;
+        }
+        all_ri &= ri;
+        has_zwj |= c == '\u{200D}';
+        has_ctl |= c.is_control();
+    }
+    if first_ri && all_ri {
         return 2;
     }
     // Non-RGI ZWJ joins (e.g. 👨‍👩): unicode-width already returns 2 for
     // well-formed RGI sequences; for malformed left-over spans cap at 2.
-    if g.contains('\u{200D}') {
+    if has_zwj {
         w = w.min(2);
     }
     // A cluster containing a control char prints as a single U+FFFD (one
     // cell); `unicode-width` credits controls with zero, so floor the width.
-    if g.chars().any(|c| c.is_control()) {
+    if has_ctl {
         w = w.max(1);
     }
     w
@@ -3383,7 +4655,7 @@ impl WidthEntry {
 /// Only non-ASCII clusters reach it (see [`grapheme_width`]), so the ASCII hot
 /// path pays nothing for it, and one thread renders a batch at a time, so no
 /// locking is needed.
-struct WidthCache {
+pub(crate) struct WidthCache {
     sets: [[WidthEntry; WIDTH_CACHE_WAYS]; WIDTH_CACHE_SETS],
     clock: u64,
 }
@@ -3454,22 +4726,7 @@ fn width_cache_hash(g: &str) -> usize {
 thread_local! {
     /// Per-thread grapheme-width memo.  `const`-initialised so the lookup
     /// path has no lazy-init branch.
-    static WIDTH_CACHE: RefCell<WidthCache> = const { RefCell::new(WidthCache::new()) };
-}
-
-/// Single-char fallback for code that reasons per-character rather than
-/// per-grapheme.  Rendering loops should prefer [`grapheme_width`] +
-/// `graphemes(true)`.
-#[inline]
-pub(crate) fn char_width_at(c: char, current_col: usize, tab_width: usize) -> usize {
-    if c == '\t' {
-        tab_width - (current_col % tab_width)
-    } else if c.is_control() {
-        // Matches the printer: a control char becomes one U+FFFD cell.
-        1
-    } else {
-        c.width().unwrap_or(0)
-    }
+    pub(crate) static WIDTH_CACHE: RefCell<WidthCache> = const { RefCell::new(WidthCache::new()) };
 }
 
 /// Total display width of a line in terminal cells (tabs expanded).
@@ -3486,10 +4743,45 @@ pub(crate) fn line_display_width(line: &str, tab_width: usize) -> usize {
         return line.len();
     }
     let mut w = 0usize;
-    for g in line.graphemes(true) {
-        w += grapheme_width(g, w, tab_width);
-    }
+    WIDTH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        for g in line.graphemes(true) {
+            w += grapheme_width_cached(g, w, tab_width, &mut cache);
+        }
+    });
     w
+}
+
+/// Expand tabs in `s` to spaces at `tab_width`-column stops, where the text
+/// begins at (zero-based) display column `start_col`.  The diff block's
+/// `-`/`+` rows use this so a tab-indented source line aligns with the main
+/// source rows, which expand tabs in the row printer (`render_line_merged`):
+/// the tab width there depends on the *display* column, and the diff rows
+/// start several gutter cells further right.
+///
+/// Non-tab graphemes are copied verbatim (the caller has already run
+/// `sanitize_for_terminal_multiline`, so no other control can remain);
+/// column arithmetic uses [`grapheme_width`], matching the row printer.
+pub(crate) fn expand_tabs_from_col<'s>(
+    s: &'s str,
+    tab_width: usize,
+    start_col: usize,
+) -> Cow<'s, str> {
+    if !s.contains('\t') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut col = start_col;
+    for g in s.graphemes(true) {
+        let w = grapheme_width(g, col, tab_width);
+        if g == "\t" {
+            push_spaces(&mut out, w);
+        } else {
+            out.push_str(g);
+        }
+        col += w;
+    }
+    Cow::Owned(out)
 }
 
 /// Visible display width of `s`, skipping CSI (`\x1b[…m`) and OSC
@@ -3544,23 +4836,26 @@ pub(crate) fn visible_width_with_tab(s: &str, tab_width: usize) -> usize {
     // individual graphemes. `escape_len` always returns a length that ends on
     // a char boundary (CSI final byte and OSC BEL/ST are all ASCII), so the
     // slice below cannot panic.
-    while let Some(esc) = memchr::memchr(0x1b, rest.as_bytes()) {
-        // Plain-text prefix before the escape: measure grapheme by grapheme.
-        let (text, tail) = rest.split_at(esc);
-        for g in text.graphemes(true) {
-            w += grapheme_width(g, w, tab_width);
+    WIDTH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        while let Some(esc) = memchr::memchr(0x1b, rest.as_bytes()) {
+            // Plain-text prefix before the escape: measure grapheme by grapheme.
+            let (text, tail) = rest.split_at(esc);
+            for g in text.graphemes(true) {
+                w += grapheme_width_cached(g, w, tab_width, &mut cache);
+            }
+            let skip = escape_len(tail.as_bytes());
+            if skip == 1 {
+                // Lone ESC (no CSI/OSC introducer): measured as one U+FFFD cell,
+                // matching the old per-grapheme path.
+                w += grapheme_width_cached("\x1b", w, tab_width, &mut cache);
+            }
+            rest = &tail[skip..];
         }
-        let skip = escape_len(tail.as_bytes());
-        if skip == 1 {
-            // Lone ESC (no CSI/OSC introducer): measured as one U+FFFD cell,
-            // matching the old per-grapheme path.
-            w += grapheme_width("\x1b", w, tab_width);
+        for g in rest.graphemes(true) {
+            w += grapheme_width_cached(g, w, tab_width, &mut cache);
         }
-        rest = &tail[skip..];
-    }
-    for g in rest.graphemes(true) {
-        w += grapheme_width(g, w, tab_width);
-    }
+    });
     w
 }
 
@@ -3571,6 +4866,22 @@ pub(crate) fn visible_width_with_tab(s: &str, tab_width: usize) -> usize {
 /// cluster boundary so an emoji (or combining sequence) is never half-
 /// underlined.
 ///
+/// Display column of `byte_offset` within `line` (production helper for
+/// multi-line connector geometry).  Expands to the containing grapheme's
+/// start, matching `byte_range_to_display`'s start column.
+pub(crate) fn byte_offset_to_display(line: &str, byte_offset: usize, tab_width: usize) -> usize {
+    let mut col = 0usize;
+    let mut byte = 0usize;
+    for g in line.graphemes(true) {
+        if byte >= byte_offset {
+            break;
+        }
+        col += grapheme_width(g, col, tab_width);
+        byte += g.len();
+    }
+    col
+}
+
 /// Test-only oracle for the fused [`render_line_merged_with`] walk.
 #[cfg(test)]
 pub(crate) fn byte_range_to_display(
@@ -3822,11 +5133,10 @@ fn is_keyword(word: &str) -> bool {
         b'w' => matches!(word, "where" | "while" | "with"),
         _ => false,
     };
-    debug_assert_eq!(
-        hit,
-        KEYWORDS.contains(&word),
-        "is_keyword disagrees with KEYWORDS for {word:?}"
-    );
+    // No runtime `debug_assert_eq!(hit, KEYWORDS.contains(&word))` here: it
+    // is a linear scan over ~40 keywords on every identifier in debug
+    // builds, and table consistency is already pinned by the
+    // `keyword_dispatch_matches_contains` test.
     hit
 }
 
@@ -3852,11 +5162,8 @@ fn is_type(word: &str) -> bool {
         b'U' => matches!(word, "UInt" | "USize" | "Unit"),
         _ => false,
     };
-    debug_assert_eq!(
-        hit,
-        TYPES.contains(&word),
-        "is_type disagrees with TYPES for {word:?}"
-    );
+    // Same reasoning as `is_keyword`: `type_dispatch_matches_contains` pins
+    // table consistency; a per-call linear scan buys nothing.
     hit
 }
 
@@ -3911,6 +5218,46 @@ pub(crate) fn highlight_code_with_backticks(line: &str, use_color: bool) -> Cow<
     highlight_code_impl(line, use_color, true)
 }
 
+/// [`highlight_code`] writing directly into the caller's buffer — no
+/// intermediate `String` per highlighted line.  Returns `true` when a
+/// highlight was applied (the caller then uses `out`'s tail); `false` means
+/// nothing was written and the caller should push `line` verbatim.
+pub fn highlight_code_into(line: &str, use_color: bool, out: &mut String) -> bool {
+    if !use_color {
+        return false;
+    }
+    highlight_code_impl_into(line, true, false, out)
+}
+
+/// [`highlight_code_with_backticks`] writing directly into the caller's
+/// buffer (see [`highlight_code_into`] for the contract).
+pub(crate) fn highlight_code_with_backticks_into(
+    line: &str,
+    use_color: bool,
+    out: &mut String,
+) -> bool {
+    if !use_color {
+        return false;
+    }
+    highlight_code_impl_into(line, true, true, out)
+}
+
+fn highlight_code_impl<'a>(
+    line: &'a str,
+    use_color: bool,
+    add_backtick_quotes: bool,
+) -> Cow<'a, str> {
+    if !use_color {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::new();
+    if highlight_code_impl_into(line, true, add_backtick_quotes, &mut out) {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(line)
+    }
+}
+
 // ── ASCII classification table for the highlighter ─────────────
 //
 // The highlighter only branches on six ASCII byte shapes; every other
@@ -3929,11 +5276,34 @@ const STRING: u8 = 2;
 const CHAR: u8 = 3;
 const OPER: u8 = 4;
 const TICK: u8 = 5;
+const NONASCII: u8 = 6;
 
-const CLASS: [u8; 128] = build_class();
+const CLASS: [u8; 256] = build_class();
 
-const fn build_class() -> [u8; 128] {
-    let mut t = [PASS; 128];
+/// Bitmap of the `PASS` class over `0..0x80`, built from [`CLASS`] so the
+/// two can never drift.  Bytes ≥ 0x80 are always `NONASCII`, never `PASS`,
+/// so a single `u128` covers the whole PASS set.
+///
+/// The PASS run scan tests this bitmap (`(PASS_MASK >> b) & 1`) instead of
+/// loading `CLASS[b]`: one shift+mask on a register value versus a 256-byte
+/// table load that LLVM cannot vectorise through a gather.  The differential
+/// test `pass_mask_matches_class` pins the two against each other.
+const PASS_MASK: u128 = build_pass_mask();
+
+const fn build_pass_mask() -> u128 {
+    let mut m = 0u128;
+    let mut b = 0usize;
+    while b < 0x80 {
+        if CLASS[b] == PASS {
+            m |= 1u128 << b;
+        }
+        b += 1;
+    }
+    m
+}
+
+const fn build_class() -> [u8; 256] {
+    let mut t = [PASS; 256];
     let mut i = 0;
     while i < 128 {
         t[i] = match i as u8 {
@@ -3946,25 +5316,104 @@ const fn build_class() -> [u8; 128] {
         };
         i += 1;
     }
+    while i < 256 {
+        t[i] = NONASCII;
+        i += 1;
+    }
     t
 }
 
-fn highlight_code_impl<'a>(
-    line: &'a str,
+/// Per-byte "equals `target`" SWAR mark for `x` (bit 7 of each result byte).
+/// Derived from the `haszero` idiom on `x ^ target`: a byte is marked when
+/// it is exactly `target`, with a conservative *superset* under borrow
+/// chaining — the scalar fallback reclassifies any false positive, so the
+/// run scan stays exact.
+#[inline]
+const fn eq_high_mask(x: u64, target: u64) -> u64 {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let d = x ^ target.wrapping_mul(ONES);
+    d.wrapping_sub(ONES) & !d & HIGHS
+}
+
+/// Length of the leading run of `PASS`-class bytes in `bytes` (bytes that
+/// the highlighter copies verbatim: everything except identifiers' letters
+/// and `_`, `"`, `'`, `&`, `*`, `` ` `` and non-ASCII).
+///
+/// SWAR fast path: 8 bytes per iteration.  A chunk is clean when
+/// * no byte has the high bit set (non-ASCII is never PASS), and
+/// * no byte folds (`b | 0x20`) into the letter range `0x61..=0x7A` — the
+///   fold maps both cases (`a-z`, `A-Z`) there — and
+/// * no byte folds into one of the special bytes: `_`/DEL → `0x7F`
+///   (both `0x5F | 0x20` and `0x7F | 0x20` are `0x7F`; DEL is PASS but
+///   marking it dirty is only conservative), `"` → `0x22`, `&` → `0x26`,
+///   `'` → `0x27`, `*` → `0x2A`, `` ` `` → `0x60`.
+///
+/// Every SWAR predicate is a conservative superset (borrow chaining can
+/// only add false positives, never skip a real member — see the
+/// differential test), so a dirty chunk falls back to the exact scalar
+/// bitmap loop, which re-decides from the chunk start.
+fn pass_run_len(bytes: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    const FOLD: u64 = 0x2020_2020_2020_2020;
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i + 8 <= len {
+        let chunk = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        if chunk & HIGHS != 0 {
+            break;
+        }
+        let t = chunk | FOLD;
+        // Bytes in [0x60, 0x7A] minus bytes in [0x00, 0x60) — the letter
+        // band with a deliberately conservative lower edge (`0x60` instead
+        // of `0x61`) so borrow chaining can never exclude a real letter;
+        // `` ` `` (0x60) and `{`/`[`/`\\` (0x7B on a borrow edge) may spill
+        // in as false positives and cost one scalar pass.
+        let lt_60 = t.wrapping_sub(0x60 * ONES) & HIGHS;
+        let lt_7b = t.wrapping_sub(0x7b * ONES) & HIGHS;
+        let letter_band = lt_7b & !lt_60;
+        let special = eq_high_mask(t, 0x7f)
+            | eq_high_mask(t, 0x22)
+            | eq_high_mask(t, 0x26)
+            | eq_high_mask(t, 0x27)
+            | eq_high_mask(t, 0x2a)
+            | eq_high_mask(t, 0x60);
+        if letter_band != 0 || special != 0 {
+            break;
+        }
+        i += 8;
+    }
+    // Scalar fallback: the dirty chunk's tail and the run's end.  Bitmap
+    // test, not a `CLASS[b]` gather: bytes ≥ 0x80 are never PASS, so one
+    // `u128` shift+mask answers without touching the 256-byte table.
+    while i < len {
+        let b = bytes[i];
+        if b >= 0x80 || (PASS_MASK >> b) & 1 == 0 {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// The scanner proper: appends the highlighted form of `line` to `out` and
+/// returns whether any highlight was emitted.  When `false`, nothing was
+/// appended and the caller copies `line` verbatim (the Cow wrappers then
+/// return `Cow::Borrowed(line)` with zero allocation).
+fn highlight_code_impl_into(
+    line: &str,
     use_color: bool,
     add_backtick_quotes: bool,
-) -> Cow<'a, str> {
-    if !use_color {
-        return Cow::Borrowed(line);
-    }
-    // Every token this pass rewrites (keywords, type names, backtick-quoted
-    // type names, and `&`/`*` prefixes on those) contains at least one ASCII
-    // letter, so a line with none can only be passed through verbatim.
-    // Punctuation-only and digit-only lines (common in stack-trace snippets)
-    // now skip the allocation entirely.
-    if !line.bytes().any(|b| b.is_ascii_alphabetic()) {
-        return Cow::Borrowed(line);
-    }
+    out: &mut String,
+) -> bool {
+    debug_assert!(use_color, "callers gate on use_color before this point");
+    // No separate "line has no ASCII letter" pre-scan: every rewrite arm
+    // already funnels through `has_highlight`, so a line that triggers no
+    // highlight (punctuation-only, digit-only, plain prose — the common
+    // cases) leaves `out` untouched with zero allocation.  The old pre-scan
+    // was a second full pass over every highlighted line for an answer the
+    // main loop already computes.
 
     // Reset only foreground color and bold — preserve background color
     // so that callers can wrap the output in a background color block.
@@ -3972,7 +5421,16 @@ fn highlight_code_impl<'a>(
     let bold = "\x1b[1m";
     let hl = "\x1b[94m";
 
-    let mut out = String::with_capacity(line.len() + 32);
+    // Lazy materialization: `out` stays empty until the first highlight is
+    // proven necessary.  `flushed` tracks how many leading bytes of `line`
+    // are already incorporated into `out` (flushed as plain text or pushed
+    // as escaped highlight content); pass-through arms just advance `i` and
+    // leave `out`/`flushed` untouched.  A line that triggers no highlight —
+    // the common case for plain prose labels — leaves `out` empty (the
+    // caller then copies `line` verbatim / returns `Cow::Borrowed`) with
+    // zero allocation instead of eagerly copying the whole line.
+    let mut flushed = 0usize;
+    let mut has_highlight = false;
     let mut i = 0;
     let bytes = line.as_bytes();
     let len = bytes.len();
@@ -3981,37 +5439,32 @@ fn highlight_code_impl<'a>(
     // `write_header` can render them with consistent styling.
     let backtick = if add_backtick_quotes { "`" } else { "" };
 
+    // Flush the not-yet-emitted plain prefix `line[flushed..end)` into
+    // `out` and advance `flushed`.  Used at each highlight site to copy any
+    // verbatim bytes that accumulated between the last highlight and this
+    // one.  `out`, `line`, and `flushed` are the function locals above.
+    macro_rules! flush_to {
+        ($end:expr) => {{
+            out.push_str(&line[flushed..$end]);
+            flushed = $end;
+        }};
+    }
+
     while i < len {
         let b = bytes[i];
-
-        // ── Non-ASCII ────────────────────────────────────────────
-        // Decode the whole UTF-8 scalar (never split a multi-byte char).
-        // The resulting `char` cannot match any of the ASCII token
-        // shapes, so it is emitted as-is.
-        if b >= 0x80 {
-            out.push(next_char(bytes, &mut i));
-            continue;
-        }
 
         match CLASS[b as usize] {
             // ── Verbatim run ────────────────────────────────────
             // Digits, whitespace, punctuation, brackets: copied in one
-            // `push_str` per run instead of one `push` per byte.  The
-            // scan loop has straight-line bounds, so LLVM vectorises it
-            // even without an explicit SIMD kernel.  Runs of PASS bytes
+            // `push_str` per run instead of one `push` per byte.  The run
+            // scan (`pass_run_len`) advances 8 bytes per iteration via SWAR
+            // masks, falling back to the scalar bitmap loop on a dirty
+            // chunk.  Runs of PASS bytes
             // are the dominant shape in real source (` = `, ` + `,
             // `(x, y)`), so this is the hottest arm.
             PASS => {
-                let start = i;
                 i += 1;
-                while i < len {
-                    let nb = bytes[i];
-                    if nb >= 0x80 || CLASS[nb as usize] != PASS {
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str(&line[start..i]);
+                i += pass_run_len(&bytes[i..]);
             }
 
             // ── String literal ──────────────────────────────────
@@ -4021,7 +5474,6 @@ fn highlight_code_impl<'a>(
             // backslashes immediately preceding it: an even count means
             // the quote is the closing one.
             STRING => {
-                let start = i;
                 i += 1;
                 while i < len {
                     match memchr::memchr(b'"', &bytes[i..]) {
@@ -4043,35 +5495,55 @@ fn highlight_code_impl<'a>(
                         }
                     }
                 }
-                out.push_str(&line[start..i]);
             }
 
-            // ── Char literal ────────────────────────────────────
-            // Symmetric to the string scan: `memchr` for the closing
-            // `'`, with escaped `'\''` rejected the same way.
+            // ── Char literal / lifetime ─────────────────────────
+            // A `'` is a *lifetime* prefix when the byte after it is an
+            // identifier start AND the byte after *that* is not a closing
+            // quote: `'a'` is a two-char char literal, `'a` (and `'static`)
+            // is a lifetime.  Feeding a lifetime into the char-literal scan
+            // below made it hunt for the next `'` and pair the lifetime's
+            // apostrophe with a *later* one — in `def f<'a>(x: &'a Int)` the
+            // scanner swallowed everything between the two lifetimes.
+            // `'\n'`, `'\''` etc. start with `\`, so they fall through to
+            // the literal scan unchanged; an unterminated char literal
+            // still consumes to end of line.
             CHAR => {
-                let start = i;
-                i += 1;
-                while i < len {
-                    match memchr::memchr(b'\'', &bytes[i..]) {
-                        Some(off) => {
-                            let q = i + off;
-                            let mut k = q;
-                            while k > i && bytes[k - 1] == b'\\' {
-                                k -= 1;
+                let lifetime = i + 1 < len
+                    && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+                    && (i + 2 >= len || bytes[i + 2] != b'\'');
+                if lifetime {
+                    // Copy the lifetime verbatim: advance past the
+                    // identifier (the same shape as the IDENT scan) without
+                    // scanning for a closing quote and without highlighting.
+                    i += 1;
+                    while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                } else {
+                    // Symmetric to the string scan: `memchr` for the closing
+                    // `'`, with escaped `'\''` rejected the same way.
+                    i += 1;
+                    while i < len {
+                        match memchr::memchr(b'\'', &bytes[i..]) {
+                            Some(off) => {
+                                let q = i + off;
+                                let mut k = q;
+                                while k > i && bytes[k - 1] == b'\\' {
+                                    k -= 1;
+                                }
+                                i = q + 1;
+                                if (q - k) % 2 == 0 {
+                                    break;
+                                }
                             }
-                            i = q + 1;
-                            if (q - k) % 2 == 0 {
+                            None => {
+                                i = len;
                                 break;
                             }
                         }
-                        None => {
-                            i = len;
-                            break;
-                        }
                     }
                 }
-                out.push_str(&line[start..i]);
             }
 
             // ── Identifier ──────────────────────────────────────
@@ -4090,18 +5562,22 @@ fn highlight_code_impl<'a>(
                 let word = &line[start..i];
                 if is_type(word) {
                     let type_end = skip_brackets(bytes, i);
+                    flush_to!(start);
                     out.push_str(hl);
                     out.push_str(backtick);
                     out.push_str(&line[start..type_end]);
                     out.push_str(backtick);
                     out.push_str(reset);
+                    flushed = type_end;
                     i = type_end;
+                    has_highlight = true;
                 } else if is_keyword(word) {
+                    flush_to!(start);
                     out.push_str(bold);
                     out.push_str(word);
                     out.push_str(reset);
-                } else {
-                    out.push_str(word);
+                    flushed = i;
+                    has_highlight = true;
                 }
             }
 
@@ -4110,8 +5586,8 @@ fn highlight_code_impl<'a>(
             // followed by a built-in type name — `&Int<32>` becomes one
             // highlighted span; `&x` and a lone `*` are copied verbatim.
             OPER => {
-                let op = b as char;
                 if i + 1 < len && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
+                    let op_pos = i;
                     i += 1;
                     let start = i;
                     while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -4120,19 +5596,25 @@ fn highlight_code_impl<'a>(
                     let word = &line[start..i];
                     if is_type(word) {
                         let type_end = skip_brackets(bytes, i);
+                        flush_to!(op_pos);
                         out.push_str(hl);
                         out.push_str(backtick);
-                        out.push(op);
+                        out.push(b as char);
                         out.push_str(&line[start..type_end]);
                         out.push_str(backtick);
                         out.push_str(reset);
+                        flushed = type_end;
                         i = type_end;
+                        has_highlight = true;
                     } else {
-                        out.push(op);
-                        out.push_str(word);
+                        // Not a type (`&mut x`, `*const p`): rewind to the
+                        // identifier start so the IDENT arm re-examines the
+                        // word — `mut`/`const` are keywords and must still
+                        // highlight.  IDENT always advances past the word,
+                        // so this cannot loop.
+                        i = start;
                     }
                 } else {
-                    out.push(op);
                     i += 1;
                 }
             }
@@ -4151,10 +5633,11 @@ fn highlight_code_impl<'a>(
                     i += 1;
                 }
                 if i >= len {
-                    // Unterminated backtick: emit the remainder verbatim
-                    // instead of slicing out of bounds with `..=i`.
-                    out.push_str(&line[start..]);
-                    return Cow::Owned(out);
+                    // Unterminated backtick: drop to the tail flush,
+                    // which emits the remainder verbatim (this token
+                    // adds no highlight, so if nothing earlier
+                    // highlighted either, the whole line is borrowed).
+                    break;
                 }
                 let content = &line[content_start..i];
                 // Check the content *before* any bracket suffix, e.g.
@@ -4165,16 +5648,37 @@ fn highlight_code_impl<'a>(
                     .unwrap_or(content);
                 let type_name = type_name.trim_start_matches(['&', '*']);
                 if is_type(type_name) {
+                    flush_to!(start);
                     out.push_str(hl);
                     out.push_str(&line[start..=i]);
                     out.push_str(reset);
-                } else {
-                    out.push_str(&line[start..=i]);
+                    flushed = i + 1;
+                    has_highlight = true;
                 }
                 i += 1;
             }
 
-            // `CLASS` only holds the six tags above; the compiler knows
+            // ── Non-ASCII ────────────────────────────────────────
+            // Decode the whole UTF-8 scalar (never split a multi-byte
+            // char).  The resulting `char` cannot match any of the ASCII
+            // token shapes, so it is emitted as-is; only `i` advances.
+            // `NONASCII` implies `b0 >= 0x80`, and `i` is contractually on
+            // a char boundary, so the scalar length is derivable from the
+            // lead byte alone — no `#[cold]` `next_char_slow` call per
+            // CJK char on a highlighted line.
+            NONASCII => {
+                let b0 = bytes[i];
+                let n = if b0 < 0xE0 {
+                    2
+                } else if b0 < 0xF0 {
+                    3
+                } else {
+                    4
+                };
+                i += n;
+            }
+
+            // `CLASS` only holds the seven tags above; the compiler knows
             // this, so this arm is unreachable for any byte the table
             // can produce.  Keep it as a loud failure for a future table
             // edit that introduces a new class, rather than a silent
@@ -4183,54 +5687,11 @@ fn highlight_code_impl<'a>(
         }
     }
 
-    Cow::Owned(out)
-}
-
-/// Decode the UTF-8 scalar at `bytes[*i]` and advance `*i` past it.
-///
-/// Contract: `bytes` is valid UTF-8 and `*i` is on a char boundary with
-/// `*i < bytes.len()`.  This is what lets the slow path skip
-/// `char::from_u32` validation.
-#[inline]
-fn next_char(bytes: &[u8], i: &mut usize) -> char {
-    debug_assert!(*i == bytes.len() || (bytes[*i] & 0xC0) != 0x80);
-    let b0 = bytes[*i];
-    if b0 < 0x80 {
-        *i += 1;
-        b0 as char
-    } else {
-        next_char_slow(b0, bytes, i)
+    if !has_highlight {
+        return false;
     }
-}
-
-#[cold]
-#[inline(never)]
-fn next_char_slow(b0: u8, bytes: &[u8], i: &mut usize) -> char {
-    debug_assert!(b0 >= 0xC2 && b0 <= 0xF4);
-    let n = match b0 {
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        _ => 4,
-    };
-    let start = *i;
-    // One slice = one bounds check; the subsequent s[0..n] index checks are
-    // eliminated by LLVM's value-range propagation from s.len() == n.
-    let s = &bytes[start..start + n];
-    let cp = match n {
-        2 => ((s[0] & 0x1F) as u32) << 6 | (s[1] & 0x3F) as u32,
-        3 => ((s[0] & 0x0F) as u32) << 12 | ((s[1] & 0x3F) as u32) << 6 | (s[2] & 0x3F) as u32,
-        _ => {
-            ((s[0] & 0x07) as u32) << 18
-                | ((s[1] & 0x3F) as u32) << 12
-                | ((s[2] & 0x3F) as u32) << 6
-                | (s[3] & 0x3F) as u32
-        }
-    };
-    *i = start + n;
-    // SAFETY: the contract guarantees valid UTF-8 input, so cp <= 0x10FFFF
-    // and is outside the D800..=DFFF surrogate range; from_u32_unchecked
-    // cannot produce an invalid char.
-    unsafe { char::from_u32_unchecked(cp) }
+    out.push_str(&line[flushed..]);
+    true
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -4257,6 +5718,37 @@ mod tests {
         assert!(output.contains("error[E030]"));
         assert!(output.contains("trait solver error"));
         assert!(output.contains("<input>"));
+    }
+
+    /// C6: `grapheme_width` is `pub(crate)` and reached directly by
+    /// `expand_tabs_from_col` / test oracles, so a caller-supplied
+    /// `tab_width == 0` must not divide by zero.
+    #[test]
+    fn grapheme_width_clamps_zero_tab_width() {
+        assert_eq!(grapheme_width("\t", 5, 0), 1);
+        assert_eq!(grapheme_width_cached("\t", 5, 0, &mut WidthCache::new()), 1);
+    }
+
+    /// `render_summary_full` must be byte-identical to `render_summary` for
+    /// `file_count <= 1` and append the file suffix only for a multi-file
+    /// batch.
+    #[test]
+    fn render_summary_full_appends_file_suffix_only_for_multiple_files() {
+        let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
+        let r = GlyphRenderer::new(false);
+        for (e, w) in [(0, 0), (1, 0), (2, 1)] {
+            assert_eq!(r.render_summary_full(e, w, 0), r.render_summary(e, w));
+            assert_eq!(r.render_summary_full(e, w, 1), r.render_summary(e, w));
+        }
+        let multi = r.render_summary_full(2, 0, 3);
+        assert!(multi.contains("3"), "file count missing: {multi:?}");
+        assert!(
+            multi.len() > r.render_summary(2, 0).len(),
+            "multi-file summary did not append a suffix: {multi:?}"
+        );
+        // No diagnostics: no summary at any file count.
+        assert!(r.render_summary_full(0, 0, 5).is_empty());
     }
 
     #[test]
@@ -4482,20 +5974,20 @@ mod tests {
     fn legacy_render<'a>(
         line: &str,
         ranges: &[(usize, usize)],
-        meta: &[(char, &'a str, Option<usize>)],
+        meta: &[(char, Option<usize>)],
         highlight_on: &str,
         highlight_off: &str,
     ) -> (
         usize,
         String,
-        Vec<(usize, usize, char, &'a str, Option<usize>)>,
+        Vec<(usize, usize, char, Option<usize>)>,
     ) {
         let display_buf = byte_ranges_to_display(line, ranges, DEFAULT_TAB_WIDTH);
         let display_width = line_display_width(line, DEFAULT_TAB_WIDTH);
-        let raw_underlines: Vec<(usize, usize, char, &'a str, Option<usize>)> = display_buf
+        let raw_underlines: Vec<(usize, usize, char, Option<usize>)> = display_buf
             .iter()
             .zip(meta.iter())
-            .map(|(&(col, width), &(ch, msg, label_idx))| (col, width, ch, msg, label_idx))
+            .map(|(&(col, width), &(ch, label_idx))| (col, width, ch, label_idx))
             .collect();
         // Primary marks come from the raw widths, matching the fused
         // renderer's byte-overlap rule: a point on a cluster boundary
@@ -4505,9 +5997,9 @@ mod tests {
         compute_primary_cols(&raw_underlines, display_width, &mut primary_cols);
         // Insertion-point policy (mirrors the fused pipeline's underline
         // rows): zero-width annotations reach lane assignment one cell wide.
-        let underlines: Vec<(usize, usize, char, &'a str, Option<usize>)> = raw_underlines
+        let underlines: Vec<(usize, usize, char, Option<usize>)> = raw_underlines
             .iter()
-            .map(|&(col, width, ch, msg, label_idx)| (col, width.max(1), ch, msg, label_idx))
+            .map(|&(col, width, ch, label_idx)| (col, width.max(1), ch, label_idx))
             .collect();
 
         let mut rendered = String::new();
@@ -4589,21 +6081,21 @@ mod tests {
             // Annotation chars alternate between `^` (primary) and `~` so the
             // fused prefilter and the old primary-column marks are both
             // exercised; messages/label indices verify straight pass-through.
-            let meta: Vec<(char, &str, Option<usize>)> = ranges
+            let meta: Vec<(char, Option<usize>)> = ranges
                 .iter()
                 .enumerate()
                 .map(|(i, _)| {
                     if i % 2 == 0 {
-                        ('^', "", None)
+                        ('^', None)
                     } else {
-                        ('~', "some label", Some(i))
+                        ('~', Some(i))
                     }
                 })
                 .collect();
             let (want_width, want_rendered, want_out) =
                 legacy_render(line, ranges, &meta, highlight_on, highlight_off);
 
-            let mut out: SmallVec<[(usize, usize, char, &str, Option<usize>); 8]> = SmallVec::new();
+            let mut out: SmallVec<[(usize, usize, char, Option<usize>); 8]> = SmallVec::new();
             let mut rendered = String::new();
             let mut display_buf = Vec::new();
             let mut order_buf = Vec::new();
@@ -4622,6 +6114,8 @@ mod tests {
                 &mut done_buf,
                 &mut active_buf,
                 DEFAULT_TAB_WIDTH,
+                0, // test oracle: content starts at column 0
+                false,
             );
 
             assert_eq!(got_width, want_width, "width for line={line:?}");
@@ -4895,26 +6389,39 @@ mod tests {
     fn line_starts_matches_naive() {
         let src = "a\nbb\n\nccc";
         let starts = line_starts(src);
-        assert_eq!(starts, vec![0, 2, 5, 6]);
+        assert_eq!(starts, vec![0u32, 2, 5, 6]);
         for (i, &s) in starts.iter().enumerate() {
-            assert_eq!(line_start_byte(src, i), s, "mismatch at line {i}");
+            assert_eq!(line_start_byte(src, i), s as usize, "mismatch at line {i}");
         }
     }
 
     #[test]
     fn osc8_url_is_percent_encoded() {
         let src = "def x() {}\n";
+        let name = "a b\x1b]8;;evil\x07.ps";
+        // The URL encoder must neutralise control bytes and spaces whether or
+        // not the terminal probe enables hyperlinks (the probe is now
+        // stderr-tty-gated, so a bare test process legitimately disables them).
+        let url = crate::diagnostics::term::path_to_file_url(std::path::Path::new(name));
+        assert!(
+            !url.contains('\x1b') && !url.contains('\x07'),
+            "control char leaked into file URL: {url:?}"
+        );
+        assert!(url.contains("%20"), "space not encoded: {url:?}");
+
         let diag = Diagnostic::error("boom")
             .with_code_str(ErrCode::E030)
             .with_span(Span::new(FileId::DUMMY, 0, 3))
             .with_source(src)
-            .with_file_name("a b\x1b]8;;evil\x07.ps");
+            .with_file_name(name);
         let out = GlyphRenderer::new(true).render_diagnostic(&diag);
-        assert!(
-            !out.contains("\x1b]8;;evil"),
-            "control char leaked into OSC 8 URL: {out:?}"
-        );
-        assert!(out.contains("%20"), "space not encoded: {out:?}");
+        if crate::diagnostics::term::supports_hyperlinks() {
+            assert!(
+                !out.contains("\x1b]8;;evil"),
+                "control char leaked into OSC 8 URL: {out:?}"
+            );
+            assert!(out.contains("%20"), "space not encoded: {out:?}");
+        }
     }
 
     // ── Message wrapping ────────────────────────────────────────
@@ -4980,6 +6487,18 @@ mod tests {
         assert_eq!(line_display_width("中", DEFAULT_TAB_WIDTH), 2); // CJK → 2 cells
         assert_eq!(visible_width("\t"), 4);
         assert_eq!(visible_width("\x7f"), 1);
+    }
+
+    /// The PASS bitmap must agree with the `CLASS` table on every byte, so
+    /// the run-scan's shift+mask can never classify differently than the
+    /// dispatcher's table load.
+    #[test]
+    fn pass_mask_matches_class() {
+        for b in 0..=255u8 {
+            let table_pass = CLASS[b as usize] == PASS;
+            let mask_pass = b < 0x80 && (PASS_MASK >> b) & 1 == 1;
+            assert_eq!(table_pass, mask_pass, "byte {b:#04x}");
+        }
     }
 
     /// Non-ASCII characters fall through the token scanner's `next_char`
@@ -5077,6 +6596,45 @@ mod tests {
         assert!(
             wrapped_lines >= 2,
             "expected the label to wrap across lines, got:\n{out}"
+        );
+    }
+
+    /// A help message longer than `max_width` wraps, and each continuation
+    /// line must place the `│` bar **before** the padding — the bar stays in
+    /// the gutter and the text aligns under the first line's message.
+    /// Regression: `write_help_line` (and `write_note_line`) once pushed the
+    /// pad before the bar, shifting the bar right by `prefix_cols - 1`
+    /// columns and mis-aligning every continuation line.
+    #[test]
+    fn long_help_message_wraps_with_aligned_continuation() {
+        let src = "set i = 1;\n";
+        let long = "this help repeats the connector over and over again to force a wrap";
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 0, 5))
+            .with_help(long)
+            .with_source(src);
+        let opts = crate::diagnostics::DiagOpts {
+            max_width: 40,
+            use_unicode: false,
+            ..Default::default()
+        };
+        let out = GlyphRenderer::with_opts(false, Some(&opts)).render_diagnostic(&diag);
+        let mut wrapped_lines = 0;
+        for line in out.lines() {
+            // Words unique to the help text: each continuation must start
+            // with the bar itself — no leading whitespace before the gutter.
+            if line.contains("this") || line.contains("over") || line.contains("wrap") {
+                wrapped_lines += 1;
+                assert!(
+                    line.starts_with('|'),
+                    "help continuation lost the gutter: {line:?}\n{out}"
+                );
+            }
+        }
+        assert!(
+            wrapped_lines >= 2,
+            "expected the help to wrap across lines, got:\n{out}"
         );
     }
 
@@ -5317,7 +6875,7 @@ mod tests {
                     (s, s + (next() % 20) as usize)
                 })
                 .collect();
-            let mut win = LabelWindow::new(&ranges, &[]);
+            let mut win = LabelWindow::new(&ranges, &[], LabelWindowScratch::new());
             for line in 0..80usize {
                 win.advance(line);
                 let want: Vec<usize> = (0..n)
@@ -5337,7 +6895,7 @@ mod tests {
     #[test]
     fn label_window_same_line_burst_keeps_index_order() {
         let ranges: Vec<(usize, usize)> = (0..100).map(|_| (10, 20)).collect();
-        let mut win = LabelWindow::new(&ranges, &[]);
+        let mut win = LabelWindow::new(&ranges, &[], LabelWindowScratch::new());
         win.advance(10);
         let want: Vec<usize> = (0..100).collect();
         assert_eq!(win.active(), want.as_slice());
@@ -5799,9 +7357,9 @@ mod tests {
         // lane instead of stacking two identical `^^^` rows; a third,
         // genuinely overlapping annotation still opens a second lane.
         let underlines = [
-            (4usize, 6usize, '^', "", None),
-            (4usize, 6usize, '^', "same span", Some(0)),
-            (5usize, 10usize, '^', "overlap", Some(1)),
+            (4usize, 6usize, '^', None),
+            (4usize, 6usize, '^', Some(0usize)),
+            (5usize, 10usize, '^', Some(1usize)),
         ];
         let mut lanes = UnderlineLanes::new();
         let count = lanes.assign(&underlines);
@@ -5815,9 +7373,9 @@ mod tests {
         // dedup must not rely on adjacency. Without the seen-set the two
         // `^` entries stack as a redundant third lane.
         let underlines = [
-            (4usize, 6usize, '^', "", None),
-            (4usize, 6usize, '~', "secondary", Some(0)),
-            (4usize, 6usize, '^', "same span", Some(1)),
+            (4usize, 6usize, '^', None),
+            (4usize, 6usize, '~', Some(0usize)),
+            (4usize, 6usize, '^', Some(1usize)),
         ];
         let mut lanes = UnderlineLanes::new();
         let count = lanes.assign(&underlines);
@@ -5825,5 +7383,449 @@ mod tests {
             count, 2,
             "non-adjacent identical annotations must collapse; the `~` keeps its own lane"
         );
+    }
+
+    // ── Lane relabelling by descending visual weight ──
+
+    /// The greedy numbers lanes in opening order; the weighted-depth-sum
+    /// objective wants the *heaviest* lane at index 0.  One wide primary
+    /// plus many short disjoint labels that all overlap it stack the labels
+    /// into a second lane whose total weight easily outweighs the primary —
+    /// so the relabel must move that heavier lane to index 0.
+    #[test]
+    fn lanes_are_relabelled_by_descending_weight() {
+        let mut underlines: Vec<(usize, usize, char, Option<usize>)> =
+            vec![(0usize, 1000usize, '^', None)]; // primary, wide
+        for k in 0..40usize {
+            let start = 10 + k * 20;
+            underlines.push((start, 5, '~', Some(k)));
+        }
+
+        let mut lanes = UnderlineLanes::new();
+        let count = lanes.assign(&underlines);
+        assert_eq!(count, 2, "primary + disjoint labels fits in two lanes");
+
+        let weight = |l: usize| -> usize {
+            lanes.lanes[l]
+                .iter()
+                .map(|&i| underlines[i].1 + usize::from(underlines[i].3.is_some()))
+                .sum()
+        };
+        let (w0, w1) = (weight(0), weight(1));
+        assert!(
+            w0 >= w1,
+            "lane 0 ({w0}) must be at least as heavy as lane 1 ({w1})"
+        );
+    }
+
+    /// After `assign`, the used lanes are monotonically non-increasing in
+    /// total visual weight (the rearrangement-inequality orientation for the
+    /// fixed interval→lane assignment), and the assignment itself stays
+    /// well-formed: every underline appears exactly once across lanes.
+    #[test]
+    fn relabel_keeps_lane_weights_non_increasing_and_assignment_wellformed() {
+        let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed
+        };
+        for _ in 0..200 {
+            let count = 2 + (next() % 8) as usize;
+            let mut underlines: Vec<(usize, usize, char, Option<usize>)> = Vec::new();
+            for i in 0..count {
+                let start = (next() % 60) as usize;
+                let width = 1 + (next() % 20) as usize;
+                underlines.push((start, width, '^', if i % 3 == 0 { None } else { Some(i) }));
+            }
+            underlines.sort_by_key(|&(c, w, _, _)| (c, c + w));
+
+            let mut lanes = UnderlineLanes::new();
+            let n = lanes.assign(&underlines);
+
+            // Lanes non-increasing in weight.
+            let mut prev = usize::MAX;
+            for l in 0..n {
+                let w: usize = lanes.lanes[l]
+                    .iter()
+                    .map(|&i| underlines[i].1 + usize::from(underlines[i].3.is_some()))
+                    .sum();
+                assert!(
+                    w <= prev,
+                    "lane {l} weight {w} exceeds lane {} weight {prev}",
+                    l.saturating_sub(1)
+                );
+                prev = w;
+            }
+
+            // Well-formed: every *distinct* annotation appears exactly once —
+            // `assign` collapses identical `(start, ulen, char)` twins by
+            // design (they render as one fused row), so compare against the
+            // deduped input, not the raw count.
+            let mut distinct: Vec<(usize, usize, char)> = underlines
+                .iter()
+                .map(|&(c, w, ch, _)| (c, w, ch))
+                .collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let mut seen: SmallVec<[usize; 16]> = SmallVec::new();
+            for l in 0..n {
+                seen.extend(lanes.lanes[l].iter().copied());
+            }
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(
+                seen.len(),
+                distinct.len(),
+                "assignment lost distinct entries"
+            );
+        }
+    }
+
+    // ── Regression tests: context window, diff block, no-source labels ──
+
+    /// F1: `context_lines = 0` must show exactly the covered lines — the
+    /// old `end_line + 1 + context_lines` window dragged one line below the
+    /// span in even at zero context.
+    #[test]
+    fn zero_context_shows_no_line_below_the_span() {
+        let src = "one\ntwo\nthree\nfour\nfive\n";
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 8, 13)) // `three` on line 2
+            .with_source(src);
+        let opts = crate::diagnostics::DiagOpts {
+            context_lines: 0,
+            ..Default::default()
+        };
+        let out = GlyphRenderer::with_opts(false, Some(&opts)).render_diagnostic(&diag);
+        assert!(out.contains("three"), "covered line missing:\n{out}");
+        assert!(
+            !out.contains("four") && !out.contains("five"),
+            "zero context must not show lines below the span:\n{out}"
+        );
+        assert!(
+            !out.contains("two"),
+            "context above must honour the window:\n{out}"
+        );
+    }
+
+    /// F1: `context_lines = 2` shows exactly two lines below the covered
+    /// lines — not three.
+    #[test]
+    fn context_lines_two_shows_exactly_two_lines_below() {
+        let src = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 8, 13)) // `three` on line 2
+            .with_source(src);
+        let opts = crate::diagnostics::DiagOpts {
+            context_lines: 2,
+            ..Default::default()
+        };
+        let out = GlyphRenderer::with_opts(false, Some(&opts)).render_diagnostic(&diag);
+        for want in ["three", "four", "five"] {
+            assert!(out.contains(want), "{want} (within 2 context) missing:\n{out}");
+        }
+        assert!(
+            !out.contains("six"),
+            "context_lines=2 must not show a third line below:\n{out}"
+        );
+    }
+
+    /// F1: a span whose end sits exactly on a line start does not drag the
+    /// following line into the window (`span_lines` already attributes the
+    /// end to the previous line).
+    #[test]
+    fn span_ending_on_line_start_adds_no_phantom_row() {
+        let src = "aaa\nbbb\nccc\n";
+        // (0, 4) covers `aaa` plus the newline: last covered line is 0.
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 0, 4))
+            .with_source(src);
+        let opts = crate::diagnostics::DiagOpts {
+            context_lines: 0,
+            ..Default::default()
+        };
+        let out = GlyphRenderer::with_opts(false, Some(&opts)).render_diagnostic(&diag);
+        assert!(out.contains("aaa"), "covered line missing:\n{out}");
+        assert!(
+            !out.contains("bbb"),
+            "an end on a line start must not pull the next line in:\n{out}"
+        );
+    }
+
+    /// F2: on the final covered line of a multi-line label, the message loop
+    /// owns the connector + message row; the connector loop must not draw a
+    /// second, stray `|` row for the `end` part.
+    #[test]
+    fn multiline_label_end_line_has_no_duplicate_connector() {
+        let src = "aaa\nbbb\nccc\nddd\n";
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 0, 1))
+            .with_label(Span::new(FileId::DUMMY, 0, 7), "spans two lines")
+            .with_source(src);
+        let out = GlyphRenderer::new(false).render_diagnostic(&diag);
+        let lines: Vec<&str> = out.lines().collect();
+        let msg_pos = lines
+            .iter()
+            .position(|l| l.contains("spans two lines"))
+            .expect("label message missing");
+        // Between the message row and the next source row ("ccc") no bare
+        // connector row (gutter + `|`, no text) may appear — that was the
+        // stray duplicate `end` connector.
+        for line in &lines[msg_pos + 1..] {
+            if line.contains("ccc") {
+                break;
+            }
+            let bare = !line.chars().any(|c| c.is_alphanumeric()) && line.trim_end().ends_with('|');
+            assert!(
+                !bare,
+                "stray duplicate connector after the label message:\n{out}"
+            );
+        }
+        // The message itself is still rendered exactly once.
+        assert_eq!(out.matches("spans two lines").count(), 1, "{out}");
+    }
+
+    /// F3: wrapped structural-suggestion continuations align under the
+    /// message, not under the glyph.
+    #[test]
+    fn wrapped_suggestion_continuations_align_under_message() {
+        let src = "set i = j;\n";
+        let long = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam".repeat(2);
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 0, 3))
+            .with_span_suggestion(
+                Span::new(FileId::DUMMY, 0, 3),
+                "def",
+                &long,
+                Applicability::MachineApplicable,
+            )
+            .with_source(src);
+        let out = GlyphRenderer::new(false).render_diagnostic(&diag);
+        let lines: Vec<&str> = out.lines().collect();
+        let first = lines
+            .iter()
+            .position(|l| l.contains("help: "))
+            .expect("suggestion message missing");
+        // Column of the message text on the first line ("help" of `help:`).
+        let help_col = lines[first].find("help").unwrap();
+        let cont = &lines[first + 1];
+        assert!(
+            !cont.contains("set i"),
+            "message did not wrap; test inconclusive:\n{out}"
+        );
+        // First alphabetic character of the continuation = its text start;
+        // it must sit under the *message* column, i.e. the `help:` label's
+        // column plus the `label: ` gutter (`label.len() + 2`), not back at
+        // the glyph column and not past the message column.
+        let text_col = cont
+            .char_indices()
+            .find(|(_, c)| c.is_alphabetic())
+            .map(|(i, _)| i)
+            .expect("continuation has no text");
+        assert_eq!(
+            text_col,
+            help_col + "help".len() + 2,
+            "wrapped continuation not aligned under the message:\n{out}"
+        );
+    }
+
+    /// F4: a single-line span whose replacement contains a newline must
+    /// fall back to the text-only suggestion path — splicing it into the
+    /// `-`/`+` rows would produce a malformed multi-line diff row.
+    #[test]
+    fn single_line_span_with_multiline_replacement_falls_back_to_text() {
+        let src = "dem main(){}\n";
+        let diag = Diagnostic::error("unexpected identifier `dem`")
+            .with_code_str(ErrCode::E003)
+            .with_span(Span::new(FileId::DUMMY, 0, 3))
+            .with_span_suggestion(
+                Span::new(FileId::DUMMY, 0, 3),
+                "def\nmain(){}",
+                "replace `dem` with a two-line form",
+                Applicability::MachineApplicable,
+            )
+            .with_source(src);
+        let out = GlyphRenderer::new(false).render_diagnostic(&diag);
+        assert!(
+            !out.contains("- dem main(){}") && !out.contains("+ def main(){}"),
+            "multi-line replacement must not splice into a diff row:\n{out}"
+        );
+        assert!(
+            out.contains("replace `dem` with a two-line form"),
+            "text fallback missing:\n{out}"
+        );
+    }
+
+    /// F5: a tab-indented source line in the diff block expands tabs like
+    /// the main source rows do — no raw `\t` may reach the diff rows.
+    #[test]
+    fn diff_block_lines_expand_tabs() {
+        let src = "\tset i = j;\n";
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 1, 4))
+            .with_span_suggestion(
+                Span::new(FileId::DUMMY, 1, 4),
+                "let",
+                "replace `set` with `let`",
+                Applicability::MachineApplicable,
+            )
+            .with_source(src);
+        let out = GlyphRenderer::new(false).render_diagnostic(&diag);
+        assert!(out.contains("- \tset") == false, "raw tab in diff row:\n{out:?}");
+        let minus = out.lines().find(|l| l.contains("- ") && l.contains("set i"));
+        let minus = minus.expect("diff - row missing");
+        assert!(
+            !minus.contains('\t'),
+            "diff row kept a raw tab: {minus:?}\n{out}"
+        );
+        // Tabs expand to the next stop from the row's *absolute* terminal
+        // column: the main source row's payload starts after the
+        // `│ <num> │ ` gutter (1+1+1+1+1 = 5 cells → 4 − 5%4 = 3 spaces),
+        // while the diff row's payload starts after gutter + glyph + the
+        // 2-column `- `/`+ ` marker (8 cells → 4 spaces).  Both are
+        // stop-aligned in absolute terms (5+3 = 8 = 8+4 mod 4 = 0) — the
+        // payloads legitimately differ, exactly as a real terminal renders
+        // them.  Compare display columns (char counts — the plain renderer
+        // emits no ANSI and `√` is one cell), not byte offsets.
+        let main_row = out
+            .lines()
+            .find(|l| l.contains("set i = j;") && !l.contains("- "))
+            .unwrap();
+        let gutter_end = main_row.match_indices('|').nth(1).map(|(i, _)| i).unwrap();
+        let main_payload = &main_row[gutter_end + 2..]; // skip '|' + gutter space
+        let m_ws = main_payload.len() - main_payload.trim_start().len();
+        let d_gutter_end = minus.match_indices('|').nth(1).map(|(i, _)| i).unwrap();
+        let d_rest = &minus[d_gutter_end + 2..]; // "√- <expanded payload>"
+        let d_payload = &d_rest[d_rest.find("- ").expect("diff marker missing") + 2..];
+        let d_ws = d_payload.len() - d_payload.trim_start().len();
+        // Absolute columns: main content starts at 5 (`│ 1 │ `), the diff
+        // payload at 8 (gutter 5 + glyph 1 + `- ` 2); DEFAULT_TAB_WIDTH = 4.
+        assert_eq!(m_ws, 3, "main row tab must stop-align from col 5:\n{out}");
+        assert_eq!(
+            d_ws, 4,
+            "diff row tab must stop-align from col 8:\n{out}"
+        );
+    }
+
+    /// F6: labels are not dropped when no source is attached — each label
+    /// message stays visible as an `= note: <msg> at <span>` line.
+    #[test]
+    fn labels_render_without_source() {
+        let diag = Diagnostic::error("duplicate definition")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 40, 44))
+            .with_label(Span::new(FileId::DUMMY, 10, 14), "previous definition here");
+        let out = GlyphRenderer::new(false).render_diagnostic(&diag);
+        assert!(
+            out.contains("previous definition here"),
+            "label dropped with no source attached:\n{out}"
+        );
+        assert!(
+            out.contains("at 10..14"),
+            "label locator missing:\n{out}"
+        );
+        assert_eq!(
+            out.matches("previous definition here").count(),
+            1,
+            "label duplicated:\n{out}"
+        );
+    }
+
+    /// F7: a lifetime must not enter the char-literal scan — the scanner
+    /// used to pair the lifetime's apostrophe with a later one and swallow
+    /// the tokens between (here, the `set` keyword).
+    #[test]
+    fn lifetime_is_not_scanned_as_char_literal() {
+        let out = highlight_code("m = 'a; set x't", true);
+        assert!(
+            out.contains("\x1b[1mset\x1b[22m\x1b[39m"),
+            "keyword swallowed by a lifetime's apostrophe: {out:?}"
+        );
+        // Two lifetimes: nothing between them may be swallowed either.
+        let out = highlight_code("f<'a>(&x: Int, y: &'b Int)", true);
+        assert!(
+            out.contains("\x1b[94mInt\x1b[22m\x1b[39m"),
+            "type lost between lifetimes: {out:?}"
+        );
+    }
+
+    /// F7: real char literals keep working — plain, escaped, and the
+    /// quote-as-char corner.
+    #[test]
+    fn char_literals_still_scan_correctly() {
+        for line in ["c = 'x' + 'y'", r"c = '\n' + '\''", "c = 'x'"] {
+            let out = highlight_code(line, true);
+            // The literal text is preserved byte for byte (no highlight in
+            // these char-only lines — but nothing may be consumed wrongly
+            // either).
+            let plain: String = strip_ansi(&out);
+            assert_eq!(plain, line, "char literal mangled: {line:?} → {out:?}");
+        }
+        // A char literal adjacent to a lifetime does not confuse either.
+        let out = highlight_code("p = 'a' && q = &'b Int", true);
+        assert!(
+            out.contains("\x1b[94mInt\x1b[22m\x1b[39m"),
+            "type after char-literal + lifetime lost: {out:?}"
+        );
+    }
+
+    /// Scalar reference for the PASS run scan (the pre-SWAR loop).
+    fn pass_run_len_scalar(bytes: &[u8]) -> usize {
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b >= 0x80 || (PASS_MASK >> b) & 1 == 0 {
+                break;
+            }
+            i += 1;
+        }
+        i
+    }
+
+    /// F9 differential test: the SWAR run scan must advance exactly as far
+    /// as the scalar bitmap loop — over all 256 byte values (at every
+    /// substring offset) and over deterministic pseudo-random byte strings
+    /// (at every alignment, exercising unaligned 8-byte chunk loads).
+    #[test]
+    fn pass_run_len_swar_matches_scalar() {
+        // Every byte value, alone and in adversarial combinations, at every
+        // start offset.
+        let mut all: Vec<u8> = (0..=255).collect();
+        all.extend([b'a', b'A', b'_', b'"', b'\'', b'&', b'*', b'`', 0x7f, 0x80, 0xff]);
+        for start in 0..all.len() {
+            for end in start..=all.len() {
+                let window = &all[start..end];
+                assert_eq!(
+                    pass_run_len(window),
+                    pass_run_len_scalar(window),
+                    "bytes {start}..{end} of the full table"
+                );
+            }
+        }
+        // Deterministic xorshift byte strings, all alignments.
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..300 {
+            let n = (next() % 96) as usize + 1;
+            let buf: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            for s in 0..buf.len() {
+                assert_eq!(
+                    pass_run_len(&buf[s..]),
+                    pass_run_len_scalar(&buf[s..]),
+                    "buf {buf:?} from offset {s}"
+                );
+            }
+        }
     }
 }

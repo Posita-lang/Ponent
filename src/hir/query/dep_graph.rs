@@ -5,9 +5,41 @@
 //! forming a dependency graph.  When an input changes, the graph
 //! enables incremental re-evaluation.
 //!
+//! ## Why not per-node revisions (the salsa-style redesign — CLOSED)
+//!
+//! A per-node `changed_at`/`verified_at` revision model (salsa 3.x /
+//! rustc-incremental style) was evaluated as the top optimisation
+//! candidate and REJECTED, deliberately and by design.  The two models
+//! are mutually exclusive here:
+//!
+//! - In THIS graph, invalidation is LAZY: a mark fans out exactly ONE
+//!   level (direct readers, at fingerprint-change publish time), and the
+//!   transitive walk (`verify_inner`) is not merely a hit check — it is
+//!   the engine that DRIVES recomputation up the dependency chain.  A
+//!   revision-model fast path ("serve when no direct dep's `changed_at`
+//!   exceeds my `verified_at`") would serve a node whose TRANSITIVE dep
+//!   was bare-invalidated (marked without a value change yet) without
+//!   ever recomputing that dep — permanently stale if no one else
+//!   requests it.  The walk returning the dirty dep to the caller is
+//!   what triggers the re-request that recomputes it.
+//! - Salsa-family designs are sound because invalidation propagates
+//!   EAGERLY through the transitive reverse-edge graph at input-write
+//!   time.  Adopting that here means restoring the eager transitive BFS
+//!   that was removed BY DESIGN (see `dirty_readers`), plus revision
+//!   tables, plus re-deriving d16 (late fan-out epoch re-check), d24
+//!   (`finishing`), and the `lowering_epoch` seqlock window under
+//!   revision comparison.
+//!
+//! The measured walk is linear at ~30 Melem/s (`benches/dep_graph.rs`,
+//! `deep_chain_walk`), a full hit decision is ~17 ns, and the collect-
+//! all-dirty + batch re-request rework (#6) already collapses the storm
+//! from O(d) walks to two.  The revision model would buy a constant-
+//! factor walk removal at the cost of a semantic redesign — not taken.
+//! Revisit ONLY together with the eager-vs-lazy invalidation decision.
+//!
 //! ## Thread safety
 //!
-//! - `edges`, `rev_edges`, `fingerprints` and `classes` are sharded by
+//! - `edges`, `fingerprints` and `classes` are sharded by
 //!   node index: node `idx` lives in `shards[idx % 64]` at compact slot
 //!   `idx / 64`, behind one `CachePadded` `RwLock` per shard (the same
 //!   striping shape as the query system's 64-way `active_keys`).  A
@@ -214,10 +246,222 @@ pub struct TaskDeps {
     /// reader must be restored red instead of being served green stale.
     read_epochs: SmallVec<[u64; 8]>,
     spilled: Option<HashSet<DepNodeIndex>>,
+    /// Inline open-addressing dedup table over `reads` (BEFORE the
+    /// `spilled` fallback).  The linear `contains` scan this replaces was
+    /// O(k²) per dedup query-batch — 4096 compares at k=64 — and wide
+    /// queries in the 16–64 zone landed exactly in that worst segment;
+    /// probing is O(1) and removes the performance cliff at the bucket
+    /// fallback.  Only membership testing changes: `reads` keeps its
+    /// first-read push order, so the `reads`/`read_epochs` positional
+    /// pairing (`sort_reads_by_shard`) and `reconcile_forward_edges`'s
+    /// "already deduplicated" contract are untouched.
+    dedup: DedupTable,
+    /// Owned epochs-table snapshot taken lazily on the FIRST fresh read
+    ///.  Every later read in the same task
+    /// reads its epoch word from this snapshot instead of paying a TLS
+    /// `epochs_snapshot()` probe per distinct read.  Append-only + shared
+    /// blocks make a stale snapshot conservative (a grow adds blocks we
+    /// simply see as missing → epoch 0); `reset` cannot race a live task
+    /// (quiescence).
+    epochs: Option<Arc<Vec<Arc<EpochBlock>>>>,
 }
 
-/// Above this many reads, dedup switches from a linear scan to a hash set.
+/// Outcome of a [`DedupTable::insert`].  The enum is load-bearing: the
+/// caller must distinguish "stored" from "already present" from "full",
+/// because only the first may push the entry onto `reads`, and the third
+/// must NOT be conflated with the second.  A `bool` conflating them made
+/// the full-table bail-out lie "newly inserted" without storing, which
+/// appended a duplicate to `reads` and broke the "already deduplicated"
+/// invariant `reconcile_forward_edges` documents (see its contract note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertOutcome {
+    /// Entry was stored in the table.
+    Inserted,
+    /// Entry was already present.
+    AlreadyPresent,
+    /// Table was full (unreachable while the spill-before-full contract
+    /// holds — debug builds assert); the caller must spill.
+    Full,
+}
+
+/// One inline dedup table: 64 slots of linear-probed open addressing.
+/// The empty marker is `u32::MAX`; node indices are sequential from 1
+/// (`allocate_node_index`), so a real node can never collide with it.
+#[derive(Debug)]
+struct DedupTable {
+    slots: [DepNodeIndex; LINEAR_DEDUP_MAX],
+}
+
+impl DedupTable {
+    fn new() -> Self {
+        DedupTable {
+            slots: [DepNodeIndex(u32::MAX); LINEAR_DEDUP_MAX],
+        }
+    }
+
+    /// Fibonacci-hash the sequential index into the table.  Consecutive
+    /// allocations differ by 1; the golden-ratio multiplier spreads them
+    /// over the whole table instead of clustering on adjacent probes.
+    ///
+    /// Why THIS constant (verified exactly by
+    /// `research/fibonacci-occupancy/scripts/golden_ratio_occupancy.py`): 1/φ is the worst-case optimum —
+    /// its continued fraction is [0;1,1,...], so it maximizes
+    /// `min_{q<=n} ||q·alpha||` among all constants (badly approximable).
+    /// A constant with a large partial quotient collapses the sequence onto
+    /// few "strands": alpha_2 = 165902777/2^32 ≈ 1/26 drops the 64-point
+    /// bucket occupancy from 55 to 37.  The Knuth constant's effective
+    /// rotation 2654435769/2^32 sits 1.2e-10 from 1/φ, deep inside the
+    /// proven stability radius 9.4e-6, so its bucket assignment at n=64 is
+    /// identical to the exact golden one (Occ = 55, a theorem not luck).
+    #[inline]
+    fn probe_start(idx: DepNodeIndex) -> usize {
+        // 0x9E37_79B9 = 2654435769 = floor(2^32 / φ), the 32-bit
+        // golden-ratio constant.  (2654435761 is a DIFFERENT number —
+        // 0x9E3779B1-adjacent lookalikes abound; floor(2^32/φ) is the
+        // standard Knuth multiplier.  Both spread identically at this
+        // table size — the lookalike also passes the pin below — but only
+        // floor(2^32/φ) is canonical.)
+        // (`>> 26` on a u32 already leaves a value in [0, 63], so the
+        // trailing mask is technically redundant — kept as a defensive
+        // idiom; it is NOT load-bearing.)
+        (idx.0.wrapping_mul(0x9E37_79B9) >> 26) as usize & (LINEAR_DEDUP_MAX - 1)
+    }
+
+    /// Insert unless present; [`InsertOutcome::Inserted`] only when the
+    /// entry was actually STORED.  Callers must guarantee the table is not
+    /// yet full — `TaskDeps::read` spills to the hash set at
+    /// `LINEAR_DEDUP_MAX` entries before this can return to a full table.
+    ///
+    /// The return value is EXACTLY "I stored this entry": a full-table
+    /// bail-out returns [`InsertOutcome::Full`] (never `Inserted`), so a
+    /// caller that mishandles it fails loudly instead of appending a
+    /// duplicate to `reads`.  (The old `bool` bail-out returned `true`
+    /// ("newly inserted") without storing — unsound for the `reads`
+    /// dedup invariant; the path is unreachable today, but the fallback
+    /// shape is now impossible to misuse.)
+    #[inline]
+    fn insert(&mut self, other: DepNodeIndex) -> InsertOutcome {
+        debug_assert_ne!(other.0, u32::MAX, "index collides with the empty marker");
+        let empty = DepNodeIndex(u32::MAX);
+        let mut i = Self::probe_start(other);
+        // Step bound: linear probing on a FULL table would wrap forever —
+        // a silent infinite loop inside the hot miss path is the worst
+        // failure mode available.  The only caller maintains "spill before
+        // full" today, but that guarantee depends on the spill check never
+        // moving; the bound converts a hypothetical hang into a loud
+        // failure (debug_assert) with a release-side bail-out (`Full`,
+        // which the caller routes to the spill path).
+        let mut steps = 0usize;
+        loop {
+            let slot = &mut self.slots[i];
+            if *slot == other {
+                return InsertOutcome::AlreadyPresent;
+            }
+            if *slot == empty {
+                *slot = other;
+                return InsertOutcome::Inserted;
+            }
+            steps += 1;
+            if steps > LINEAR_DEDUP_MAX {
+                // Full table (or caller-contract break): see the step-bound
+                // comment above.  Debug builds fail loudly; release reports
+                // `Full` so the caller spills and STORES the entry — the
+                // return value stays exactly "I stored this".
+                debug_assert!(
+                    false,
+                    "dedup table full; TaskDeps must spill to the hash set \
+                     before inserting (LINEAR_DEDUP_MAX)"
+                );
+                return InsertOutcome::Full;
+            }
+            i = (i + 1) & (LINEAR_DEDUP_MAX - 1);
+        }
+    }
+}
+
+/// Inline open-addressing dedup capacity; above this many reads the
+/// dedup set spills to a hash table.
 const LINEAR_DEDUP_MAX: usize = 64;
+
+/// A finished task's read set, kept in the membership structure it already
+/// had at record time (reuse-DedupTable follow-up): `TaskDeps::read` built
+/// this index while deduplicating — re-deriving the same containment
+/// relation with a linear scan on the finish side was pure waste, and
+/// `reconcile_forward_edges`' stale-edge scan pays it for EVERY `old` edge.
+///
+/// - `Table` — k < `LINEAR_DEDUP_MAX`: the inline open-addressing table,
+///   exactly the reads (every `DedupTable::insert` returned
+///   `InsertOutcome::Inserted` — the table cannot fill without spilling,
+///   and a `Full` outcome routes the caller to the spill path).  O(1)
+///   probe per membership test.
+/// - `Spilled` — k ≥ `LINEAR_DEDUP_MAX`: the hash set, which by
+///   construction holds the FULL read set (spill seeds it from `reads`,
+///   and post-spill inserts go through it).
+/// - `Empty` — no reads at all (the `finish_task_and_publish` no-frame
+///   fallback): every membership test is `false`, no table to build.
+pub(crate) enum ReadsIndex {
+    Table(DedupTable),
+    Spilled(HashSet<DepNodeIndex>),
+    Empty,
+}
+
+impl ReadsIndex {
+    /// Build an index from an existing read slice (tests / callers that
+    /// hold only the slice): `Spilled` at capacity, `Table` below it.
+    #[cfg(test)]
+    fn build(reads: &[DepNodeIndex]) -> Self {
+        if reads.is_empty() {
+            return ReadsIndex::Empty;
+        }
+        if reads.len() >= LINEAR_DEDUP_MAX {
+            return ReadsIndex::Spilled(reads.iter().copied().collect());
+        }
+        let mut table = DedupTable::new();
+        for &r in reads {
+            let _ = table.insert(r);
+        }
+        ReadsIndex::Table(table)
+    }
+
+    /// O(1) membership test against the finished read set.
+    #[inline]
+    fn contains(&self, n: DepNodeIndex) -> bool {
+        match self {
+            ReadsIndex::Table(t) => {
+                let empty = DepNodeIndex(u32::MAX);
+                let mut i = DedupTable::probe_start(n);
+                let mut steps = 0usize;
+                loop {
+                    let slot = t.slots[i];
+                    if slot == n {
+                        return true;
+                    }
+                    if slot == empty {
+                        return false;
+                    }
+                    steps += 1;
+                    if steps > LINEAR_DEDUP_MAX {
+                        // Unreachable for an index built from a set smaller
+                        // than the table (a full table implies `spilled` is
+                        // already `Some`, so `Table` is never probed full).
+                        // The sound direction is `false`: `n` was not found
+                        // in a probe that walked the whole table, and
+                        // `reconcile_forward_edges` treats a membership miss
+                        // as "the old edge is stale, remove it" — reporting
+                        // a false PRESENT here would keep a dead edge, and
+                        // reporting on a corrupt table at all is the loud-
+                        // assert's job, not a widening heuristic's.
+                        debug_assert!(false, "ReadsIndex::contains: table full (corrupt)");
+                        return false;
+                    }
+                    i = (i + 1) & (LINEAR_DEDUP_MAX - 1);
+                }
+            }
+            ReadsIndex::Spilled(s) => s.contains(&n),
+            ReadsIndex::Empty => false,
+        }
+    }
+}
 
 impl TaskDeps {
     pub fn new(current_node: DepNodeIndex, system_id: usize) -> Self {
@@ -227,7 +471,18 @@ impl TaskDeps {
             reads: SmallVec::new(),
             read_epochs: SmallVec::new(),
             spilled: None,
+            dedup: DedupTable::new(),
+            epochs: None,
         }
+    }
+
+    /// Epoch of `node` read from this task's own snapshot, if one has been
+    /// taken.  `None` means the caller should take it lazily.
+    #[inline]
+    fn cached_epoch(&self, node: DepNodeIndex) -> Option<u64> {
+        self.epochs
+            .as_ref()
+            .map(|snap| epoch_from_owned(snap.as_slice(), node))
     }
 
     /// Insert `other` unless it is already recorded, and report which
@@ -250,14 +505,33 @@ impl TaskDeps {
             }
             return false;
         }
-        if self.reads.contains(&other) {
-            return false;
+        match self.dedup.insert(other) {
+            InsertOutcome::AlreadyPresent => false,
+            InsertOutcome::Inserted => {
+                self.reads.push(other);
+                if self.reads.len() >= LINEAR_DEDUP_MAX {
+                    self.spilled = Some(self.reads.iter().copied().collect());
+                }
+                true
+            }
+            InsertOutcome::Full => {
+                // Unreachable while "spill before full" holds (debug builds
+                // already asserted inside `insert`), but handled SOUNDLY:
+                // spill NOW, into a set seeded from the reads taken so far,
+                // and store `other` — the outcome contract is "Full means
+                // NOT stored", so the caller must not report a kept entry
+                // that no structure holds (the old `bool` bail-out did
+                // exactly that, appending a duplicate to `reads`).
+                let mut set: HashSet<DepNodeIndex> = self.reads.iter().copied().collect();
+                if set.insert(other) {
+                    self.reads.push(other);
+                    self.spilled = Some(set);
+                    true
+                } else {
+                    false
+                }
+            }
         }
-        self.reads.push(other);
-        if self.reads.len() >= LINEAR_DEDUP_MAX {
-            self.spilled = Some(self.reads.iter().copied().collect());
-        }
-        true
     }
 
     /// Supply `epoch` for the entry [`Self::read`] just reported as
@@ -277,13 +551,41 @@ impl TaskDeps {
     }
 
     /// Consume the recorded reads together with their start-revision
-    /// epochs (parallel vectors, same order).  Deliberately unordered:
-    /// every consumer feeds an unordered `HashSet` (`edges` /
-    /// `rev_edges`), so sorting here was O(k log k) of pure waste on
-    /// every query execution.  Sort at a serialization boundary if
-    /// deterministic order is ever needed.
-    pub fn into_reads_with_epochs(self) -> (SmallVec<[DepNodeIndex; 8]>, SmallVec<[u64; 8]>) {
-        (self.reads, self.read_epochs)
+    /// epochs (parallel vectors, same order) and the read set's membership
+    /// index (`ReadsIndex`): the dedup structure `TaskDeps::read` already
+    /// maintained, handed to the finish side so `reconcile_forward_edges`
+    /// probes it instead of re-deriving containment with an O(k) scan per
+    /// stale-edge candidate.  Deliberately unordered: every consumer feeds
+    /// an unordered `HashSet` (`edges` / `rev_edges`), so sorting here was
+    /// O(k log k) of pure waste on every query execution.  Sort at a
+    /// serialization boundary if deterministic order is ever needed.
+    pub fn into_reads_with_epochs(
+        self,
+    ) -> (
+        SmallVec<[DepNodeIndex; 8]>,
+        SmallVec<[u64; 8]>,
+        ReadsIndex,
+    ) {
+        // The two vectors are POSITIONAL by construction (every `read`
+        // pushes both in lockstep) and `sort_reads_by_shard` swaps them in
+        // lockstep — a length drift would mispair the finish-side epoch
+        // re-check, so pin it in debug builds.
+        debug_assert_eq!(
+            self.reads.len(),
+            self.read_epochs.len(),
+            "TaskDeps: reads and read_epochs must stay positionally paired"
+        );
+        let index = match self.spilled {
+            Some(spilled) => ReadsIndex::Spilled(spilled),
+            None if self.reads.is_empty() => ReadsIndex::Empty,
+            // Below the spill threshold the inline table holds EXACTLY the
+            // reads: every `read` took the `dedup.insert` path, `Inserted`
+            // pushed the entry (and full implies spilled), `AlreadyPresent`
+            // meant a member, and `Full` (unreachable) spilled-and-stored —
+            // so the table can never hold a false member nor miss one.
+            None => ReadsIndex::Table(self.dedup),
+        };
+        (self.reads, self.read_epochs, index)
     }
 }
 
@@ -397,8 +699,82 @@ const VERIFY_SEQLOCK_RETRIES: usize = 3;
 /// dropped instead of returned to TLS.
 const VERIFY_SCRATCH_CAP: usize = 2048;
 
+/// Generation-stamped visited bitmap for `verify_inner` (#3 of the perf
+/// pass): replaces the pooled `HashSet<DepNodeIndex>` — one hash insert +
+/// one hash probe per visit (~10–30 ns) — with two bit ops (~1–2 ns) on a
+/// per-thread `Vec<u64>` pair.
+///
+/// The `stamps` word per bit-word records the walk generation a word was
+/// last (re)written at; on a new walk `current` bumps and any word whose
+/// stamp is stale is cleared lazily on first touch — zero clearing cost per
+/// walk, O(words/64) growth amortized across walks.  Revisit = "green by
+/// the first visit" carries over trivially: the visited test is one
+/// `bits[w] & (1 << b)` load.
+struct VisitedBitmap {
+    bits: Vec<u64>,
+    stamps: Vec<u64>,
+    current: u64,
+}
+
+impl VisitedBitmap {
+    fn new() -> Self {
+        Self {
+            bits: Vec::new(),
+            stamps: Vec::new(),
+            current: 0,
+        }
+    }
+}
+
+impl Default for VisitedBitmap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VisitedBitmap {
+    /// Begin a new walk: bump the generation; stale words clear lazily.
+    ///
+    /// Generation WRAP (theoretical): after exactly 2⁶⁴ `clear()`s,
+    /// `current` collides with a stale word's stamp and that word's
+    /// visited bits survive into the new walk — a false "already visited",
+    /// which for a verifier only bounds the walk's precision, never its
+    /// soundness.  Unreachable in practice (a 10 ns walk per ns for 584
+    /// years); documented rather than defended.
+    #[inline]
+    fn clear(&mut self) {
+        self.current = self.current.wrapping_add(1);
+    }
+
+    /// Mark `n` visited; returns `false` if it was already visited on this
+    /// walk (same contract as `HashSet::insert`'s return).
+    #[inline]
+    fn insert(&mut self, n: DepNodeIndex) -> bool {
+        let i = n.0 as usize;
+        let w = i >> 6;
+        let b = i & 63;
+        if w >= self.bits.len() {
+            self.bits.resize(w + 1, 0);
+            // New words are stamped with the PREVIOUS generation so their
+            // first touch this walk clears them.
+            self.stamps
+                .resize(w + 1, self.current.wrapping_sub(1));
+        }
+        if self.stamps[w] != self.current {
+            self.bits[w] = 0;
+            self.stamps[w] = self.current;
+        }
+        let mask = 1u64 << b;
+        if self.bits[w] & mask != 0 {
+            return false;
+        }
+        self.bits[w] |= mask;
+        true
+    }
+}
+
 /// Thread-local reuse for `verify_inner`'s walk state (#11): the
-/// unstamped traversal allocated a fresh `HashSet` + `Vec` per call —
+/// unstamped traversal allocated a fresh visited-set + `Vec` per call —
 /// pure allocator churn after an invalidation storm, when every request
 /// walks until stamps are rebuilt.  Buffers are taken out of TLS on
 /// entry and restored cleared on `Drop`, so every exit path returns
@@ -406,15 +782,31 @@ const VERIFY_SCRATCH_CAP: usize = 2048;
 /// on the same thread, so a failed borrow (TLS destruction) falls back
 /// to fresh locals instead of deadlocking.
 thread_local! {
-    static VERIFY_SCRATCH: RefCell<(HashSet<DepNodeIndex>, Vec<(DepNodeIndex, bool)>)> =
-        RefCell::new((HashSet::default(), Vec::with_capacity(16)));
+    static VERIFY_SCRATCH: RefCell<(
+        VisitedBitmap,
+        [Vec<DepNodeIndex>; 2],
+        Vec<DepNodeIndex>,
+        [SmallVec<[DepNodeIndex; 8]>; DEP_SHARDS],
+    )> = RefCell::new((
+        VisitedBitmap::new(),
+        [Vec::new(), Vec::new()],
+        Vec::new(),
+        std::array::from_fn(|_| SmallVec::new()),
+    ));
 }
 
-/// Pooled `verify_inner` walk state: `take` it, use `.visited`/`.stack`
-/// directly, and `Drop` returns the cleared buffers to TLS.
+/// Pooled `verify_inner` walk state: `take` it, use `.visited`,
+/// `.level[..]` and `.to_stamp` directly, and `Drop` returns the cleared
+/// buffers to TLS.  The DFS `(node, exiting)` stack is dead — the walk is
+/// now a two-phase level-by-level BFS, so the pooled buffers are the
+/// ping-pong level pair and the to-stamp list.
 struct VerifyScratch {
-    visited: HashSet<DepNodeIndex>,
-    stack: Vec<(DepNodeIndex, bool)>,
+    visited: VisitedBitmap,
+    level: [Vec<DepNodeIndex>; 2],
+    to_stamp: Vec<DepNodeIndex>,
+    /// Per-level `shard → nodes` expansion buckets: 64 `SmallVec`s the old
+    /// walk rebuilt on every call (≈2–3 KB of stack init on the storm path).
+    shards_to_expand: [SmallVec<[DepNodeIndex; 8]>; DEP_SHARDS],
     pooled: bool,
 }
 
@@ -422,20 +814,32 @@ impl VerifyScratch {
     fn take() -> Self {
         let pooled = VERIFY_SCRATCH
             .try_with(|c| {
-                c.try_borrow_mut()
-                    .ok()
-                    .map(|mut b| (std::mem::take(&mut b.0), std::mem::take(&mut b.1)))
+                c.try_borrow_mut().ok().map(|mut b| {
+                    (
+                        std::mem::take(&mut b.0),
+                        std::mem::take(&mut b.1),
+                        std::mem::take(&mut b.2),
+                        std::mem::replace(
+                            &mut b.3,
+                            std::array::from_fn(|_| SmallVec::new()),
+                        ),
+                    )
+                })
             })
             .unwrap_or(None);
         match pooled {
-            Some((visited, stack)) => Self {
+            Some((visited, level, to_stamp, shards_to_expand)) => Self {
                 visited,
-                stack,
+                level,
+                to_stamp,
+                shards_to_expand,
                 pooled: true,
             },
             None => Self {
-                visited: HashSet::default(),
-                stack: Vec::with_capacity(16),
+                visited: VisitedBitmap::new(),
+                level: [Vec::new(), Vec::new()],
+                to_stamp: Vec::new(),
+                shards_to_expand: std::array::from_fn(|_| SmallVec::new()),
                 pooled: false,
             },
         }
@@ -447,22 +851,48 @@ impl Drop for VerifyScratch {
         if !self.pooled {
             return;
         }
-        if self.visited.capacity() > VERIFY_SCRATCH_CAP
-            || self.stack.capacity() > VERIFY_SCRATCH_CAP
+        // 2 bits per node (bits + level/stamp words) — compare the byte
+        // footprint against the same cap the HashSet version used.
+        let level_cap = self
+            .level
+            .iter()
+            .map(|v| v.capacity())
+            .max()
+            .unwrap_or(0);
+        if self.visited.bits.len() * 16 > VERIFY_SCRATCH_CAP
+            || level_cap > VERIFY_SCRATCH_CAP
+            || self.to_stamp.capacity() > VERIFY_SCRATCH_CAP
+            || self
+                .shards_to_expand
+                .iter()
+                .any(|v| v.capacity() > VERIFY_SCRATCH_CAP / DEP_SHARDS)
         {
             return;
         }
         self.visited.clear();
-        self.stack.clear();
+        for v in self.level.iter_mut() {
+            v.clear();
+        }
+        self.to_stamp.clear();
+        for v in self.shards_to_expand.iter_mut() {
+            v.clear();
+        }
         let mut visited = std::mem::take(&mut self.visited);
-        let mut stack = std::mem::take(&mut self.stack);
+        let mut level = std::mem::take(&mut self.level);
+        let mut to_stamp = std::mem::take(&mut self.to_stamp);
+        let mut shards = std::mem::replace(
+            &mut self.shards_to_expand,
+            std::array::from_fn(|_| SmallVec::new()),
+        );
         // `take` left empty defaults behind, so TLS holds valid buffers;
         // swap the grown ones back in and drop the defaults.  Failure
         // (TLS destruction) just drops the buffers.
         let _ = VERIFY_SCRATCH.try_with(|c| {
             if let Ok(mut b) = c.try_borrow_mut() {
                 std::mem::swap(&mut b.0, &mut visited);
-                std::mem::swap(&mut b.1, &mut stack);
+                std::mem::swap(&mut b.1, &mut level);
+                std::mem::swap(&mut b.2, &mut to_stamp);
+                std::mem::swap(&mut b.3, &mut shards);
             }
         });
     }
@@ -542,117 +972,6 @@ impl Drop for StampBuf {
     }
 }
 
-/// Cap on a pooled fan-out buffer.  `DepNodeIndex` is 4 bytes, so 4096
-/// entries ≈ 16 KiB — four times the entry count of the stamp pool for
-/// the same footprint, because a node's reverse-edge list is far more
-/// often large than a walk's stamp list is deep.
-const FANOUT_POOL_CAP: usize = 4096;
-
-thread_local! {
-    static FANOUT_POOL: RefCell<Vec<DepNodeIndex>> = RefCell::new(Vec::new());
-}
-
-/// Pooled publish-time fan-out reader list.
-///
-/// The marks themselves run AFTER the node's shard write lock releases
-/// (perf item 1), so the list is pure scratch — but it is FILLED under the
-/// lock, and an inline `SmallVec` heap-allocates as soon as the node has
-/// more than four direct readers.  That is exactly the wrong place for it:
-/// the lock being held is the one every reader's own `finish` must take, so
-/// a hot node's tail latency would carry a malloc.  Same shape as
-/// [`StampBuf`] — taken out of TLS, returned cleared on `Drop`, so the
-/// allocation is amortized across finishes on the thread and every exit
-/// path (including a panic unwind) hands the buffer back.
-struct FanoutBuf {
-    readers: Vec<DepNodeIndex>,
-    pooled: bool,
-}
-
-impl FanoutBuf {
-    fn take() -> Self {
-        let pooled = FANOUT_POOL
-            .try_with(|c| c.try_borrow_mut().ok().map(|mut b| std::mem::take(&mut *b)))
-            .unwrap_or(None);
-        match pooled {
-            Some(readers) => Self {
-                readers,
-                pooled: true,
-            },
-            None => Self {
-                readers: Vec::new(),
-                pooled: false,
-            },
-        }
-    }
-
-    /// FILL side only — called INSIDE the shard section.
-    ///
-    /// Deliberately takes the reader slice as an ARGUMENT and returns
-    /// nothing: there is no accessor on this type that hands out a
-    /// `&mut Vec`, so a consume site has nothing to call that could wipe
-    /// the list.  That is the whole point of the shape —
-    /// the previous API exposed `cleared() -> &mut Vec` for the fill side,
-    /// and the consume site reached for it too, which CLEARED the list
-    /// about to be walked and turned the entire publish-time fan-out into
-    /// a silent no-op (readers of a changed node were
-    /// never marked red, so a transitively stale value could be served
-    /// forever).  Keeping `cleared` but documenting the rule was a
-    /// convention; this makes it structural.
-    #[inline]
-    fn fill(&mut self, readers: &[DepNodeIndex]) {
-        self.readers.clear();
-        self.readers.extend_from_slice(readers);
-    }
-
-    /// CONSUME side — called AFTER the section releases, to walk the list
-    /// the section filled.
-    ///
-    /// Returns a newtype rather than `&[DepNodeIndex]` so the two halves
-    /// are distinguishable at a call site, and so that no `&mut Vec` is in
-    /// scope here at all: [`Self::fill`] takes the source data as an
-    /// argument, so the only mutable access is the one the fill side
-    /// needs.
-    #[inline]
-    fn filled(&self) -> FilledFanout<'_> {
-        FilledFanout(&self.readers)
-    }
-}
-
-/// The FILLED half of a [`FanoutBuf`] — the value the consume side walks.
-///
-/// Zero cost (a slice newtype).  Its purpose is purely to make the
-/// fill/consume split a TYPE-level rule: a consume site holding this has no
-/// access to anything mutable, so the `cleared()`-on-the-consume-side bug
-/// cannot be written even by accident.
-struct FilledFanout<'a>(&'a [DepNodeIndex]);
-
-impl<'a> FilledFanout<'a> {
-    #[inline]
-    fn iter(&self) -> std::iter::Copied<std::slice::Iter<'a, DepNodeIndex>> {
-        self.0.iter().copied()
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl Drop for FanoutBuf {
-    fn drop(&mut self) {
-        if !self.pooled || self.readers.capacity() > FANOUT_POOL_CAP {
-            return;
-        }
-        self.readers.clear();
-        let mut s = std::mem::take(&mut self.readers);
-        let _ = FANOUT_POOL.try_with(|c| {
-            if let Ok(mut b) = c.try_borrow_mut() {
-                std::mem::swap(&mut *b, &mut s);
-            }
-        });
-    }
-}
-
 // ── DepGraph ─────────────────────────────────────────────────────
 
 /// Number of shards.  Power of two for fast `&`-modulo; 64 matches the
@@ -677,7 +996,6 @@ pub(crate) struct DepShard {
     /// is an idempotent atomic bit) — the dedup is a memory bound, not
     /// a correctness requirement.
     edges: Vec<SmallVec<[DepNodeIndex; 4]>>,
-    rev_edges: Vec<SmallVec<[DepNodeIndex; 4]>>,
     fingerprints: Vec<Option<u64>>,
     /// Declared `ContentClass` of each node (single bit, fixed at
     /// allocation from the owning query's descriptor).  Class is a
@@ -704,13 +1022,442 @@ fn slot_of(node: DepNodeIndex) -> usize {
     (node.0 as usize) / DEP_SHARDS
 }
 
-/// Insert `v` into an inline edge list if not already present.  Edge
-/// lists are tiny (typical k ≤ 8), so a linear probe beats hashing and
-/// keeps repeated recomputes of a node from growing the list.
+/// Reverse-edge list for ONE node: inline `SmallVec` up to
+/// [`REV_INLINE_LIMIT`] entries, then a hash set.
+///
+/// `rev_edges[n]` is the list of ALL readers of node `n`, and every finish
+/// of a reader inserts into the same list.  The old shape — a `SmallVec`
+/// with a linear `contains` probe — is O(k) PER insert, i.e. O(N²) TOTAL
+/// for a node with N readers (N=1000 → ~500K compares per republish
+/// cycle).  Popular nodes are exactly the ones memoization exists for, so
+/// they are the ones that fan out; the hybrid keeps the inline path
+/// allocation-free for the typical k ≤ 8 case and makes the popular tail
+/// O(1) amortized per insert.
+///
+/// Iteration order of a SPILLED list is non-deterministic.  That is
+/// deliberate and safe: every consumer feeds idempotent `mark_dirty`
+/// marks or level-lowering (`lower_durability_to` is monotone), so the
+/// order only affects which marks coalesce, never the outcome.
+const REV_INLINE_LIMIT: usize = 16;
+
+#[derive(Debug, Clone)]
+enum RevEdges {
+    Inline(SmallVec<[DepNodeIndex; 4]>),
+    Spilled(HashSet<DepNodeIndex>),
+}
+
+impl RevEdges {
+    #[inline]
+    fn new() -> Self {
+        RevEdges::Inline(SmallVec::new())
+    }
+
+    /// Idempotent insert — O(1) amortized once spilled, linear (tiny k)
+    /// while inline.
+    fn insert(&mut self, v: DepNodeIndex) {
+        match self {
+            RevEdges::Inline(list) => {
+                if list.contains(&v) {
+                    return;
+                }
+                if list.len() >= REV_INLINE_LIMIT {
+                    let mut set: HashSet<DepNodeIndex> =
+                        list.iter().copied().collect();
+                    set.insert(v);
+                    *self = RevEdges::Spilled(set);
+                    return;
+                }
+                list.push(v);
+            }
+            RevEdges::Spilled(set) => {
+                set.insert(v);
+            }
+        }
+    }
+
+    fn retain(&mut self, mut f: impl FnMut(DepNodeIndex) -> bool) {
+        match self {
+            RevEdges::Inline(list) => list.retain(|n| f(*n)),
+            RevEdges::Spilled(set) => set.retain(|n| f(*n)),
+        }
+    }
+
+    fn iter(&self) -> RevEdgesIter<'_> {
+        match self {
+            RevEdges::Inline(list) => RevEdgesIter(RevEdgesIterInner::Inline(list.iter())),
+            RevEdges::Spilled(set) => RevEdgesIter(RevEdgesIterInner::Spilled(set.iter())),
+        }
+    }
+}
+
+/// Iterator over a [`RevEdges`] list — yields `&DepNodeIndex` either way,
+/// so existing `.iter().copied()` consumers keep working.
+struct RevEdgesIter<'a>(RevEdgesIterInner<'a>);
+
+enum RevEdgesIterInner<'a> {
+    Inline(std::slice::Iter<'a, DepNodeIndex>),
+    Spilled(std::collections::hash_set::Iter<'a, DepNodeIndex>),
+}
+
+impl<'a> Iterator for RevEdgesIter<'a> {
+    type Item = &'a DepNodeIndex;
+    #[inline]
+    fn next(&mut self) -> Option<&'a DepNodeIndex> {
+        match &mut self.0 {
+            RevEdgesIterInner::Inline(it) => it.next(),
+            RevEdgesIterInner::Spilled(it) => it.next(),
+        }
+    }
+}
+
+// ── Reverse-edge log (lock-free rework, #10) ─────────────────────────
+
+/// One entry in the per-shard reverse-edge log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeOp {
+    /// `(node, reader)` — reader now reads node.
+    Insert(DepNodeIndex, DepNodeIndex),
+    /// `(node, reader)` — reader no longer reads node.
+    Tombstone(DepNodeIndex, DepNodeIndex),
+}
+
+impl EdgeOp {
+    #[inline]
+    fn node(self) -> DepNodeIndex {
+        match self {
+            EdgeOp::Insert(n, _) | EdgeOp::Tombstone(n, _) => n,
+        }
+    }
+    #[inline]
+    fn reader(self) -> DepNodeIndex {
+        match self {
+            EdgeOp::Insert(_, r) | EdgeOp::Tombstone(_, r) => r,
+        }
+    }
+    #[inline]
+    fn is_tombstone(self) -> bool {
+        matches!(self, EdgeOp::Tombstone(..))
+    }
+}
+
+/// Log-length threshold at which a quiesced `mutate_world` compacts a
+/// shard. Bounds the append-only log between compactions; also bounds the
+/// tail a reader scans. Lowering it trades more compaction work for
+/// smaller scans.
+const SHARD_LOG_COMPACT_THRESHOLD: usize = 4096;
+
+/// Per-shard reverse-edge log + compacted index (the lock-free rework of
+/// the old `Vec<RevEdges>` field — the full safety argument lives on the
+/// `DepShard::rev_log` field doc).
+///
+/// ## Safety direction (over-marks, never under-marks)
+///
+/// - **Tombstones over-mark.** Until compaction drains them, a deleted
+///   edge remains visible to readers. Over-marking is sound (`mark_dirty`
+///   is an idempotent bit set; `lower_durability_to` is
+///   monotone-downward).
+/// - **Inserts may under-mark.** A reader that loads the index snapshot
+///   and a stale log tail can miss a recent `Insert` — but only a push
+///   that has not landed yet, and that reader's `finishing` flag is still
+///   set, so its own d16 late-fan-out re-check repairs it. This is why
+///   compaction is quiesced: a quiesced compaction cannot interleave with
+///   a reader's scan.
+///
+/// ## Per-slot tail index
+///
+/// The log tail is ALSO indexed by `slot_of(op.node())`: `by_slot[s]`
+/// lists the log positions of every op touching slot `s`, in log order.
+/// `collect_readers` folds only the target node's ops instead of scanning
+/// the whole tail — a batch compile with no invalidations (which never
+/// compacts) previously made the i-th publish scan ~`i·reads/64` ops, an
+/// Θ(E²) blowup on exactly the workload the query system exists to
+/// accelerate. `by_slot` is maintained under the SAME mutex as `ops`
+/// (one struct, one critical section), so per-node op order — the
+/// tombstone-over-insert property — is preserved by construction, and the
+/// over-mark/never-under-mark argument above is unchanged: a fresh node
+/// simply has no entry in `by_slot`, and every op it does have is folded
+/// in the same order the flat scan would.
+///
+/// `#[doc(hidden)]`: implementation detail of `DepShard`.
+pub(crate) struct ShardLog {
+    /// Append-only operation log PLUS its per-slot index, guarded by one
+    /// mutex. Short critical section: one `Vec::push` + one `SmallVec`
+    /// push per edge. `crate::sync::Mutex` (shuttle-aware), like every
+    /// other lock in the graph.
+    log: Mutex<ShardLogOps>,
+    /// Compacted index snapshot. Readers `load()` this lock-free (a debt
+    /// guard, no refcount RMW).  Indices are slots (`slot_of(node)`); each
+    /// slot's edge list is its OWN `Arc`, so compaction reuses untouched
+    /// slots by pointer copy and deep-clones only slots that received ops
+    ///.  `ArcSwap<Vec<_>>` wraps the snapshot in its own
+    /// `Arc` — no explicit second layer.
+    index: ArcSwap<Vec<Arc<RevEdges>>>,
+    /// Mirror of `log.ops.len()` readable without the log mutex, so the
+    /// common post-compaction `collect_readers` skips the lock entirely
+    ///.  Written under the log mutex; a stale read can only
+    /// miss a just-pushed edge, which the d16 epoch re-check repairs.
+    ops_len: AtomicUsize,
+    /// Set when a push crosses the compaction threshold; lets
+    /// `compact_rev_edges` skip scanning all 64 shard logs on every
+    /// mutation when none is due.
+    compact_needed: AtomicBool,
+}
+
+/// The mutex-guarded half of [`ShardLog`]: ops plus their per-slot index.
+#[derive(Default)]
+struct ShardLogOps {
+    ops: Vec<EdgeOp>,
+    /// `by_slot[s]` = positions (indices into `ops`) of every op whose
+    /// node lives in slot `s`, in log order. Cleared at compaction/reset
+    /// together with `ops`.
+    by_slot: Vec<SmallVec<[u32; 8]>>,
+}
+
+impl ShardLogOps {
+    #[inline]
+    fn push(&mut self, op: EdgeOp) {
+        let slot = slot_of(op.node());
+        self.ops.push(op);
+        if slot >= self.by_slot.len() {
+            self.by_slot.resize_with(slot + 1, SmallVec::new);
+        }
+        self.by_slot[slot].push((self.ops.len() - 1) as u32);
+    }
+}
+
+/// Pick between `collect_readers`' linear in-place fold and the set-based
+/// fold.  Cost model, in arbitrary time units: the linear
+/// fold is ≈`3·P·R` (a scan/compare per op per reader), the set fold is
+/// ≈`100·R + 50·P` (one `HashSet` build plus one probe per op).
+///
+/// The previous fixed gate (`P > 8 && R > 16`) left the linear path in
+/// charge for shapes like `P = 40, R = 1000`, where it is the worst-case
+/// ABSOLUTE cost.  This predicate is the algebraic crossover; it is cheap
+/// integer arithmetic on two length fields.
 #[inline]
-fn edge_insert(list: &mut SmallVec<[DepNodeIndex; 4]>, v: DepNodeIndex) {
-    if !list.contains(&v) {
-        list.push(v);
+fn prefer_set_path(ops: usize, readers: usize) -> bool {
+    let (p, r) = (ops as u64, readers as u64);
+    3 * p * r > 100 * r + 50 * p
+}
+
+thread_local! {
+    /// Per-thread pool of reader fan-out buffers.  The republish fan-out is
+    /// hot, and a node with more than the inline `SmallVec` capacity used to
+    /// malloc on every publish; the switchboard below reuses one buffer per
+    /// nested call.  Bounded so an exceptional fan-out cannot pin memory.
+    static READERS_POOL: std::cell::RefCell<Vec<SmallVec<[DepNodeIndex; 8]>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Buffers kept per thread.
+const READERS_POOL_SLOTS: usize = 8;
+/// A pooled buffer that grew past this is dropped rather than retained.
+const READERS_POOL_MAX_CAP: usize = 64;
+
+impl ShardLog {
+    fn new() -> Self {
+        Self {
+            log: Mutex::new(ShardLogOps::default()),
+            index: ArcSwap::from_pointee(Vec::new()),
+            ops_len: AtomicUsize::new(0),
+            compact_needed: AtomicBool::new(false),
+        }
+    }
+
+    /// Append one edge operation. Short critical section: one `Vec::push`
+    /// plus one `SmallVec::push` into the per-slot index. This is the
+    /// whole write path — no shard write lock.
+    #[inline]
+    fn push(&self, op: EdgeOp) {
+        let _tw_rev_log =
+            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.push");
+        let mut log = self.log.lock();
+        log.push(op);
+        let len = log.ops.len();
+        self.ops_len.store(len, Ordering::Release);
+        if len >= SHARD_LOG_COMPACT_THRESHOLD {
+            self.compact_needed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Collect the current readers of `node` from `(compacted index) +
+    /// (log tail)`, applying inserts and tombstones in log order. Returns
+    /// a deduplicated list.
+    ///
+    /// The tail fold visits ONLY this node's ops (via `by_slot`), so its
+    /// cost is O(this node's recent ops), not O(log tail) — the P0 rework.
+    /// The mutex is released before the caller processes the readers, so
+    /// callers can take other locks (class shards, epoch words) without
+    /// deadlock — no log → shard lock ordering exists anywhere.
+    fn collect_readers(&self, node: DepNodeIndex) -> SmallVec<[DepNodeIndex; 8]> {
+        let mut readers = SmallVec::new();
+        self.collect_readers_into(node, &mut readers);
+        readers
+    }
+
+    /// [`collect_readers`](Self::collect_readers) into a caller-supplied
+    /// buffer.  The pooled [`with_readers`](Self::with_readers) path uses it
+    /// so a node with more than 8 direct readers no longer mallocs on every
+    /// republish — the exact hot path memoization exists for.
+    fn collect_readers_into(
+        &self,
+        node: DepNodeIndex,
+        readers: &mut SmallVec<[DepNodeIndex; 8]>,
+    ) {
+        readers.clear();
+        // `load()` takes a debt guard instead of `load_full()`'s refcount
+        // pair on a shared line that every reader of every shard contends
+        // on.
+        let index = self.index.load();
+        // Compacted readers for this slot.
+        if let Some(list) = index.get(slot_of(node)) {
+            readers.extend(list.iter().copied());
+        }
+        // Empty-tail fast path: after a compaction the log
+        // is empty and the index is the whole answer.  A concurrent push
+        // racing this load can be missed; that reader is still finishing,
+        // so the d16 epoch re-check repairs it (the same tolerance the
+        // pre-lock collection relied on).
+        //
+        // #6: this tolerance is a precondition, not a bug — callers that need
+        // a *complete* reader set must be finishing-task (d16 re-check runs)
+        // or quiesced.  A future completeness-expecting caller needs a
+        // lock-taking variant, not this fast path.
+        if self.ops_len.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        // Apply the log tail on top, IN ORDER: a Tombstone after an Insert
+        // must win, and vice versa.
+        let _tw_rev_log =
+            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.collect");
+        let log = self.log.lock();
+        if let Some(positions) = log.by_slot.get(slot_of(node)) {
+            if prefer_set_path(positions.len(), readers.len()) {
+                // Hot/churned node: the linear `retain`/`contains` fold is
+                // O(readers × ops).  Fold through ONE set
+                // in log order: the previous shape built
+                // `seen`, `order`, `out` and `emitted` — five allocations on
+                // the very path that exists because the node is hot.
+                //
+                // ORDER IS DELIBERATELY UNSPECIFIED: every consumer
+                // (`mark_dirty_batch`, `lower_durability_to`,
+                // `dirty_readers_by_class`) iterates unordered or re-sorts
+                // by shard, so a direct set drain is equivalent.
+                let mut seen: HashSet<DepNodeIndex> = readers.iter().copied().collect();
+                for &i in positions.iter() {
+                    let op = log.ops[i as usize];
+                    debug_assert_eq!(op.node(), node);
+                    if op.is_tombstone() {
+                        // Bounded set: a tombstone for a reader that was
+                        // never present is a no-op (same as the linear
+                        // `retain` arm below).
+                        seen.remove(&op.reader());
+                    } else {
+                        seen.insert(op.reader());
+                    }
+                }
+                *readers = seen.into_iter().collect();
+            } else {
+                for &i in positions.iter() {
+                    let op = log.ops[i as usize];
+                    debug_assert_eq!(op.node(), node);
+                    if op.is_tombstone() {
+                        readers.retain(|x| *x != op.reader());
+                    } else if !readers.contains(&op.reader()) {
+                        readers.push(op.reader());
+                    }
+                }
+            }
+        }
+        drop(log);
+    }
+
+    /// Take a pooled reader buffer, fill it with `node`'s live readers, run
+    /// `f`, then check the buffer back in.  Per-thread and bounded; a buffer
+    /// that grew past [`READERS_POOL_MAX_CAP`] is simply dropped.
+    fn with_readers<R>(
+        &self,
+        node: DepNodeIndex,
+        f: impl FnOnce(&mut SmallVec<[DepNodeIndex; 8]>) -> R,
+    ) -> R {
+        let mut readers = READERS_POOL
+            .try_with(|c| c.try_borrow_mut().ok().and_then(|mut b| b.pop()))
+            .unwrap_or(None)
+            .unwrap_or_default();
+        self.collect_readers_into(node, &mut readers);
+        let out = f(&mut readers);
+        if readers.capacity() <= READERS_POOL_MAX_CAP {
+            let _ = READERS_POOL.try_with(|c| {
+                if let Ok(mut pool) = c.try_borrow_mut()
+                    && pool.len() < READERS_POOL_SLOTS
+                {
+                    pool.push(readers);
+                }
+            });
+        }
+        out
+    }
+
+    /// Compaction: rebuild the index from `index + log`, publish it, and
+    /// clear the log (and its per-slot index). MUST run under quiescence
+    /// (write lock) — clearing the log tail out from under any reader
+    /// otherwise loses its inserts permanently (an under-mark that the
+    /// finishing flag does NOT repair: the missed reader may have finished
+    /// long ago).
+    fn compact(&self) {
+        let _tw_rev_log =
+            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.compact");
+        let guard = self.index.load();
+        let mut log = self.log.lock();
+        if log.ops.is_empty() {
+            return;
+        }
+        // The mutex is held across the rebuild: pushes serialize on it, so
+        // no op is lost between the take and the clear.  Only the Vec's
+        // POINTERS are copied here; `Arc::make_mut` deep-clones a slot at
+        // most once, and only if that slot received an op.
+        let mut new_index: Vec<Arc<RevEdges>> = guard.iter().cloned().collect();
+        for op in log.ops.iter().copied() {
+            let slot = slot_of(op.node());
+            match op {
+                EdgeOp::Insert(_, r) => {
+                    if slot >= new_index.len() {
+                        new_index.resize_with(slot + 1, || Arc::new(RevEdges::new()));
+                    }
+                    Arc::make_mut(&mut new_index[slot]).insert(r);
+                }
+                EdgeOp::Tombstone(_, r) => {
+                    if let Some(list) = new_index.get_mut(slot) {
+                        Arc::make_mut(list).retain(|x| x != r);
+                    }
+                }
+            }
+        }
+        self.index.store(Arc::new(new_index));
+        log.ops.clear();
+        log.by_slot.clear();
+        self.ops_len.store(0, Ordering::Release);
+        self.compact_needed.store(false, Ordering::Release);
+    }
+
+    /// Reset: clear both log (with its per-slot index) and index. Quiesced
+    /// (called from `reset`).
+    fn reset(&self) {
+        let _tw_rev_log =
+            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.reset");
+        let mut log = self.log.lock();
+        log.ops.clear();
+        log.by_slot.clear();
+        drop(log);
+        self.ops_len.store(0, Ordering::Release);
+        self.compact_needed.store(false, Ordering::Release);
+        self.index.store(Arc::new(Vec::new()));
+    }
+
+    /// `true` when the log has grown past the compaction threshold.
+    #[inline]
+    fn needs_compaction(&self) -> bool {
+        self.compact_needed.load(Ordering::Acquire)
     }
 }
 
@@ -728,6 +1475,7 @@ fn edge_insert(list: &mut SmallVec<[DepNodeIndex; 4]>, v: DepNodeIndex) {
 fn reconcile_forward_edges(
     list: &mut SmallVec<[DepNodeIndex; 4]>,
     reads: &[DepNodeIndex],
+    reads_index: &ReadsIndex,
 ) -> SmallVec<[DepNodeIndex; 4]> {
     // NO dedup pass: `reads` arrives ALREADY deduplicated, in first-read
     // order — `TaskDeps::read` guarantees it (linear `contains` up to
@@ -738,12 +1486,26 @@ fn reconcile_forward_edges(
     // of this function rely on that invariant, so re-adding a dedup here
     // must be justified against `TaskDeps::read` first.
     //
+    // Fast path 1 — SAME LIST, same order: a deterministic `compute`
+    // re-records exactly the reads it recorded last time, so elementwise
+    // equality is the overwhelmingly common shape.  `removed` is trivially
+    // empty and the list is left untouched (skipping even the O(k)
+    // clear-and-extend write).  One memcmp instead of the O(|list| × k)
+    // containment scan below.
+    if list.as_slice() == reads {
+        return SmallVec::new();
+    }
     // Stale edges: entries of the previous list the current read set no
-    // longer contains.  O(|list| × k) is unavoidable without hashing;
-    // both sides are normally a handful.
+    // longer contains.  The membership test probes the read set's OWN
+    // index (reuse-DedupTable follow-up): `TaskDeps::read` already built
+    // the inline table / spill set while deduplicating, so the old
+    // `reads.contains(&old)` linear scan — O(|list| × k) — collapses to
+    // O(|list|) probes.  `ReadsIndex::Table`/`Spilled` are exact sets of
+    // `reads`, `Empty` (no reads) rejects everything, so the output is
+    // identical to the linear scan.
     let mut removed: SmallVec<[DepNodeIndex; 4]> = SmallVec::new();
     for &old in list.iter() {
-        if !reads.contains(&old) {
+        if !reads_index.contains(old) {
             removed.push(old);
         }
     }
@@ -764,7 +1526,8 @@ fn reconcile_forward_edges(
 fn ensure_shard_len(shard: &mut DepShard, slot: usize) {
     if slot >= shard.edges.len() {
         shard.edges.resize_with(slot + 1, SmallVec::new);
-        shard.rev_edges.resize_with(slot + 1, SmallVec::new);
+        // NOTE: no `rev_log` growth here — the log is a flat `Vec` of ops
+        // and the compacted index grows during `ShardLog::compact`.
         shard.fingerprints.resize_with(slot + 1, || None);
         shard.classes.resize_with(slot + 1, ContentClass::default);
         shard.digests.resize_with(slot + 1, || None);
@@ -874,10 +1637,29 @@ fn block_of(idx: u32) -> usize {
 /// `order.sort_by_key`) and an insertion sort with a STRICT `>`
 /// comparator agree exactly, which is what keeps the positional pairing
 /// intact rather than merely "still sorted".
+/// TLS pool for `sort_reads_by_shard`'s >64-band permutation buffer
+///: take-and-return, cleared on the way back in. Cap mirrors
+/// the other finish-path pools loosely — a pathological wide query's
+/// buffer is dropped rather than pooled past this size.
+// 4096 entries (32 KiB per thread) covers any plausible wide query; a
+// genuinely gigantic one re-allocates once instead of pinning 512 KiB of
+// TLS per worker.
+const SORT_ORDER_POOL_CAP: usize = 1 << 12;
+
+thread_local! {
+    static SORT_ORDER_POOL: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
 fn sort_reads_by_shard(
     reads: &mut SmallVec<[DepNodeIndex; 8]>,
     mut epochs: Option<&mut SmallVec<[u64; 8]>>,
 ) {
+    // Lockstep-swap contract: the epochs vector (when present) must cover
+    // exactly the reads it permutes alongside.
+    debug_assert!(
+        epochs.as_ref().is_none_or(|e| e.len() == reads.len()),
+        "sort_reads_by_shard: epochs length must match reads length"
+    );
     if reads.len() <= 1 {
         return; // nothing to permute; pairing trivially intact
     }
@@ -894,12 +1676,13 @@ fn sort_reads_by_shard(
     if sorted {
         return;
     }
-    if reads.len() <= 16 {
-        // Small fan-outs: in-place insertion sort, stable, with the
+    if reads.len() <= 32 {
+        // Small/medium fan-outs: in-place insertion sort, stable, with the
         // epochs swapped in lockstep so the parallel pairing follows the
-        // same swaps.  Beats the old allocate-an-index-vec + two collects:
-        // k = 3 (a typical query) went from three heap round-trips to
-        // none, and it stays inline up to k = 16.
+        // same swaps.  Both paths are allocation-free in this band, and
+        // insertion sort still beats counting sort's `starts[64]` init plus
+        // second pass up to about k = 32 — which is where realistic wide
+        // read sets cluster.
         for i in 1..reads.len() {
             let mut j = i;
             while j > 0 && shard_of(reads[j - 1]) > shard_of(reads[j]) {
@@ -919,10 +1702,39 @@ fn sort_reads_by_shard(
     //
     // The permutation is applied IN PLACE by cycle rotation, so
     // the two `sorted_reads`/`sorted_epochs` output buffers are gone.
-    // `order` is the one remaining allocation and it is unavoidable: the
-    // counting path is reached only for k > 16, so no inline capacity
-    // below 17 is ever useful here.
-    let mut order: SmallVec<[usize; 8]> = (0..reads.len()).collect();
+    // `order` is the one remaining allocation — and only for k > 64
+    // (#7 of the perf pass): the counting path is reached for k > 16,
+    // so the `SmallVec<[usize; 8]>` it used ALWAYS heap-allocated
+    // (8 < 17) for the whole 17–64 band.  A `[usize; 64]` stack
+    // buffer (512 B) covers that band allocation-free; `Vec` beyond.
+    // `[0; 64]` instead of `from_fn(|i| i)`: the counting phase below
+    // overwrites `order[0..reads.len()]` completely, so any initial value is
+    // dead — both compile to the same memset, but zero is the honest one
+    //.
+    let mut stack_order: [usize; 64] = [0; 64];
+    let mut pooled_order: Option<Vec<usize>> = None;
+    let order: &mut [usize] = if reads.len() <= 64 {
+        &mut stack_order[..reads.len()]
+    } else {
+        // Wide tail (k > 64): the permutation buffer is TLS-POOLED
+        // instead of a fresh `Vec` collect per finish — a
+        // wide-read query paid a malloc/free on every publish otherwise.
+        // Take-and-return after the permutation below, cleared on the way
+        // back in.
+        let v = SORT_ORDER_POOL
+            .try_with(|c| {
+                c.try_borrow_mut().ok().map(|mut b| {
+                    let mut v = std::mem::take(&mut *b);
+                    v.clear();
+                    v.resize(reads.len(), 0);
+                    v
+                })
+            })
+            .unwrap_or(None)
+            .unwrap_or_else(|| vec![0usize; reads.len()]);
+        pooled_order = Some(v);
+        pooled_order.as_mut().unwrap()
+    };
     let mut starts = [0usize; DEP_SHARDS];
     for &r in reads.iter() {
         starts[shard_of(r)] += 1;
@@ -960,7 +1772,7 @@ fn sort_reads_by_shard(
             if src == start {
                 reads[i] = tmp_r;
                 if let Some(e) = eps.as_mut() {
-                    e[i] = tmp_e.expect("parity: epochs present iff starts[i]");
+                    e[i] = tmp_e.expect("parity: epochs present iff eps was Some");
                 }
                 break;
             }
@@ -969,6 +1781,19 @@ fn sort_reads_by_shard(
                 e[i] = e[src];
             }
             i = src;
+        }
+    }
+    // Hand the wide-band permutation buffer back to the TLS pool
+    //: the borrow through `order` ends above, so the Vec can
+    // be moved into the pool for the next wide finish on this thread.
+    // Oversized buffers are dropped, not pooled.
+    if let Some(mut buf) = pooled_order.take() {
+        if buf.capacity() <= SORT_ORDER_POOL_CAP {
+            let _ = SORT_ORDER_POOL.try_with(|c| {
+                if let Ok(mut b) = c.try_borrow_mut() {
+                    std::mem::swap(&mut *b, &mut buf);
+                }
+            });
         }
     }
 }
@@ -984,59 +1809,33 @@ fn mask_of(idx: u32) -> u64 {
     1u64 << (idx & 63)
 }
 
-/// Cached view of the dirty bitmap for one use, mirroring `VtableResolve`:
-/// the `Cached` arm fences a `RefCell` borrow through `Ref::filter_map`
-/// (no raw reference ever escapes the borrow tracker); the `Owned` arm
-/// serves first uses, post-grow/reset staleness, and slot contention
-/// without touching the slot at all.
-enum DirtySnap<'a> {
-    Cached(std::cell::Ref<'a, Vec<Arc<DirtyBlock>>>),
-    Owned(Arc<Vec<Arc<DirtyBlock>>>),
+/// Cached view of an append-only per-node table for one use, mirroring
+/// `VtableResolve`: the `Cached` arm fences a `RefCell` borrow through
+/// `Ref::filter_map` (no raw reference ever escapes the borrow tracker);
+/// the `Owned` arm serves first uses, post-grow/reset staleness, and slot
+/// contention without touching the slot at all.
+///
+/// One generic replaces the three byte-identical `DirtySnap`/`EpochSnap`/
+/// `StampSnap` enums: the borrow-fencing argument now lives
+/// in ONE place instead of three copies that could drift.
+enum Snap<'a, T> {
+    Cached(std::cell::Ref<'a, Vec<Arc<T>>>),
+    Owned(Arc<Vec<Arc<T>>>),
 }
 
-impl std::ops::Deref for DirtySnap<'_> {
-    type Target = Vec<Arc<DirtyBlock>>;
+impl<T> std::ops::Deref for Snap<'_, T> {
+    type Target = Vec<Arc<T>>;
     fn deref(&self) -> &Self::Target {
         match self {
-            DirtySnap::Cached(r) => r,
-            DirtySnap::Owned(a) => a,
+            Snap::Cached(r) => r,
+            Snap::Owned(a) => a,
         }
     }
 }
 
-/// Cached view of the epochs table for one use, mirroring `DirtySnap`
-/// (same borrow-fencing protocol — see `DirtySnap`).
-enum EpochSnap<'a> {
-    Cached(std::cell::Ref<'a, Vec<Arc<EpochBlock>>>),
-    Owned(Arc<Vec<Arc<EpochBlock>>>),
-}
-
-impl std::ops::Deref for EpochSnap<'_> {
-    type Target = Vec<Arc<EpochBlock>>;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            EpochSnap::Cached(r) => r,
-            EpochSnap::Owned(a) => a,
-        }
-    }
-}
-
-/// Cached view of the stamps table for one use, mirroring `DirtySnap`
-/// (same borrow-fencing protocol — see `DirtySnap`).
-enum StampSnap<'a> {
-    Cached(std::cell::Ref<'a, Vec<Arc<StampBlock>>>),
-    Owned(Arc<Vec<Arc<StampBlock>>>),
-}
-
-impl std::ops::Deref for StampSnap<'_> {
-    type Target = Vec<Arc<StampBlock>>;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            StampSnap::Cached(r) => r,
-            StampSnap::Owned(a) => a,
-        }
-    }
-}
+type DirtySnap<'a> = Snap<'a, DirtyBlock>;
+type EpochSnap<'a> = Snap<'a, EpochBlock>;
+type StampSnap<'a> = Snap<'a, StampBlock>;
 
 /// One block of per-node dirty epochs: one `AtomicU64` per node, 4096
 /// nodes per block (same blocking as the dirty bitmap, so `block_of`
@@ -1055,6 +1854,16 @@ fn zero_epoch_block() -> Arc<EpochBlock> {
 #[inline]
 fn epoch_word_of(idx: u32) -> usize {
     (idx & 4095) as usize
+}
+
+/// Read one node's epoch word from an owned epochs snapshot (the
+/// per-task path).  A missing block is post-grow/post-reset and reads 0 —
+/// the same conservative arm as [`DepGraph::epoch_of`].
+#[inline]
+fn epoch_from_owned(snap: &[Arc<EpochBlock>], node: DepNodeIndex) -> u64 {
+    snap.get(block_of(node.0))
+        .map(|b| b[epoch_word_of(node.0)].load(Ordering::Acquire) & EPOCH_MASK)
+        .unwrap_or(0)
 }
 
 /// One per-node stamp slot in the append-only `stamps` table.
@@ -1145,7 +1954,7 @@ fn word_dur(word: u64) -> Durability {
 /// (read -> readers) so that `invalidate()` can find all transitive
 /// readers in O(1) per dirty node rather than O(N) per scan.
 ///
-/// Thread-safe: `edges` / `rev_edges` / `fingerprints` / `classes` are
+/// Thread-safe: `edges` / `fingerprints` / `classes` are
 /// striped across `DEP_SHARDS` `CachePadded` `RwLock`s by node index, so
 /// concurrent task finishes collide only when they touch the same shard
 /// (the measured serial point of the old single-`RwLock` design); no
@@ -1174,6 +1983,73 @@ pub struct DepGraph<S: Scheduler> {
     /// minting.  (Test code may read shards directly for white-box
     /// assertions — it holds no other family; production code may not.)
     shards: Vec<CachePadded<RwLock<DepShard>>>,
+    /// REVERSE-EDGE LOG (#10) — IMPLEMENTED. Parallel to `shards` by shard
+    /// index, deliberately OUTSIDE the shard `RwLock`: the finish path
+    /// (`flush_rev_edges` / `prune_rev_edges`) must touch NO shard lock —
+    /// putting the log inside `DepShard` would force even a log push to
+    /// take the shard's read lock and queue behind the publish critical
+    /// section, defeating the rework. Each entry is a `ShardLog`: an
+    /// append-only `Mutex<Vec<EdgeOp>>` log plus an
+    /// `ArcSwap<Vec<Arc<RevEdges>>>` compacted index.
+    ///
+    /// ## Write path
+    ///
+    /// `flush_rev_edges` pushes `Insert(node, reader)`; `prune_rev_edges`
+    /// pushes `Tombstone(node, reader)`. The critical section is one
+    /// `Vec::push` under the log's short mutex — no shard lock anywhere on
+    /// the finish path.
+    ///
+    /// ## Read path
+    ///
+    /// `dirty_readers{,_by_class}`, the fan-out fill in
+    /// `finish_task_and_publish` (collected BEFORE the shard write lock —
+    /// never nested), and `propagate_lowering` call
+    /// `ShardLog::collect_readers(node)`, which loads the index snapshot
+    /// lock-free, scans the log tail under the short mutex, and returns
+    /// the deduplicated reader list. The mutex is released before any
+    /// other lock is taken (no log → shard ordering anywhere).
+    ///
+    /// ## Safety direction (over-marks, never under-marks)
+    ///
+    /// - **Tombstones over-mark**: a deleted edge remains visible to
+    ///   readers until compaction drains it. `mark_dirty` is idempotent;
+    ///   `lower_durability_to` is monotone-downward — both tolerate stale
+    ///   marks.
+    /// - **Inserts may under-mark** a concurrent reader that missed a
+    ///   recent push. The only possible miss is a reader whose `flush`
+    ///   push has not landed yet — and that reader's `finishing` flag is
+    ///   still set (the push precedes `clear_finishing`), so no verifier
+    ///   can serve its value across the gap; its own d16 late-fan-out
+    ///   epoch re-check recomputes it. This is the same tolerance the old
+    ///   in-shard `rev_edges` design documented ("a reader committing its
+    ///   edge between the phases is missed").
+    ///
+    /// ## Compaction
+    ///
+    /// `ShardLog::compact()` rebuilds the index from `index + log` and
+    /// clears the log. It runs under quiescence (write lock):
+    /// - **Trigger**: `mutate_world` calls `compact_rev_edges` when any
+    ///   shard's log exceeds `SHARD_LOG_COMPACT_THRESHOLD` (4096 entries).
+    /// - **`reset`**: `clear_all` clears the log and index to empty.
+    /// - **No mid-scan races**: the quiesce write lock excludes every
+    ///   reader (they hold either the `InFlightGuard` read pin or
+    ///   `&Quiesced`), so compaction can safely clear the log — readers
+    ///   never run during it.
+    ///
+    /// ## Known bounded lags
+    ///
+    /// - **Tombstone accumulation** is bounded by
+    ///   `SHARD_LOG_COMPACT_THRESHOLD`. Between compactions, a node with
+    ///   many churned readers pays the fan-out cost of the stale entries
+    ///   (idempotent `mark_dirty` per stale reader).
+    /// - **Log-tail growth between mutations**: a query-heavy phase with
+    ///   no `mutate_world` (e.g. one full compile pass) lets the log grow
+    ///   with every recorded read, and each `collect_readers` scans the
+    ///   whole tail. The next `mutate_world` (invalidate / `clear_all`)
+    ///   compacts it back under the threshold — for edit-driven sessions
+    ///   that is every keystroke; a pure batch compile pays the tail scan
+    ///   for that one pass.
+    rev_logs: Vec<CachePadded<ShardLog>>,
     /// Serializes bitmap regrowths so two growers cannot race their
     /// clone-append-store cycles and drop a block range.  A leaf lock:
     /// never held while acquiring a shard lock (allocation holds its
@@ -1240,11 +2116,22 @@ pub struct DepGraph<S: Scheduler> {
     /// reads one stable [`StampSlot`] instead of taking the node shard's
     /// read lock.  See [`StampSlot`] for the counter and d24 invariants.
     stamps: ArcSwap<Vec<Arc<StampBlock>>>,
+    /// Fast-path cover bound for [`Self::tables_cover`]: the
+    /// number of leading BLOCKS for which all three tables are known
+    /// covered. Growth is monotone within a generation, so this is updated
+    /// at the END of `grow_dirty` (after all three stores, before the
+    /// `table_gen` bump) and re-derived in `reset`. A stale-low value is
+    /// only a slow-path fallback (the authoritative grow-locked check);
+    /// a too-high value is impossible — it is only ever raised from
+    /// `min(dirty, epochs)` block counts observed after the stores.
+    /// Relaxed: correctness does not depend on freshness, only on the
+    /// value never exceeding the true covered prefix.
+    covered_upto: CachePadded<AtomicU32>,
     /// Global dirty generation counter.  Incremented on every
     /// `invalidate()`.  Nodes verified transitively green are stamped
     /// with this generation; hits skip re-verification when
     /// `node.verified_gen >= dirty_generation`.
-    dirty_generation: AtomicU64,
+    dirty_generation: CachePadded<AtomicU64>,
     /// Monotonic version of the dirty/epochs/stamps guard identity.
     ///
     /// # Sustaining invariant
@@ -1265,7 +2152,7 @@ pub struct DepGraph<S: Scheduler> {
     /// grep audit can confirm nothing escaped untagged; a future fourth
     /// table or one-table store sequence would silently break
     /// `dirty_snapshot`/`epochs_snapshot`/`stamps_snapshot` otherwise.
-    table_gen: AtomicU64,
+    table_gen: CachePadded<AtomicU64>,
     /// Per-thread cache of the [`Self::dirty`], [`Self::epochs`] and
     /// [`Self::stamps`] guards, keyed by generation.
     ///
@@ -1318,7 +2205,7 @@ pub struct DepGraph<S: Scheduler> {
     /// linearization point (its bump, the last store of the mark) and its
     /// own doctrine, unchanged — only the ordering between the two is
     /// now specified rather than incidental.
-    rev: [AtomicU64; Durability::LEVELS],
+    rev: [CachePadded<AtomicU64>; Durability::LEVELS],
     /// Single-writer mutex for lowering events.  A lowering writes
     /// per-node level bits via lock-free CAS and then cascades along the
     /// reverse edges; while one is in flight the stored levels are
@@ -1418,7 +2305,7 @@ impl<S: Scheduler> DepGraph<S> {
         sync_order::check(sync_order::Fam::DepShard, "dep.take_shard_w");
         (
             ticket::DepShardW::new(self.shards[i].write()),
-            ticket::Held::<St::After>::of(),
+            _t.take_dep_shard(),
         )
     }
 
@@ -1432,7 +2319,7 @@ impl<S: Scheduler> DepGraph<S> {
         sync_order::check(sync_order::Fam::DepShard, "dep.take_shard_r");
         (
             ticket::DepShardR::new(self.shards[i].read()),
-            ticket::Held::<St::After>::of(),
+            _t.take_dep_shard(),
         )
     }
 
@@ -1445,7 +2332,7 @@ impl<S: Scheduler> DepGraph<S> {
         sync_order::check(sync_order::Fam::GrowLock, "dep.take_grow");
         (
             ticket::GrowGuard::new(self.grow_lock.lock()),
-            ticket::Held::<ticket::ShardAndGrow>::of(),
+            _t.take_grow(),
         )
     }
 
@@ -1461,19 +2348,15 @@ impl<S: Scheduler> DepGraph<S> {
         sync_order::check(sync_order::Fam::Lowering, "dep.take_lowering");
         (
             ticket::LoweringGuard::new(self.lowering_lock.lock()),
-            ticket::Held::<ticket::LoweringHeld>::of(),
+            _t.acquire_lowering(),
         )
     }
 
-    /// Cascade shape: take one shard read while holding lowering (table #13).
-    #[inline]
-    fn take_cascade_shard_r(
-        &self,
-        i: usize,
-        t: ticket::Held<ticket::LoweringHeld>,
-    ) -> (ticket::DepShardR<'_>, ticket::Held<ticket::LoweringShard>) {
-        self.take_shard_r(i, t)
-    }
+    // (The old "cascade shape" combinator — `take_cascade_shard_r`,
+    // `LoweringHeld → LoweringShard`, table #13 — is retired: the
+    // reverse-edge log rework (#10) removed the shard lock from
+    // `propagate_lowering`'s reader walk, so there is no shard lock for
+    // the ticket to scope while lowering is held.)
 
     /// Single-shard write critical-section combinator: no ticket and no
     /// minting authority inside the closure body → a second lock in the
@@ -1491,7 +2374,7 @@ impl<S: Scheduler> DepGraph<S> {
     ) -> (R, ticket::Held<ticket::Idle>) {
         let (mut g, t1) = self.take_shard_w(i, t);
         let r = f(&mut g);
-        (r, ticket::release_shard_w(g, t1))
+        (r, t1.release_shard_w(g))
     }
 
     /// Single-shard read critical-section combinator (same, read shape).
@@ -1504,7 +2387,7 @@ impl<S: Scheduler> DepGraph<S> {
     ) -> (R, ticket::Held<ticket::Idle>) {
         let (g, t1) = self.take_shard_r(i, t);
         let r = f(&g);
-        (r, ticket::release_shard_r(g, t1))
+        (r, t1.release_shard_r(g))
     }
 
     /// allocate shape (the compile face of tables #11/#12):
@@ -1519,8 +2402,8 @@ impl<S: Scheduler> DepGraph<S> {
         let (mut g, t1) = self.take_shard_w(i, t);
         let (gg, t2) = self.take_grow(t1);
         let r = f(&mut g, &gg);
-        let t3 = ticket::release_grow(gg, t2); // → OneShard (shard still held)
-        (r, ticket::release_shard_w(g, t3)) // → Idle
+        let t3 = t2.release_grow(gg); // → OneShard (shard still held)
+        (r, t3.release_shard_w(g)) // → Idle
     }
 }
 
@@ -1543,6 +2426,18 @@ impl<S: Scheduler> DepGraph<S> {
     /// `with_owner` still overrides it explicitly (a `QuerySystem` hand-tags
     /// its own graph).
     fn next_owner_id() -> usize {
+        // 64-bit only: `1 << 48` does not compile on a
+        // 32-bit target (shift ≥ width). Rather than derive the offset
+        // from `usize::BITS` — which would silently shrink the safety
+        // margin against `NEXT_SYSTEM_ID`'s range to something the
+        // "can never alias" argument no longer supports — fail the build
+        // with a clear message.
+        #[cfg(not(target_pointer_width = "64"))]
+        compile_error!(
+            "DepGraph::next_owner_id assumes a 64-bit target: the \
+             NEXT_GRAPH_ID start offset (1 << 48) needs the width to keep \
+             standalone graph ids out of NEXT_SYSTEM_ID's range"
+        );
         static NEXT_GRAPH_ID: AtomicUsize = AtomicUsize::new(1 << 48);
         NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed)
     }
@@ -1554,13 +2449,13 @@ impl<S: Scheduler> DepGraph<S> {
                 .map(|_| {
                     CachePadded(RwLock::new(DepShard {
                         edges: Vec::new(),
-                        rev_edges: Vec::new(),
                         fingerprints: Vec::new(),
                         classes: Vec::new(),
                         digests: Vec::new(),
                     }))
                 })
                 .collect(),
+            rev_logs: (0..DEP_SHARDS).map(|_| CachePadded(ShardLog::new())).collect(),
             grow_lock: Mutex::new(()),
             dirty: ArcSwap::from_pointee((0..DIRTY_INIT_BLOCKS).map(|_| zero_block()).collect()),
             epochs: ArcSwap::from_pointee(
@@ -1569,10 +2464,15 @@ impl<S: Scheduler> DepGraph<S> {
             stamps: ArcSwap::from_pointee(
                 (0..STAMP_INIT_BLOCKS).map(|_| zero_stamp_block()).collect(),
             ),
-            dirty_generation: AtomicU64::new(0),
-            table_gen: AtomicU64::new(0),
+            // Resting cover bound = the SMALLEST of the three init block
+            // counts (epochs has the smallest head start on purpose).
+            covered_upto: CachePadded(AtomicU32::new(
+                (DIRTY_INIT_BLOCKS.min(EPOCH_INIT_BLOCKS)).min(STAMP_INIT_BLOCKS) as u32,
+            )),
+            dirty_generation: CachePadded(AtomicU64::new(0)),
+            table_gen: CachePadded(AtomicU64::new(0)),
             dirty_table_cache: thread_local::ThreadLocal::new(),
-            rev: [const { AtomicU64::new(0) }; Durability::LEVELS],
+            rev: std::array::from_fn(|_| CachePadded(AtomicU64::new(0))),
             lowering_lock: Mutex::new(()),
             lowering_epoch: AtomicU64::new(0),
             // Minted, not `0`: a shared sentinel would let two standalone
@@ -1635,10 +2535,23 @@ impl<S: Scheduler> DepGraph<S> {
         if cur.len() >= need && ecur.len() >= need && scur.len() >= need {
             return;
         }
-        let new_len = need
+        let dirty_new_len = need
             .next_power_of_two()
             .max(cur.len().max(ecur.len()) * 2)
             .max(DIRTY_INIT_BLOCKS);
+        // The epoch table has its own per-block cost (`EpochBlock` is
+        // `[AtomicU64; 4096]` = 32 KiB) and its own resting length
+        // (`EPOCH_INIT_BLOCKS` = 4).  Growing it with `dirty_new_len` (which
+        // has a 64-block floor) jumped it straight to 128 blocks ≈ 4 MiB on
+        // the first growth past the epoch head start — defeating the reason
+        // `EPOCH_INIT_BLOCKS` exists.  Size it geometrically from its *own*
+        // length instead; the invariant is per-allocated-node coverage, not a
+        // shared length order, and `grow_dirty` re-runs until all three tables
+        // cover `need`.
+        let epoch_new_len = need
+            .next_power_of_two()
+            .max(ecur.len() * 2)
+            .max(EPOCH_INIT_BLOCKS);
         // The stamp table has its own per-node cost (two `AtomicU64`s plus
         // the d24 flag), so it must NOT inherit the dirty table's
         // `DIRTY_INIT_BLOCKS` floor.  Size it independently and let it
@@ -1655,28 +2568,43 @@ impl<S: Scheduler> DepGraph<S> {
         // The reverse order would let a mark of a just-covered slot find its
         // dirty block but miss its epoch block — `bump_epoch` would then
         // silently drop the bump that the finish-side epoch re-check relies
-        // on.
-        let ecur = self.epochs.load(); // re-load under the lock
-        let mut ev: Vec<Arc<EpochBlock>> = Vec::with_capacity(new_len);
+        // on.  The `ecur` snapshot from the top is reused — the grow lock
+        // the caller holds pins the table for this whole function, so a
+        // re-load could only see the same blocks (the old "re-load under
+        // the lock" line was stale pre-lock-era text).
+        let mut ev: Vec<Arc<EpochBlock>> = Vec::with_capacity(epoch_new_len);
         ev.extend(ecur.iter().cloned());
-        ev.extend((ecur.len()..new_len).map(|_| zero_epoch_block()));
+        ev.extend((ecur.len()..epoch_new_len).map(|_| zero_epoch_block()));
         self.epochs.store(Arc::new(ev));
 
-        let mut v: Vec<Arc<DirtyBlock>> = Vec::with_capacity(new_len);
+        let mut v: Vec<Arc<DirtyBlock>> = Vec::with_capacity(dirty_new_len);
         v.extend(cur.iter().cloned());
-        v.extend((cur.len()..new_len).map(|_| zero_block()));
+        v.extend((cur.len()..dirty_new_len).map(|_| zero_block()));
         self.dirty.store(Arc::new(v));
 
         // Stamps last: a missing stamp slot degrades to "no stamp" (a
         // walk), so its position relative to dirty/epochs is not
         // safety-critical.  It still must be stored before the shared
         // generation bump below, or a snapshot could accept a stale stamp
-        // guard.
-        let scur = self.stamps.load(); // re-load under the lock
+        // guard.  The top-of-function `scur` snapshot is authoritative
+        // for the same grow-lock reason as `ecur` above.
         let mut sv: Vec<Arc<StampBlock>> = Vec::with_capacity(stamp_new_len);
         sv.extend(scur.iter().cloned());
         sv.extend((scur.len()..stamp_new_len).map(|_| zero_stamp_block()));
         self.stamps.store(Arc::new(sv));
+
+        // Raise the cover bound AFTER all three stores.  `Release`
+        // (not `Relaxed`): a thread that observes the new bound via the
+        // matching `Acquire` load must also observe the table stores above,
+        // otherwise it could take the fast path without the grown tables and
+        // then hit the pre-growth table via its TLS snapshot — the
+        // consumer-side skew that fired spurious `BUG` reports.
+        self.covered_upto.store(
+            dirty_new_len
+                .min(epoch_new_len)
+                .min(stamp_new_len) as u32,
+            Ordering::Release,
+        );
 
         // Every table store must bump the shared generation (Release)
         // AFTER the last store of the sequence — see `table_gen`. All
@@ -1698,8 +2626,12 @@ impl<S: Scheduler> DepGraph<S> {
     /// bumped on every dirty mark AND on every changed-fingerprint
     /// republish (`mark_dirty` / `publish` / `finish_task_and_publish`).
     /// `Acquire` load, paired with the `AcqRel` bumps.
+    ///
+    /// `pub(crate)`: the cached-serve path in `mod.rs` captures the epoch
+    /// at PROBE time (C1) and hands it back through `read_with_epoch`, so
+    /// the capture is made from outside this module.
     #[inline]
-    fn epoch_of(&self, node: DepNodeIndex) -> u64 {
+    pub(crate) fn epoch_of(&self, node: DepNodeIndex) -> u64 {
         self.with_epoch_word(node, |w| {
             w.map(|w| w.load(Ordering::Acquire) & EPOCH_MASK)
                 .unwrap_or(0)
@@ -1734,6 +2666,11 @@ impl<S: Scheduler> DepGraph<S> {
     /// query's descriptor).  Runs once per node before the index escapes
     /// the allocator, so a plain CAS-store cannot race a real conflict.
     pub(crate) fn set_node_durability(&self, node: DepNodeIndex, d: Durability) {
+        debug_assert_ne!(
+            node.0, DepNodeIndex::ZERO.0,
+            "set_node_durability called with DepNodeIndex::ZERO — index 0 is the \
+             DefaultCache 'no node' sentinel and is never allocated"
+        );
         self.with_epoch_word(node, |w| {
             let Some(w) = w else { return };
             debug_assert_eq!(
@@ -1760,20 +2697,61 @@ impl<S: Scheduler> DepGraph<S> {
     /// propagation ([`DepGraph::lower_and_propagate`]); a no-op must not
     /// cascade (it would revisit settled readers forever).
     fn lower_durability_to(&self, node: DepNodeIndex, d: Durability) -> bool {
-        self.with_epoch_word(node, |w| {
-            let Some(w) = w else { return false };
-            let mut cur = w.load(Ordering::Relaxed);
-            loop {
-                if word_dur(cur) <= d {
-                    return false;
-                }
-                let next = (cur & EPOCH_MASK) | dur_bits(d);
-                match w.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => return true,
-                    Err(c) => cur = c,
-                }
+        let snap = self.epochs_snapshot();
+        self.lower_durability_to_on(&snap, node, d)
+    }
+
+    /// `lower_durability_to` against a CALLER-PROVIDED epochs snapshot
+    ///.  `propagate_lowering` hoists ONE snapshot for the
+    /// whole cascade: a popular node with N readers otherwise paid N TLS
+    /// borrows + `table_gen` loads, exactly what `mark_dirty_batch` already
+    /// avoids by using `bump_epoch_on`.  Same append-only argument: a block
+    /// in a generation-matching snapshot is current, and a node allocated
+    /// AFTER the snapshot degrades to the missing-block arm below.
+    fn lower_durability_to_on(
+        &self,
+        snap: &EpochSnap<'_>,
+        node: DepNodeIndex,
+        d: Durability,
+    ) -> bool {
+        let w = snap
+            .get(block_of(node.0))
+            .map(|b| &b[epoch_word_of(node.0)]);
+        let Some(w) = w else {
+            // A node allocated after the snapshot: its own finish-side
+            // aggregation re-reads the (now lowered) levels of its reads and
+            // settles it, so skipping it here is sound — the same
+            // conservative direction `bump_epoch_on`'s missing-block arm
+            // takes.  Keep the release-mode tripwire for the OTHER reason a
+            // block can be missing (an allocated node the table never
+            // covered), which would silently disable the cascade.
+            debug_assert!(
+                node.0 >= self.next_index.load(Ordering::Relaxed),
+                "lower_durability_to_on: missing epoch word for ALLOCATED node {node:?} \
+                 (next_index = {}) — allocate_node_index must have grown the \
+                 epoch table before the index escaped",
+                self.next_index.load(Ordering::Relaxed),
+            );
+            if node.0 < self.next_index.load(Ordering::Relaxed) {
+                eprintln!(
+                    "BUG: lower_durability_to_on: ALLOCATED node {node:?} has no epoch \
+                     word (next_index = {}); the lowering cascade is blind",
+                    self.next_index.load(Ordering::Relaxed),
+                );
             }
-        })
+            return false;
+        };
+        let mut cur = w.load(Ordering::Relaxed);
+        loop {
+            if word_dur(cur) <= d {
+                return false;
+            }
+            let next = (cur & EPOCH_MASK) | dur_bits(d);
+            match w.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(c) => cur = c,
+            }
+        }
     }
 
     /// Reverse-edge propagation of a durability LOWERING: `start` has
@@ -1797,48 +2775,45 @@ impl<S: Scheduler> DepGraph<S> {
     /// also makes cycles harmless.  Explicit heap worklist: the reader
     /// graph can be deep, recursion could overflow.
     ///
-    /// Lock discipline: one shard READ lock at a time (module invariant); the
-    /// level writes are lock-free epoch-word CASes. Called only under
-    /// [`DepGraph::lowering_lock`] (single writer). The compile face of
-    /// table #13: LoweringHeld → LoweringShard → LoweringHeld.
+    /// Lock discipline: NO shard lock at all (log rework #10) — the reader
+    /// lists come from `ShardLog::collect_readers` (index snapshot +
+    /// short log mutex, released before any other lock), and the level
+    /// writes are lock-free epoch-word CASes. Called only under
+    /// [`DepGraph::lowering_lock`] (single writer). The old cascade shape
+    /// (`LoweringHeld → LoweringShard`, table #13) is retired: with no
+    /// shard lock on this path there is nothing for the ticket to scope —
+    /// it is held and returned unchanged.
     fn propagate_lowering(
         &self,
         start: DepNodeIndex,
         to: Durability,
         mut t: ticket::Held<ticket::LoweringHeld>,
     ) -> ticket::Held<ticket::LoweringHeld> {
+        let _ = &mut t; // held unchanged across the cascade (see doc)
+        // ONE growing worklist instead of a fresh `Vec` per level
+        //.  Termination is unchanged: levels
+        // are monotone downward with only [`Durability::LEVELS`] values, so
+        // each node drops at most `LEVELS - 1` times EVER; the
+        // `lower_durability_to` success rule doubles as the revisit filter,
+        // which also makes cycles harmless.  Stale (tombstoned-but-
+        // uncompacted) edges over-lower at worst — monotone-downward, so
+        // sound; see the `rev_logs` doc's "known bounded lags".
         let mut work: Vec<(DepNodeIndex, Durability)> = vec![(start, to)];
-        while let Some((node, level)) = work.pop() {
-            // Walk this node's reverse edges IN PLACE under the same
-            // guard — no `SmallVec` clone, hence no allocation under the
-            // lock.  This mirrors `verify_inner`'s `take_shard_r` +
-            // explicit `release_shard_r` shape: the old
-            // `.cloned()` heap-allocated for reader sets wider than the
-            // inline four, and a popular node (every query reads it) is
-            // exactly the case where that matters.
-            //
-            // Holding the guard across the per-reader work is sound
-            // because that work is LOCK-FREE: `lower_durability_to` is a
-            // `with_epoch_word` CAS loop, and `with_epoch_word` only takes
-            // the `epochs` table snapshot (a TLS cache probe plus an
-            // index) — no nested dep-shard lock, and the `GrowLock` is
-            // only reachable from `mark_dirty`, which is not on this path.
-            // So the module invariant "one shard READ lock at a time" is
-            // unchanged, and the only extra latency is against a WRITER
-            // of this shard (a finisher publishing into it); readers take
-            // the same lock shared and never block on us.
-            //
-            // The guard is also re-taken per node, so a deep cascade does
-            // not pin any shard across the whole walk.
-            let (guard, t1) = self.take_cascade_shard_r(shard_of(node), t);
-            if let Some(readers) = (&*guard).rev_edges.get(slot_of(node)) {
+        // ONE epochs snapshot for the whole cascade: the
+        // previous per-reader `lower_durability_to` re-paid the TLS borrow +
+        // generation load for every reader of every popped node.
+        let snap = self.epochs_snapshot();
+        let mut i = 0;
+        while i < work.len() {
+            let (node, level) = work[i];
+            i += 1;
+            self.rev_logs[shard_of(node)].with_readers(node, |readers| {
                 for &r in readers.iter() {
-                    if self.lower_durability_to(r, level) {
+                    if self.lower_durability_to_on(&snap, r, level) {
                         work.push((r, level));
                     }
                 }
-            }
-            t = ticket::release_cascade_shard_r(guard, t1);
+            });
         }
         t
     }
@@ -1879,16 +2854,26 @@ impl<S: Scheduler> DepGraph<S> {
         // race and already lowered this node (or its closure) to `to`;
         // bailing out BEFORE the odd bump keeps the seqlock quiet.
         if self.durability_of(node) <= to {
-            drop(ticket::release_lowering(writer, t_l)); // → Idle
+            drop(t_l.release_lowering(writer)); // → Idle
             return false;
         }
+        // Panic-safe odd→even bracket: the old explicit
+        // second bump was skipped on unwind, leaving `lowering_epoch`
+        // permanently odd and silently retiring the per-level fast path.
+        struct LoweringSeqlock<'a>(&'a std::sync::atomic::AtomicU64);
+        impl Drop for LoweringSeqlock<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
         self.lowering_epoch.fetch_add(1, Ordering::AcqRel); // → odd: in flight
+        let _seqlock = LoweringSeqlock(&self.lowering_epoch);
         let lowered = self.lower_durability_to(node, to);
         if lowered {
             t_l = self.propagate_lowering(node, to, t_l);
         }
-        self.lowering_epoch.fetch_add(1, Ordering::AcqRel); // → even: stable
-        drop(ticket::release_lowering(writer, t_l)); // → Idle
+        drop(_seqlock); // → even: stable, on the normal path
+        drop(t_l.release_lowering(writer)); // → Idle
         lowered
     }
 
@@ -1910,24 +2895,123 @@ impl<S: Scheduler> DepGraph<S> {
     /// access; every other caller ignores the return.
     #[inline]
     fn bump_epoch(&self, node: DepNodeIndex) -> Durability {
-        self.with_epoch_word(node, |w| {
-            let Some(w) = w else { return Durability::LOW };
-            // CAS loop instead of `fetch_add`: the durability bits live
-            // in the same word and must not absorb the carry.  An
-            // epoch-counter overflow into bit 62 is unreachable in
-            // practice (see `EPOCH_MASK`).
-            let mut cur = w.load(Ordering::Relaxed);
-            loop {
-                let next = ((cur & EPOCH_MASK).wrapping_add(1) & EPOCH_MASK) | (cur & !EPOCH_MASK);
-                match w.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-                    // `next` preserved `cur`'s high bits verbatim, so
-                    // this IS the durability at the successful swap —
-                    // no second word read.
-                    Ok(_) => return word_dur(next),
-                    Err(c) => cur = c,
-                }
+        let snap = self.epochs_snapshot();
+        self.bump_epoch_on(&snap, node)
+    }
+
+    /// `bump_epoch` against a CALLER-PROVIDED epochs snapshot.  The
+    /// batch fan-out (`mark_dirty_batch`) hoists ONE snapshot for the
+    /// whole loop: per-reader `epochs_snapshot()` re-paid the Acquire
+    /// `table_gen` load plus the TLS borrow probe on every reader of a
+    /// hot node's publish.  Same append-only/allocated-before argument
+    /// as the shared dirty snapshot: a block present in a
+    /// generation-matching snapshot is current, and a node allocated
+    /// AFTER the snapshot degrades to the missing-block arm (`LOW`) —
+    /// the same conservative direction a fresh snapshot would take.
+    fn bump_epoch_on(&self, snap: &EpochSnap<'_>, node: DepNodeIndex) -> Durability {
+        let w = snap
+            .get(block_of(node.0))
+            .map(|b| &b[epoch_word_of(node.0)]);
+        let Some(w) = w else {
+            // Unreachable for an ALLOCATED node: `allocate_node_index`
+            // grows the epoch table to cover `idx` before the index
+            // escapes (see `grow_dirty`).  The silent `LOW` degradation is
+            // the exact "epoch bump dropped → finish-side re-check compares
+            // 0 vs 0" failure mode `grow_dirty`'s doc warns about — assert
+            // the only valid reason (never-allocated, post-`reset`
+            // resting-skew index) instead of trusting it.
+            debug_assert!(
+                node.0 >= self.next_index.load(Ordering::Relaxed),
+                "bump_epoch_on: missing epoch word for ALLOCATED node {node:?} \
+                 (next_index = {}) — allocate_node_index must have grown the \
+                 epoch table before the index escaped; dropping this bump \
+                 makes the finish-side epoch re-check compare 0 vs 0",
+                self.next_index.load(Ordering::Relaxed),
+            );
+            // Release-mode tripwire: the debug assert above
+            // vanishes in release, where this arm would otherwise drop the
+            // epoch bump silently and make the finish-side re-check compare
+            // 0 against 0.  The arm is unreachable-by-construction, so the
+            // log line costs nothing on the hot path and makes any future
+            // violation observable in production.
+            if node.0 < self.next_index.load(Ordering::Relaxed) {
+                eprintln!(
+                    "BUG: bump_epoch_on: ALLOCATED node {node:?} has no epoch word \
+                     (next_index = {}); the d16 re-check is blind",
+                    self.next_index.load(Ordering::Relaxed),
+                );
             }
-        })
+            return Durability::LOW;
+        };
+        // CAS loop instead of `fetch_add`: the durability bits live
+        // in the same word and must not absorb the carry.  An
+        // epoch-counter overflow into bit 62 is unreachable in
+        // practice (see `EPOCH_MASK`).
+        let mut cur = w.load(Ordering::Relaxed);
+        loop {
+            let next = ((cur & EPOCH_MASK).wrapping_add(1) & EPOCH_MASK) | (cur & !EPOCH_MASK);
+            match w.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                // `next` preserved `cur`'s high bits verbatim, so
+                // this IS the durability at the successful swap —
+                // no second word read.
+                Ok(_) => return word_dur(next),
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// Generation-validated snapshot of the dirty table: one `Acquire`
+    /// load of `table_gen` plus a TLS slot hit replaces the
+    /// `ArcSwap::load` (atomic load + refcount inc/dec RMWs) on every
+    /// use.  Soundness: blocks are append-only and `Arc`-shared across
+    /// guard versions, so a block PRESENT in a generation-matching slot
+    /// is always current; a missing block (post-grow/post-reset world)
+    /// falls through to the caller's existing missing-block arm, and a
+    /// generation mismatch takes the seqlock slow path (`g1/load/g2`)
+    /// that also refreshes the slot best-effort.  All borrows use
+    /// `try_*` so unforeseen reentrancy degrades to `Owned`, never
+    /// panics.
+    /// All-or-nothing slow-path refresh of the shared TLS slot, shared by
+    /// `dirty_snapshot` / `epochs_snapshot` / `stamps_snapshot` /
+    /// `dirty_stamps_snapshot`.  The slot is keyed by the single
+    /// `table_gen`, which advances only after all three stores — a partial
+    /// refresh would leave the other fields at the previous generation
+    /// while stamping the slot with the new one, and a later `Cached` fast
+    /// path would then hand back a pre-reset table.  Loading all three
+    /// here (gen-stable between the two `table_gen` loads) is what makes
+    /// "all three or none" STRUCTURAL instead of a grep-audit contract;
+    /// it is cheap because this slow path runs only on grow/reset, never
+    /// on a hit.  Returns freshly loaded `Arc`s of all three tables at
+    /// the stable point; the caller wraps the one it needs.
+    fn refresh_shared_slot(
+        &self,
+        cell: &std::cell::RefCell<(
+            u64,
+            Option<std::sync::Arc<Vec<std::sync::Arc<DirtyBlock>>>>,
+            Option<std::sync::Arc<Vec<std::sync::Arc<EpochBlock>>>>,
+            Option<std::sync::Arc<Vec<std::sync::Arc<StampBlock>>>>,
+        )>,
+    ) -> (
+        std::sync::Arc<Vec<std::sync::Arc<DirtyBlock>>>,
+        std::sync::Arc<Vec<std::sync::Arc<EpochBlock>>>,
+        std::sync::Arc<Vec<std::sync::Arc<StampBlock>>>,
+    ) {
+        loop {
+            let g1 = self.table_gen.load(Ordering::Acquire);
+            let dirty = self.dirty.load_full();
+            let epochs = self.epochs.load_full();
+            let stamps = self.stamps.load_full();
+            let g2 = self.table_gen.load(Ordering::Acquire);
+            if g1 == g2 {
+                if let Ok(mut w) = cell.try_borrow_mut() {
+                    w.0 = g2;
+                    w.1 = Some(std::sync::Arc::clone(&dirty));
+                    w.2 = Some(std::sync::Arc::clone(&epochs));
+                    w.3 = Some(std::sync::Arc::clone(&stamps));
+                }
+                return (dirty, epochs, stamps);
+            }
+        }
     }
 
     /// Generation-validated snapshot of the dirty table: one `Acquire`
@@ -1954,30 +3038,44 @@ impl<S: Scheduler> DepGraph<S> {
                 }
             }
         }
-        loop {
-            let g1 = self.table_gen.load(Ordering::Acquire);
-            let full = self.dirty.load_full();
-            // Refresh EVERY table in the shared slot, not just this one.
-            // The slot is keyed by the single `table_gen`, which advances
-            // only after all three stores.  A partial refresh would leave
-            // the other fields at the previous generation while stamping
-            // the slot with the new one, and the next helper's `Cached`
-            // fast path would then hand back a pre-reset table.  Loading
-            // all three here is cheap: this slow path runs only on
-            // grow/reset, never on a hit.
-            let epochs = self.epochs.load_full();
-            let stamps = self.stamps.load_full();
-            let g2 = self.table_gen.load(Ordering::Acquire);
-            if g1 == g2 {
-                if let Ok(mut w) = cell.try_borrow_mut() {
-                    w.0 = g2;
-                    w.1 = Some(Arc::clone(&full));
-                    w.2 = Some(epochs);
-                    w.3 = Some(stamps);
+        let (full, _, _) = self.refresh_shared_slot(&cell);
+        DirtySnap::Owned(full)
+    }
+
+    /// Batched dirty + stamps snapshot (#6 of the perf pass): ONE
+    /// `table_gen` load and one TLS slot fetch serve BOTH snapshots, where
+    /// `dirty_snapshot()` + `stamps_snapshot()` back-to-back paid two of
+    /// each.  `verify_inner` calls this on every uncached verify — the
+    /// three `RefCell` shared borrows coexist legally, and the slow path is
+    /// the same gen-stable refresh loop the individual helpers run.  The
+    /// epochs snapshot stays lazy in the caller: the dominant verify touches
+    /// no epoch word, so taking it eagerly here would be a pure loss.
+    fn dirty_stamps_snapshot(&self) -> (DirtySnap<'_>, StampSnap<'_>) {
+        let tbl_gen = self.table_gen.load(Ordering::Acquire);
+        let cell = self
+            .dirty_table_cache
+            .get_or(|| std::cell::RefCell::new((u64::MAX, None, None, None)));
+        // Fast path: the slot is current — ONE shared borrow serves both.
+        // (Split borrows so inference on the closure params flows from the
+        // cell's tuple type; the two `Ref`s coexist legally.)
+        if let Ok(r) = cell.try_borrow() {
+            if r.0 == tbl_gen {
+                let dirty_ref =
+                    std::cell::Ref::filter_map(std::cell::Ref::clone(&r), |t| {
+                        t.1.as_ref().map(|a| &**a)
+                    });
+                let stamp_ref =
+                    std::cell::Ref::filter_map(r, |t| t.3.as_ref().map(|a| &**a));
+                if let (Ok(d), Ok(s)) = (dirty_ref, stamp_ref) {
+                    return (DirtySnap::Cached(d), StampSnap::Cached(s));
                 }
-                return DirtySnap::Owned(full);
             }
         }
+        // Slow path (grow/reset only): one gen-stable refresh of the shared
+        // slot filling BOTH halves — see `refresh_shared_slot` for why a
+        // partial refresh is forbidden.
+        let (dirty, _, stamps) = self.refresh_shared_slot(&cell);
+        (DirtySnap::Owned(dirty), StampSnap::Owned(stamps))
     }
 
     /// Generation-validated snapshot of the epochs table: same protocol
@@ -1998,25 +3096,28 @@ impl<S: Scheduler> DepGraph<S> {
                 }
             }
         }
-        loop {
-            let g1 = self.table_gen.load(Ordering::Acquire);
-            let full = self.epochs.load_full();
-            // All-or-nothing refresh of the shared slot — see
-            // `dirty_snapshot`'s slow path for why a partial refresh
-            // would let the shared `table_gen` certify a stale sibling.
-            let dirty = self.dirty.load_full();
-            let stamps = self.stamps.load_full();
-            let g2 = self.table_gen.load(Ordering::Acquire);
-            if g1 == g2 {
-                if let Ok(mut w) = cell.try_borrow_mut() {
-                    w.0 = g2;
-                    w.1 = Some(dirty);
-                    w.2 = Some(Arc::clone(&full));
-                    w.3 = Some(stamps);
+        let (_, full, _) = self.refresh_shared_slot(&cell);
+        EpochSnap::Owned(full)
+    }
+
+    /// Owned variant of [`Self::epochs_snapshot`] for [`TaskDeps`]: same
+    /// generation-validated TLS slot hit, but always returns a cloneable
+    /// `Arc` so the task can keep it across reads.  One `Arc` bump per
+    /// task (first fresh read), replacing one TLS probe per read.
+    fn epochs_owned(&self) -> Arc<Vec<Arc<EpochBlock>>> {
+        let tbl_gen = self.table_gen.load(Ordering::Acquire);
+        let cell = self
+            .dirty_table_cache
+            .get_or(|| std::cell::RefCell::new((u64::MAX, None, None, None)));
+        if let Ok(r) = cell.try_borrow() {
+            if r.0 == tbl_gen {
+                if let Some(epochs) = &r.2 {
+                    return Arc::clone(epochs);
                 }
-                return EpochSnap::Owned(full);
             }
         }
+        let (_, full, _) = self.refresh_shared_slot(&cell);
+        full
     }
 
     /// Generation-validated snapshot of the stamps table: same protocol
@@ -2037,25 +3138,8 @@ impl<S: Scheduler> DepGraph<S> {
                 }
             }
         }
-        loop {
-            let g1 = self.table_gen.load(Ordering::Acquire);
-            let full = self.stamps.load_full();
-            // All-or-nothing refresh of the shared slot — see
-            // `dirty_snapshot`'s slow path for why a partial refresh
-            // would let the shared `table_gen` certify a stale sibling.
-            let dirty = self.dirty.load_full();
-            let epochs = self.epochs.load_full();
-            let g2 = self.table_gen.load(Ordering::Acquire);
-            if g1 == g2 {
-                if let Ok(mut w) = cell.try_borrow_mut() {
-                    w.0 = g2;
-                    w.1 = Some(dirty);
-                    w.2 = Some(epochs);
-                    w.3 = Some(Arc::clone(&full));
-                }
-                return StampSnap::Owned(full);
-            }
-        }
+        let (_, _, full) = self.refresh_shared_slot(&cell);
+        StampSnap::Owned(full)
     }
 
     /// Set the dirty bit for `node`.
@@ -2067,11 +3151,47 @@ impl<S: Scheduler> DepGraph<S> {
     /// mark there is the safe direction (nothing is cached any more).
     #[inline]
     fn mark_dirty(&self, node: DepNodeIndex) {
+        let dirty_snap = self.dirty_snapshot();
+        let epochs_snap = self.epochs_snapshot();
+        self.mark_dirty_on(&dirty_snap, &epochs_snap, node);
+    }
+
+    /// Abort-path colour repair: a panic after the publish section can
+    /// leave a node green with no staged value, and a transitive reader
+    /// would then verify a green closure and serve its own stale value.
+    /// `mark_dirty` is lock-free and idempotent, so it is safe under the
+    /// quiesce read pin the abort path holds.
+    pub(crate) fn mark_dirty_for_abort(&self, node: DepNodeIndex) {
+        self.mark_dirty(node);
+    }
+
+    /// Snapshot-parameterized body of [`Self::mark_dirty`]: the caller
+    /// supplies BOTH append-only snapshots, so a hot in-section caller (the
+    /// colour decision inside `finish_task_and_publish`'s shard write
+    /// closure) pays no TLS probe or ArcSwap load under the lock.  Same
+    /// append-only/`reset`-excluded validity argument as the batch path: a
+    /// stale snapshot is conservative (an already-red early return, or a
+    /// redundant re-set the idempotent `fetch_or` absorbs; a missing block
+    /// takes the LOW/conservative arm).
+    fn mark_dirty_on(
+        &self,
+        dirty_snap: &DirtySnap<'_>,
+        epochs_snap: &EpochSnap<'_>,
+        node: DepNodeIndex,
+    ) {
+        debug_assert_ne!(
+            node.0, DepNodeIndex::ZERO.0,
+            "mark_dirty called with DepNodeIndex::ZERO — index 0 is the \
+             DefaultCache 'no node' sentinel and is never allocated; marking \
+             it would set a phantom bit nothing can clear"
+        );
         // Declared here, assigned in the block branch: the 0→1 tail below
         // (after the early returns) consumes the level the bump's CAS
         // returned.  The missing-block branch returns without touching it.
+        // (The singular wrapper takes fresh snapshots per call; hot
+        // in-section callers use `mark_dirty_on` with a hoisted pair.)
         let d;
-        if let Some(block) = self.dirty_snapshot().get(block_of(node.0)) {
+        if let Some(block) = dirty_snap.get(block_of(node.0)) {
             // For an ALLOCATED node the epoch word is guaranteed present:
             // `allocate_node_index` grows BOTH tables to cover `idx` before
             // the index escapes (see `grow_dirty`), and every caller here
@@ -2100,7 +3220,8 @@ impl<S: Scheduler> DepGraph<S> {
             // so an earlier read yields a level >= a later one and the
             // `0..=d` bump set below is a superset — over-bumping kills
             // extra fast paths, only MISSING a bump would be unsound.
-            d = self.bump_epoch(node);
+            // unreachable from this branch for valid input.
+            d = self.bump_epoch_on(&epochs_snap, node);
             // 0→1 transition gate: only a bit that WAS CLEAR carries new
             // information, so only it invalidates stamps.  A redundant
             // mark (bit already set) would otherwise thrash every
@@ -2119,6 +3240,20 @@ impl<S: Scheduler> DepGraph<S> {
             // capture also read the epoch as 0 (`epoch_of` maps a missing
             // block to 0), so captures compare equal and no spurious
             // restore fires.
+            // Same assumption `mark_dirty_batch`'s missing-block arm
+            // asserts: the only valid missing-block reason is a
+            // never-allocated node.  If `grow_dirty` ever failed to cover
+            // an ALLOCATED node, this branch silently drops the epoch bump
+            // and only bumps `rev[LOW]` + `dirty_generation` — the
+            // finish-side epoch re-check then compares 0 against 0 and can
+            // miss the mark.
+            debug_assert!(
+                node.0 >= self.next_index.load(Ordering::Relaxed),
+                "mark_dirty: missing dirty block for ALLOCATED node {node:?} \
+                 (next_index = {}): the only valid missing-block reason is \
+                 that the node was never allocated",
+                self.next_index.load(Ordering::Relaxed),
+            );
             // Per-level add BEFORE the generation bump, the same
             // load-bearing order as the live-block branch below (see
             // there for the straddle argument): a verifier that observes
@@ -2226,13 +3361,210 @@ impl<S: Scheduler> DepGraph<S> {
         self.dirty_generation.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Batch form of [`DepGraph::mark_dirty`] for the publish-time fan-out:
+    /// N marks → one linearization.  The per-reader work that CANNOT batch
+    /// stays per-reader (the `bump_epoch` CAS and the `fetch_or` bit — both
+    /// per-node words), but the three SYSTEM-WIDE effects collapse:
+    ///
+    ///  * ONE `dirty_snapshot` for the whole batch — the append-only
+    ///    discipline that validates `mark_dirty`'s single snapshot covers a
+    ///    batch unchanged: a block present at snapshot time stays valid
+    ///    forever, and every batch reader was allocated before this node's
+    ///    rev-edge list (the list the fan-out reads) was built.
+    ///  * ONE `dirty_snapshot` AND ONE `epochs_snapshot` for the whole
+    ///    batch — both tables' append-only discipline validates them (the
+    ///    same argument as the shared dirty snapshot: a block present in a
+    ///    generation-matching snapshot is current).  The epochs snapshot
+    ///    feeds `bump_epoch_on`; without it, per-reader `bump_epoch` would
+    ///    re-pay the Acquire `table_gen` load plus the TLS borrow probe on
+    ///    every reader of a hot node's publish.  An auditor counting "what
+    ///    does one batch pay?" must count BOTH snapshot round-trips.
+    ///  * ONE `rev[l]` add PER LEVEL (delta = count of 0→1 transitions at
+    ///    durability ≥ l) instead of d+1 adds per mark — the shared counter
+    ///    line stops taking N RMWs per republish.
+    ///  * ONE `dirty_generation` bump for the whole batch, LAST.
+    ///
+    /// The batching is a CLEANER linearization INSIDE `mark_dirty`'s own
+    /// argument (do not weaken it — see the MUST-bump comment there): what
+    /// that argument forbids is bits whose Release-set is not ordered
+    /// before the batch's bump.  Here every bit set (Release) and every
+    /// rev add (AcqRel) is sequenced-before the single bump, so a walk
+    /// that loads the bumped generation sees ALL bits and ALL adds — a
+    /// strictly stronger guarantee than N sequential marks, where a walk
+    /// could interleave between two marks.  A walk that loads the
+    /// generation before the bump misses the whole batch: the same valid
+    /// "walk overlaps the marking thread" linearization as before, and the
+    /// stamp it writes is stale relative to future lookups (the bump lands
+    /// first) — the conservative direction.
+    ///
+    /// The 0→1 transition gate is preserved PER READER: an already-red
+    /// reader contributes no rev adds (a redundant mark must not thrash
+    /// every stamp — see the gate comment in `mark_dirty`), though its
+    /// epoch CAS still runs (over-bumping an epoch is conservative).  The
+    /// bump is skipped entirely when NO reader transitioned — the batch
+    /// form of the early return.
+    fn mark_dirty_batch<I: IntoIterator<Item = DepNodeIndex>>(&self, readers: I) {
+        // Empty fan-out early-out: an unchanged-fingerprint
+        // republish reaches here with an empty list — take the two TLS
+        // snapshots (dirty + epochs) only when there is at least one reader.
+        let mut readers = readers.into_iter();
+        let Some(first) = readers.next() else {
+            return;
+        };
+        let mut level_counts = [0usize; Durability::LEVELS];
+        let mut any = false;
+        let snap = self.dirty_snapshot();
+        // ONE epochs snapshot for the whole fan-out loop (see
+        // `bump_epoch_on`): per-reader `bump_epoch` calls re-paid the
+        // Acquire `table_gen` load + TLS borrow probe each — the publish
+        // of a hot node is exactly the path this file optimizes
+        // elsewhere.
+        let epochs_snap = self.epochs_snapshot();
+        // The first reader runs through the same body as the iterator
+        // tail (one loop, `first` folded back in).
+        for node in std::iter::once(first).chain(readers) {
+            debug_assert_ne!(
+                node.0, DepNodeIndex::ZERO.0,
+                "mark_dirty_batch called with DepNodeIndex::ZERO — index 0 is \
+                 the DefaultCache 'no node' sentinel and is never allocated"
+            );
+            let Some(block) = snap.get(block_of(node.0)) else {
+                // Post-`reset` reader: no cached value can exist, but keep
+                // `mark_dirty`'s missing-block accounting — a rev[LOW] add
+                // and (below) the generation bump, no bit, no epoch CAS.
+                // The epoch-silence here is safe ONLY because the reader was
+                // never allocated (post-`reset`, `next_index` restarted at
+                // 1 and `reset` cleared every `rev_edges` list, so no
+                // allocated reader can be in this set): assert that
+                // assumption instead of trusting it — if a future change
+                // ever lets a stale reader survive `reset`, this fires
+                // instead of silently dropping the epoch bump.
+                debug_assert!(
+                    node.0 >= self.next_index.load(Ordering::Relaxed),
+                    "mark_dirty_batch: missing dirty block for ALLOCATED node \
+                     {node:?} (next_index = {}): the only valid missing-block \
+                     reason is that the node was never allocated; an allocated \
+                     reader whose epoch bump is dropped here stays stale \
+                     forever (the finish-side re-check compares 0 vs 0)",
+                    self.next_index.load(Ordering::Relaxed),
+                );
+                // Release-mode tripwire: the debug assert
+                // vanishes in release, where this arm would otherwise drop
+                // the reader's epoch bump and the bit set SILENTLY — the
+                // exact permanent-staleness mode `bump_epoch_on` already
+                // guards with a release arm.  Unreachable by construction,
+                // so the log line costs nothing on the hot path.
+                if node.0 < self.next_index.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "BUG: mark_dirty_batch: ALLOCATED node {node:?} has no dirty \
+                         block (next_index = {}); its mark is dropped and the \
+                         d16 re-check is blind",
+                        self.next_index.load(Ordering::Relaxed),
+                    );
+                }
+                level_counts[0] += 1;
+                any = true;
+                continue;
+            };
+            // Epoch bump BEFORE the bit set, per reader (see `mark_dirty`):
+            // an Acquire observer of this reader's red bit must also
+            // observe its epoch bump, or the finish-side epoch re-check
+            // (d16) can miss a mark whose bit was observable.
+            //
+            // NO red pre-check: the old `load(Acquire)` +
+            // `continue` skipped BOTH the epoch bump and the bit set for an
+            // already-red reader — but a concurrent `clear_dirty_on` (the
+            // reader's own finish) could clear the bit between that load and
+            // this point, silently dropping the mark entirely. The
+            // finishing node's post-flush late re-check cannot repair that:
+            // its fresh epoch load has no happens-before edge with this
+            // thread's skipped CAS. Always running `bump_epoch_on` +
+            // `fetch_or` is the sound shape: each reader has its own epoch
+            // word, so the extra CAS on an already-red reader is
+            // uncontended, and `prev & mask != 0` (below) still gates the
+            // per-level rev adds. An over-bumped epoch is conservative —
+            // never an under-mark.
+            let mask = mask_of(node.0);
+            let d = self.bump_epoch_on(&epochs_snap, node);
+            let prev = block[word_of(node.0)].fetch_or(mask, Ordering::Release);
+            if prev & mask != 0 {
+                continue; // already red — stamps were invalidated when it turned red
+            }
+            any = true;
+            for l in 0..=(d as usize) {
+                level_counts[l] += 1;
+            }
+        }
+        if !any {
+            return; // no 0→1 transition in the batch — no invalidation at all
+        }
+        // rev adds BEFORE the generation bump, all adds after ALL bits
+        // (the per-mark straddle argument applies to the batch as a
+        // whole: seeing a bumped rev[l] implies every bit sequenced before
+        // the rev phase; seeing the bump implies every add).
+        for (l, &c) in level_counts.iter().enumerate() {
+            if c > 0 {
+                self.rev[l].fetch_add(c as u64, Ordering::AcqRel);
+            }
+        }
+        self.dirty_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Clear the dirty bit for `node`.  Same append-only-snapshot
     /// discipline as [`DepGraph::mark_dirty`].
     #[inline]
     fn clear_dirty(&self, node: DepNodeIndex) {
-        if let Some(block) = self.dirty_snapshot().get(block_of(node.0)) {
+        let dirty_snap = self.dirty_snapshot();
+        self.clear_dirty_on(&dirty_snap, node);
+    }
+
+    /// Snapshot-parameterized body of [`Self::clear_dirty`] — see
+    /// `mark_dirty_on` for the validity argument.
+    #[inline]
+    fn clear_dirty_on(&self, dirty_snap: &DirtySnap<'_>, node: DepNodeIndex) {
+        debug_assert_ne!(
+            node.0, DepNodeIndex::ZERO.0,
+            "clear_dirty called with DepNodeIndex::ZERO"
+        );
+        if let Some(block) = dirty_snap.get(block_of(node.0)) {
             block[word_of(node.0)].fetch_and(!mask_of(node.0), Ordering::Release);
         }
+    }
+
+    /// Lock-free pre-check: do all three append-only tables already cover
+    /// `idx`?  Safe without the grow lock because the tables only ever
+    /// GROW (`grow_dirty`) or are swapped by a quiesced `reset` (which
+    /// runs under the quiesce write lock and cannot overlap an allocator,
+    /// which holds the quiesce read guard for its whole frame).  A
+    /// "covered" verdict is therefore final: no other thread can shrink
+    /// the table out from under us.  A "not covered" verdict is advisory —
+    /// the caller falls back to the authoritative grow-locked path.
+    ///
+    /// This is what keeps the global `grow_lock` cold: without it, every
+    /// node allocation serialized on the grow mutex even though growth is
+    /// a rare event — the exact global serial point this file otherwise
+    /// removes (sharded locks, deferred fan-out).
+    #[inline]
+    fn tables_cover(&self, idx: u32) -> bool {
+        // Fast path: one `Acquire` load replaces three
+        // `ArcSwap` loads per node allocation.  `Acquire` pairs with the
+        // `Release` store in `grow` so a covered verdict also observes the
+        // grown tables (a stale-low value still falls through to the
+        // grow-locked check, which is the safe direction).
+        if block_of(idx) + 1 <= self.covered_upto.load(Ordering::Acquire) as usize {
+            return true;
+        }
+        let need = block_of(idx) + 1;
+        if self.dirty.load().len() < need {
+            return false;
+        }
+        if self.epochs.load().len() < need {
+            return false;
+        }
+        if self.stamps.load().len() < need {
+            return false;
+        }
+        true
     }
 
     /// Allocate a node with its DECLARED content class (fixed for the
@@ -2242,40 +3574,82 @@ impl<S: Scheduler> DepGraph<S> {
     /// Idle → OneShard → ShardAndGrow → OneShard → Idle; `grow_dirty` only
     /// accepts `&GrowGuard`.
     pub fn allocate_node_index(&self, class: ContentClass) -> DepNodeIndex {
-        // `checked_add` inside `fetch_update`, NOT `fetch_add`: the old
+        // `checked_add` inside `try_update`, NOT `fetch_add`: the old
         // shape wrapped the counter to 0 BEFORE the assert fired, so a
         // caller that caught the panic would keep allocating from
         // `DepNodeIndex(0)` — the `DefaultCache` sentinel for "no node"
         // (index 0 is never allocated: the counter starts at 1) — and
-        // alias every live slot.  On exhaustion `fetch_update` leaves the
-        // counter SATURATED at `u32::MAX`, so every later call panics the
-        // same way instead of handing out index 0.  2^32 nodes is far
-        // beyond any real session — fail loudly, but fail closed.
+        // alias every live slot.
+        //
+        // The bound is `u32::MAX`, not `u32::MAX - 1`: `try_update` returns
+        // the value BEFORE the update, so `prev` here IS the minted index —
+        // indices run 1, 2, …, `u32::MAX - 1`.  `u32::MAX` itself is never
+        // minted: it is `DedupTable`'s inline dedup EMPTY marker (see
+        // `TaskDeps`) — handing it out would fire its `debug_assert_ne`
+        // inside the hot read path in debug builds, and in release builds
+        // silently treat every read of that node as "freshly inserted"
+        // WITHOUT storing it — duplicates in `reads`, breaking the
+        // documented "`reconcile_forward_edges` receives an
+        // already-deduplicated list" invariant for that one node.  (The
+        // previous bound refused at `u32::MAX - 1`, which wasted one index
+        // and misdescribed `try_update`'s result as the post-update value.)
+        // `try_update` leaves the counter SATURATED at `u32::MAX`, so every
+        // later call panics the same way.  2^32 nodes is far beyond any
+        // real session — fail loudly, fail closed.
         let prev = self
             .next_index
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                cur.checked_add(1)
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur >= u32::MAX {
+                    None
+                } else {
+                    Some(cur + 1)
+                }
             })
             .unwrap_or_else(|cur| {
                 panic!("DepNodeIndex address space exhausted (next_index = {cur})")
             });
+        // `prev` is the pre-update counter value, i.e. the minted index.
         let idx = DepNodeIndex(prev);
         let slot = slot_of(idx);
-        let (_, _t) = self.with_shard_and_grow(shard_of(idx), self.ticket(), |shard, growth| {
-            self.grow_dirty(idx.0, growth);
-            ensure_shard_len(shard, slot);
-            // Written unconditionally, NOT via `resize_with(.., || class)`:
-            // a concurrent allocator's resize must never leave THIS node's
-            // slot holding a foreign class — the class is fixed at
-            // allocation and drives the semantic-purity debug checks and
-            // class-scoped invalidation.
-            shard.classes[slot] = class;
-        });
+        if self.tables_cover(idx.0) {
+            // Fast path: all three tables already cover `idx` — skip the
+            // global grow lock entirely.  Sequential allocations almost
+            // never grow; taking `grow_lock` on every allocation turned a
+            // rare-event mutex into a global serial point on the cold-miss
+            // path.  The pre-check is final (see `tables_cover`): a
+            // "covered" verdict cannot be invalidated under us.
+            let (_, _t) = self.with_shard_w(shard_of(idx), self.ticket(), |shard| {
+                ensure_shard_len(shard, slot);
+                // Written unconditionally, NOT via `resize_with(.., || class)`:
+                // a concurrent allocator's resize must never leave THIS node's
+                // slot holding a foreign class — the class is fixed at
+                // allocation and drives the semantic-purity debug checks and
+                // class-scoped invalidation.
+                shard.classes[slot] = class;
+            });
+        } else {
+            let (_, _t) =
+                self.with_shard_and_grow(shard_of(idx), self.ticket(), |shard, growth| {
+                    self.grow_dirty(idx.0, growth);
+                    ensure_shard_len(shard, slot);
+                    shard.classes[slot] = class;
+                });
+        }
         idx
     }
 
     /// The declared content class of a node, if the node exists.
+    ///
+    /// `DepNodeIndex(0)` is the never-allocated sentinel (the allocation
+    /// counter starts at 1): a class read for it would return whichever
+    /// class the FIRST allocated node (slot 0) happens to carry — the
+    /// classic sentinel-aliasing bug, so make it loud in debug builds.
     pub fn class_of(&self, node: DepNodeIndex) -> Option<ContentClass> {
+        debug_assert_ne!(
+            node.0, DepNodeIndex::ZERO.0,
+            "class_of called with DepNodeIndex::ZERO — index 0 is the \
+             'no node' sentinel and never allocated"
+        );
         let (r, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
             shard.classes.get(slot_of(node)).copied()
         });
@@ -2289,8 +3663,30 @@ impl<S: Scheduler> DepGraph<S> {
     }
 
     /// Record that the current task (top of current thread's stack) read
-    /// another query.  If no task is active, this is a no-op.
+    /// another query.  If no task is active, this is a no-op.  The read's
+    /// "start revision" epoch is captured HERE, at record time — use
+    /// [`Self::read_with_epoch`] when the caller captured the epoch
+    /// EARLIER (the cached-serve path captures it at probe time, before
+    /// the value can become stale: C1).
     pub fn read(&self, other: DepNodeIndex) {
+        self.read_impl(other, None);
+    }
+
+    /// Record a read with a CALLER-CAPTURED epoch.  The epoch must have
+    /// been captured at or before the moment the value was obtained (probe
+    /// time on the cached-serve path).  Using a pre-capture is STRICTLY
+    /// CONSERVATIVE: any bump landing between capture and this call is
+    /// detected by the finish-side re-check and restores the reader red,
+    /// even if the bump did not actually change the value — one extra
+    /// recomputation against a swallowed permanent-stale window (C1: a
+    /// thread preempted between "value received" and the read-edge record
+    /// used to capture the epoch AFTER the mark, compare equal, and
+    /// publish green over the pre-mark value).
+    pub fn read_with_epoch(&self, other: DepNodeIndex, epoch: u64) {
+        self.read_impl(other, Some(epoch));
+    }
+
+    fn read_impl(&self, other: DepNodeIndex, captured: Option<u64>) {
         // One borrow_mut instead of borrow → drop → borrow_mut: halves the
         // RefCell traffic on the hit path, which calls read() per node.
         // Deliberately NOT `try_borrow_mut`: silently skipping the push
@@ -2339,7 +3735,19 @@ impl<S: Scheduler> DepGraph<S> {
             // the node as freshly inserted, so a duplicate read does not pay
             // a TLS snapshot round trip for a value that would be discarded.
             if task.read(other) {
-                task.read_with_epoch(other, self.epoch_of(other));
+                let e = match captured {
+                    Some(e) => e,
+                    None => task.cached_epoch(other).unwrap_or_else(|| {
+                        // First fresh read of this task: take the owned
+                        // snapshot once, then serve every subsequent read
+                        // from it.
+                        let snap = self.epochs_owned();
+                        let e = epoch_from_owned(snap.as_slice(), other);
+                        task.epochs = Some(snap);
+                        e
+                    }),
+                };
+                task.read_with_epoch(other, e);
             }
         });
     }
@@ -2357,6 +3765,12 @@ impl<S: Scheduler> DepGraph<S> {
     /// [`DepGraph::finish_task_and_publish`], which additionally publishes
     /// the fingerprint (or `None` on a panic path) and runs the in-section
     /// colour decision plus the post-flush epoch re-check.
+    ///
+    /// NOTE: this path deliberately discards `read_epochs` — no fingerprint
+    /// is published, so there is no stale-restore to run.  Tests that intend
+    /// to exercise the epoch re-check (d16/d24) must use
+    /// `finish_task_and_publish`; using `finish_task` here means the
+    /// stale-reader detection never fires.
     #[cfg(test)]
     pub fn finish_task(&self) {
         let task = TASK_STACK.with(|s| s.borrow_mut().pop());
@@ -2365,7 +3779,7 @@ impl<S: Scheduler> DepGraph<S> {
         // Diagnostic/test path (no value is published here), so the
         // finish-side stale-restore does not apply; the epochs are still
         // consumed to keep the parallel-vec invariant in one place.
-        let (reads, _read_epochs) = task.into_reads_with_epochs();
+        let (reads, _read_epochs, reads_index) = task.into_reads_with_epochs();
         let mut reads = reads;
 
         // This node's shard: forward edges, RECONCILED to the current
@@ -2374,7 +3788,7 @@ impl<S: Scheduler> DepGraph<S> {
             let tslot = slot_of(task_node);
             let (r, _t) = self.with_shard_w(shard_of(task_node), self.ticket(), |shard| {
                 ensure_shard_len(shard, tslot);
-                reconcile_forward_edges(&mut shard.edges[tslot], &reads)
+                reconcile_forward_edges(&mut shard.edges[tslot], &reads, &reads_index)
             });
             r
         };
@@ -2386,11 +3800,16 @@ impl<S: Scheduler> DepGraph<S> {
         self.prune_rev_edges(task_node, removed);
     }
 
-    /// Remove `task_node` from the reverse-edge lists of `removed` deps —
-    /// the counterpart of [`Self::flush_rev_edges`] for edges the node's
-    /// CURRENT recomputation no longer has.  One lock per shard, grouped,
-    /// never two at once (module invariant); runs after the node-shard
+    /// Remove `task_node` from the reverse edges of `removed` deps — the
+    /// counterpart of [`Self::flush_rev_edges`] for edges the node's
+    /// CURRENT recomputation no longer has. Runs after the node-shard
     /// critical section that produced `removed` has been released.
+    ///
+    /// Log rework (#10): each removed edge is one `Tombstone` push onto the
+    /// read node's shard log — a single `Vec::push` under the log's short
+    /// mutex, NO shard write lock. The tombstone over-marks until the next
+    /// quiesced compaction drains it (sound: `mark_dirty` is idempotent,
+    /// `lower_durability_to` is monotone-downward — see `ShardLog`'s doc).
     fn prune_rev_edges(&self, task_node: DepNodeIndex, mut removed: SmallVec<[DepNodeIndex; 4]>) {
         if removed.is_empty() {
             return;
@@ -2404,31 +3823,21 @@ impl<S: Scheduler> DepGraph<S> {
                 i += 1;
             }
             let group = &removed[start..i];
-            let max_slot = group
-                .iter()
-                .map(|&r| slot_of(r))
-                .max()
-                .expect("group is non-empty");
-            let (_, _t) = self.with_shard_w(s, self.ticket(), |shard| {
-                ensure_shard_len(shard, max_slot);
-                for &r in group {
-                    if let Some(list) = shard.rev_edges.get_mut(slot_of(r)) {
-                        list.retain(|n| *n != task_node);
-                    }
-                }
-            });
+            let log = &self.rev_logs[s];
+            for &r in group {
+                log.push(EdgeOp::Tombstone(r, task_node));
+            }
         }
     }
 
     /// Insert the reverse edges `read → task_node` into the READ nodes'
-    /// shards — one write lock at a time, never two at once (module
-    /// invariant).  Reads are grouped by shard so each shard's lock is
-    /// taken at most once: with the old single global lock one
-    /// acquisition covered all reads; with sharding, acquiring a lock
-    /// per read would multiply the CAS traffic by the read count.
+    /// shard logs — one `Insert` push per read, grouped by shard.  Log
+    /// rework (#10): the critical section is a single `Vec::push` under
+    /// the log's short mutex; NO shard lock is taken anywhere (see
+    /// `rev_logs`' doc for why the log lives outside the shard `RwLock`).
     ///
-    /// Deliberately unordered across shards: every consumer is an
-    /// unordered `HashSet`, so grouping order changes nothing
+    /// Deliberately unordered across shards: every consumer feeds
+    /// idempotent `mark_dirty` marks, so grouping order changes nothing
     /// semantically.
     ///
     /// Takes `reads` by `&mut` (sorted in place) instead of by value: the
@@ -2437,8 +3846,8 @@ impl<S: Scheduler> DepGraph<S> {
     /// any LATER fan-out reaches this task normally.
     fn flush_rev_edges(&self, task_node: DepNodeIndex, reads: &mut SmallVec<[DepNodeIndex; 8]>) {
         // Callers MUST pre-sort `reads` by shard (`sort_reads_by_shard`)
-        // so the grouping below takes each shard's lock exactly once — and
-        // so any parallel epoch vector stays paired (see
+        // so the grouping below touches each shard's log once — and so
+        // any parallel epoch vector stays paired (see
         // `sort_reads_by_shard`).
         #[cfg(debug_assertions)]
         debug_assert!(
@@ -2453,17 +3862,10 @@ impl<S: Scheduler> DepGraph<S> {
                 i += 1;
             }
             let group = &reads[start..i];
-            let max_slot = group
-                .iter()
-                .map(|&r| slot_of(r))
-                .max()
-                .expect("group is non-empty");
-            let (_, _t) = self.with_shard_w(s, self.ticket(), |shard| {
-                ensure_shard_len(shard, max_slot);
-                for &r in group {
-                    edge_insert(&mut shard.rev_edges[slot_of(r)], task_node);
-                }
-            });
+            let log = &self.rev_logs[s];
+            for &r in group {
+                log.push(EdgeOp::Insert(r, task_node));
+            }
         }
     }
 
@@ -2548,13 +3950,18 @@ impl<S: Scheduler> DepGraph<S> {
         // Pop the task stack outside any shard lock: RefCell work must
         // not run while other threads spin on a shard lock.
         let task = TASK_STACK.with(|s| s.borrow_mut().pop());
-        let (task_node, mut reads, mut read_epochs) = match task {
+        let (task_node, mut reads, mut read_epochs, reads_index) = match task {
             Some(t) => {
                 let node = t.current_node;
-                let (reads, epochs) = t.into_reads_with_epochs();
-                (Some(node), reads, epochs)
+                let (reads, epochs, index) = t.into_reads_with_epochs();
+                (Some(node), reads, epochs, index)
             }
-            None => (None, SmallVec::new(), SmallVec::new()),
+            None => (
+                None,
+                SmallVec::new(),
+                SmallVec::new(),
+                ReadsIndex::Empty,
+            ),
         };
 
         // The popped frame MUST belong to `node`: the fused section below
@@ -2570,11 +3977,31 @@ impl<S: Scheduler> DepGraph<S> {
             );
         }
 
+        // Sort reads and their captured epochs TOGETHER (identical
+        // permutation) BEFORE the durability aggregation and the shard
+        // write section.  The order is by SHARD
+        // (`shard_of = idx & 63`), not by block (`block_of = idx >> 12`), so
+        // it does NOT make the epoch lookups walk ascending block indices
+        // — what it buys is that `flush_rev_edges` touches
+        // each shard's log mutex once per group, and the shard-grouped
+        // aggregation keeps the epoch-word reads within one shard's slot
+        // run.  The previous finish stored the forward-edge list in this
+        // same order, so `reconcile_forward_edges`'s memcmp fast path still
+        // hits.  The epoch re-check below stays positional because the
+        // permutation is shared.
+        sort_reads_by_shard(&mut reads, Some(&mut read_epochs));
+
         // ---- validate before mutate (debug) ----
         // The class assertion runs BEFORE the forward-edge reconcile, the
-        // reverse-edge insert, the fingerprint write and the reader
-        // dirtying — a panicking assert must never leave a partially
-        // mutated graph.
+        // reverse-edge insert, the fingerprint write, the reader dirtying,
+        // AND the durability aggregation — `lower_and_propagate` (the
+        // aggregation's propagation tail) CASes epoch words and can
+        // cascade taking shard read locks, so it counts as a mutation
+        // here too: a panicking assert must never leave a partially
+        // mutated graph.  The task-frame pop above necessarily precedes
+        // it (the read set IS the popped frame's), but it is TLS-local
+        // and atomic-in-effect — no graph state is touched before this
+        // point.
         #[cfg(debug_assertions)]
         if let Some(tn) = task_node {
             self.validate_semantic_reads(tn, &reads);
@@ -2592,15 +4019,38 @@ impl<S: Scheduler> DepGraph<S> {
         // marks on the newly-less-durable closure.  Readers whose own
         // finish is still in flight are not in the snapshot; their own
         // aggregation re-reads the levels at THEIR finish, and the
-        // post-flush re-check below covers the residual window.
-        if !reads.is_empty() {
-            // ONE snapshot for the whole pass — and it is the
-            // TLS-cached `epochs_snapshot()`, not a raw `ArcSwap::load`
-            // The promotion buys back the full load +
-            // refcount pair that aggregation #1 used to pay.  The
-            // in-section suspect check below ALREADY uses this form, and
-            // the safety argument is identical (see its comment).
-            let snap = self.epochs_snapshot();
+        // Post-flush re-check below covers the residual window.
+        //
+        // fp: None (the poison-cleanup path — both production callers are
+        // panic unwinds in get_shared_inner) skips aggregation #1, which
+        // exists only to keep the PUBLISHED value's level correct, and a
+        // poisoned node is red regardless: its next successful compute
+        // re-aggregates from its own read set.
+        //
+        // The LATE re-check below still runs on this path and is
+        // load-bearing, not an oversight: a reader of the poisoned node X
+        // can verify BEFORE X's next recompute and still reach X's
+        // surviving `verified_lvl` stamp (only the gen stamp is killed).
+        // Without the late propagation lowering `stored(X)`, a mark on a
+        // newly-less-durable closure node m with `dur(m) < stored(X)`
+        // would never bump `rev[stored(X)]` and the stamp would survive
+        // past m's red bit.  So do NOT "complete" the skip by dropping the
+        // late re-check.  The stated tail-latency benefit of skipping
+        // aggregation #1 is real but partial: `lower_and_propagate`'s
+        // racy pre-check keeps `lowering_lock` cold unless a lowering is
+        // genuinely due.
+        //
+        // The in-section suspect re-check's epoch snapshot is taken
+        // HERE, before the write lock, rather than inside the closure.  The
+        // closure captures it by reference; the soundness argument for
+        // taking it early (the late re-check below is a strict superset and
+        // restores anything this one misses, with `finishing` covering the
+        // whole method) is written at the use site.  The durability
+        // aggregation below REUSES this same snapshot: both
+        // passes read the same epoch words, so one TLS setup serves both.
+        let suspect_epochs = self.epochs_snapshot();
+        if fp.is_some() && !reads.is_empty() {
+            let snap = &suspect_epochs;
             let mut min_dur = Durability::HIGH;
             for &r in reads.iter() {
                 let d = match snap.get(block_of(r.0)) {
@@ -2611,35 +4061,40 @@ impl<S: Scheduler> DepGraph<S> {
                     min_dur = d;
                 }
             }
-            drop(snap);
             self.lower_and_propagate(node, min_dur);
         }
 
         // Stale forward edges dropped by the reconciliation below; the
         // pruning of their reverse edges runs AFTER the critical section
         // releases (the removed deps may live in OTHER shards — never
-        // two shard locks at once).  The third element is the publish-time
-        // fan-out reader list, cloned into a POOLED buffer: an inline
-        // SmallVec heap-allocates once the node has more
-        // than four direct readers — under this very lock, which every
-        // reader's own finish must take) so the marks can run lock-free
-        // outside the section (see the comment at its only writer).
-        // The in-section suspect re-check's epoch snapshot is taken
-        // HERE, before the write lock, rather than inside the closure.  The
-        // closure captures it by reference; the soundness argument for
-        // taking it early (the late re-check below is a strict superset and
-        // restores anything this one misses, with `finishing` covering the
-        // whole method) is written at the use site.
-        let suspect_epochs = self.epochs_snapshot();
-        let (changed_in_section, removed, mut fanout): (
-            bool,
-            SmallVec<[DepNodeIndex; 4]>,
-            FanoutBuf,
-        ) = {
+        // two shard locks at once).  The publish-time fan-out reader list
+        // is collected BEFORE the lock (see below) — no pooled buffer copy
+        // anymore.
+        // The dirty-table twin of `suspect_epochs`: the in-section colour
+        // decision (`mark_dirty_on` / `clear_dirty_on` below) reads it
+        // under the node's shard write lock without paying a TLS probe or
+        // ArcSwap load there.  A stale snapshot is conservative (see
+        // `mark_dirty_on`): an already-red reader early-returns and a
+        // redundant re-set is absorbed by the idempotent RMW.
+        //
+        // Taken only on the publish path (`fp.is_some()`): the colour
+        // decision itself is gated on `fp`, so the panic-cleanup path used
+        // to pay a TLS snapshot probe for a value it never reads.
+        let suspect_dirty = fp.is_some().then(|| self.dirty_snapshot());
+        // Fan-out reader list: collected AFTER the shard write section,
+        // gated on `changed_in_section`.  Collecting before
+        // the section left the window `collect < flush(R) < recheck(R) <
+        // bump(this node)`: R is absent from the list AND R's epoch
+        // re-check ran before the bump, so R stayed green-stale forever.
+        // Collecting after the bump closes it: an R already in the list is
+        // marked; an R that flushes after the collect necessarily
+        // re-checks after its flush, hence after the bump, and restores
+        // itself.  This also skips the collect entirely for unchanged
+        // republishes.
+        let (changed_in_section, removed): (bool, SmallVec<[DepNodeIndex; 4]>) = {
             let (out, _t) = self.with_shard_w(shard_of(node), self.ticket(), |shard| {
                 let slot = slot_of(node);
                 ensure_shard_len(shard, slot);
-                let mut fanout = FanoutBuf::take();
 
                 // ---- finish_task part: forward edges, RECONCILED to the
                 // current read set (stale edges removed — see
@@ -2650,7 +4105,7 @@ impl<S: Scheduler> DepGraph<S> {
                 let removed = if let Some(tn) = task_node {
                     let tslot = slot_of(tn);
                     ensure_shard_len(shard, tslot);
-                    reconcile_forward_edges(&mut shard.edges[tslot], &reads)
+                    reconcile_forward_edges(&mut shard.edges[tslot], &reads, &reads_index)
                 } else {
                     SmallVec::new()
                 };
@@ -2668,8 +4123,10 @@ impl<S: Scheduler> DepGraph<S> {
                     // in the [clear_dirty .. late re-check] window.  The
                     // in-section check is lock-free (one snapshot, then an
                     // atomic load per read) and positionally correct:
-                    // `reads`/`read_epochs` are still the unsorted,
-                    // parallel-by-construction vectors here.
+                    // `reads`/`read_epochs` are already shard-sorted by the sort above;
+                    // the pairing is maintained by the SAME permutation being
+                    // applied to both vectors in lockstep, not by original
+                    // order.
                     //
                     // d24: the residual sub-window [this check .. the
                     // post-flush re-check] is closed by the per-node
@@ -2704,6 +4161,9 @@ impl<S: Scheduler> DepGraph<S> {
                             }) != e
                         })
                     };
+                    let suspect_dirty = suspect_dirty
+                        .as_ref()
+                        .expect("dirty snapshot is taken exactly when fp.is_some()");
                     if suspect {
                         // Keep/put the node red.  The value stays staged in
                         // the cache, but `probe` gates on `is_green`, so it
@@ -2711,9 +4171,17 @@ impl<S: Scheduler> DepGraph<S> {
                         // path (the `Started` entry is still installed until
                         // the completion path in `get_shared` runs, so it
                         // waits, then re-probes and recomputes).
-                        self.mark_dirty(node);
+                        //
+                        // Snapshot-parameterized forms (`suspect_dirty` /
+                        // `suspect_epochs`, hoisted before the section):
+                        // taking fresh snapshots here would re-pay a TLS
+                        // probe + ArcSwap load under THIS node's write lock
+                        // — the same cost the hoisted suspect check above
+                        // exists to avoid, and the same append-only
+                        // validity argument applies.
+                        self.mark_dirty_on(suspect_dirty, &suspect_epochs, node);
                     } else {
-                        self.clear_dirty(node);
+                        self.clear_dirty_on(suspect_dirty, node);
                     }
                     // ─── CONCURRENT FAN-OUT MARK OF THIS NODE ───
                     //
@@ -2764,8 +4232,14 @@ impl<S: Scheduler> DepGraph<S> {
                         // Same unmarked-value-change bump as `publish` (see
                         // there): an in-flight reader's finish re-check is
                         // epoch-based and otherwise blind to value changes
-                        // that arrive without a mark.
-                        self.bump_epoch(node);
+                        // that arrive without a mark.  Uses the hoisted
+                        // `suspect_epochs` (via `bump_epoch_on`, the batch
+                        // path's helper) instead of a fresh
+                        // `bump_epoch` snapshot under the write lock; the
+                        // CAS target word is the same either way — the
+                        // snapshot only decides block presence, and a stale
+                        // snapshot degrades to the conservative LOW arm.
+                        self.bump_epoch_on(&suspect_epochs, node);
                         // Perf item 1: the fan-out is O(readers) x 4–6
                         // atomic RMWs, and it used to run here — under THIS
                         // NODE'S SHARD WRITE LOCK, which every reader's own
@@ -2815,9 +4289,14 @@ impl<S: Scheduler> DepGraph<S> {
                         //    section: moving it out would open a window where
                         //    the new fingerprint is visible but the node's
                         //    epoch is still the old one.
-                        if let Some(readers) = shard.rev_edges.get(slot) {
-                            fanout.fill(readers);
-                        }
+                        //
+                        // The reader list itself is NOT touched here
+                        // anymore: `fanout_readers` was
+                        // collected BEFORE the section, and copying it
+                        // into a pooled buffer under the write lock was a
+                        // vestigial memcpy from the era when collection
+                        // ran in-lock. The marks below consume
+                        // `fanout_readers` directly.
                     }
                     changed
                 } else {
@@ -2837,7 +4316,7 @@ impl<S: Scheduler> DepGraph<S> {
                     // is driven by `read_epochs`, not by `changed`.
                     false
                 };
-                (changed, removed, fanout)
+                (changed, removed)
             });
             out
         };
@@ -2846,28 +4325,40 @@ impl<S: Scheduler> DepGraph<S> {
         // lock-free `mark_dirty` per direct reader of this node.  Same
         // marks, same order as before the deferral (perf item 1).
         //
-        // The binding is a `FilledFanout` newtype, so nothing
-        // mutable is in scope here.  The old shape exposed
-        // `cleared() -> &mut Vec` for the fill side and the consume side
-        // reached for it by mistake — see `FanoutBuf::fill` for the bug
-        // that caused.
-        let fanout = fanout.filled();
-        for r in fanout.iter() {
-            self.mark_dirty(r);
+        // GATED on `changed_in_section`: the old
+        // `FanoutBuf` was filled ONLY inside the `if changed` arm, so an
+        // unchanged-fingerprint republish fanned out to nobody. The
+        // pre-lock `fanout_readers` list is collected whenever `fp` is
+        // present, so feeding it to `mark_dirty_batch` unconditionally
+        // would dirty every reader of every clean republish (g1's exact
+        // contract).
+        //
+        // Batched marks: one snapshot, per-level rev adds, ONE generation
+        // bump for the whole fan-out (see `mark_dirty_batch` — the same
+        // marks, same per-reader epoch/bit work, one linearization).
+        // The reader list is collected HERE, after the section: the epoch
+        // bump ran inside it, so collecting now closes the d16 window
+        // where a reader that flushed after the old pre-lock collect but
+        // re-checked before the bump stayed green-stale.
+        if changed_in_section {
+            self.rev_logs[shard_of(node)]
+                .with_readers(node, |readers| self.mark_dirty_batch(readers.iter().copied()));
         }
 
         // ---- reverse-edge flush for this task's reads: one lock per
         // READ shard ----
         if let Some(tn) = task_node {
-            // Finish window: in-section colour decision taken, rev-edge
-            // flush not yet run — no shard lock is held at this park site.
+            // Finish window: the ENTIRE in-section work has run — the
+            // colour decision is taken AND the deferred fan-out flush
+            // (`mark_dirty_batch` above) has been applied; only the
+            // rev-edge flush is still ahead.  No shard lock is held at
+            // this park site.  (Kept in sync with `SchedulePoint::
+            // FinishWindow`'s doc in scheduler.rs — §0 mandate.)
             self.sched
                 .suspend(SchedulePoint::FinishWindow { node: tn.0 });
-            // Sort reads and their captured epochs TOGETHER (identical
-            // permutation) before the flush — the epoch re-check below is
-            // positional and must compare each node against ITS OWN
-            // start-of-task revision.
-            sort_reads_by_shard(&mut reads, Some(&mut read_epochs));
+            // `reads`/`read_epochs` were already sorted together before
+            // the aggregation/write section, so the flush needs no second
+            // permutation.
             self.flush_rev_edges(tn, &mut reads);
             // Drop the reverse edges of reads this recomputation no
             // longer has (see `reconcile_forward_edges` / g3).
@@ -2909,9 +4400,14 @@ impl<S: Scheduler> DepGraph<S> {
             // safety argument as aggregation #1 above.  `reads` is
             // shard-sorted at this point, so the block index walk is
             // ascending — cache friendly on top of the load savings.  The
-            // snapshot is the TLS-cached `epochs_snapshot()`:
-            // same argument as aggregation #1 above.
-            let snap = self.epochs_snapshot();
+            // snapshot is the SAME `suspect_epochs` taken before the shard write
+            // section: `finish_task_and_publish` runs under the
+            // caller's quiesce read pin, so `clear_all` cannot reset the table
+            // under it and one snapshot serves the aggregation, the in-section
+            // re-check and this late re-check — the previous second
+            // `epochs_snapshot()` here paid a TLS borrow + generation load for
+            // identical data.
+            let snap = &suspect_epochs;
             let mut min_dur = Durability::HIGH;
             let mut suspect = false;
             for (i, &r) in reads.iter().enumerate() {
@@ -2929,7 +4425,6 @@ impl<S: Scheduler> DepGraph<S> {
                     suspect = true;
                 }
             }
-            drop(snap);
             self.lower_and_propagate(tn, min_dur);
             if suspect {
                 self.mark_dirty(tn);
@@ -2989,6 +4484,24 @@ impl<S: Scheduler> DepGraph<S> {
         changed
     }
 
+    /// Read-only twin of [`DepGraph::digest_gate`]: reports whether
+    /// `input_digest` differs from the recorded digest WITHOUT storing it.
+    /// `invalidate_if_changed` uses this so the digest is written only
+    /// inside the (possibly deferred) invalidation closure — otherwise a
+    /// deferred invalidation left the new digest visible and a concurrent
+    /// caller concluded "unchanged" while the invalidation was still
+    /// queued.
+    pub(crate) fn digest_would_change(&self, node: DepNodeIndex, input_digest: u64) -> bool {
+        let slot = slot_of(node);
+        let (changed, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
+            match shard.digests.get(slot).copied().flatten() {
+                Some(old) => old != input_digest,
+                None => true,
+            }
+        });
+        changed
+    }
+
     /// Record `input_digest` for `node` WITHOUT any comparison or
     /// invalidation — the driver-side companion to [`DepGraph::digest_gate`]
     /// for the first iteration, where the node does not exist yet when the
@@ -3014,7 +4527,11 @@ impl<S: Scheduler> DepGraph<S> {
     /// the caller must present `&Quiesced` (minted inside
     /// `mutate_world`/`run_deferred_batch` scope, or via
     /// `assume_for_test` in tests).
-    pub(crate) fn invalidate(&self, node: DepNodeIndex, _q: &Quiesced) {
+    /// The package is a binary (empty lib), so `pub` here does not escape
+    /// the crate: these four mutators are widened from `pub(crate)` so the
+    /// `benches/dep_graph.rs` harness — a separate crate `#[path]`-including
+    /// this file — can drive the red-green machinery directly.
+    pub fn invalidate(&self, node: DepNodeIndex, _q: &Quiesced) {
         // O(1) atomic RMW, seqlock-guarded: invalidators serialise on
         // nothing at all — not even a shard read lock.  (The generation
         // bump lives in `mark_dirty`: every red-bit creator bumps, not
@@ -3022,16 +4539,21 @@ impl<S: Scheduler> DepGraph<S> {
         self.mark_dirty(node);
     }
 
-    pub(crate) fn dirty_readers(&self, node: DepNodeIndex, _q: &Quiesced) {
-        // Read lock, not write: we only read `rev_edges`.  The dirty
-        // marks themselves need no shard lock (seqlock-guarded atomics).
-        let (_, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
-            if let Some(readers) = shard.rev_edges.get(slot_of(node)) {
-                for &r in readers {
-                    self.mark_dirty(r);
-                }
-            }
-        });
+    /// Batch form of [`invalidate`](Self::invalidate).  Same per-node red-bit
+    /// work, but the system-wide effects (generation bump, level counters)
+    /// collapse to one linearization — strictly stronger than N independent
+    /// marks, and N−1 fewer RMWs on the hot counters.
+    pub fn invalidate_many(&self, nodes: &[DepNodeIndex], _q: &Quiesced) {
+        self.mark_dirty_batch(nodes.iter().copied());
+    }
+
+    pub fn dirty_readers(&self, node: DepNodeIndex, _q: &Quiesced) {
+        // Log rework (#10): the reader list comes from the shard log
+        // (index snapshot + short log mutex, released before the marks);
+        // the dirty marks themselves need no shard lock (seqlock-guarded
+        // atomics).
+        self.rev_logs[shard_of(node)]
+            .with_readers(node, |readers| self.mark_dirty_batch(readers.iter().copied()));
     }
 
     /// Like [`DepGraph::dirty_readers`], but marks only the DIRECT
@@ -3044,50 +4566,49 @@ impl<S: Scheduler> DepGraph<S> {
     /// per-query-class split already gives differential invalidation
     /// naturally, so filtering in `publish` would only risk staleness.
     ///
-    /// Two phases, one shard lock at a time (module invariant): first
-    /// snapshot the reader list under the READ node's shard, then filter
-    /// by each reader's declared class under the READER's own shard
-    /// (classes live with their node).  A reader committing its edge
-    /// between the phases is missed — exactly like a reader committing
-    /// after the old single-lock scan.
+    /// Two phases: first collect the reader list via the log (index
+    /// snapshot + short log mutex, no shard lock), then filter by each
+    /// reader's declared class under the READER's own shard (classes live
+    /// with their node).  A reader committing its edge between the phases
+    /// is missed — the same tolerance as before (see `rev_logs`' doc).
     pub(crate) fn dirty_readers_by_class(
         &self,
         node: DepNodeIndex,
         class: ContentClass,
         _q: &Quiesced,
     ) {
-        let mut readers: SmallVec<[DepNodeIndex; 8]> = {
-            let (r, _t) = self.with_shard_r(shard_of(node), self.ticket(), |shard| {
-                shard
-                    .rev_edges
-                    .get(slot_of(node))
-                    .map(|r| r.iter().copied().collect())
-                    .unwrap_or_default()
-            });
-            r
-        };
-        if readers.len() > 1 {
-            readers.sort_by_key(|&r| shard_of(r));
-        }
-        let mut i = 0;
-        while i < readers.len() {
-            let s = shard_of(readers[i]);
-            let start = i;
-            while i < readers.len() && shard_of(readers[i]) == s {
-                i += 1;
+        self.rev_logs[shard_of(node)].with_readers(node, |readers| {
+            if readers.len() > 1 {
+                readers.sort_by_key(|&r| shard_of(r));
             }
-            let (_, _t) = self.with_shard_r(s, self.ticket(), |shard| {
-                for &r in &readers[start..i] {
-                    if shard
-                        .classes
-                        .get(slot_of(r))
-                        .is_some_and(|&c| c.intersects(class))
-                    {
-                        self.mark_dirty(r);
-                    }
+            let mut i = 0;
+            while i < readers.len() {
+                let s = shard_of(readers[i]);
+                let start = i;
+                while i < readers.len() && shard_of(readers[i]) == s {
+                    i += 1;
                 }
-            });
-        }
+                // Filter under the READER's own shard, then batch: one
+                // `mark_dirty_batch` per shard mirrors `dirty_readers`'s
+                // single-linearization publish (one generation bump per
+                // batch, one shared snapshot round-trip) instead of N
+                // per-reader `mark_dirty` calls — same invalidation
+                // semantics, N× fewer linearization points.
+                let (_, _t) = self.with_shard_r(s, self.ticket(), |shard| {
+                    let matching = readers[start..i]
+                        .iter()
+                        .copied()
+                        .filter(|&r| {
+                            shard
+                                .classes
+                                .get(slot_of(r))
+                                .is_some_and(|&c| c.intersects(class))
+                        })
+                        .collect::<SmallVec<[DepNodeIndex; 8]>>();
+                    self.mark_dirty_batch(matching);
+                });
+            }
+        });
     }
 
     /// Publish a freshly computed value in ONE critical section — on the
@@ -3105,8 +4626,19 @@ impl<S: Scheduler> DepGraph<S> {
     /// stale-restore — using it as a finalize path would regress g3 and
     /// d16.  Production finalization MUST go through
     /// [`DepGraph::finish_task_and_publish`].
+    ///
+    /// NOTE: its fan-out runs IN-LOCK (per-reader `mark_dirty` inside the
+    /// shard write section), while production `finish_task_and_publish`
+    /// defers the fan-out outside the lock (`mark_dirty_batch` on a pooled
+    /// `FanoutBuf`).  The fan-out SEMANTICS are identical; the structural
+    /// difference is a perf concern only, which is why tests using
+    /// `publish` must not be read as exercising the deferred fan-out path.
+    /// Log rework (#10): the reader list is collected from the shard log
+    /// BEFORE the write section (never nested under it); the per-reader
+    /// marks inside are lock-free.
     #[cfg(test)]
     pub(crate) fn publish(&self, node: DepNodeIndex, fp: u64, _q: &Quiesced) -> bool {
+        let readers = self.rev_logs[shard_of(node)].collect_readers(node);
         let slot = slot_of(node);
         let (changed, _t) = self.with_shard_w(shard_of(node), self.ticket(), |shard| {
             ensure_shard_len(shard, slot);
@@ -3122,10 +4654,8 @@ impl<S: Scheduler> DepGraph<S> {
                 // no shard lock (lock-free epoch blocks), so calling it under
                 // this write lock breaks no ordering.
                 self.bump_epoch(node);
-                if let Some(readers) = shard.rev_edges.get(slot) {
-                    for &r in readers {
-                        self.mark_dirty(r);
-                    }
+                for r in &readers {
+                    self.mark_dirty(*r);
                 }
             }
             changed
@@ -3133,7 +4663,7 @@ impl<S: Scheduler> DepGraph<S> {
         changed
     }
 
-    pub(crate) fn set_fingerprint(&self, node: DepNodeIndex, fp: u64) {
+    pub fn set_fingerprint(&self, node: DepNodeIndex, fp: u64) {
         let slot = slot_of(node);
         let (_, _t) = self.with_shard_w(shard_of(node), self.ticket(), |shard| {
             ensure_shard_len(shard, slot);
@@ -3165,6 +4695,11 @@ impl<S: Scheduler> DepGraph<S> {
             r.store(0, Ordering::Relaxed);
         }
         self.lowering_epoch.store(0, Ordering::Relaxed);
+        // Restart the global generation at the same value as the freshly
+        // zeroed stamps.  Leaving it at its pre-reset value
+        // made every post-`clear_all` first hit fail `verified_gen >=
+        // current_gen` and pay the seqlock walk until re-stamped.
+        self.dirty_generation.store(0, Ordering::Relaxed);
         // Clear shard by shard — one write lock at a time (the only
         // multi-shard path; ascending order, and never two locks held at
         // once, so no deadlock).  Routed through `with_shard_w` so the
@@ -3182,7 +4717,6 @@ impl<S: Scheduler> DepGraph<S> {
             let (
                 (
                     taken_edges,
-                    taken_rev,
                     taken_fp,
                     taken_classes,
                     taken_digests,
@@ -3191,7 +4725,6 @@ impl<S: Scheduler> DepGraph<S> {
             ) = self.with_shard_w(i, self.ticket(), |sh| {
                 (
                     std::mem::take(&mut sh.edges),
-                    std::mem::take(&mut sh.rev_edges),
                     std::mem::take(&mut sh.fingerprints),
                     std::mem::take(&mut sh.classes),
                     // Digest gate state dies with everything else: a reused node
@@ -3201,7 +4734,11 @@ impl<S: Scheduler> DepGraph<S> {
                     std::mem::take(&mut sh.digests),
                 )
             });
-            drop((taken_edges, taken_rev, taken_fp, taken_classes, taken_digests));
+            drop((taken_edges, taken_fp, taken_classes, taken_digests));
+            // Clear the reverse-edge log + index (log rework #10). `reset`
+            // runs under quiescence, so no reader holds a log guard or an
+            // index snapshot — the clear cannot strand a scan.
+            self.rev_logs[i].reset();
         }
         // Append-only bitmap: swap in a fresh zero bitmap under the
         // growth lock.  A mark racing this reset lands on the replaced
@@ -3259,6 +4796,12 @@ impl<S: Scheduler> DepGraph<S> {
         self.stamps.store(Arc::new(
             (0..STAMP_INIT_BLOCKS).map(|_| zero_stamp_block()).collect(),
         ));
+        // Cover bound tracks the resting tables: the same
+        // resting min as the constructor.
+        self.covered_upto.store(
+            (DIRTY_INIT_BLOCKS.min(EPOCH_INIT_BLOCKS)).min(STAMP_INIT_BLOCKS) as u32,
+            Ordering::Relaxed,
+        );
         // Shared-generation bump AFTER the last store of the sequence —
         // see `table_gen`. All three tables were swapped above, so one bump
         // covers all three and no thread can cache a mixed old/new tuple.
@@ -3277,6 +4820,21 @@ impl<S: Scheduler> DepGraph<S> {
         // stack is already empty.  The clear is belt-and-braces for the
         // calling thread.
         TASK_STACK.with(|s| s.borrow_mut().clear());
+    }
+
+    /// Compact any shard whose reverse-edge log has grown past
+    /// `SHARD_LOG_COMPACT_THRESHOLD`.  Called under quiescence (write
+    /// lock) from `mutate_world` — the ONLY scheduled compaction site.
+    /// Readers cannot be scanning during this call: the quiesce write lock
+    /// excludes every reader (they hold either the `InFlightGuard` read
+    /// pin or `&Quiesced`), so `ShardLog::compact` can safely clear the
+    /// log — the lost-tail race that would otherwise strand inserts.
+    pub(crate) fn compact_rev_edges(&self, _q: &Quiesced) {
+        for shard in &self.rev_logs {
+            if shard.needs_compaction() {
+                shard.compact();
+            }
+        }
     }
 
     /// Test-only view of a node's `verified_gen` stamp.  d9's Window 2
@@ -3340,15 +4898,57 @@ impl<S: Scheduler> DepGraph<S> {
     /// answer there.
     #[inline]
     pub fn is_green(&self, node: DepNodeIndex) -> bool {
+        debug_assert_ne!(
+            node.0, DepNodeIndex::ZERO.0,
+            "is_green called with DepNodeIndex::ZERO — index 0 is the \
+             DefaultCache 'no node' sentinel; block 0 bit 0 would report a \
+             phantom green"
+        );
         self.dirty_snapshot()
             .get(block_of(node.0))
             .is_none_or(|b| b[word_of(node.0)].load(Ordering::Acquire) & mask_of(node.0) == 0)
     }
 
+    /// `is_green` against a CALLER-HELD dirty snapshot: identical
+    /// predicate, but the snapshot's TLS round-trip (`table_gen` Acquire
+    /// + borrow probe) is paid once per walk instead of once per node —
+    /// `verify_inner`'s 10k-node storm walks paid two snapshot
+    /// round-trips per node (`stamps_snapshot` + `is_green`'s
+    /// `dirty_snapshot`).  Holding the snapshot across the walk is sound
+    /// by the tables' own discipline: blocks are `Arc`-stable and
+    /// append-only, every reachable node was allocated before the walk
+    /// began.
+    ///
+    /// A MISSING BLOCK reads green — and that is the conservative
+    /// direction HERE, which is non-obvious.  A missing block means the
+    /// node was allocated after the snapshot (or not yet allocated at
+    /// all).  If such a node were RED, the invariant
+    /// `reader green ⟹ read green` forces the reader that reaches it to
+    /// be red too: a red node's `mark_dirty` fans out to its direct
+    /// readers, so any reader whose rev edge was flushed before the mark
+    /// is marked red itself, and a reader whose rev edge was not yet
+    /// flushed is caught by the finish-side epoch re-check (d16).  So a
+    /// walk that arrives at a missing block from a green reader is either
+    /// looking at a node that cannot be red, or the invariant already
+    /// forced the reader red and the walk would not have started.  Any
+    /// LATER mark bumps `dirty_generation` and invalidates the stamp, so
+    /// a post-snapshot miss cannot hide behind a green verdict forever.
+    /// Do NOT "fix" the missing arm to `false`: post-`reset` walks would
+    /// spuriously recompute everything.  And a future node type that does
+    /// not fan out on mark (e.g. a "constant" eval_always node) would
+    /// silently break the invariant above — it needs its own soundness
+    /// argument first.
+    #[inline]
+    fn is_green_on(snap: &DirtySnap<'_>, node: DepNodeIndex) -> bool {
+        snap.get(block_of(node.0)).is_none_or(|b| {
+            b[word_of(node.0)].load(Ordering::Acquire) & mask_of(node.0) == 0
+        })
+    }
+
     /// Mark a node as re-computed (green again).  Lock-free: the bitmap
     /// RMW is seqlock-guarded against swaps, so no shard lock is needed.
     #[inline]
-    pub(crate) fn mark_green(&self, node: DepNodeIndex, _q: &Quiesced) {
+    pub fn mark_green(&self, node: DepNodeIndex, _q: &Quiesced) {
         self.clear_dirty(node);
     }
 
@@ -3397,9 +4997,12 @@ impl<S: Scheduler> DepGraph<S> {
             .is_some_and(|b| b[stamp_word_of(node.0)].finishing.load(Ordering::Acquire))
     }
 
-    /// Returns the first dirty
-    /// dependency found (if any) so the caller can re-request it.
-    /// Returns `None` if the entire transitive closure is green.
+    /// Returns the first dirty dependency found (if any) so the caller can
+    /// re-request it.  Returns `None` if the entire transitive closure is
+    /// green.  Thin compatibility wrapper over
+    /// [`DepGraph::verify_green_collect_dirty`] — `try_serve_verified_inner`
+    /// uses the collect variant to batch re-requests; this first-dirty form
+    /// remains for tests and single-dep callers.
     ///
     /// Iterative post-order DFS over an explicit heap stack: the old
     /// plain-recursive walk had no visited set and no depth bound, so a
@@ -3416,6 +5019,109 @@ impl<S: Scheduler> DepGraph<S> {
     /// read critical section per branch; the ticket travels with the loop,
     /// and every early return carries the ticket back (ZST, no cost).
     pub fn verify_green_transitive_with_dirty(&self, node: DepNodeIndex) -> Option<DepNodeIndex> {
+        let mut out = SmallVec::new();
+        if self.verify_green_collect_dirty(node, &mut out) {
+            None
+        } else {
+            Some(out[0])
+        }
+    }
+
+    /// Transitive green check collecting EVERY dirty dependency, not just
+    /// the first (see `verify_inner`).  Returns `true` when the entire
+    /// closure is green — and only then are the buffered post-order stamps
+    /// committed.  The batch shape lets the caller re-request all dirty
+    /// deps and run ONE final re-verify, instead of paying a full-closure
+    /// walk per dirty dep after an invalidation storm.
+    /// Lock-free global-generation pre-check for
+    /// [`Self::verify_green_collect_dirty`]'s fast path: does `node`'s
+    /// closure stamp certify the whole closure green at the CURRENT
+    /// generation?
+    ///
+    /// One `dirty_stamps_snapshot` (the same single-TLS-probe pair
+    /// `verify_inner` uses) plus four Acquire loads — no `StampBuf`, no
+    /// walk state, no `lowering_epoch` samples.  A `true` verdict is
+    /// lowering-safe by construction (see the call-site comment): a stamp
+    /// can only be current if no mark has linearized since it was written,
+    /// and lowerings never mark.  A `false` verdict is advisory — the
+    /// caller falls through to the full seqlock walk.
+    fn is_globally_verified(&self, node: DepNodeIndex) -> bool {
+        let current_gen = self.dirty_generation.load(Ordering::Acquire);
+        let (dirty_snap, stamps_all) = self.dirty_stamps_snapshot();
+        let slot = stamps_all
+            .get(block_of(node.0))
+            .map(|b| &b[stamp_word_of(node.0)]);
+        // d24 read order: `finishing` FIRST — a node whose finish tail is
+        // in flight must never be fast-pathed, its colour is not final.
+        if slot.is_some_and(|s| s.finishing.load(Ordering::Acquire)) {
+            return false;
+        }
+        if slot.map_or(0, |s| s.verified_gen.load(Ordering::Acquire)) < current_gen {
+            return false;
+        }
+        // Ground truth: the node's own red bit.  A current stamp should
+        // imply green (the stamp was written post-order over a fully
+        // verified subtree, and any later mark would have bumped the
+        // generation) — this load is belt-and-braces that keeps this
+        // path's contract byte-identical to `verify_inner`'s first
+        // per-node check.
+        Self::is_green_on(&dirty_snap, node)
+    }
+
+    pub fn verify_green_collect_dirty(
+        &self,
+        node: DepNodeIndex,
+        dirty_out: &mut SmallVec<[DepNodeIndex; 8]>,
+    ) -> bool {
+        self.verify_green_impl(node, Some(dirty_out))
+    }
+
+    /// Verdict-only variant used for the second (post-re-request) walk:
+    /// same global fast path and seqlock, but dirty deps are counted, not
+    /// collected — the caller only needs "green or not".
+    pub fn verify_green_only(&self, node: DepNodeIndex) -> bool {
+        self.verify_green_impl(node, None)
+    }
+
+    fn verify_green_impl(
+        &self,
+        node: DepNodeIndex,
+        mut dirty_out: Option<&mut SmallVec<[DepNodeIndex; 8]>>,
+    ) -> bool {
+        // The contract is "green means no dirty deps", so a reused buffer must
+        // not retain entries from a previous call.  Clear it here, *before*
+        // the global fast path below can return without touching it.
+        if let Some(d) = dirty_out.as_deref_mut() {
+            d.clear();
+        }
+        // ── Global-generation fast path (BEFORE the seqlock) ──────────
+        // A node whose closure stamp is current does not need the
+        // durability seqlock at all: `verified_gen >= current_gen` means
+        // NO mark has occurred since the stamp (every 0→1 mark bumps
+        // `dirty_generation` — see `mark_dirty`), and lowerings never
+        // mark, so the closure cannot contain a red bit regardless of
+        // level state.  The seqlock exists to seal the per-LEVEL verdicts
+        // against mid-repair cascades; this verdict rests only on the
+        // generation, which an in-flight lowering does not touch.  The
+        // common fully-green hit therefore skips `StampBuf` take/return,
+        // the `verify_inner` call and both `lowering_epoch` samples.
+        //
+        // Read order matches `verify_inner`'s root fast path exactly and
+        // is load-bearing for the same reason: `finishing` FIRST (a
+        // finishing node is not verifiable, d24), then `verified_gen`,
+        // then the node's own red bit as ground truth (belt-and-braces —
+        // a stamp can never legitimately coexist with a red bit, but the
+        // check costs one load and keeps this path's contract identical
+        // to the walk's first per-node check).
+        //
+        // The `VerifyWindow` suspension is kept so scheduler-driven test
+        // choreography observes the same park point it always did.
+        if self.is_globally_verified(node) {
+            self.sched
+                .suspend(SchedulePoint::VerifyWindow { node: node.0 });
+            return true;
+        }
+
         // ── Lowering seqlock (durability propagation) ────────────────
         // A durability lowering (`lower_and_propagate`) writes per-node
         // level bits via lock-free CAS and then cascades along the
@@ -3470,9 +5176,14 @@ impl<S: Scheduler> DepGraph<S> {
         // `Vec` per attempt.  `Drop` returns it to TLS on every exit path.
         let mut buf = StampBuf::take();
         for _ in 0..VERIFY_SEQLOCK_RETRIES {
+            // Fresh collect buffer per attempt: a discarded (overlapped)
+            // attempt's dirty deps must not leak into the verdict.
+            if let Some(d) = dirty_out.as_deref_mut() {
+                d.clear();
+            }
             let s1 = self.lowering_epoch.load(Ordering::Acquire);
             let stamps = buf.cleared();
-            let verdict = self.verify_inner(node, true, stamps);
+            let clean = self.verify_inner(node, true, stamps, dirty_out.as_deref_mut());
             self.sched
                 .suspend(SchedulePoint::VerifyWindow { node: node.0 });
             let s2 = self.lowering_epoch.load(Ordering::Acquire);
@@ -3484,10 +5195,14 @@ impl<S: Scheduler> DepGraph<S> {
                 // window is stable and the verdict seals).
                 continue;
             }
-            if verdict.is_none() {
+            // Stamps commit ONLY on a fully-green walk: with dirty deps
+            // recorded, exit frames above them ran but their subtrees are
+            // NOT verified (see `verify_inner`'s collect-all note).
+            if clean {
                 self.flush_stamps(stamps);
+                return true;
             }
-            return verdict;
+            return false;
         }
         // Pathological fallback: lowerings kept overlapping every retry
         // (effectively unreachable — see `VERIFY_SEQLOCK_RETRIES`).  A
@@ -3497,30 +5212,87 @@ impl<S: Scheduler> DepGraph<S> {
         // lowering-safe (see above).  No seqlock seal is needed here:
         // without the level shortcuts the walk reads actual colours, and
         // a recompute verdict is conservative under any interleaving.
-        let stamps = buf.cleared();
-        let verdict = self.verify_inner(node, false, stamps);
-        if verdict.is_none() {
-            self.flush_stamps(stamps);
+        if let Some(d) = dirty_out.as_deref_mut() {
+            d.clear();
         }
-        verdict
+        let stamps = buf.cleared();
+        let clean = self.verify_inner(node, false, stamps, dirty_out.as_deref_mut());
+        if clean {
+            self.flush_stamps(stamps);
+            return true;
+        }
+        false
     }
 
     /// The verification walk proper: root fast paths + iterative
-    /// post-order DFS, factored out of
-    /// [`DepGraph::verify_green_transitive_with_dirty`] so the seqlock
-    /// retry loop can re-run it.  `allow_durability_fast_path` gates ONLY
-    /// the per-LEVEL shortcuts (root and interior) — the generation
+    /// post-order DFS, factored out of [`DepGraph::verify_green_collect_dirty`]
+    /// so the seqlock retry loop can re-run it.  `allow_durability_fast_path`
+    /// gates ONLY the per-LEVEL shortcuts (root and interior) — the generation
     /// shortcuts are lowering-safe and stay on in both modes.  Exit
     /// frames push into `stamps` instead of writing the shards directly;
     /// [`DepGraph::flush_stamps`] commits them after the seqlock window
     /// closes.
+    ///
+    /// COLLECT-ALL-DIRTY: every dirty dependency found is appended to
+    /// `dirty_out` and the walk CONTINUES (a dirty node is recorded once —
+    /// the visited set stops later paths from re-recording it), instead of
+    /// the old first-dirty early abort.  This turns `d` dirty deps from
+    /// `d` full-closure walks (caller re-requests → re-walks) into ONE walk
+    /// + one batch re-request + one final re-verify.  When `dirty_out` is
+    /// non-empty the caller must NOT flush `stamps`: exit frames above a
+    /// recorded dirty node still ran, but their subtree is NOT verified —
+    /// the buffer is discarded wholesale (pure subtrees lose their stamps,
+    /// the conservative direction: a storm is recomputing anyway).
+    #[allow(unused_assignments)] // `dirty_seen` is not read on the early-return arms
     fn verify_inner(
         &self,
         node: DepNodeIndex,
         allow_durability_fast_path: bool,
         stamps: &mut Vec<PendingStamp>,
-    ) -> Option<DepNodeIndex> {
+        mut dirty_out: Option<&mut SmallVec<[DepNodeIndex; 8]>>,
+    ) -> bool {
+        let mut dirty_seen = false;
+        // Record a dirty dep, or (no-collect mode) just remember that one
+        // was seen.  The second re-verify after re-requests only needs the
+        // verdict, so skipping the buffer writes is free.
+        macro_rules! mark_dirty {
+            ($n:expr) => {{
+                dirty_seen = true;
+                if let Some(out) = dirty_out.as_mut() {
+                    out.push($n);
+                } else {
+                    // No-collect mode (`verify_green_only`): the verdict is
+                    // already decided and the stamps are discarded, so
+                    // expanding the rest of the closure is pure waste.
+                    return false;
+                }
+            }};
+        }
         let current_gen = self.dirty_generation.load(Ordering::Acquire);
+        // F1 (soundness): sample the per-level mark counters ONCE at walk
+        // start and use this sample for every emitted stamp.  Sampling
+        // `rev[l]` at *commit* time (the old emit loop) let any mark landing
+        // in `[evidence .. flush_stamps]` — a window that includes the
+        // arbitrarily long `VerifyWindow` suspend — be absorbed into the
+        // stamp instead of killing it: a later verifier could then re-certify
+        // over a value computed from the pre-edit node.  Any mark after this
+        // sample pushes `rev[l]` above `rev_ws[l]` and fails the durability
+        // check; marks before it are reflected in the sample.  (The root
+        // re-certification inside the fast path keeps using the *checked*
+        // `vl`, which is equally sound and more permissive.)
+        let rev_ws: [u64; Durability::LEVELS] =
+            std::array::from_fn(|i| self.rev[i].load(Ordering::Acquire));
+
+        // ONE batched dirty + stamps snapshot for the WHOLE walk (#6 of the
+        // perf pass; perf): the loop body used to pay `is_green`'s and the
+        // stamp checks' TLS round-trips per node; the tables' own discipline
+        // (Arc-stable append-only blocks, `table_gen`-certified all-or-nothing
+        // refresh, reachable nodes allocated pre-walk) makes the held
+        // snapshot equivalent — see `is_green_on`.  One `table_gen` load and
+        // one TLS slot fetch now serve both snapshots (`dirty_stamps_snapshot`);
+        // the seqlock retry loop re-hoists per attempt.  The epochs snapshot
+        // stays lazy below — the dominant verify touches no epoch word.
+        let (dirty_snap, stamps_all) = self.dirty_stamps_snapshot();
 
         // Root fast paths, BEFORE the walk state is built.  Every
         // steady-state cached hit runs this function, and the vast
@@ -3529,8 +5301,9 @@ impl<S: Scheduler> DepGraph<S> {
         // allocator round-trips per hit.  Ordering matches the walk's own
         // per-node checks exactly: the red bit is ground truth (checked
         // first), the stamp only skips the subtree walk.
-        if !self.is_green(node) {
-            return Some(node);
+        if !Self::is_green_on(&dirty_snap, node) {
+            mark_dirty!(node);
+            return false;
         }
         // (3.2) Lazily-hoisted epochs snapshot for EVERY durability read
         // of this walk: the root fast path, the interior per-level fast
@@ -3547,6 +5320,17 @@ impl<S: Scheduler> DepGraph<S> {
         // level read now linearizes at snapshot time, still inside the
         // sealed s1..s2 window.
         let mut epochs: Option<EpochSnap<'_>> = None;
+        // Lazy snapshot: taken on first `dur_of` use so the dominant hit
+        // (root `verified_gen`) touches no epoch word.  Borrow safety with
+        // the walk's reentrancy: `get_or_insert_with` re-borrows the
+        // `Option` on each call, and the `Ref` inside an `EpochSnap::Cached`
+        // is dropped at the end of the SAME `dur_of` invocation — nothing
+        // escapes into the walk's state — so a later `dur_of` call simply
+        // re-borrows the already-taken snapshot.  (A parallel-vec epoch
+        // capture like `finish_task_and_publish`'s forbids a nested refill;
+        // this closure makes no such demand.)  The seqlock window
+        // (`s1..s2`) brackets every access, so all epoch reads inside one
+        // attempt linearize consistently.
         let mut dur_of = |n: DepNodeIndex| -> Durability {
             let snap = epochs.get_or_insert_with(|| self.epochs_snapshot());
             snap.get(block_of(n.0)).map_or(Durability::LOW, |b| {
@@ -3554,8 +5338,7 @@ impl<S: Scheduler> DepGraph<S> {
             })
         };
         {
-            let snap = self.stamps_snapshot();
-            let slot = snap
+            let slot = stamps_all
                 .get(block_of(node.0))
                 .map(|b| &b[stamp_word_of(node.0)]);
             // NEW (d24): a finish tail in flight — the colour is not final
@@ -3565,10 +5348,11 @@ impl<S: Scheduler> DepGraph<S> {
             // (append-only table), so these are three lock-free Acquire
             // loads; the read order is load-bearing.
             if slot.is_some_and(|s| s.finishing.load(Ordering::Acquire)) {
-                return Some(node);
+                mark_dirty!(node);
+                return false;
             }
             if slot.map_or(0, |s| s.verified_gen.load(Ordering::Acquire)) >= current_gen {
-                return None;
+                return true;
             }
             // Durability fast path (structural soundness — see
             // `Durability`): the closure was verified at per-level stamp
@@ -3585,7 +5369,18 @@ impl<S: Scheduler> DepGraph<S> {
             if allow_durability_fast_path {
                 let vl = slot.map_or(0, |s| s.verified_lvl.load(Ordering::Acquire));
                 if vl >= self.rev[dur_of(node) as usize].load(Ordering::Acquire) {
-                    return None;
+                    // Re-certify at the CURRENT generation.
+                    // The level stamp proves the closure is unaffected by
+                    // the lower-durability marks that bumped
+                    // `dirty_generation`, so promoting `verified_gen` here
+                    // restores the O(1) global fast path instead of making
+                    // every subsequent hit walk to this same check.
+                    stamps.push(PendingStamp {
+                        node,
+                        generation: current_gen,
+                        lvl: vl,
+                    });
+                    return true;
                 }
             }
         }
@@ -3597,128 +5392,200 @@ impl<S: Scheduler> DepGraph<S> {
         // see `StampSlot` for why the three words need not be packed.
         //
         // Walk state is TLS-pooled across traversals instead of
-        // reallocated per walk.  `(node, exiting)` frames: `false` = enter,
-        // `true` = all deps
-        // verified, stamp post-order.
+        // reallocated per walk.
+        //
+        // TWO-PHASE BFS, SHARD-GROUPED: the old DFS took
+        // one shard read lock PER NODE whose fast paths missed. A wide
+        // closure scattered across all 64 shards paid up to 64 lock
+        // acquisitions per level where a shard-grouped expansion pays one
+        // per DISTINCT shard that level touches. The post-order DFS
+        // stamps are replaced by two-phase collect-then-stamp: equivalent
+        // because (a) `flush_stamps` writes all buffered stamps in one
+        // loop with independent `Release` stores (`verified_gen`/
+        // `verified_lvl` are independent certificates — see `StampSlot`),
+        // and (b) the caller discards the whole buffer whenever
+        // `dirty_out` is non-empty, so per-node exit ordering carried no
+        // verdict weight.  `dirty_out` order becomes BFS order; the
+        // collect-all contract ("every dirty dep") is order-free, and
+        // `try_serve_verified_inner` re-requests each dirty dep
+        // independently before one final full re-verify.
         let mut scratch = VerifyScratch::take();
         let visited = &mut scratch.visited;
-        let stack = &mut scratch.stack;
-        stack.push((node, false));
-        while let Some((n, exiting)) = stack.pop() {
-            if exiting {
-                // All green: stamp this node with the current generation
-                // AND the per-level mark counter for its durability — the
-                // durability fast path's valid_rev.  BUFFERED (see the
-                // seqlock loop in
-                // `verify_green_transitive_with_dirty`): the pair is
-                // committed by `flush_stamps` only after the seqlock
-                // window closes, so no stamp enshrines a verdict computed
-                // inside an unstable window — deliberate conservatism,
-                // not a soundness requirement (the correction argument
-                // for deleting the buffer lives in that loop's comment).
+
+        // Nodes whose fast paths missed.  Collected separately from
+        // `stamps` so a dirty walk emits nothing (matches the DFS
+        // per-exit gate, minus the wasted `PendingStamp` constructions).
+        let to_stamp = &mut scratch.to_stamp;
+        to_stamp.push(node);
+        // The root is the only node not deduped at push time (it enters
+        // the walk without a parent's expansion loop).
+        visited.insert(node);
+
+        // Expand the root's edges into level 1 — one shard read lock,
+        // same acquisition count as the DFS's first node.
+        // The ping-pong level pair is swapped BY VALUE each round (two
+        // simultaneous `&mut scratch.level[..]` would alias — E0499);
+        // each iteration owns one full buffer and hands it back cleared
+        // on the next round.
+        let mut current = std::mem::take(&mut scratch.level[0]);
+        {
+            let (guard, tkt) = self.take_shard_r(shard_of(node), self.ticket());
+            let shard = &*guard;
+            if let Some(edges) = shard.edges.get(slot_of(node)) {
+                for &dep in edges.iter() {
+                    // Push-time dedup: first arrival wins.
+                    if visited.insert(dep) {
+                        current.push(dep);
+                    }
+                }
+            }
+            let _ = tkt.release_shard_r(guard);
+        }
+        // Hoisted out of the level loop: rebuilding
+        // 64 SmallVecs on EVERY BFS level was pure stack traffic, dominant
+        // on deep single-node chains.  `touched` lets a level clear only
+        // the shards it used.
+        const _: () = assert!(DEP_SHARDS == u64::BITS as usize);
+        let shards_to_expand = &mut scratch.shards_to_expand;
+        let mut touched: u64 = 0;
+        while !current.is_empty() {
+            let mut next = std::mem::take(&mut scratch.level[1]);
+            // The taken buffer holds whatever the previous round left in
+            // the scratch slot (the old level's nodes) — clear it before
+            // pushing, or stale nodes would ride along.
+            next.clear();
+            // Phase A — fast-path checks, no locks.  First visit is
+            // guaranteed by push-time dedup, so no `visited` re-check
+            // runs here: the check runs exactly once per node, on its
+            // sole arrival ("green by first visit" survives the DFS→BFS
+            // move unchanged).
+            for &n in current.iter() {
+                // The node itself must be green — checked BEFORE the
+                // stamp fast path.  The stamp is an optimistic summary
+                // written under a generation snapshot that this walk's
+                // `dirty_generation` load can legitimately miss (no
+                // happens-before edge from the marking thread to this
+                // walk), so a "current" stamp must never override the
+                // node's own red bit.  Linearization: a walk that loads
+                // the generation before a mark's bump overlaps the mark
+                // and linearizes before it — its verdict is validly
+                // stale and rejected by the next reader that loads the
+                // bumped generation.
+                if !Self::is_green_on(&dirty_snap, n) {
+                    mark_dirty!(n);
+                    continue;
+                }
+                let sslot = stamps_all
+                    .get(block_of(n.0))
+                    .map(|b| &b[stamp_word_of(n.0)]);
+                // d24: finishing nodes are not verifiable — treat as
+                // dirty (read order finishing → gen → lvl, load-bearing).
+                if sslot.is_some_and(|s| s.finishing.load(Ordering::Acquire)) {
+                    mark_dirty!(n);
+                    continue;
+                }
+                // Fast path: the CLOSURE was already verified at this
+                // generation — do NOT expand, do NOT re-stamp.
+                if sslot.map_or(0, |s| s.verified_gen.load(Ordering::Acquire)) >= current_gen {
+                    continue;
+                }
+                // Per-level durability fast path — same structural
+                // contract as the root check above.
+                if allow_durability_fast_path {
+                    let vl = sslot.map_or(0, |s| s.verified_lvl.load(Ordering::Acquire));
+                    if vl >= self.rev[dur_of(n) as usize].load(Ordering::Acquire) {
+                        // Same re-certification as the root path: the node
+                        // was not expanded because its level stamp proves
+                        // its subtree unaffected, so stamp it at the
+                        // current generation.
+                        to_stamp.push(n);
+                        continue;
+                    }
+                }
+                // Fast paths missed: needs expansion; needs a fresh
+                // stamp iff the closure stays clean.
+                to_stamp.push(n);
+                let s = shard_of(n);
+                if shards_to_expand[s].is_empty() {
+                    touched |= 1u64 << s;
+                }
+                shards_to_expand[s].push(n);
+            }
+            // Phase B — expand: ONE shard read lock per DISTINCT shard
+            // this level touches, held across every node the shard owns
+            // (the same shape `flush_rev_edges` uses on the write side).
+            let mut bits = touched;
+            while bits != 0 {
+                let s = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let group = &shards_to_expand[s];
+                let (guard, tkt) = self.take_shard_r(s, self.ticket());
+                let shard = &*guard;
+                for &n in group.iter() {
+                    if let Some(edges) = shard.edges.get(slot_of(n)) {
+                        for &dep in edges.iter() {
+                            // Push-time dedup: later arrivals (from other
+                            // parents in this level, or already-seen
+                            // ancestors) are dropped here.
+                            if visited.insert(dep) {
+                                next.push(dep);
+                            }
+                        }
+                    }
+                }
+                let _ = tkt.release_shard_r(guard);
+            }
+            // Clear only the shards this level used; capacity is retained
+            // for the next level.
+            let mut bits = touched;
+            while bits != 0 {
+                let s = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                shards_to_expand[s].clear();
+            }
+            touched = 0;
+            // Ping-pong: `next` becomes `current`; the consumed old-level
+            // buffer (its nodes all processed above) goes back into the
+            // scratch slot.  Its stale contents are cleared on the next
+            // round's `take` (see the clear above).
+            let consumed = std::mem::replace(&mut next, Vec::new());
+            scratch.level[1] = current;
+            current = consumed;
+        }
+        // Walk over: return both level buffers to the scratch for the
+        // Drop to pool (cap-checked, cleared there).
+        scratch.level[0] = current;
+
+        // Emit stamps iff the closure is clean.  Matches the DFS gate's
+        // caller-visible behavior: when any dirty dep exists, the whole
+        // buffer is discarded by the caller, so constructing
+        // `PendingStamp`s in that case is pure waste.  Reading
+        // `rev[dur_of(n)]` here is safe: the seqlock (`s1`/`s2` around
+        // `verify_inner`) retries the whole walk if `lowering_epoch`
+        // moved, so every read inside this window linearizes
+        // consistently.
+        if !dirty_seen {
+            // Take the epoch snapshot ONCE for the whole emit loop
+            //: `dur_of` re-borrowed the `Option`/`Ref` per
+            // stamped node.
+            let dur_snap = epochs.get_or_insert_with(|| self.epochs_snapshot());
+            let mut lvls: SmallVec<[usize; 16]> = SmallVec::new();
+            lvls.reserve(to_stamp.len());
+            for &n in to_stamp.iter() {
+                let d = dur_snap.get(block_of(n.0)).map_or(Durability::LOW, |b| {
+                    word_dur(b[epoch_word_of(n.0)].load(Ordering::Acquire))
+                });
+                lvls.push(d as usize);
+            }
+            for (&n, &l) in to_stamp.iter().zip(lvls.iter()) {
                 stamps.push(PendingStamp {
                     node: n,
                     generation: current_gen,
-                    lvl: self.rev[dur_of(n) as usize].load(Ordering::Acquire),
+                    lvl: rev_ws[l],
                 });
-                continue;
             }
-            // Visited on this walk (another path, sibling dedup, or a
-            // cycle back-edge): green by the first visit.
-            if !visited.insert(n) {
-                continue;
-            }
-            // The node itself must be green — checked BEFORE the stamp fast
-            // path.  The stamp is an optimistic summary written under a
-            // generation snapshot that this walk's `dirty_generation` load
-            // can legitimately miss (there is no happens-before edge from
-            // the marking thread to this walk), so a "current" stamp must
-            // never override the node's own red bit.  One lock-free atomic
-            // load; the O(1) subtree skip below (the actual win) is
-            // retained.
-            //
-            // Linearization note (see `mark_dirty`): a walk that loads the
-            // generation before a mark's bump overlaps the marking
-            // operation and linearizes before it — its all-green verdict
-            // (and every stamp it writes at the stale generation) is then
-            // validly stale and rejected by any future reader that loads
-            // the bumped generation.  The mark's linearization point is
-            // its generation bump, not its bit-set.
-            if !self.is_green(n) {
-                return Some(n);
-            }
-            // Lock-free stamp checks.  The stable append-only slot makes
-            // these plain Acquire loads; the read order is load-bearing
-            // (`finishing` FIRST: a finishing node must never be
-            // fast-pathed on a stamp), exactly as on the root path above.
-            let stamp_snap = self.stamps_snapshot();
-            let sslot = stamp_snap
-                .get(block_of(n.0))
-                .map(|b| &b[stamp_word_of(n.0)]);
-            // NEW (d24): finishing nodes are not verifiable — treat as
-            // dirty.  Returning (instead of `continue`) also guarantees
-            // the node is never exit-stamped while its colour is still
-            // unfinalized.
-            if sslot.is_some_and(|s| s.finishing.load(Ordering::Acquire)) {
-                return Some(n);
-            }
-            // Fast path: the CLOSURE was already verified at this
-            // generation, so skip re-walking its edges.
-            if sslot.map_or(0, |s| s.verified_gen.load(Ordering::Acquire)) >= current_gen {
-                continue;
-            }
-            // Per-level durability fast path for interior nodes — same
-            // structural contract as the root check above: skips the
-            // subtree walk when no mark of this node's durability or
-            // higher has linearized since its stamp.  Defaults keep every
-            // existing query on the global check; the seqlock-fallback
-            // walk disables it.
-            if allow_durability_fast_path {
-                let vl = sslot.map_or(0, |s| s.verified_lvl.load(Ordering::Acquire));
-                if vl >= self.rev[dur_of(n) as usize].load(Ordering::Acquire) {
-                    continue;
-                }
-            }
-            // The shard read lock below covers ONLY the dependency-edge
-            // fetch; the stamp checks above are lock-free.  It is held in
-            // the open (not lent to a `with_shard_r` closure) so it
-            // outlives the edge walk below.  The slow path iterates the
-            // edge list IN PLACE under the guard — no `SmallVec` clone,
-            // hence no allocation under the lock (the old `.cloned()`
-            // heap-allocated for edge sets wider than the inline four).
-            // Releasing explicitly on every exit path is the same ticket
-            // hand-off `with_shard_r` performs internally; the ticket is a
-            // fresh `Held<Idle>` per node, so no state threads across
-            // iterations.  Still strictly read-only: the shard's write
-            // lock stays exclusive to the exit frame's post-order stamp
-            // and to structural mutation.
-            //
-            // Widening note: the guard also covers the local
-            // `stack.push`es.  They touch no shard (no nested lock, so no
-            // deadlock cycle).  The per-edge work is the same work the old
-            // code did — it just moves from after the lock to under it —
-            // but the `SmallVec` allocation, and its malloc/free under the
-            // shard lock, is gone.
-            let (guard, tkt) = self.take_shard_r(shard_of(n), self.ticket());
-            let shard = &*guard;
-            let slot = slot_of(n);
-            // Both fast paths missed: defer the stamp until every
-            // dependency has verified, then enter all direct dependencies
-            // (reversed so LIFO pops them in declaration order — keeps the
-            // "first dirty found" stable with the old recursive walk),
-            // reading this node's CURRENT edge set in place.  Pushing the
-            // exit frame before the dep frames is immaterial: it sits
-            // below them on the LIFO stack either way, and an early
-            // `Some(dirty)` abort discards it exactly as before.
-            stack.push((n, true));
-            if let Some(edges) = shard.edges.get(slot) {
-                for &dep in edges.iter().rev() {
-                    stack.push((dep, false));
-                }
-            }
-            let _ = ticket::release_shard_r(guard, tkt);
         }
-        None
+        !dirty_seen
     }
 
     /// Commit the buffered post-order stamps of a completed,
@@ -3776,6 +5643,126 @@ mod tests {
         dg.read(c);
         dg.finish_task();
         (a, b, c)
+    }
+
+    /// Consecutive `DepNodeIndex` values — the allocation shape this
+    /// table exists to dedup — must spread across the table.  The
+    /// original constant was `0x9E3_79B9` (one hex digit short of the
+    /// 32-bit golden ratio): `K >> 26 ≈ 2` collapsed the spread to 2–3
+    /// slots apart, so a task reading a contiguous run of freshly
+    /// allocated nodes filled the table in near-linear order and linear
+    /// probing degraded toward O(k) per insert — reviving the O(k²)
+    /// cliff this table removed.  There was no test on `probe_start`,
+    /// which is why the typo survived.
+    ///
+    /// The pinned bound is MEASURED, not aspirational: the first 64
+    /// multiples of the golden ratio hit 55 of 64 top-six-bit buckets
+    /// (a three-distance-theorem artifact — they do not biject onto the
+    /// 64 buckets; the gap multiset is φ⁻⁸×24, φ⁻⁹×31, φ⁻¹⁰×10), while
+    /// the typo'd constant hit only 37 with adjacent clustering.  52
+    /// sits well clear of both.  The full proof — why 1/φ maximizes
+    /// `min ||q·alpha||`, the exact occupancy ledger (9 empty / 9 double
+    /// buckets), the stability wall 2215/3584, and the alpha_2 = 37
+    /// counterexample — lives in `research/fibonacci-occupancy/scripts/golden_ratio_occupancy.py`,
+    /// whose every claim is proven in integer arithmetic, not sampled.
+    #[test]
+    fn dedup_probe_start_spreads_consecutive_indices() {
+        let mut seen = [false; LINEAR_DEDUP_MAX];
+        for i in 1..=LINEAR_DEDUP_MAX as u32 {
+            seen[DedupTable::probe_start(DepNodeIndex(i))] = true;
+        }
+        let distinct = seen.iter().filter(|&&s| s).count();
+        assert_eq!(
+            distinct, 55,
+            "consecutive DepNodeIndex values must spread to exactly 55/64 slots \
+             under 0x9E37_79B9.  This is a theorem, not a measurement: the \
+             constant sits 1.2e-10 from 1/phi, far inside the proven pattern \
+             radius 9.4e-6, so its full bucket assignment equals the golden \
+             one and Occ(64,64) = 55 (derivations.md §3.2; \
+             research/fibonacci-occupancy/scripts/golden_ratio_occupancy.py::check_q3 asserts it exactly). \
+             The 0x09E379B9 typo collapses to 37/64.  Got {distinct}/64"
+        );
+    }
+
+    /// Wide-closure regression guard for the BFS verify walk
+    /// §4.2): a root with 128 direct leaves (past the inline `SmallVec`
+    /// capacity, spread over many shards) whose closure is verified,
+    /// partially invalidated, collected, re-requested (re-published) and
+    /// re-verified.  Pins, as SETS (never sorted — the contract is
+    /// "every dirty dep", not an order):
+    ///   1. a clean wide closure verifies green in one pass;
+    ///   2. the collect reports EXACTLY the marked subset — no dropped
+    ///      node (shard-grouping bug between group construction and
+    ///      expansion), no spurious extra (stale `visited` reuse from
+    ///      the TLS pool);
+    ///   3. after every dirty leaf republishes with an UNCHANGED
+    ///      fingerprint, the final re-verify passes and re-stamps.
+    #[test]
+    fn verify_wide_closure_reports_every_dirty_dep_before_restamp() {
+        let dg = DepGraph::new(Arc::new(NoOpScheduler));
+        const N: usize = 128;
+        // N leaves, each published with its own fingerprint.
+        let mut leaves = Vec::with_capacity(N);
+        for i in 0..N {
+            let l = dg.allocate_node_index(ContentClass::SEMANTIC);
+            dg.start_task(l);
+            dg.finish_task();
+            dg.finish_task_and_publish(l, Some(i as u64));
+            leaves.push(l);
+        }
+        // Root reads all of them in one task, then publishes.
+        let root = dg.allocate_node_index(ContentClass::SEMANTIC);
+        dg.start_task(root);
+        for &l in &leaves {
+            dg.read(l);
+        }
+        dg.finish_task();
+        dg.finish_task_and_publish(root, Some(0xDEAD_BEEF));
+
+        // 1. Clean wide closure: green in one pass.
+        let mut dirty: SmallVec<[DepNodeIndex; 8]> = SmallVec::new();
+        assert!(
+            dg.verify_green_collect_dirty(root, &mut dirty),
+            "a fully published wide closure must verify green"
+        );
+        assert!(dirty.is_empty());
+
+        // 2. Mark a scattered subset dirty; the collect must report it
+        //    exactly (as a set).
+        let subset: Vec<DepNodeIndex> =
+            leaves.iter().step_by(3).copied().collect();
+        for &l in &subset {
+            dg.invalidate(l, &q());
+        }
+        dirty.clear();
+        assert!(
+            !dg.verify_green_collect_dirty(root, &mut dirty),
+            "a closure containing red leaves must come back dirty"
+        );
+        let mut got: Vec<DepNodeIndex> = dirty.iter().copied().collect();
+        got.sort_by_key(|n| n.0);
+        let mut want: Vec<DepNodeIndex> = subset.clone();
+        want.sort_by_key(|n| n.0);
+        assert_eq!(got, want, "collect-all must report exactly the marked subset");
+
+        // 3. Re-request = republish each dirty leaf with its UNCHANGED
+        //    fingerprint (changed == false ⇒ the leaf is cleared, the
+        //    root is NOT fanned out to).  The final re-verify must then
+        //    pass and re-stamp every clean leaf plus the root.
+        for (i, &l) in leaves.iter().enumerate() {
+            if subset.contains(&l) {
+                dg.finish_task_and_publish(l, Some(i as u64));
+            }
+        }
+        dirty.clear();
+        assert!(
+            dg.verify_green_collect_dirty(root, &mut dirty),
+            "after every dirty leaf re-publishes unchanged, the final \
+             re-verify must pass"
+        );
+        assert!(dirty.is_empty());
+        // The root's stamp is back: the global fast path now serves it.
+        assert!(dg.is_globally_verified(root));
     }
 
     /// Lazy invalidation: `invalidate(c)` marks ONLY `c` red.  Readers are
@@ -3855,13 +5842,18 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_node_resizes_rev_edges() {
+    fn test_allocate_node_resizes_shard_slots() {
         let dg = DepGraph::new(Arc::new(NoOpScheduler));
         let a = dg.allocate_node_index(ContentClass::SEMANTIC);
         let b = dg.allocate_node_index(ContentClass::SEMANTIC);
         assert!(a.0 < b.0);
         let shard = dg.shards[shard_of(b)].read();
-        assert!(shard.rev_edges.len() > slot_of(b));
+        // Log rework (#10): the reverse-edge log is a flat `Vec` of ops
+        // (its compacted index grows only at compaction), but the shard's
+        // per-slot vectors must still cover the new node.
+        assert!(shard.edges.len() > slot_of(b));
+        assert!(shard.fingerprints.len() > slot_of(b));
+        assert!(shard.classes.len() > slot_of(b));
     }
 
     /// Sharding layout: node `idx` lives in shard `idx % 64` at compact
@@ -3884,7 +5876,7 @@ mod tests {
             assert_eq!(dg.class_of(n), Some(class), "class for node {n:?}");
             let shard = dg.shards[shard_of(n)].read();
             assert!(shard.classes.len() > slot_of(n));
-            assert!(shard.rev_edges.len() > slot_of(n));
+            assert!(shard.edges.len() > slot_of(n));
         }
         // Each shard holds only its 1/64th share of the nodes.
         let per_shard_cap = nodes.len() / DEP_SHARDS + 1;
@@ -4111,6 +6103,13 @@ mod tests {
         assert_eq!(dg.rev_of(Durability::HIGH), 1);
         // Fast path: still all-green at level HIGH, no walk needed.
         assert_eq!(dg.verify_green_transitive_with_dirty(root), None);
+        // The durability fast path must RE-CERTIFY at the current
+        // generation: otherwise every later hit keeps walking
+        // to the level check instead of taking the O(1) global stamp.
+        assert!(
+            dg.is_globally_verified(root),
+            "durability fast path must refresh verified_gen"
+        );
 
         // A HIGH-level mark (stdlib): bumps all three levels — the
         // stamp no longer covers rev[HIGH], so the walk runs and finds
@@ -4344,12 +6343,27 @@ mod tests {
             .collect();
         let late = *nodes.last().expect("nonempty");
 
-        // Grow-path shape (a never-reset graph): the epoch table is not
-        // the shorter one.  This is NOT the safety invariant — see the
-        // test doc.
+        // Node coverage, not a length order: the epoch table now grows
+        // geometrically from its own (small) resting size, so it is expected
+        // to be the *shorter* table on a grown graph.  The safety invariant is
+        // that every allocated node's block exists in both tables.
+        let allocated_blocks = n.div_ceil(4096) as usize;
         assert!(
-            dg.dirty_snapshot().len() <= dg.epochs_snapshot().len(),
-            "grow left the epoch table shorter than the dirty table: dirty={} epochs={}",
+            dg.epochs_snapshot().len() >= allocated_blocks,
+            "epoch table does not cover every allocated node: epochs={} need={allocated_blocks}",
+            dg.epochs_snapshot().len(),
+        );
+        assert!(
+            dg.dirty_snapshot().len() >= allocated_blocks,
+            "dirty table does not cover every allocated node: dirty={} need={allocated_blocks}",
+            dg.dirty_snapshot().len(),
+        );
+        // The independent sizing must actually pay off: the epoch table (32
+        // KiB per block) stays far smaller than the dirty table (512 B per
+        // block) after the same allocation.
+        assert!(
+            dg.epochs_snapshot().len() < dg.dirty_snapshot().len(),
+            "epoch table was sized like the dirty table again: dirty={} epochs={}",
             dg.dirty_snapshot().len(),
             dg.epochs_snapshot().len(),
         );
@@ -4546,7 +6560,8 @@ mod tests {
         let mut list: SmallVec<[DepNodeIndex; 4]> =
             [5u32, 7, 9].into_iter().map(DepNodeIndex).collect();
         let reads = [7u32, 5, 11].map(DepNodeIndex);
-        let removed = super::reconcile_forward_edges(&mut list, &reads);
+        let index = super::ReadsIndex::build(&reads);
+        let removed = super::reconcile_forward_edges(&mut list, &reads, &index);
         assert_eq!(
             list.to_vec(),
             reads.to_vec(),
@@ -4558,7 +6573,7 @@ mod tests {
             "only the edge the read set no longer has is stale"
         );
         // Idempotent: reconciling the same read set again is a no-op.
-        let removed2 = super::reconcile_forward_edges(&mut list, &reads);
+        let removed2 = super::reconcile_forward_edges(&mut list, &reads, &index);
         assert_eq!(
             removed2.to_vec(),
             vec![],
@@ -4690,6 +6705,18 @@ mod tests {
         let vl_before = dg.verified_lvl_of(x);
         assert!(vl_before > 0);
         assert_eq!(dg.durability_of(x), Durability::HIGH);
+
+        // Force the SEQLOCK path, not the global fast path: an unrelated
+        // LOW-durability mark bumps `dirty_generation` past x's closure
+        // stamp (so `is_globally_verified` fails and the seqlock loop runs)
+        // while leaving `rev[HIGH]` untouched (so x's per-level stamp still
+        // passes inside the walk and the verdict stays green).  Without
+        // this, the VerifyWindow park/retry choreography below would be
+        // short-circuited by the generation shortcut.
+        let unverified = dg.allocate_node_index(ContentClass::SEMANTIC);
+        dg.set_node_durability(unverified, Durability::LOW);
+        dg.invalidate(unverified, &q());
+        assert!(dg.verified_lvl_of(x) > 0);
 
         // Park a verification after its verdict, then bracket a lowering
         // event (odd bump, level drop — the real writer's cascade would

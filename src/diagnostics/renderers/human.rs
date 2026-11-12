@@ -57,6 +57,10 @@ impl Renderer for HumanRenderer {
                 self.glyph.max_width(),
                 self.glyph.tab_width(),
                 Some(cx),
+                // C6: anchors foreign-file span detection to the diagnostic's
+                // own file, so a chain entry from another file is rendered as
+                // its kind label instead of bogus coordinates.
+                diag.spans().first().map(|s| s.file),
                 out,
             );
         }

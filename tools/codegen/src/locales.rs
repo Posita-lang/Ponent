@@ -1,7 +1,7 @@
 //! Validation of `locales/*.ftl` against the English source of truth and
 //! per-locale translation coverage.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -43,7 +43,20 @@ pub fn validate_locales(dir: &Path) -> Locales {
     };
     let (en_res, en_parse) = parse(&en_src);
     push_parse_errors(&mut errors, "en.ftl", &en_parse);
-    let en: BTreeMap<&str, BTreeSet<String>> = messages(&en_res);
+    let en: BTreeMap<&str, Vec<String>> = messages(&en_res);
+
+    // #13: `messages()` only extracts variables, so `A = { B }` previously
+    // passed even when `B` did not exist (Fluent then renders the raw id at
+    // runtime).  Check every message's references: each referrer is visited,
+    // so a missing node anywhere in the reference graph is reported with the
+    // slug that points at it (which is the transitive closure for existence).
+    for (from, to) in message_refs(&en_res) {
+        if !en.contains_key(to) {
+            errors.push(format!(
+                "locales/en.ftl: {from}: message reference to undefined slug {to:?}"
+            ));
+        }
+    }
 
     let mut coverage = vec![CoverageRow {
         locale: "en".to_string(),
@@ -69,7 +82,7 @@ pub fn validate_locales(dir: &Path) -> Locales {
         };
         let (res, parse_errors) = parse(&src);
         push_parse_errors(&mut errors, &file, &parse_errors);
-        let locale: BTreeMap<&str, BTreeSet<String>> = messages(&res);
+        let locale: BTreeMap<&str, Vec<String>> = messages(&res);
         let locale_name = file.trim_end_matches(".ftl");
 
         for (slug, vars) in &locale {
@@ -77,11 +90,24 @@ pub fn validate_locales(dir: &Path) -> Locales {
                 None => errors.push(format!(
                     "locales/{file}: orphan message {slug:?} (not defined in en.ftl)"
                 )),
-                Some(en_vars) if en_vars != vars => {
-                    let missing: Vec<String> =
-                        en_vars.difference(vars).map(|v| format!("${v}")).collect();
-                    let extra: Vec<String> =
-                        vars.difference(en_vars).map(|v| format!("${v}")).collect();
+                Some(en_vars) if {
+                    // Order differs by design (each locale's first-appearance
+                    // order); the placeholder contract is set equality.
+                    let en_set: BTreeSet<&str> = en_vars.iter().map(String::as_str).collect();
+                    let loc_set: BTreeSet<&str> = vars.iter().map(String::as_str).collect();
+                    en_set != loc_set
+                } =>
+                {
+                    let en_set: BTreeSet<&str> = en_vars.iter().map(String::as_str).collect();
+                    let loc_set: BTreeSet<&str> = vars.iter().map(String::as_str).collect();
+                    let missing: Vec<String> = en_set
+                        .difference(&loc_set)
+                        .map(|v| format!("${v}"))
+                        .collect();
+                    let extra: Vec<String> = loc_set
+                        .difference(&en_set)
+                        .map(|v| format!("${v}"))
+                        .collect();
                     let mut parts = Vec::new();
                     if !missing.is_empty() {
                         parts.push(format!("missing {}", missing.join(", ")));
@@ -138,16 +164,20 @@ fn push_parse_errors(
 
 /// Message slug → set of `$variable` placeholders (from message values and
 /// attributes; terms and function names are not placeholders).
-fn messages<'a>(res: &'a ast::Resource<&'a str>) -> BTreeMap<&'a str, BTreeSet<String>> {
+fn messages<'a>(res: &'a ast::Resource<&'a str>) -> BTreeMap<&'a str, Vec<String>> {
     let mut out = BTreeMap::new();
     for entry in &res.body {
         if let ast::Entry::Message(msg) = entry {
-            let mut vars = BTreeSet::new();
+            // First-appearance order, not `BTreeSet` order: callers of the
+            // generated typed functions pass arguments positionally, so the
+            // parameter order must match the FTL pattern (and the `tr!` docs).
+            let mut vars = Vec::new();
+            let mut seen = HashSet::new();
             if let Some(value) = &msg.value {
-                pattern_vars(value, &mut vars);
+                pattern_vars(value, &mut vars, &mut seen);
             }
             for attr in &msg.attributes {
-                pattern_vars(&attr.value, &mut vars);
+                pattern_vars(&attr.value, &mut vars, &mut seen);
             }
             out.insert(msg.id.name, vars);
         }
@@ -155,48 +185,189 @@ fn messages<'a>(res: &'a ast::Resource<&'a str>) -> BTreeMap<&'a str, BTreeSet<S
     out
 }
 
-fn pattern_vars(pattern: &ast::Pattern<&str>, out: &mut BTreeSet<String>) {
+fn pattern_vars(
+    pattern: &ast::Pattern<&str>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
     for element in &pattern.elements {
         if let ast::PatternElement::Placeable { expression } = element {
-            expr_vars(expression, out);
+            expr_vars(expression, out, seen);
         }
     }
 }
 
-fn expr_vars(expr: &ast::Expression<&str>, out: &mut BTreeSet<String>) {
+fn expr_vars(expr: &ast::Expression<&str>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     match expr {
         ast::Expression::Select { selector, variants } => {
-            inline_vars(selector, out);
+            inline_vars(selector, out, seen);
             for variant in variants {
-                pattern_vars(&variant.value, out);
+                pattern_vars(&variant.value, out, seen);
             }
         }
-        ast::Expression::Inline(inline) => inline_vars(inline, out),
+        ast::Expression::Inline(inline) => inline_vars(inline, out, seen),
     }
 }
 
-fn inline_vars(inline: &ast::InlineExpression<&str>, out: &mut BTreeSet<String>) {
+fn inline_vars(
+    inline: &ast::InlineExpression<&str>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
     match inline {
         ast::InlineExpression::VariableReference { id } => {
-            out.insert(id.name.to_string());
+            let name = id.name.to_string();
+            if seen.insert(name.clone()) {
+                out.push(name);
+            }
         }
-        ast::InlineExpression::Placeable { expression } => expr_vars(expression, out),
-        ast::InlineExpression::FunctionReference { arguments, .. } => call_vars(arguments, out),
+        ast::InlineExpression::Placeable { expression } => expr_vars(expression, out, seen),
+        ast::InlineExpression::FunctionReference { arguments, .. } => {
+            call_vars(arguments, out, seen)
+        }
         ast::InlineExpression::TermReference {
             arguments: Some(args),
             ..
-        } => call_vars(args, out),
+        } => call_vars(args, out, seen),
         _ => {}
     }
 }
 
-fn call_vars(args: &ast::CallArguments<&str>, out: &mut BTreeSet<String>) {
+fn call_vars(args: &ast::CallArguments<&str>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     for arg in &args.positional {
-        inline_vars(arg, out);
+        inline_vars(arg, out, seen);
     }
     for arg in &args.named {
-        inline_vars(&arg.value, out);
+        inline_vars(&arg.value, out, seen);
     }
+}
+
+/// Every `$variable` used as a `select` / plural **selector** in `res`.
+///
+/// These are the keys that must reach Fluent as `FluentValue::Number` — a
+/// selector passed as a string silently falls to the `other` CLDR category,
+/// so the runtime numeric-key set has to cover them.  Derived from the
+/// parsed AST (not a hardcoded list) so adding a plural message with a new
+/// selector name cannot drift out of sync.
+fn select_selector_keys(res: &ast::Resource<&str>) -> BTreeSet<String> {
+    fn walk(pattern: &ast::Pattern<&str>, out: &mut BTreeSet<String>) {
+        for element in &pattern.elements {
+            if let ast::PatternElement::Placeable { expression } = element {
+                selector_vars(expression, out);
+            }
+        }
+    }
+    // Selector names only: a select whose selector is a plain `$variable`
+    // contributes that name; nested selects inside variants are picked up
+    // recursively.  Everything else (functions, terms) is not a runtime
+    // argument key.
+    fn selector_vars(expr: &ast::Expression<&str>, out: &mut BTreeSet<String>) {
+        match expr {
+            ast::Expression::Select { selector, variants } => {
+                if let ast::InlineExpression::VariableReference { id } = selector {
+                    out.insert(id.name.to_string());
+                }
+                for variant in variants {
+                    walk(&variant.value, out);
+                }
+            }
+            // #14: parity with `expr_vars` — a select nested inside a
+            // placeable must still contribute its selector key.
+            ast::Expression::Inline(ast::InlineExpression::Placeable { expression }) => {
+                selector_vars(expression, out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    for entry in &res.body {
+        if let ast::Entry::Message(msg) = entry {
+            if let Some(value) = &msg.value {
+                walk(value, &mut out);
+            }
+            for attr in &msg.attributes {
+                walk(&attr.value, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Every `(referrer, referenced)` message-slug pair in `res`.
+///
+/// Collects `MessageReference`s from message values, attributes, select
+/// variants, and call arguments.  Terms and function names are not message
+/// slugs and are ignored (term existence is checked by Fluent itself).
+fn message_refs<'a>(res: &'a ast::Resource<&'a str>) -> Vec<(&'a str, &'a str)> {
+    fn walk_pattern<'a>(
+        p: &'a ast::Pattern<&'a str>,
+        from: &'a str,
+        out: &mut Vec<(&'a str, &'a str)>,
+    ) {
+        for el in &p.elements {
+            if let ast::PatternElement::Placeable { expression } = el {
+                walk_expr(expression, from, out);
+            }
+        }
+    }
+    fn walk_expr<'a>(
+        e: &'a ast::Expression<&'a str>,
+        from: &'a str,
+        out: &mut Vec<(&'a str, &'a str)>,
+    ) {
+        match e {
+            ast::Expression::Select { selector, variants } => {
+                walk_inline(selector, from, out);
+                for v in variants {
+                    walk_pattern(&v.value, from, out);
+                }
+            }
+            ast::Expression::Inline(i) => walk_inline(i, from, out),
+        }
+    }
+    fn walk_inline<'a>(
+        i: &'a ast::InlineExpression<&'a str>,
+        from: &'a str,
+        out: &mut Vec<(&'a str, &'a str)>,
+    ) {
+        match i {
+            ast::InlineExpression::MessageReference { id, .. } => out.push((from, id.name)),
+            ast::InlineExpression::Placeable { expression } => walk_expr(expression, from, out),
+            ast::InlineExpression::FunctionReference { arguments, .. } => {
+                walk_args(arguments, from, out)
+            }
+            ast::InlineExpression::TermReference {
+                arguments: Some(args),
+                ..
+            } => walk_args(args, from, out),
+            _ => {}
+        }
+    }
+    fn walk_args<'a>(
+        args: &'a ast::CallArguments<&'a str>,
+        from: &'a str,
+        out: &mut Vec<(&'a str, &'a str)>,
+    ) {
+        for a in &args.positional {
+            walk_inline(a, from, out);
+        }
+        for a in &args.named {
+            walk_inline(&a.value, from, out);
+        }
+    }
+    let mut out = Vec::new();
+    for entry in &res.body {
+        if let ast::Entry::Message(msg) = entry {
+            let from = msg.id.name;
+            if let Some(v) = &msg.value {
+                walk_pattern(v, from, &mut out);
+            }
+            for attr in &msg.attributes {
+                walk_pattern(&attr.value, from, &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// Generate typed Rust functions for every Fluent slug in `en.ftl`.
@@ -216,22 +387,119 @@ pub fn generate_fluent_functions(dir: &Path) -> String {
     let (res, _) = parse(&en_src);
     let msgs = messages(&res);
 
+    // Numeric argument keys, derived from the source of truth: every `$var`
+    // used as a select/plural selector in *any* locale (union, not just
+    // en.ftl), plus the legacy count names.  Unioning across locales matters:
+    // a translation that introduces a differently-named plural selector
+    // (e.g. `{ $pluralCount }` in ru.ftl) would otherwise arrive as a
+    // `FluentValue::String` and silently fall to the `other` CLDR branch —
+    // exactly the failure this mechanism exists to prevent.
+    let mut numeric: BTreeSet<String> = select_selector_keys(&res);
+    // #3: union across *every* locale, not a hardcoded ru/zh pair.  A new
+    // `fr.ftl` introducing a differently-named plural selector must extend
+    // the numeric key set just like the existing locales do.
+    let mut others: Vec<std::path::PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|f| f.path())
+        .filter(|p| {
+            p.extension().and_then(|e| e.to_str()) == Some("ftl")
+                && p.file_name().and_then(|n| n.to_str()) != Some("en.ftl")
+        })
+        .collect();
+    others.sort();
+    for path in &others {
+        if let Ok(src) = fs::read_to_string(path) {
+            let (other, _) = parse(&src);
+            numeric.extend(select_selector_keys(&other));
+        }
+    }
+    numeric.extend(["count", "n", "num"].map(str::to_string));
+    let numeric_keys: Vec<String> = numeric.iter().map(|k| format!("{k:?}")).collect();
+
     let mut rs = String::from(
         "// @generated by build.rs from locales/en.ftl — DO NOT EDIT.\n\
          // Edit that file instead; this module is regenerated on every build.\n\
          use crate::diagnostics::i18n::{render, TrValue};\n\
          use std::borrow::Cow;\n\n",
     );
+    // Bitmap/match lookup instead of a linear scan over a slice: the checker
+    // hits this once per argument of every slug message, and the key set is
+    // tiny and closed at build time.  Emitting a `match` lets the compiler
+    // build a length-dispatched decision tree (no per-call slice walk).
+    let match_arms = numeric_keys
+        .iter()
+        .map(|k| format!("        {k} => true,\n"))
+        .collect::<String>();
+    let _ = std::fmt::Write::write_fmt(
+        &mut rs,
+        format_args!(
+            "/// Whether `key` must reach Fluent as a number (select / plural\n\
+             /// selectors in any locale, plus the legacy count names), so CLDR\n\
+             /// plural categories are actually selected.\n\
+             #[inline]\n\
+             pub(crate) fn is_numeric_arg_key(key: &str) -> bool {{\n\
+                 match key {{\n{}\
+                     _ => false,\n\
+                 }}\n\
+             }}\n\n",
+            match_arms
+        ),
+    );
+
+    // Zero-argument slugs get a build-time direct-addressed cache: the slug
+    // set is closed (it comes from en.ftl), so we emit a per-slug slot
+    // holding one `String` per language.  First call per (slug, lang)
+    // formats through the bundle; every later call is one array read and
+    // returns `Cow::Borrowed` — zero allocation, zero formatting.  This
+    // generalizes the hand-rolled `cached_label!` tables to every slug.
+    let zero_arg: Vec<&str> =
+        msgs.iter().filter(|(_, v)| v.is_empty()).map(|(s, _)| *s).collect();
+    if !zero_arg.is_empty() {
+        rs.push_str(
+            "static ZERO_ARG_TABLE: [[std::sync::OnceLock<String>; 3]; ",
+        );
+        rs.push_str(&zero_arg.len().to_string());
+        rs.push_str("] = [const { [const { std::sync::OnceLock::new() }; 3] }; ");
+        rs.push_str(&zero_arg.len().to_string());
+        rs.push_str("];\n\n");
+        rs.push_str("pub(crate) fn zero_arg_slug(slug: &str) -> Option<Cow<'static, str>> {\n");
+        rs.push_str("    let idx = match slug {\n");
+        for (i, s) in zero_arg.iter().enumerate() {
+            let _ = std::fmt::Write::write_fmt(&mut rs, format_args!("        {s:?} => {i},\n"));
+        }
+        rs.push_str("        _ => return None,\n");
+        rs.push_str("    };\n");
+        rs.push_str(
+            // #4: `Lang::index()` is zero-based; the old `as usize - 1`
+            // underflowed if `En` ever took the default discriminant 0.
+            // #10: per-(slug, lang) `OnceLock` instead of eagerly translating
+            // all three languages on the first access to any one of them.
+            "    let li = super::Lang::current().index();\n\
+             \x20   Some(Cow::Borrowed(\n\
+             \x20       ZERO_ARG_TABLE[idx][li]\n\
+             \x20           .get_or_init(|| match super::format_slug(super::lang_id_at(li), slug, None) {\n\
+             \x20               Some(s) => s,\n\
+             \x20               None => slug.to_string(),\n\
+             \x20           })\n\
+             \x20           .as_str(),\n\
+             \x20   ))\n\
+             }\n\n",
+        );
+    }
 
     for (slug, vars) in &msgs {
         let fn_name = slug.replace('-', "_");
         let params: Vec<&String> = vars.iter().collect();
         if params.is_empty() {
+            // #7: route through the build-time zero-argument cache instead of
+            // re-formatting through Fluent on every call.
             let _ = std::fmt::Write::write_fmt(
                 &mut rs,
                 format_args!(
                     "pub fn {fn_name}() -> Cow<'static, str> {{\n    \
-                     render({slug:?}, &[])\n}}\n\n",
+                     zero_arg_slug({slug:?}).unwrap_or_else(|| render({slug:?}, &[]))\n}}\n\n",
                 ),
             );
         } else {
@@ -271,7 +539,7 @@ fn escape_kw(name: &str) -> String {
         "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
         "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
         "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
-        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "gen",
     ];
     if KEYWORDS.contains(&name) {
         format!("{name}_")

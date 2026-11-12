@@ -35,6 +35,15 @@ impl StableHash for FpValue {
 /// this note is about the leak, `EPOCH_INIT_BLOCKS`' doc about the size,
 /// and both are needed because the bounded-total argument above is what
 /// licenses the leak at all.
+///
+/// WHY NOT DROPPED after the runner run (verified empirically, then
+/// reverted): `QuerySystem::drop` runs the deferred-drain path, which
+/// touches shuttle task machinery — outside an active shuttle execution
+/// that panics ("Tried to get ExecutionState … NotSet"), the panic
+/// cascades into every subsequent test in the process.  The leak is
+/// therefore DELIBERATE and total-bounded (one graph per `run_check`
+/// call; if calls are ever looped, revisit with a drop strategy that
+/// `mem::forget`s the deferred queue first).
 fn leak_system() -> &'static QuerySystem<'static, 'static, NoOpScheduler> {
     Box::leak(Box::new(QuerySystem::new()))
 }
@@ -51,6 +60,31 @@ fn run_check<F: Fn() + Send + Sync + 'static>(f: F) {
     config.failure_persistence = shuttle::FailurePersistence::File(None);
     let runner = shuttle::Runner::new(shuttle::scheduler::PctScheduler::new(8, 50), config);
     runner.run(f);
+}
+
+/// `run_check` with a SEED SWEEP: `PctScheduler::new(8, 50)` with a fixed
+/// budget explores one deterministic schedule per run, which is fine for
+/// the gate-choreographed tests (their interleavings are hand-built) but
+/// thin for the UNCONSTRAINED ones — d1/d2/d11/tstress benefit from seeing
+/// several schedules.  Keep the sweep small (8 seeds): each seed is a full
+/// model-checking run and these tests already run fast; widen only if a
+/// failure class needs more breadth.  Assertions must hold for EVERY seed
+/// — a sweep failure reports the seed so `shuttle::replay` can pin it.
+/// (Each seed leaks its own system/provider — see `leak_system`'s doc for
+/// why they are not dropped.)
+fn run_check_swept<F: Fn() + Send + Sync + 'static>(f: F) {
+    let f = std::sync::Arc::new(f);
+    // Seeds start at 1: `PctScheduler::new(0, …)` asserts `max_depth > 0`
+    // (seed 0 is not a valid depth).
+    for seed in 1..=8usize {
+        let f = std::sync::Arc::clone(&f);
+        let mut config = shuttle::Config::default();
+        config.stack_size = 2 * 1024 * 1024;
+        config.failure_persistence = shuttle::FailurePersistence::File(None);
+        let runner =
+            shuttle::Runner::new(shuttle::scheduler::PctScheduler::new(seed, 50), config);
+        runner.run(move || f());
+    }
 }
 
 fn spin_until(flag: &AtomicBool, what: &str) {

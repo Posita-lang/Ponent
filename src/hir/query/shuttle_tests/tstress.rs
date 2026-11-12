@@ -23,31 +23,79 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// later test, and every other phase keeps printing.  To debug a phase-3
 /// failure, set `PONENT_NOISY_PANICS=1` to opt out of the swap.
 struct QuietPanics {
-    prev: Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>,
+    // Stored as an `Arc` so the filtered hook can delegate to it: only
+    // the EXPECTED stress-injection panic is silenced; every other panic
+    // (a real assertion failure in a concurrently running test) still
+    // reaches the previous hook.  The old blanket no-op hook silenced
+    // those too — under `cargo test -- --test-threads=8` a concurrent
+    // test's real failure could vanish while phase 3 was running.
+    prev: std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>,
+    // Serializes the take/set hook swap process-wide: `cargo test` runs
+    // tests on parallel threads, and two concurrent installs would
+    // interleave — A takes the real hook, B takes A's no-op as "prev", and
+    // whichever drops LAST leaves A's no-op installed for every
+    // subsequent test, silencing legitimate panic output process-wide.
+    // The guard is held for the whole struct lifetime (install → drop),
+    // so concurrent phase-3 loops fully serialize around the swap.
+    //
+    // SHUTTLE CONSTRAINT: under `--features shuttle` every task runs on
+    // ONE OS thread and this is a real OS-thread mutex — a contended
+    // `lock()` here would BLOCK the runner, not yield to the scheduler.
+    // Correct today only because no two shuttle tests install
+    // concurrently (libtest serializes same-thread tests); if a second
+    // shuttle test ever grows its own `QuietPanics`, the overlap becomes
+    // a hang, so keep installs exclusive or switch to a
+    // try-lock-or-skip shape.
+    _lock: parking_lot::MutexGuard<'static, ()>,
 }
+
+static QUIET_PANICS_LOCK: parking_lot::Mutex<> = parking_lot::Mutex::new;
 
 impl QuietPanics {
     fn install() -> Option<Self> {
         if std::env::var_os("PONENT_NOISY_PANICS").is_some() {
             return None;
         }
+        // Lock BEFORE take_hook: the swap itself must already be exclusive.
+        let lock = QUIET_PANICS_LOCK.lock();
         // `take_hook` returns the previously installed hook; there is no
         // other way to observe it, so this swap-and-restore is the only
         // shape available.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        Some(Self { prev })
+        let prev: std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send> =
+            std::sync::Arc::from(std::panic::take_hook());
+        let prev_hook = std::sync::Arc::clone(&prev);
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                ""
+            };
+            // Only silence the expected stress-injection panic.
+            if !msg.contains("stress panic injection") {
+                prev_hook(info);
+            }
+        }));
+        Some(Self { prev, _lock: lock })
     }
 }
 
 impl Drop for QuietPanics {
     fn drop(&mut self) {
-        std::panic::set_hook(std::mem::replace(&mut self.prev, Box::new(|_| {})));
+        // Restore the previous hook through the Arc clone — set_hook
+        // consumes, so the field would otherwise be moved out.
+        let prev = std::sync::Arc::clone(&self.prev);
+        std::panic::set_hook(Box::new(move |info| prev(info)));
+        // `_lock` releases after the restore (field drop order: the local
+        // `prev` clone above keeps `self.prev` intact, and `_lock` drops
+        // last) — the next installer cannot interleave between set_hook
+        // and unlock.
     }
 }
 #[test]
 fn stress_random_concurrent_graph_oracle() {
-    run_check(|| {
+    run_check_swept(|| {
         const STRESS_SLOTS: usize = 16;
         const PANIC_SLOT: usize = 15;
 

@@ -68,7 +68,7 @@ pub use chain::CallChain;
 pub use collector::DiagCtxt;
 pub use emitter::Emitter;
 pub use error_code::{ErrCode, ErrorCategory};
-pub use fix::{FixEdit, FixHints, FixSet, apply_fixes};
+pub use fix::{FixEdit, FixHints, FixSet, apply_fixes, apply_fixes_for_file};
 pub use glyph::GlyphRenderer;
 pub use i18n::DisplayArg;
 pub use kind::{ComptimeReason, DiagnosticKind, Humanizer, TypeCtx};
@@ -86,7 +86,6 @@ use compact_str::{CompactString, format_compact};
 use covariant_vec::CovariantVec;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -158,6 +157,15 @@ pub struct DiagOpts {
     /// Number of source-context lines to show above and below the primary span.
     pub context_lines: usize,
     /// Whether to emit ANSI colour codes (only relevant for terminal emitters).
+    ///
+    /// Sharp edge: [`DiagOpts::default`] hard-codes `use_color: true` while
+    /// [`ColorChoice::default`] (see `term.rs`) is `Auto`.  Any caller that
+    /// builds `DiagOpts::default()` *without* following up with
+    /// [`DiagOpts::detect`] (or an explicit `--color` flag override) forces
+    /// colour on even when stdout is a pipe.  This is intentional — the
+    /// snapshot tests pin `DiagOpts::default()` output as colored — but it
+    /// means batch callers must use `detect()` (or set `use_color` themselves)
+    /// to get environment-correct behaviour.
     pub use_color: bool,
     /// Whether to emit Unicode box-drawing and highlight glyphs (only
     /// relevant for terminal emitters); `false` selects the ASCII charset.
@@ -185,6 +193,11 @@ pub struct DiagOpts {
     pub only_codes: Vec<String>,
     pub only_categories: Vec<ErrorCategory>,
     pub only_files: Vec<String>,
+    /// Codes to *suppress*, rustc `-A`-style: a diagnostic whose code is in
+    /// this list is filtered out (not rendered, not counted).  The name
+    /// follows rustc's `-A`/`--allow` lint levels — an "allowed" diagnostic
+    /// is permitted to fail silently.  For the opposite (show *only* these
+    /// codes) use [`DiagOpts::only_codes`].
     pub allow_codes: Vec<String>,
     pub quiet: bool,
     pub no_wrap: bool,
@@ -249,16 +262,41 @@ pub(crate) struct DiagFilter {
     only_codes: rustc_hash::FxHashSet<String>,
     only_categories: rustc_hash::FxHashSet<ErrorCategory>,
     only_files: Vec<String>,
+    /// Precomputed "no filter is set": the common unfiltered batch turns
+    /// `matches` into one predictable branch instead of four `is_empty()`
+    /// checks per diagnostic.
+    is_empty: bool,
 }
 
 impl DiagFilter {
     /// Build the fast-match view from a [`DiagOpts`].
     pub(crate) fn from_opts(opts: &DiagOpts) -> Self {
+        // Codes are resolved case-insensitively everywhere else in the
+        // codebase (`ErrCode::new`, `try_new`, `suggest_code`), and
+        // `matches` compares against `ErrCode::code()` — which is the
+        // canonical table spelling.  Collecting the raw CLI strings here made
+        // `--allow e030` silently match nothing.  Canonicalize once at
+        // construction; unknown codes stay verbatim so they still filter.
+        let canon = |pat: &str| -> String {
+            crate::diagnostics::error_code::lookup_uppercased(pat)
+                .map(|e| e.code.to_string())
+                .unwrap_or_else(|| pat.to_string())
+        };
+        let allow_codes: rustc_hash::FxHashSet<String> =
+            opts.allow_codes.iter().map(|s| canon(s)).collect();
+        let only_codes: rustc_hash::FxHashSet<String> =
+            opts.only_codes.iter().map(|s| canon(s)).collect();
+        let only_categories: rustc_hash::FxHashSet<ErrorCategory> =
+            opts.only_categories.iter().copied().collect();
+        let only_files = opts.only_files.clone();
+        let is_empty =
+            allow_codes.is_empty() && only_codes.is_empty() && only_categories.is_empty() && only_files.is_empty();
         DiagFilter {
-            allow_codes: opts.allow_codes.iter().cloned().collect(),
-            only_codes: opts.only_codes.iter().cloned().collect(),
-            only_categories: opts.only_categories.iter().copied().collect(),
-            only_files: opts.only_files.clone(),
+            allow_codes,
+            only_codes,
+            only_categories,
+            only_files,
+            is_empty,
         }
     }
 
@@ -266,16 +304,21 @@ impl DiagFilter {
     /// [`Diagnostic::matches_filter`] exactly, with hash lookups for the
     /// exact-match fields.
     pub(crate) fn matches(&self, diag: &Diagnostic<'_>) -> bool {
+        if self.is_empty {
+            return true;
+        }
         let code = diag.code();
+        // Suppress list (rustc `-A` semantics): a code in `allow_codes` is
+        // *dropped*.  Pinned by `allow_codes_suppresses_matching_diagnostics`.
         if !self.allow_codes.is_empty()
             && let Some(c) = code
-            && self.allow_codes.contains(c.code())
+            && self.allow_codes.contains(c.canonical())
         {
             return false;
         }
         if !self.only_codes.is_empty() {
             match code {
-                Some(c) if self.only_codes.contains(c.code()) => {}
+                Some(c) if self.only_codes.contains(c.canonical()) => {}
                 _ => return false,
             }
         }
@@ -478,6 +521,19 @@ pub struct MultiSpan {
     // contain duplicates; `primary()` sorts + dedups before returning.
     primary: SmallVec<[Span; 2]>,
     dirty: bool,
+    /// Cached sorted+deduped view for the `dirty` state, populated on the
+    /// first `primary()`/`primary_ref()` read after a dirtying `push` (a
+    /// boxed slice, not a clone of the inline `SmallVec`: the cache must not
+    /// grow `Diagnostic` past its size guard, and the dirty path is rare
+    /// enough that one heap allocation is noise).
+    /// Interior mutability is safe here: `MultiSpan` only ever crosses
+    /// threads by *move* (`&mut Diagnostic` chunks in the emitter's scoped
+    /// threads need `Send`, not `Sync`, and `OnceLock<Box<[..]>>` stays
+    /// `Send` *and* `Sync` — the latter is required because `Diagnostic`
+    /// values are stored in the query cache (`FnBodyCheck`), whose storage
+    /// is `Sync`).
+    /// Invalidated by every `push`/`clear`.
+    sorted_cache: std::sync::OnceLock<Box<[Span]>>,
 }
 
 impl MultiSpan {
@@ -485,11 +541,17 @@ impl MultiSpan {
         MultiSpan {
             primary: smallvec![span],
             dirty: false,
+            sorted_cache: std::sync::OnceLock::new(),
         }
     }
 
-    /// Insert a primary span, keeping the vector sorted by `(file, start)`.
-    /// Duplicate spans are ignored (idempotent — safe for repeated `humanize`).
+    /// Insert a primary span, appending in O(1).
+    ///
+    /// Duplicates of the *tail* are ignored immediately; a duplicate of an
+    /// earlier element is appended and removed by the deferred sort+dedup on
+    /// the next [`primary`](Self::primary) / [`first`](Self::first) read, so
+    /// the observable span set stays idempotent (safe for repeated
+    /// `humanize`) while the `SmallVec` may transiently hold a duplicate.
     ///
     /// Compilers emit spans in ascending source order, so the fast path
     /// compares against the tail and appends in O(1).  An out-of-order span
@@ -498,6 +560,10 @@ impl MultiSpan {
     /// [`first`](Self::first) read, so a fully reverse-sorted push stream
     /// costs `O(n log n)` total instead of `O(n²)` memmoves.
     pub fn push(&mut self, span: Span) {
+        // The sorted view cache is dropped on every push: `OnceCell::take`
+        // is a single `Option` swap, no allocation, and re-population only
+        // happens on the next dirty read.
+        self.sorted_cache.take();
         match self.primary.last() {
             Some(last) if *last == span => {}
             Some(last) if *last > span => {
@@ -509,9 +575,14 @@ impl MultiSpan {
     }
 
     /// The earliest primary span, or `None` if empty.  When `dirty`, scans
-    /// for the minimum in `O(n)` without sorting; otherwise `O(1)`.
+    /// for the minimum in `O(n)` without sorting; otherwise `O(1)`.  If a
+    /// previous `primary_ref()` already populated the sorted cache, read its
+    /// first entry instead of rescanning.
     pub fn first(&self) -> Option<Span> {
         if self.dirty {
+            if let Some(c) = self.sorted_cache.get() {
+                return c.first().copied();
+            }
             self.primary.iter().min().copied()
         } else {
             self.primary.first().copied()
@@ -522,22 +593,61 @@ impl MultiSpan {
     pub fn clear(&mut self) {
         self.primary.clear();
         self.dirty = false;
+        self.sorted_cache.take();
     }
 
-    /// Return the spans in sorted order.  When `dirty`, sorts + dedups in
-    /// `O(n log n)`; otherwise clones the already-sorted vector (inline for
-    /// `n ≤ 2`, so no heap allocation in the common case).
+    /// Return the spans in sorted order.  When `dirty`, sorts + dedups once
+    /// and caches the result in `sorted_cache` — repeated reads between
+    /// pushes skip the `O(n log n)` re-sort; otherwise clones the
+    /// already-sorted vector (inline for `n ≤ 2`, so no heap allocation in
+    /// the common case).
     pub fn primary(&self) -> SmallVec<[Span; 2]> {
-        let mut out = self.primary.clone();
-        if self.dirty {
+        // Route through `primary_ref` so the sort/dedup/cache discipline has
+        // exactly one implementation: a dirty span sorts once and both
+        // accessors then read the cached view.
+        self.primary_ref().iter().copied().collect()
+    }
+
+    /// The primary spans as a borrowed slice when possible, avoiding the
+    /// [`SmallVec`] clone that [`primary`](Self::primary) performs even when
+    /// the vector is already sorted (`!dirty`, the common case —
+    /// [`push`](Self::push) keeps it in ascending order).  On a `dirty`
+    /// read it either borrows the cached sorted view or owns a freshly
+    /// sorted + deduped `Vec` (which is then cached, so subsequent dirty
+    /// reads borrow too).  Callers that only iterate or read `len`/`first`
+    /// pay no clone on the fast path.
+    pub fn primary_ref(&self) -> Cow<'_, [Span]> {
+        if !self.dirty {
+            Cow::Borrowed(self.primary.as_ref())
+        } else if let Some(cached) = self.sorted_cache.get() {
+            // The cache is behind `&self`, so the borrowed view is exact.
+            Cow::Borrowed(cached)
+        } else {
+            let mut out: SmallVec<[Span; 2]> = self.primary.clone();
             out.sort_unstable();
             out.dedup();
+            debug_assert!(
+                out.windows(2).all(|w| w[0] <= w[1]),
+                "MultiSpan::primary must be sorted by (file, start)"
+            );
+            // Cache the sorted view so repeated reads between pushes skip
+            // the sort; the boxed-slice allocation is one small heap copy
+            // against an `O(n log n)` sort per read.  Return a borrow of the
+            // cache rather than cloning it: the cache lives behind `&self`,
+            // so the borrow is exact and the dirty path costs no extra copy.
+            let _ = self.sorted_cache.set(out.into_vec().into_boxed_slice());
+            // Two threads may both compute and both attempt `set`; the loser
+            // then reads the winner's value.  `OnceLock::set` is release and
+            // `get` is acquire, so a successful `set` *or* a concurrent
+            // winner's `set` is visible here — the value cannot be observed as
+            // `None`.  This relies on `OnceLock`'s synchronization: replacing
+            // it with an unsynchronized cell would make the read racy.
+            debug_assert!(
+                self.sorted_cache.get().is_some(),
+                "sorted cache set immediately before this read"
+            );
+            Cow::Borrowed(self.sorted_cache.get().expect("just set"))
         }
-        debug_assert!(
-            out.windows(2).all(|w| w[0] <= w[1]),
-            "MultiSpan::primary must be sorted by (file, start)"
-        );
-        out
     }
 }
 
@@ -729,7 +839,7 @@ pub struct Diagnostic<'src> {
     code: Option<ErrCode>,
     /// Structured error kind (Vale-style ADT).  When present, the humanizer
     /// can derive `message`, `labels`, and other fields automatically.
-    kind: Option<Box<DiagnosticKind<'src>>>,
+    kind: Option<std::sync::Arc<DiagnosticKind<'src>>>,
     /// Primary spans (multiple for multi-location diagnostics).
     spans: MultiSpan,
     help: Option<Cow<'src, str>>,
@@ -754,10 +864,32 @@ pub struct Diagnostic<'src> {
     /// at the constructor default.  `humanize()` leaves them alone in that
     /// case instead of deriving fresh primary spans from the kind's labels.
     spans_user_set: bool,
+    /// Whether `help` was set by a user-facing builder rather than derived
+    /// from `kind`. `humanize()` leaves it alone in that case instead of
+    /// silently overwriting it (C3).
+    help_user_set: bool,
+    /// Whether `suggestions` were set by a user-facing builder; `humanize()`
+    /// must not clear/replace them (C3), matching the spans precedent.
+    suggestions_user_set: bool,
+    /// How many entries at the *front* of `labels` were derived from `kind`
+    /// by the last [`humanize`](Self::humanize).  User labels appended after
+    /// that block (`with_label`, `with_secondary_label`, `augment`) survive
+    /// re-humanization: the derived block is truncated and re-derived in the
+    /// new language, the user block is preserved.  Labels are kind-derived
+    /// first, then user-added — the same order the builders establish, since
+    /// user builders only ever append.
+    kind_derived_labels: u8,
     /// Whether [`humanize`](Self::humanize) has already populated `message`
     /// and `labels` from `kind`. Guards against redundant re-rendering on a
     /// second call (the operation is idempotent, but not free).
     humanized: bool,
+    /// The [`Lang`](crate::diagnostics::i18n::Lang) discriminant active at
+    /// the last [`humanize`](Self::humanize) (`0` = never humanized).  When
+    /// the process language changes, the next `humanize()` re-derives
+    /// `message`/`labels`/`help` from the retained `kind` in the new
+    /// language — the LSP re-emit contract documented on
+    /// [`error_kind`](Self::error_kind).
+    humanized_lang: u8,
     /// Cached result of [`stable_id`](Self::stable_id). `0` means "not yet
     /// computed" — FNV-1a over non-empty input is virtually never exactly 0,
     /// and even if it were, the only consequence is recomputing on every
@@ -784,7 +916,11 @@ impl<'src> Clone for Diagnostic<'src> {
             related_errors: self.related_errors.clone(),
             foreign_sources: self.foreign_sources.clone(),
             spans_user_set: self.spans_user_set,
+            help_user_set: self.help_user_set,
+            suggestions_user_set: self.suggestions_user_set,
+            kind_derived_labels: self.kind_derived_labels,
             humanized: self.humanized,
+            humanized_lang: self.humanized_lang,
             stable_id_cache: AtomicU64::new(self.stable_id_cache.load(Ordering::Relaxed)),
         }
     }
@@ -866,6 +1002,10 @@ impl<'src> Diagnostic<'src> {
     }
     pub fn set_file_name(&mut self, file_name: impl AsRef<str>) {
         self.file_name = Cow::Owned(file_name.as_ref().to_owned());
+        // C9: `stable_id` hashes the file name, so a rename must invalidate a
+        // previously computed id (otherwise a stale id keyed to the old name
+        // is returned, reintroducing cross-file collisions).
+        self.invalidate_stable_id();
     }
 
     pub fn with_foreign_source(
@@ -933,7 +1073,12 @@ impl<'src> Diagnostic<'src> {
             h = h.wrapping_mul(FNV_PRIME);
         };
         if let Some(c) = self.code() {
-            for b in c.code().as_bytes() {
+            // `canonical`, not `code`: the latter echoes the verbatim spelling
+            // for `ErrCode::unknown("e030")`, while `PartialEq`/`Hash` treat
+            // it as `E030`.  Hashing the verbatim form would let two `==`
+            // diagnostics emit different ids, breaking the dedup contract this
+            // accessor exists for.
+            for b in c.canonical().as_bytes() {
                 feed(*b);
             }
         }
@@ -950,7 +1095,22 @@ impl<'src> Diagnostic<'src> {
             }
         }
         feed(0);
-        for b in self.message().as_bytes() {
+        // `message_unchecked`, not `message()`: `stable_id` is a public
+        // accessor with no documented humanize precondition, so it must not
+        // debug-panic on a kind-built diagnostic read before `humanize()`.
+        // The cache is invalidated by `humanize`, so the id recomputes once
+        // the real message is populated.
+        for b in self.message_unchecked().as_bytes() {
+            feed(*b);
+        }
+        // The file NAME (not `FileId`, which is process-local) so two
+        // diagnostics with identical code/span/message in different files do
+        // not collide and silently suppress each other in a tool's dedupe
+        // set.  `set_file_name`/`with_file_name` therefore invalidate the
+        // cache: a caller that reads the id, renames, and reads again must see
+        // a new id keyed to the new name (C9), not the stale one.
+        feed(0);
+        for b in self.file_name().as_bytes() {
             feed(*b);
         }
         h
@@ -1097,7 +1257,11 @@ impl<'src> Diagnostic<'src> {
             related_errors: Vec::new(),
             foreign_sources: None,
             humanized: false,
+            humanized_lang: 0,
             spans_user_set: false,
+            help_user_set: false,
+            suggestions_user_set: false,
+            kind_derived_labels: 0,
             stable_id_cache: AtomicU64::new(0),
         }
     }
@@ -1136,7 +1300,7 @@ impl<'src> Diagnostic<'src> {
     /// truth so `humanize()` can re-run if the kind is replaced.
     pub fn error_kind(kind: DiagnosticKind<'src>) -> Self {
         let mut diag = Self::new(DiagnosticLevel::Error, "");
-        diag.kind = Some(Box::new(kind));
+        diag.kind = Some(std::sync::Arc::new(kind));
         diag
     }
 
@@ -1146,7 +1310,7 @@ impl<'src> Diagnostic<'src> {
     /// contract: derived fields stay unfilled until `humanize()` runs.
     pub fn fatal_kind(kind: DiagnosticKind<'src>) -> Self {
         let mut diag = Self::new(DiagnosticLevel::Fatal, "");
-        diag.kind = Some(Box::new(kind));
+        diag.kind = Some(std::sync::Arc::new(kind));
         diag
     }
 
@@ -1156,7 +1320,7 @@ impl<'src> Diagnostic<'src> {
     /// contract: derived fields stay unfilled until `humanize()` runs.
     pub fn warning_kind(kind: DiagnosticKind<'src>) -> Self {
         let mut diag = Self::new(DiagnosticLevel::Warning, "");
-        diag.kind = Some(Box::new(kind));
+        diag.kind = Some(std::sync::Arc::new(kind));
         diag
     }
 
@@ -1226,6 +1390,9 @@ impl<'src> Diagnostic<'src> {
     /// Add a help message.
     pub fn with_help(mut self, help: impl Into<Cow<'src, str>>) -> Self {
         self.help = Some(help.into());
+        // C3: user help survives `humanize`; kind-derived help fills only
+        // when the caller has not supplied its own.
+        self.help_user_set = true;
         self
     }
 
@@ -1242,6 +1409,7 @@ impl<'src> Diagnostic<'src> {
             span: None,
             replacement: None,
         });
+        self.suggestions_user_set = true;
         self
     }
 
@@ -1259,6 +1427,7 @@ impl<'src> Diagnostic<'src> {
             span: None,
             replacement: None,
         });
+        self.suggestions_user_set = true;
         self
     }
 
@@ -1282,12 +1451,14 @@ impl<'src> Diagnostic<'src> {
             span: Some(span),
             replacement: Some(replacement.into()),
         });
+        self.suggestions_user_set = true;
         self
     }
 
     /// Replace suggestions list.
     pub fn with_suggestions(mut self, suggestions: Vec<Suggestion<'src>>) -> Self {
         self.suggestions = suggestions.into();
+        self.suggestions_user_set = true;
         self
     }
 
@@ -1329,6 +1500,7 @@ impl<'src> Diagnostic<'src> {
     /// Set the source file name for the `┌─ <file>:1:1` location header.
     pub fn with_file_name(mut self, file_name: impl Into<Cow<'src, str>>) -> Self {
         self.file_name = file_name.into();
+        self.invalidate_stable_id();
         self
     }
 
@@ -1338,9 +1510,12 @@ impl<'src> Diagnostic<'src> {
     /// fields from the kind's structured data, producing more precise error
     /// messages than a flat string.
     pub fn with_kind(mut self, kind: DiagnosticKind<'src>) -> Self {
-        self.kind = Some(Box::new(kind));
-        // A new kind must be materialized by the next `humanize()`.
+        self.kind = Some(std::sync::Arc::new(kind));
+        // A new kind must be materialized by the next `humanize()`, and the
+        // cached `stable_id` (hashed over `(code, span, message)`) is stale
+        // until then — invalidate it exactly like every other mutator.
         self.humanized = false;
+        self.invalidate_stable_id();
         self
     }
 
@@ -1375,10 +1550,19 @@ impl<'src> Diagnostic<'src> {
     /// Run the humanizer on `self.kind` (if present) to populate `message`,
     /// `labels`, `help`, and `suggestions` from the structured data.
     ///
-    /// Idempotent: a `None` kind latches `humanized = true` and a second
-    /// call short-circuits, so repeated calls (e.g. the emitter rendering
-    /// the same batch twice) are free.  `with_kind` resets the latch so a
+    /// Idempotent for a fixed language: a `None` kind latches `humanized`
+    /// and repeated calls short-circuit, so the emitter rendering the same
+    /// batch twice pays nothing.  `with_kind` resets the latch so a
     /// re-kind'ed diagnostic is re-derived.
+    ///
+    /// The latch is keyed to the current [`Lang`] as well: a diagnostic
+    /// humanized in one language re-derives `message`/`labels`/`help` in
+    /// the new language when the process language changes between emits —
+    /// the LSP re-translation contract documented on
+    /// [`error_kind`](Self::error_kind).  The `kind` is retained (never
+    /// dropped) as the structured source of truth that makes this possible;
+    /// the one-`clone`-per-humanize cost replaces the old take-and-drain,
+    /// which froze the rendered language forever and left `kind()` empty.
     ///
     /// Until this runs, `message` / `labels` / `spans` / `help` /
     /// `suggestions` of a `*_kind`-built diagnostic hold their
@@ -1391,30 +1575,48 @@ impl<'src> Diagnostic<'src> {
     /// labels — so attaching the kind first and the span second is the
     /// supported builder ordering.  `help`/`suggestions` are always
     /// re-derived from the kind.
-    ///
-    /// The latch is keyed to `kind`, not language: once humanized, changing
-    /// the process language does not re-resolve the already-rendered strings;
-    /// [`with_kind`](Self::with_kind) resets the latch (see its docs).
     pub fn humanize(&mut self) {
+        let lang = crate::diagnostics::i18n::Lang::current() as u8;
         if self.humanized {
-            return;
+            // No kind: message/labels were set manually — there is nothing
+            // to re-resolve in another language.  Same language: the latch
+            // holds and the call is free.
+            if self.kind.is_none() || self.humanized_lang == lang {
+                return;
+            }
         }
-        // Take the kind out of the box and consume it in one pass via
-        // `humanize_into`, which moves shared fields (e.g. `expected`/
-        // `found`) into one output and clones into the other — one clone
-        // instead of the two that `&self`-based `message()` + `labels()`
-        // each paid.  `render_into_owned` then moves the Fluent-arg pairs
-        // into the bundle map, skipping `String::clone` on `Cow::Owned`.
-        // `kind()` has no callers, so draining `self.kind` is safe; a
-        // subsequent `with_kind` replaces it and clears `humanized`.
-        let Some(kind) = self.kind.take() else {
+        self.invalidate_stable_id();
+        // Panic-safety: `self.kind` is *taken* (temporarily `None`) while the
+        // kind is humanized.  If `humanize_into` panics, the diagnostic keeps
+        // its constructor message and empty derived fields — an acceptable
+        // degraded state for a renderer, so no rollback guard is paid for.
+        let kind_box = std::mem::take(&mut self.kind);
+        let Some(kind) = kind_box.as_deref() else {
             // No kind: message/labels were set manually.  Latch so later
             // calls skip the `kind` lookup entirely.
+            self.kind = kind_box;
             self.humanized = true;
+            self.humanized_lang = lang;
             return;
         };
-        self.invalidate_stable_id();
-        let (message, labels, help, suggestions) = (*kind).humanize_into();
+        // `kind` is retained: humanize a *clone* so `kind()` keeps serving
+        // the structured data and a later `Lang::set` can re-derive the
+        // rendered fields.  `humanize_into` still consumes its argument, so
+        // the shared fields move into one output within that pass — exactly
+        // one deep clone of the kind per humanize.
+        //
+        // A borrowing `humanize_into_ref(&self)` cannot replace this: the
+        // returned `DiagMessage<'src>` / `Label<'src>` must borrow for the
+        // kind's own `'src`, but a `&self` borrow only proves the shorter
+        // lifetime of the `&self`, and the values are stored back into `self`
+        // (an immutable borrow of `self.kind` cannot overlap the assignments
+        // to `self.message`/`self.labels`).  Keeping the clone is therefore
+        // structural, not laziness — and for `Cow::Borrowed` fields (the
+        // overwhelmingly common kind) a clone is a handful of pointer copies.
+        // Only kinds with large *owned* side fields (`Comptime.traceback`, a
+        // long `reason`) pay a deep copy, once per language switch.
+        let (message, labels, help, suggestions) = (*kind).clone().humanize_into();
+        self.kind = kind_box;
         // Static messages move straight into `message`: a borrowed static
         // stays borrowed (zero allocation), an owned one is moved — only
         // the Fluent-slug path needs the render buffer.
@@ -1439,27 +1641,66 @@ impl<'src> Diagnostic<'src> {
                 }
             }
         }
-        // `humanize_into` returns the same inline-capacity container, so
-        // this is a move: a single-label kind never hits the heap, and a
-        // two-label kind skips the intermediate `Vec` that `into()` used
-        // to allocate.
-        self.labels = labels;
+        // Labels: replace exactly the previous kind-derived block and
+        // re-append user labels after the fresh block — kind-derived first,
+        // then user-added (`with_label` / `with_secondary_label` /
+        // `augment` only ever append), the order the builders establish.
+        // Truncating just the derived block makes re-humanization on a
+        // language change idempotent: derived labels refresh, user labels
+        // neither duplicate nor vanish.  (A >255-label kind would saturate
+        // the counter; kinds derive a handful of labels, so the bound is
+        // unreachable in practice.  `min` below also tolerates external
+        // mutation through `labels_mut()` that shrank the vector under our
+        // bookkeeping.)
+        let prev_derived = (self.kind_derived_labels as usize).min(self.labels.len());
+        // Reuse both allocations instead of building fresh containers: move
+        // the user-added tail aside, overwrite the (discarded) derived block
+        // in place, then re-append the user labels.  `drain` leaves the
+        // original buffer's capacity intact for the fresh derived block.
+        let mut user: CovariantVec<'src, Label<'src>, 1> = CovariantVec::new();
+        for lbl in self.labels.drain(prev_derived..) {
+            user.push(lbl);
+        }
+        self.labels.truncate(0);
+        for lbl in labels {
+            self.labels.push(lbl);
+        }
+        debug_assert!(
+            self.labels.len() <= u8::MAX as usize,
+            "kind derives >255 labels; widen kind_derived_labels"
+        );
+        self.kind_derived_labels = self.labels.len().min(u8::MAX as usize) as u8;
+        for lbl in user.drain(..) {
+            self.labels.push(lbl);
+        }
         // help/suggestions are re-derived from `kind` on every humanize: a
-        // diagnostic can be re-kind'ed (e.g. `with_kind(k1).humanize()` then
-        // `with_kind(k2).humanize()`), and guarded rebuilding would keep
-        // k1's derived notes on a diagnostic that no longer is k1.
-        self.help = help;
-        self.suggestions = suggestions
-            .into_iter()
-            .map(|s| Suggestion {
-                message: s,
-                applicability: Applicability::MachineApplicable,
-                style: SuggestionStyle::ShowAlways,
-                span: None,
-                replacement: None,
-            })
-            .collect();
+        // diagnostic can be re-kind'ed, and guarded rebuilding would keep
+        // k1's derived notes on a diagnostic that no longer is k1.  Caller-
+        // supplied help/suggestions are preserved, matching the spans
+        // precedent (C3) — overwriting them silently lost user data.
+        if !self.help_user_set {
+            self.help = help;
+        }
+        if !self.suggestions_user_set {
+            // Reuse the suggestions allocation across re-humanization
+            // (language switches in an LSP re-derive every diagnostic).
+            self.suggestions.clear();
+            self.suggestions
+                .extend(suggestions.into_iter().map(|s| Suggestion {
+                    message: s,
+                    // `humanize_into` yields plain strings with no
+                    // per-suggestion classification, so these are *not* known
+                    // to be mechanically applicable.  `Unspecified` is the
+                    // crate's documented safe default: an auto-apply pass must
+                    // not treat them as machine-applicable without review.
+                    applicability: Applicability::Unspecified,
+                    style: SuggestionStyle::ShowAlways,
+                    span: None,
+                    replacement: None,
+                }));
+        }
         self.humanized = true;
+        self.humanized_lang = lang;
     }
 
     // ── Query methods ──────────────────────────────────────────────
@@ -1588,7 +1829,10 @@ impl<'src> Diagnostic<'src> {
 /// Note, however, that `push` may return a *suppressed* guarantee without
 /// recording anything — a warning pushed while `can_emit_warnings` is false.
 /// Therefore a growing diagnostic count is *not* guaranteed on the `Err`
-/// path; augmentation is applied only when a diagnostic is actually present.
+/// path; augmentation is applied only when the closure actually grew the
+/// context (diagnostic count strictly larger than before the call), so a
+/// pre-existing diagnostic is never silently re-spanned by an unrelated
+/// failure.
 ///
 /// # Example
 /// ```ignore
@@ -1603,13 +1847,18 @@ pub fn adorn_with_span<'src, T>(
     source: Option<&'src str>,
     f: impl FnOnce(&mut DiagCtxt<'src>) -> Result<T, EmissionGuaranteed>,
 ) -> Result<T, EmissionGuaranteed> {
+    let before = ctxt.len();
     let result = f(ctxt);
     // If the closure failed, augment the last diagnostic with context.
     if result.is_err() {
         // The closure may have returned `Err` from a *suppressed* warning
-        // push (which records nothing), so only augment when a diagnostic
-        // is actually present.
-        if let Some(diag) = ctxt.last_mut() {
+        // push (which records nothing) — or from a check that failed without
+        // pushing at all.  In both cases `last_mut()` would return an
+        // *earlier, unrelated* diagnostic and corrupt its span/source, so
+        // augment only when the closure actually grew the context.
+        if ctxt.len() > before
+            && let Some(diag) = ctxt.last_mut()
+        {
             if diag.spans.first().is_none() {
                 diag.spans = MultiSpan::new(span);
                 diag.spans_user_set = true;
@@ -1631,6 +1880,15 @@ pub fn adorn_with_span<'src, T>(
 
 impl fmt::Display for Diagnostic<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Display` reads `self.message` directly, while every message
+        // accessor enforces the humanize precondition.  A kind-built
+        // diagnostic rendered before `humanize()` would otherwise silently
+        // print an empty message; make that contract violation loud in debug
+        // builds instead.
+        debug_assert!(
+            self.kind.is_none() || self.humanized,
+            "Display on a kind-built Diagnostic before humanize(): message is empty"
+        );
         let code_str = self.code.as_ref().map(|c| c.code()).unwrap_or("?");
         let level_str = self.level.label().to_uppercase();
 
@@ -1697,17 +1955,21 @@ pub fn explain_error_code(code_str: &str, use_color: bool) -> String {
         code_str,
         use_color,
         term::detect_color_depth(),
+        DEFAULT_MAX_WIDTH,
         glyph::DEFAULT_TAB_WIDTH,
     )
 }
 
-/// Like [`explain_error_code`] but with an explicit colour depth and tab
-/// width, so the caller can share a probed [`term::ColorDepth`] and a
-/// configured tab width across multiple calls.
+/// Like [`explain_error_code`] but with an explicit colour depth, wrap width
+/// and tab width, so the caller can share a probed [`term::ColorDepth`] and a
+/// configured `--width`/`--tab-width` across multiple calls.  (Before P5 this
+/// hardcoded [`DEFAULT_MAX_WIDTH`], so `--width` narrowed diagnostics but not
+/// `--explain` output.)
 pub fn explain_error_code_with_depth(
     code_str: &str,
     use_color: bool,
     color_depth: term::ColorDepth,
+    max_width: usize,
     tab_width: usize,
 ) -> String {
     use std::fmt::Write;
@@ -1725,14 +1987,17 @@ pub fn explain_error_code_with_depth(
             );
             return if use_color {
                 format!(
-                    "\x1b[1;31m{error_label}\x1b[0m\x1b[2m[E000]\x1b[0m {unknown_msg}\n\
+                    "\x1b[1;31m{error_label}\x1b[0m {unknown_msg}\n\
                      {}",
-                    suggest_code(code_str),
+                    suggest_code(code_str, true),
                 )
             } else {
+                // No `[E000]` placeholder: `E000` is asserted absent from the
+                // registry, so printing it would invite users to look up (or
+                // report) a code that cannot exist.
                 format!(
-                    "{error_label}[E000] {unknown_msg}\n{}",
-                    suggest_code(code_str),
+                    "{error_label} {unknown_msg}\n{}",
+                    suggest_code(code_str, false),
                 )
             };
         }
@@ -1791,8 +2056,9 @@ pub fn explain_error_code_with_depth(
             }
             // Regular text — wrap at the shared diagnostic width so the
             // explain text and rendered diagnostics agree on one width.
-            for seg in crate::diagnostics::wrap::wrap_optimal(line, DEFAULT_MAX_WIDTH, tab_width) {
-                let _ = writeln!(out, "{seg}");
+            for seg in crate::diagnostics::wrap::wrap_optimal(line, max_width, tab_width) {
+                out.push_str(seg.as_ref());
+                out.push('\n');
             }
         }
     }
@@ -1806,16 +2072,18 @@ pub fn explain_error_code_with_depth(
     if !related.is_empty() {
         let _ = writeln!(out);
         if use_color {
-            let _ = writeln!(out, "\x1b[1mSee also:\x1b[0m");
+            out.push_str("\x1b[1mSee also:\x1b[0m\n");
         } else {
-            let _ = writeln!(out, "See also:");
+            out.push_str("See also:\n");
         }
         for rel in &related {
+            out.push_str("  ");
+            out.push_str(rel);
             if let Some(entry) = crate::diagnostics::error_code::lookup(rel) {
-                let _ = writeln!(out, "  {rel}  {}", entry.title);
-            } else {
-                let _ = writeln!(out, "  {rel}");
+                out.push_str("  ");
+                out.push_str(entry.title);
             }
+            out.push('\n');
         }
     }
 
@@ -1871,6 +2139,81 @@ fn osa_distance(a: &str, b: &str) -> usize {
     prev[n]
 }
 
+/// OSA distance restricted to the ≤ 1 question: `Some(d)` with `d ∈ {0, 1}`
+/// when the Damerau-Levenshtein (OSA) distance of `a` and `b` is at most 1,
+/// `None` when it is ≥ 2.
+///
+/// The full DP answers a Boolean question with `O(|a|·|b|)` work; for
+/// `max_dist == 1` — every realistic code typo, since `suggest_code`'s radius
+/// is `max(1, needle_len / 3)` and codes are ≤ 5 chars — the answer is a
+/// 4-case check: equality (0), same length with exactly one substitution
+/// (1), same length with one adjacent transposition (1), or length differing
+/// by one with the shorter a subsequence-with-one-hole of the longer (1).
+/// Comparison is over `char`s, matching [`osa_distance`]'s semantics for
+/// non-ASCII needles.
+///
+/// `None` from this function does *not* pin the distance to ≥ 2 for needles
+/// longer than 8 chars by itself — callers with `max_dist > 1` must fall
+/// back to [`osa_distance`] (which `suggest_code` does).
+fn osa_dist_le_1(a: &str, b: &str) -> Option<usize> {
+    // Every table code is ≤ 5 chars, so an 8-char inline buffer covers all
+    // equal-or-shorter sides without a heap allocation.
+    const INLINE: usize = 8;
+    let a: SmallVec<[char; INLINE]> = a.chars().collect();
+    let b: SmallVec<[char; INLINE]> = b.chars().collect();
+    if a == b {
+        return Some(0);
+    }
+    let (s, l) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    match l.len() - s.len() {
+        0 => {
+            // Same length: either one substitution or one adjacent
+            // transposition of the two differing positions.
+            let mut d0 = 0usize;
+            let mut d1 = 0usize;
+            let mut n = 0usize;
+            for i in 0..s.len() {
+                if s[i] != l[i] {
+                    if n >= 2 {
+                        return None;
+                    }
+                    if n == 0 {
+                        d0 = i;
+                    } else {
+                        d1 = i;
+                    }
+                    n += 1;
+                }
+            }
+            match n {
+                1 => Some(1), // substitution
+                2
+                    if d1 == d0 + 1
+                        && s[d0] == l[d1]
+                        && s[d1] == l[d0] =>
+                {
+                    Some(1) // transposition
+                }
+                _ => None,
+            }
+        }
+        1 => {
+            // One insertion/deletion: the shared prefix, then the tail of
+            // the longer string must equal the tail of the shorter.
+            let mut i = 0;
+            while i < s.len() && s[i] == l[i] {
+                i += 1;
+            }
+            if l[i + 1..] == s[i..] {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Summarise the known error codes as contiguous ranges, e.g.
 /// `E001–E004, E007, W113`.  Derived from `CODE_TABLE` so the fallback help
 /// text cannot drift out of sync as codes are added.
@@ -1897,8 +2240,10 @@ fn format_code_ranges(codes: &[&str]) -> String {
     // Sort by (prefix, numeric value, raw string): within a prefix,
     // lexicographic order only matches numeric order while codes are
     // equal-width — a future 4-digit `E1000` would sort before `E999`
-    // lexicographically.
-    codes.sort_by_cached_key(|c| {
+    // lexicographically.  `sort_unstable_by_key` avoids the Vec allocation
+    // of `sort_by_cached_key`; the key is `Copy` and cheap to compute, and
+    // the slice is small (typically 1–5 codes).
+    codes.sort_unstable_by_key(|c| {
         (
             c.as_bytes().first().copied().unwrap_or(b'?'),
             c.get(1..)
@@ -1948,7 +2293,60 @@ fn format_code_ranges(codes: &[&str]) -> String {
 ///   1. smaller edit distance
 ///   2. longer common prefix with the input (so `E03` → `E030`, not `E003`)
 ///   3. lexicographically smaller code (stable, deterministic output)
-fn suggest_code(input: &str) -> CompactString {
+/// Insert `(dist, prefix, code)` into a fixed-size top-3 by
+/// `(dist asc, prefix desc, code asc)` — the ranking `suggest_code` pins.
+///
+/// Tie-break at the boundary: when `top` is already full, an entry that ties
+/// all three incumbents is **dropped** ("first encountered wins at the
+/// boundary") — it is not re-sorted into the full `(dist asc, prefix desc,
+/// code asc)` order by evicting the worst incumbent.  Only an entry
+/// *strictly better* than some incumbent takes its slot (`position` finds the
+/// first strictly-better position; `pos == 3` means no incumbent is worse, so
+/// the entry is discarded).
+#[inline]
+/// Insert `(dist, prefix, code)` into the fixed-size top-3, keeping the
+/// `(dist asc, prefix desc, code asc)` order.  Tie-break at the boundary:
+/// when the top is full (`pos == 3`), an entry that ties all three existing
+/// ones is *dropped* — "first encountered wins at the boundary", not a full
+/// re-sort of equal entries.  Only strictly-better entries evict.
+fn insert_top3<'a>(
+    top: &mut ArrayVec<(usize, usize, &'a str), 3>,
+    dist: usize,
+    prefix: usize,
+    code: &'a str,
+) {
+    let entry = (dist, prefix, code);
+    let pos = top
+        .iter()
+        .position(|t| {
+            entry.0 < t.0
+                || (entry.0 == t.0 && (entry.1 > t.1 || (entry.1 == t.1 && entry.2 < t.2)))
+        })
+        .unwrap_or(top.len());
+    if pos < 3 {
+        if top.is_full() {
+            top.pop();
+        }
+        top.insert(pos, entry);
+    }
+}
+
+/// Whether `a` (4 digit bytes) with exactly one deletion equals `b`
+/// (3 digit bytes) — i.e. `b` is a subsequence of `a` obtained by deleting
+/// one character.  One forward mismatch scan + one tail compare: no DP.
+fn digits_match_with_one_deletion(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), 4);
+    debug_assert_eq!(b.len(), 3);
+    let mut i = 0;
+    while i < 3 && a[i] == b[i] {
+        i += 1;
+    }
+    // Deleting `a[i]` splices the tail over the mismatch; when the loop
+    // exhausts (first three digits equal), the deletion is at the end.
+    a[i + 1..] == b[i..]
+}
+
+fn suggest_code(input: &str, use_color: bool) -> CompactString {
     // Normalise case so `e030` matches the canonical `E030`.
     let mut needle = CompactString::from(input);
     needle.as_mut_str().make_ascii_uppercase();
@@ -1959,77 +2357,312 @@ fn suggest_code(input: &str) -> CompactString {
 
     // Top-3 by (dist asc, prefix desc, code asc) via fixed-size insertion
     // sort — avoids the `Vec` + `O(n log n)` sort for a 3-element result.
-    let mut top: ArrayVec<(usize, usize, &str), 3> = ArrayVec::new();
-    for e in crate::diagnostics::error_code::CODE_TABLE
-        .iter()
-        // Length prefilter: each edit changes length by at most one, so
-        // |Δlen| is a lower bound on the distance — an entry whose code
-        // length differs by more than the radius can never match, and its
-        // DP is skipped.  The needle uses a char count (not byte length) so
-        // the bound stays exact for non-ASCII typos; every table code is
-        // validated to `^[EW]\d{3}$`, so `e.code.len()` is already its char
-        // count (constant 4) and skips the per-code char walk.
-        .filter(|e| needle_len.abs_diff(e.code.len()) <= max_dist)
-    {
-        let dist = osa_distance(&needle, e.code);
-        if dist > max_dist {
-            continue;
-        }
-        let prefix = common_prefix_len(&needle, e.code);
-        let entry = (dist, prefix, e.code);
-        let pos = top
-            .iter()
-            .position(|t| {
-                entry.0 < t.0
-                    || (entry.0 == t.0 && (entry.1 > t.1 || (entry.1 == t.1 && entry.2 < t.2)))
-            })
-            .unwrap_or(top.len());
-        if pos < 3 {
-            if top.is_full() {
-                top.pop();
-            }
-            top.insert(pos, entry);
-        }
-    }
+    let nb = needle.as_bytes();
+    // A needle shaped like the registry (`[EW]\d{3,4}`) takes the
+    // direct-address neighbourhood enumeration; everything else keeps the
+    // general table scan (which also carries the bucketed branch as the
+    // differential-test reference for `suggest_top3_direct`).
+    let bucketed = matches!(needle_len, 4 | 5)
+        && matches!(nb[0], b'E' | b'W')
+        && nb[1..].iter().all(u8::is_ascii_digit);
+    let top = if bucketed {
+        suggest_top3_direct(&needle)
+    } else {
+        suggest_top3_scan(&needle, max_dist, needle_len)
+    };
 
     let candidates: ArrayVec<&str, 3> = top.iter().map(|(_, _, code)| *code).collect();
 
     if candidates.is_empty() {
-        format_compact!(
-            "\x1b[1;34m{help_label}\x1b[0m: {valid_codes} — \n       {hint}",
-            help_label = DiagnosticLevel::Help.label(),
-            valid_codes = crate::diagnostics::i18n::fluent::help_valid_codes(known_code_ranges()),
-            hint = crate::diagnostics::i18n::fluent::run_explain_hint_example(),
-        )
+        let help_label = DiagnosticLevel::Help.label();
+        if use_color {
+            format_compact!(
+                "\x1b[1;34m{help_label}\x1b[0m: {valid_codes} — \n       {hint}",
+                valid_codes = crate::diagnostics::i18n::fluent::help_valid_codes(known_code_ranges()),
+                hint = crate::diagnostics::i18n::fluent::run_explain_hint_example(),
+            )
+        } else {
+            format_compact!(
+                "{help_label}: {valid_codes} — \n       {hint}",
+                valid_codes = crate::diagnostics::i18n::fluent::help_valid_codes(known_code_ranges()),
+                hint = crate::diagnostics::i18n::fluent::run_explain_hint_example(),
+            )
+        }
     } else {
-        format_compact!(
-            "\x1b[1;34m{help_label}\x1b[0m: {did_you_mean}\n       {hint}",
-            help_label = DiagnosticLevel::Help.label(),
-            did_you_mean =
-                crate::diagnostics::i18n::fluent::did_you_mean(candidates.join("` or `")),
-            hint = crate::diagnostics::i18n::fluent::run_explain_hint_detail(),
-        )
+        let help_label = DiagnosticLevel::Help.label();
+        let did_you_mean =
+            crate::diagnostics::i18n::fluent::did_you_mean(candidates.join("` or `"));
+        let hint = crate::diagnostics::i18n::fluent::run_explain_hint_detail();
+        if use_color {
+            format_compact!("\x1b[1;34m{help_label}\x1b[0m: {did_you_mean}\n       {hint}")
+        } else {
+            format_compact!("{help_label}: {did_you_mean}\n       {hint}")
+        }
     }
 }
 
+/// The general candidate scan: OSA distance against the (prefiltered) table,
+/// plus the first-char bucketing shortcut for `[EW]\d{3,4}` needles.  In
+/// production this only serves needles that do NOT match the registry shape
+/// (short/long/non-EW/non-digit input); the shape-needle bucketed branch is
+/// retained as the reference implementation that
+/// `suggest_code_direct_matches_scan` differentially tests against
+/// [`suggest_top3_direct`].
+fn suggest_top3_scan(
+    needle: &str,
+    max_dist: usize,
+    // #14: the caller already counts the needle's chars; recomputing it per
+    // scan was a second full pass on every `--explain` typo.
+    needle_len: usize,
+) -> ArrayVec<(usize, usize, &'static str), 3> {
+    // Top-3 by (dist asc, prefix desc, code asc) via fixed-size insertion
+    // sort — avoids the `Vec` + `O(n log n)` sort for a 3-element result.
+    let mut top: ArrayVec<(usize, usize, &str), 3> = ArrayVec::new();
+    let needle_len = needle.chars().count();
+    let nb = needle.as_bytes();
+
+    // ── First-char bucketing ─────────────────────────────────────
+    // The registry is validated to `^[EW]\d{3}$`, so a 4-char needle that
+    // itself matches that shape can only match entries in one of two
+    // buckets:
+    //
+    //   * same-prefix (`E###` vs `E###`): up to `max_dist` edits anywhere;
+    //     run `osa_distance` on the whole code.
+    //
+    //   * cross-prefix (`E###` vs `W###`): a single prefix substitution
+    //     consumes the *entire* `max_dist == 1` budget, so the 3-digit
+    //     remainder must be an **exact** match — no OSA pass needed.
+    //
+    // No other prefixes exist, so the cross-prefix remainder check plus
+    // the same-prefix OSA pass covers every match, halving the OSA calls.
+    // `needle_len == 4` forces `max_dist == 1` (4/3 == 1); so does
+    // `needle_len == 5` — but a 5-char needle can only match a 4-char code
+    // at distance 1 by a *pure insertion* (the length delta already spends
+    // the whole budget), so its same-prefix branch is an exact
+    // delete-one-digit test and its cross-prefix branch can never match
+    // (substitution + insertion = distance 2 > max_dist).  Extending the
+    // bucket to 5 keeps an `E0308`-shaped typo from walking the whole table
+    // through the full rolling DP.  Non-shape needles (shorter, longer,
+    // non-EW prefix, non-digit body) fall through to the unrestricted scan
+    // below.
+    let bucketed = matches!(needle_len, 4 | 5)
+        && matches!(nb[0], b'E' | b'W')
+        && nb[1..].iter().all(u8::is_ascii_digit);
+    if bucketed {
+        let same_prefix = nb[0];
+        let rest = &needle[1..];
+        for e in crate::diagnostics::error_code::CODE_TABLE.iter() {
+            let eb = e.code.as_bytes();
+            if eb[0] != same_prefix {
+                // Cross-prefix: for a 4-char needle a prefix substitution
+                // consumes the whole `max_dist == 1` budget, so the digits
+                // must match exactly; for a 5-char needle substitution +
+                // insertion is distance 2 — never within budget.
+                if needle_len == 4 && eb[0] == (if same_prefix == b'E' { b'W' } else { b'E' }) {
+                    if &e.code[1..] != rest {
+                        continue;
+                    }
+                    let prefix = common_prefix_len(&needle, e.code);
+                    insert_top3(&mut top, 1, prefix, e.code);
+                }
+                continue;
+            }
+            // The table is validated to `^[EW]\d{3}$`, so every code is
+            // exactly 4 bytes — `debug_assert_eq!` pins it.
+            debug_assert_eq!(eb.len(), 4, "CODE_TABLE codes must be 4 bytes");
+            let dist = if needle_len == 4 {
+                // `max_dist == 1` here, so ask the ≤ 1 question directly: a
+                // ~4-compare check instead of the full rolling DP.
+                match osa_dist_le_1(&needle, e.code) {
+                    Some(d) => d,
+                    None => continue, // distance ≥ 2 > max_dist
+                }
+            } else {
+                // `max_dist == 1` and the needle is one digit longer, so the
+                // only surviving edit is a single insertion into the code:
+                // the code's digits must be the needle's digits minus one.
+                if !digits_match_with_one_deletion(rest.as_bytes(), &e.code.as_bytes()[1..]) {
+                    continue;
+                }
+                1
+            };
+            if dist > max_dist {
+                continue;
+            }
+            let prefix = common_prefix_len(&needle, e.code);
+            insert_top3(&mut top, dist, prefix, e.code);
+        }
+    } else {
+        for e in crate::diagnostics::error_code::CODE_TABLE
+            .iter()
+            // Length prefilter: each edit changes length by at most one, so
+            // |Δlen| is a lower bound on the distance — an entry whose code
+            // length differs by more than the radius can never match, and its
+            // DP is skipped.  The needle uses a char count (not byte length) so
+            // the bound stays exact for non-ASCII typos; every table code is
+            // validated to `^[EW]\d{3}$`, so `e.code.len()` is already its char
+            // count (constant 4) and skips the per-code char walk.
+            .filter(|e| needle_len.abs_diff(e.code.len()) <= max_dist)
+        {
+            // `max_dist == 1` covers every needle up to 5 chars — the common
+            // typo shape — so the ≤ 1 oracle answers it without the DP;
+            // wider radii fall back to the full DP, which remains the
+            // reference the differential tests pin.
+            let dist = if max_dist == 1 {
+                match osa_dist_le_1(&needle, e.code) {
+                    Some(d) => d,
+                    None => continue,
+                }
+            } else {
+                osa_distance(&needle, e.code)
+            };
+            if dist > max_dist {
+                continue;
+            }
+            let prefix = common_prefix_len(&needle, e.code);
+            insert_top3(&mut top, dist, prefix, e.code);
+        }
+    }
+
+    top
+}
+
+/// Direct-address neighbourhood enumeration for `[EW]\d{3,4}`-shaped needles,
+/// replacing the 452-entry table walk of [`suggest_top3_scan`].
+///
+/// Every registry code at OSA distance ≤ 1 from a shaped needle is reachable
+/// by exactly one of:
+///
+/// * identity (distance 0);
+/// * one substitution — the prefix (`E↔W`, which forces an exact digit
+///   remainder) or any single digit lane (10 digits each): 1 + 3·10 slots;
+/// * one transposition of an adjacent digit pair: 3 slots;
+/// * for a 5-digit needle, one insertion *into the code* — the length delta
+///   already spends the whole radius, so the code's digits must be the
+///   needle's digits minus one (the 4 deletion candidates).
+///
+/// That is ≤ 41 candidate slots per query (deduped), each resolved `O(1)`
+/// through [`lookup`]'s `code_slot` + `CODE_INDEX` read, versus a full
+/// 452-entry table walk whose per-entry test is itself several compares.
+/// [`insert_top3`]'s comparator is a strict total order on distinct
+/// `(dist, prefix, code)` entries, so enumeration order cannot change the
+/// top-3 — pinned differentially against [`suggest_top3_scan`].
+fn suggest_top3_direct(needle: &str) -> ArrayVec<(usize, usize, &'static str), 3> {
+    // Only `[EW]\d{3}` / `[EW]\d{4}` needles have an enumerable
+    // direct-address neighbourhood.  Anything else (typos like "E03",
+    // longer strings, noise) has no enumeration shape — fall back to the
+    // table scan so the entry point is total (the differential test feeds
+    // exactly such inputs).  Production callers route shaped needles here
+    // and unshaped ones straight to the scan, so this branch is cold.
+    let nb = needle.as_bytes();
+    let shaped = matches!(nb.len(), 4 | 5)
+        && matches!(nb[0], b'E' | b'W')
+        && nb[1..].iter().all(u8::is_ascii_digit);
+    if !shaped {
+        let max_dist = std::cmp::max(1, nb.len() / 3);
+        return suggest_top3_scan(needle, max_dist, needle.chars().count());
+    }
+    /// Resolve one candidate slot (if a known code) into the top-3.
+    fn consider(
+        top: &mut ArrayVec<(usize, usize, &'static str), 3>,
+        needle: &str,
+        cand: &[u8; 4],
+        dist: usize,
+    ) {
+        let code = std::str::from_utf8(cand).expect("E/W + ASCII digits is UTF-8");
+        if let Some(e) = crate::diagnostics::error_code::lookup(code) {
+            // Dedup by code: the 5-char deletion branch can enumerate the
+            // same 4-char code at two `skip` positions when the needle's
+            // digits repeat, and `insert_top3` does not dedup.  The same
+            // code from the same needle always carries the same claimed
+            // distance, so skipping a duplicate never changes the ranking.
+            if top.iter().any(|t| t.2 == e.code) {
+                return;
+            }
+            insert_top3(top, dist, common_prefix_len(needle, e.code), e.code);
+        }
+    }
+
+    let nb = needle.as_bytes();
+    let prefix = nb[0];
+    let digits = &nb[1..];
+    let mut top: ArrayVec<(usize, usize, &'static str), 3> = ArrayVec::new();
+
+    if digits.len() == 3 {
+        // Identity (distance 0) — the table lookup simply confirms presence.
+        let mut cand = [prefix, digits[0], digits[1], digits[2]];
+        consider(&mut top, needle, &cand, 0);
+        // Prefix substitution (distance 1, whole budget).
+        cand[0] = if prefix == b'E' { b'W' } else { b'E' };
+        consider(&mut top, needle, &cand, 1);
+        // Digit substitutions, one lane at a time (distance 1 each).  The
+        // candidate is rebuilt from the needle every iteration so lanes set
+        // by previous substitutions never leak into the next one.
+        for p in 0..3 {
+            for d in 0..10u32 {
+                let dv = b'0' + d as u8;
+                if dv == digits[p] {
+                    continue; // identity, already considered
+                }
+                cand = [prefix, digits[0], digits[1], digits[2]];
+                cand[p + 1] = dv;
+                consider(&mut top, needle, &cand, 1);
+            }
+        }
+        // Adjacent-digit transpositions (OSA distance 1 each).  Transposing
+        // two *equal* digits reproduces the needle verbatim — a distance-0
+        // duplicate, not a distance-1 neighbour — so skip that candidate;
+        // `insert_top3` would otherwise record it at the claimed distance 1.
+        for p in 0..2 {
+            cand = [prefix, digits[0], digits[1], digits[2]];
+            cand.swap(p + 1, p + 2);
+            if cand == [prefix, digits[0], digits[1], digits[2]] {
+                continue;
+            }
+            consider(&mut top, needle, &cand, 1);
+        }
+    } else {
+        debug_assert_eq!(digits.len(), 4, "shaped needle is [EW]\\d{{3,4}}");
+        // 5-char needle: only a single insertion into a 4-char code stays
+        // within the radius — the code's digits are the needle's minus one.
+        for skip in 0..4 {
+            let mut cand = [prefix, 0u8, 0, 0];
+            let mut k = 1;
+            for (i, &d) in digits.iter().enumerate() {
+                if i != skip {
+                    cand[k] = d;
+                    k += 1;
+                }
+            }
+            consider(&mut top, needle, &cand, 1);
+        }
+    }
+    top
+}
+
 /// List all available error codes with their titles, formatted for terminal output.
-pub fn list_error_codes() -> String {
+pub fn list_error_codes(use_color: bool) -> String {
     use std::fmt::Write;
+    let (bold, cyan, dim, reset) = if use_color {
+        ("\x1b[1m", "\x1b[36m", "\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "\x1b[1m{}\x1b[0m\n",
+        "{bold}{}{reset}\n",
         crate::diagnostics::i18n::fluent::available_error_codes()
     );
     for (cat, entries) in crate::diagnostics::error_code::code_entries_by_category() {
-        let _ = writeln!(out, " \x1b[36m── {} ──\x1b[0m", cat.label(),);
+        let _ = writeln!(out, " {cyan}── {} ──{reset}", cat.label(),);
         for entry in entries {
-            let _ = writeln!(out, "  \x1b[1m{}\x1b[0m  {}", entry.code, entry.title,);
+            let _ = writeln!(out, "  {bold}{}{reset}  {}", entry.code, entry.title,);
         }
     }
     let _ = writeln!(
         out,
-        "\n\x1b[2m{}\x1b[0m",
+        "\n{dim}{}{reset}",
         crate::diagnostics::i18n::fluent::run_explain_detail()
     );
     out
@@ -2102,10 +2735,49 @@ pub(crate) fn floor_char_boundary(source: &str, offset: usize) -> usize {
 /// `char_col = b − cumulative_extra` for non-ASCII chars starting before `b`.
 /// `sparse` is a sorted `[(start_byte, cumulative_extra)]` table; one
 /// `partition_point` + one array read gives the answer in `O(log K)`.
-fn char_col_from_sparse(sparse: &[(u32, u32)], b: usize) -> usize {
-    let k = sparse.partition_point(|&(p, _)| (p as usize) < b);
-    let extra = if k > 0 { sparse[k - 1].1 as usize } else { 0 };
-    b - extra
+/// `None` means the line is ASCII, so char col equals byte col (`b`).
+/// Kept as the reference implementation for differential testing; the
+/// production path uses the hinted variant below.
+#[cfg_attr(not(test), allow(dead_code))]
+fn char_col_from_sparse(sparse: Option<&[(u32, u32)]>, b: usize) -> usize {
+    match sparse {
+        Some(s) => {
+            let k = s.partition_point(|&(p, _)| (p as usize) < b);
+            let extra = if k > 0 { s[k - 1].1 as usize } else { 0 };
+            b - extra
+        }
+        None => b,
+    }
+}
+
+/// Hinted variant of [`char_col_from_sparse`]: `hint` caches the last
+/// `partition_point` result, so a *sequence* of increasing `b` on the same
+/// line — spans sorted by offset, the common render shape — advances a scalar
+/// `O(1)` per step instead of binary-searching from scratch each time.  A
+/// shrink (`b` below the hint's line position) falls back to `partition_point`
+/// once and re-anchors the hint, so scattered access stays correct at
+/// `O(log K)`.
+///
+/// The hint is an `AtomicUsize` (relaxed load/store) so the sparse tables can
+/// live in a map shared across parallel render workers: a racy store can only
+/// cost one re-anchor, never a wrong answer.
+fn char_col_from_sparse_hinted(
+    s: &[(u32, u32)],
+    hint: &std::sync::atomic::AtomicUsize,
+    b: usize,
+) -> usize {
+    use std::sync::atomic::Ordering;
+    let mut k = hint.load(Ordering::Relaxed).min(s.len());
+    // Advance while the next entry's start is still below `b`.
+    while k < s.len() && (s[k].0 as usize) < b {
+        k += 1;
+    }
+    // Overshot (`b` shrank since the hint was set): re-anchor via binary search.
+    if k > 0 && (s[k - 1].0 as usize) >= b {
+        k = s.partition_point(|&(p, _)| (p as usize) < b);
+    }
+    hint.store(k, Ordering::Relaxed);
+    b - if k > 0 { s[k - 1].1 as usize } else { 0 }
 }
 
 /// Convert a byte-offset span into a 0-based (line, col) pair.
@@ -2130,9 +2802,51 @@ pub(crate) fn is_real_file_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('<')
 }
 
-/// Convert a byte column within `line` to a character column (0-based).
-pub(crate) fn byte_col_to_char_col(line: &str, byte_col: usize) -> usize {
-    line[..byte_col.min(line.len())].chars().count()
+/// [`sanitize_for_terminal`] variant for one-line renderers that flatten
+/// breaks themselves: identical SWAR gates and replacement, but `\n`, `\r`
+/// and `\t` survive as layout bytes — the caller consumes them as break runs
+/// (the plain variant would turn them into U+FFFD first and defeat the
+/// flattening).  The short renderer's `push_flattened` collapses all three
+/// to a single space, so a tab never reaches the one-line output verbatim.
+pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    let (has_high, dirty) = scan_terminal_control_flags_flatten(bytes);
+    if !has_high && !dirty {
+        return Cow::Borrowed(s);
+    }
+    // Non-ASCII with no C0/C1/DEL *and* no bidi override/isolate: borrow.
+    // Bidi formatting characters (U+202A–U+202E, U+2066–U+2069) are neither
+    // controls nor visible, so the byte-level scan cannot see them — they are
+    // probed separately (see [`sanitize_for_terminal`] for the spoofing
+    // rationale) and must reach the owned path for removal.
+    if has_high && !dirty && !has_c1_sequence(bytes) && !has_bidi_override_bytes(bytes) {
+        return Cow::Borrowed(s);
+    }
+    // Bidi overrides/isolates are *removed* (not U+FFFD'd), matching
+    // [`sanitize_filename`] and the source-row renderer: they carry no
+    // content, only rendering direction, so replacement would just inject
+    // noise while `\n`/`\r`/`\t` survive for the flattening caller.
+    if has_bidi_override_bytes(bytes) {
+        return Cow::Owned(s.chars()
+            .filter(|c| !is_bidi_override(*c))
+            .map(|c| {
+                if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect());
+    }
+    Cow::Owned(s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect())
 }
 
 /// Replace control characters with U+FFFD so external text cannot inject
@@ -2154,24 +2868,207 @@ pub(crate) fn byte_col_to_char_col(line: &str, byte_col: usize) -> usize {
 ///    is borrowed.  Only strings that actually contain a control character
 ///    pay the allocate-and-copy path.  `is_control` covers C0
 ///    (`0x00..=0x1F`), C1 (`0x80..=0x9F`) and DEL (`0x7F`).
+///
+/// Bidi overrides/isolates (U+202A–U+202E, U+2066–U+2069) are neither
+/// controls nor visible, so they escape both fast paths' scans; a gated
+/// `memchr(0xE2)` precheck catches them and they are **removed** in the
+/// owned path (same convention as [`sanitize_filename`]) so a path like
+/// `evil.cod\u{202E}exe` cannot spoof its extension in terminal output.
 pub(crate) fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
-    // ASCII fast path: no control character can be printable ASCII, so the
-    // whole `is_printable_ascii` range (0x20..=0x7E) is control-free.
-    if crate::diagnostics::ascii::is_printable_ascii(s.as_bytes()) {
+    // One fused SWAR pass answers both gates.  The old sequence
+    // (`is_printable_ascii` then `has_control_byte_level`) loaded the same
+    // clean bytes twice — the printable-ASCII lane already rejects every
+    // byte < 0x20, so the control probe re-scanned what the first pass had
+    // just cleared.
+    let bytes = s.as_bytes();
+    let (has_high, dirty) = scan_terminal_control_flags(bytes);
+    if !has_high && !dirty {
+        // Every byte in 0x20..=0x7E: printable ASCII, control-free.
         return Cow::Borrowed(s);
     }
-    // Non-ASCII: check whether any replacement is actually needed.  This is
-    // the hot path for localized text (CJK / Cyrillic / accented Latin), which
-    // contains no control characters and must not pay the allocate-and-copy
-    // cost that a naive `collect` would incur.
-    if !s.chars().any(char::is_control) {
+    // The dominant i18n case (pure Cyrillic / CJK / accented Latin, no
+    // controls): non-ASCII, but nothing to replace — borrow.  C1 is only
+    // possible where high bytes exist, so the `memchr(0xC2)` probe is gated.
+    // Bidi overrides/isolates (U+202A–U+202E, U+2066–U+2069) are invisible
+    // and not controls, so they escape the SWAR scan — but they reorder
+    // surrounding display text (`evil.cod\u{202E}exe` spoofs its extension),
+    // so they are probed with the same gated `memchr(0xE2)` precheck and
+    // force the owned path.  Owned: they are *removed*, matching
+    // [`sanitize_filename`] — direction-only characters have no content, and
+    // U+FFFD would just inject noise.
+    let bidi = has_high && has_bidi_override_bytes(bytes);
+    if has_high && !dirty && !has_c1_sequence(bytes) && !bidi {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(
-        s.chars()
-            .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-            .collect(),
-    )
+    if bidi {
+        Cow::Owned(
+            s.chars()
+                .filter(|c| !is_bidi_override(*c))
+                .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Owned(
+            s.chars()
+                .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+                .collect(),
+        )
+    }
+}
+
+/// One SWAR pass classifying a byte slice for the terminal sanitizers.
+///
+/// Returns `(has_high, dirty)`:
+///
+/// * `has_high` — any byte ≥ 0x80 (non-ASCII UTF-8 byte, lead or
+///   continuation);
+/// * `dirty` — any byte that a sanitizer must replace: byte < 0x20 (C0) or
+///   `0x7F` (DEL).
+///
+/// Three masks per 8-byte chunk (`hasless(0x20)`, `has_zero(0x7F)`, the
+/// high-bit OR) instead of the two full scans the previous two-gate
+/// structure ran over clean input.  C1 (`0xC2 0x80..=0x9F`) is *not* folded
+/// in — it needs a positional two-byte check, and it is only possible when
+/// `has_high` is set, so callers probe it separately via
+/// [`has_c1_sequence`].
+fn scan_terminal_control_flags(s: &[u8]) -> (bool, bool) {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const SP: u64 = 0x2020_2020_2020_2020;
+    const DEL: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+
+    let mut has_high = false;
+    let mut dirty = false;
+    let mut i = 0;
+    while i + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        has_high |= x & HI != 0;
+        // C0: any byte < 0x20 (existentially exact).
+        dirty |= x.wrapping_sub(SP) & !x & HI != 0;
+        // DEL: any byte == 0x7F (exact — any flag implies a real lane).
+        let q = x ^ DEL;
+        dirty |= q.wrapping_sub(ONES) & !q & HI != 0;
+        i += 8;
+    }
+    for &b in &s[i..] {
+        has_high |= b >= 0x80;
+        dirty |= b < 0x20 || b == 0x7F;
+    }
+    (has_high, dirty)
+}
+
+/// Whether `s` contains a C1 control sequence (`0xC2` followed by
+/// `0x80..=0x9F`) — the UTF-8 encoding of Unicode category `Cc` above DEL.
+/// Only worth calling when the slice is known to contain high bytes.
+fn has_c1_sequence(s: &[u8]) -> bool {
+    let mut j = 0;
+    while let Some(off) = memchr::memchr(0xC2, &s[j..]) {
+        let k = j + off;
+        if k + 1 < s.len() && (0x80..=0x9F).contains(&s[k + 1]) {
+            return true;
+        }
+        j = k + 1;
+    }
+    false
+}
+
+/// One fused SWAR pass classifying a byte slice for
+/// [`sanitize_for_terminal_multiline`]: returns `(has_high, dirty)` where
+/// `has_high` is any byte ≥ 0x80 and `dirty` is any byte the multiline
+/// sanitizer must replace — a C0 byte other than `\t`/`\n`, or DEL.  The
+/// `\t`/`\n` exclusion keeps the old dirty-chunk discipline: the `< 0x20`
+/// mask is only existentially exact (it cannot be masked per-lane), so a
+/// chunk that trips it gets its *flagged lanes* resolved by exact byte
+/// checks (`trailing_zeros`/8 → offset) — never a full 8-byte rescan, so a
+/// multiline message whose every chunk contains `\t`/`\n` stays near full
+/// SWAR speed.  C1 is probed separately via [`has_c1_sequence`], only when
+/// `has_high`.
+pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool) {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const SP: u64 = 0x2020_2020_2020_2020;
+    const DEL: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const TAB: u64 = 0x0909_0909_0909_0909;
+    const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+
+    let mut has_high = false;
+    let mut dirty = false;
+    let mut i = 0;
+    while i + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        has_high |= x & HI != 0;
+        // DEL: exact — any flag implies a genuine 0x7F lane.
+        let q = x ^ DEL;
+        if q.wrapping_sub(ONES) & !q & HI != 0 {
+            dirty = true;
+        }
+        // C0: exact per-lane `< 0x20` mask (the `| HI` before the subtraction
+        // prevents an inter-lane borrow), with `\t`/`\n` masked back out.
+        // Unlike the inexact `hasless` idiom this needs no flagged-lane
+        // resolution, so tab/newline-dense text stays O(chunks), not O(bytes).
+        // High-byte lanes are excluded explicitly: this scanner cannot
+        // early-return on `x & HI` (unlike `ascii.rs`), and the raw form also
+        // flags bytes in `0x80..=0x9F`.
+        let lt20 = !((x | HI).wrapping_sub(SP)) & HI & !(x & HI);
+        if lt20 != 0 {
+            let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI;
+            let nl = !(((x ^ NL) | HI).wrapping_sub(ONES)) & HI;
+            if lt20 & !tab & !nl != 0 {
+                dirty = true;
+            }
+        }
+        i += 8;
+    }
+    for &b in &s[i..] {
+        has_high |= b >= 0x80;
+        dirty |= (b < 0x20 && b != b'\t' && b != b'\n') || b == 0x7F;
+    }
+    (has_high, dirty)
+}
+
+/// [`scan_terminal_control_flags_multiline`] variant for
+/// [`sanitize_for_terminal_flatten`]: `\t`, `\n` *and* `\r` are excluded from
+/// the dirty set, because those are exactly the layout bytes the flatten path
+/// keeps or consumes (`push_flattened`).  A multi-line message with no other
+/// controls therefore stays `Cow::Borrowed`, and flagged-lane resolution (not
+/// whole-chunk rescans) keeps tab/newline/CR-dense text at SWAR speed.
+fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool) {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const SP: u64 = 0x2020_2020_2020_2020;
+    const DEL: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const TAB: u64 = 0x0909_0909_0909_0909;
+    const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+    const CR: u64 = 0x0D0D_0D0D_0D0D_0D0D;
+
+    let mut has_high = false;
+    let mut dirty = false;
+    let mut i = 0;
+    while i + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        has_high |= x & HI != 0;
+        let q = x ^ DEL;
+        if q.wrapping_sub(ONES) & !q & HI != 0 {
+            dirty = true;
+        }
+        // Exact C0 mask, minus high-byte lanes (see the multiline scanner),
+        // then minus the layout bytes `push_flattened` consumes.
+        let lt20 = !((x | HI).wrapping_sub(SP)) & HI & !(x & HI);
+        if lt20 != 0 {
+            let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI;
+            let nl = !(((x ^ NL) | HI).wrapping_sub(ONES)) & HI;
+            let cr = !(((x ^ CR) | HI).wrapping_sub(ONES)) & HI;
+            if lt20 & !tab & !nl & !cr != 0 {
+                dirty = true;
+            }
+        }
+        i += 8;
+    }
+    for &b in &s[i..] {
+        has_high |= b >= 0x80;
+        dirty |= (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F;
+    }
+    (has_high, dirty)
 }
 
 /// Unicode bidirectional formatting characters: the U+202A–U+202E
@@ -2182,17 +3079,43 @@ pub(crate) fn is_bidi_override(c: char) -> bool {
     ('\u{202A}'..='\u{202E}').contains(&c) || ('\u{2066}'..='\u{2069}').contains(&c)
 }
 
+/// Byte-level precheck for [`is_bidi_override`]: every bidi override/isolate
+/// is a three-byte UTF-8 sequence starting with `0xE2` (`E2 80 AA..AE` for the
+/// overrides, `E2 81 A6..A9` for the isolates).  Returns `false` for any
+/// string that cannot contain one, letting callers skip the char-by-char
+/// scan entirely.
+pub(crate) fn has_bidi_override_bytes(s: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(off) = memchr::memchr(0xE2, &s[i..]) {
+        let j = i + off;
+        if j + 2 < s.len() {
+            let b1 = s[j + 1];
+            let b2 = s[j + 2];
+            let is_override = (b1 == 0x80 && (0xAA..=0xAE).contains(&b2))
+                || (b1 == 0x81 && (0xA6..=0xA9).contains(&b2));
+            if is_override {
+                return true;
+            }
+        }
+        i = j + 1;
+    }
+    false
+}
+
 /// Sanitize a filename for terminal display: [`sanitize_for_terminal`],
 /// plus bidirectional formatting characters removed outright.  Unlike
 /// control characters they carry no content — only rendering direction —
 /// so replacement with U+FFFD would just inject noise into the path;
 /// removal kills the spoofing.
 pub(crate) fn sanitize_filename(s: &str) -> Cow<'_, str> {
-    let base = sanitize_for_terminal(s);
-    if !base.chars().any(is_bidi_override) {
-        return base;
-    }
-    Cow::Owned(base.chars().filter(|c| !is_bidi_override(*c)).collect())
+    // `sanitize_for_terminal` already *removes* bidirectional
+    // overrides/isolates whenever `has_bidi_override_bytes` is true (its
+    // `bidi` branch), and control characters were replaced on the same pass.
+    // The old second `has_bidi_override_bytes` filter here was therefore
+    // unreachable and cost a full `memchr(0xE2)` scan per filename render.
+    // The composed contract is pinned by
+    // `sanitize_filename_removes_bidi_overrides` in the tests.
+    sanitize_for_terminal(s)
 }
 
 /// Multi-line variant of [`sanitize_for_terminal`] for text whose `\n`/`\t`
@@ -2204,21 +3127,42 @@ pub(crate) fn sanitize_filename(s: &str) -> Cow<'_, str> {
 /// are `\n`/`\t` — the common i18n case, which the naive `collect` would
 /// otherwise allocate and copy on every render.
 pub(crate) fn sanitize_for_terminal_multiline(s: &str) -> Cow<'_, str> {
-    if crate::diagnostics::ascii::is_printable_ascii_multiline(s.as_bytes()) {
+    // One fused SWAR pass answers both gates (see
+    // [`scan_terminal_control_flags_multiline`]): the printable-ASCII probe
+    // already rejects every byte < 0x20, so the control probe re-scanned the
+    // same clean bytes a second time.
+    let bytes = s.as_bytes();
+    let (has_high, dirty) = scan_terminal_control_flags_multiline(bytes);
+    if !has_high && !dirty {
+        // Printable ASCII plus `\t`/`\n` layout controls: borrow verbatim.
         return Cow::Borrowed(s);
     }
-    // Replacement is needed only for a control character other than `\n`/`\t`.
-    // Short-circuits on the first such character, so the cost is bounded by
-    // the position of the first control, not the string length.
+    // Byte-level gate: `\t`/`\n` preserved, every other C0/DEL/C1 rejected.
+    // Pure i18n text without controls exits here after a bounded byte scan,
+    // skipping the per-char `is_control` iteration entirely.  C1 is only
+    // possible where high bytes exist, so the probe is gated.  As in
+    // [`sanitize_for_terminal`], invisible bidi overrides/isolates escape the
+    // control scan and force the owned path, where they are removed (same
+    // convention as [`sanitize_filename`]).
+    let bidi = has_high && has_bidi_override_bytes(bytes);
+    if has_high && !dirty && !has_c1_sequence(bytes) && !bidi {
+        return Cow::Borrowed(s);
+    }
     let needs_replace = |c: char| c.is_control() && c != '\n' && c != '\t';
-    if !s.chars().any(needs_replace) {
-        return Cow::Borrowed(s);
+    if bidi {
+        Cow::Owned(
+            s.chars()
+                .filter(|c| !is_bidi_override(*c))
+                .map(|c| if needs_replace(c) { '\u{FFFD}' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Owned(
+            s.chars()
+                .map(|c| if needs_replace(c) { '\u{FFFD}' } else { c })
+                .collect(),
+        )
     }
-    Cow::Owned(
-        s.chars()
-            .map(|c| if needs_replace(c) { '\u{FFFD}' } else { c })
-            .collect(),
-    )
 }
 
 /// Precomputed line-start table for O(log n) byte-offset → line lookup.
@@ -2237,7 +3181,7 @@ pub(crate) struct LineIndex<'a> {
     /// `Arc`-shared so a cached index can be handed to a later render by an
     /// O(1) clone instead of rebuilding or copying the table (see
     /// [`RenderCtx::line_index`](crate::diagnostics::render::RenderCtx::line_index)).
-    starts: Arc<[usize]>,
+    starts: Arc<[u32]>,
     source: &'a str,
     /// Whether `source` is pure ASCII.  When true, byte columns equal
     /// character columns, so [`LineIndex::linecol_display`] skips the
@@ -2249,10 +3193,12 @@ pub(crate) struct LineIndex<'a> {
     /// hit never rescans.
     ascii: bool,
     /// Lazily-populated sparse non-ASCII char-extra table per line, keyed by
-    /// line index.  Each entry is `Arc<[(u32, u32)]>` — one `(start_byte,
-    /// cumulative_extra)` pair per non-ASCII char, where `cumulative_extra`
-    /// is the running sum of `len_utf8 − 1`.  Then
-    /// `char_col(b) = b − cumulative_extra` for all non-ASCII chars whose
+    /// line index.  Each entry is
+    /// `Option<(CharPrefixTable, AtomicUsize)>`:
+    /// `None` marks an ASCII line (char col == byte col, no table needed),
+    /// `Some` holds one `(start_byte, cumulative_extra)` pair per non-ASCII
+    /// char, where `cumulative_extra` is the running sum of `len_utf8 − 1`.
+    /// Then `char_col(b) = b − cumulative_extra` for all non-ASCII chars whose
     /// `start_byte < b`, found by one `partition_point` + one array read.
     ///
     /// Only built on the non-ASCII path of [`linecol_display`](Self::linecol_display):
@@ -2265,24 +3211,168 @@ pub(crate) struct LineIndex<'a> {
     /// `Arc`-shared across every index built from the same cached source
     /// (threaded through [`from_shared`](Self::from_shared) and the
     /// `RenderCtx` LRU), so a batch of M diagnostics over one long non-ASCII
-    /// line pays one build, not M.  `RefCell` is the render path is
-    /// single-threaded and the borrow in [`char_col`](Self::char_col) never
-    /// spans another borrow.
-    char_prefixes: Arc<RefCell<FxHashMap<usize, Arc<[(u32, u32)]>>>>,
+    /// line pays one build, not M.  Behind a `RwLock` so the parallel render
+    /// path can share one map across workers; storing `None` for ASCII lines
+    /// (instead of an
+    /// empty table) avoids any allocation per ASCII line in a mixed
+    /// CJK/ASCII source — the common case for real code with comments.  The
+    /// per-line table itself is an inline `SmallVec<[(u32, u32); 8]>`, not an
+    /// inner `Arc`: the map is shared by reference, so the inner refcount was
+    /// always 1 and only bought a heap allocation per non-ASCII line.
+    ///
+    /// CAVEAT: the `AtomicUsize` hint is shared through the map.  A racy
+    /// `store` can only make a later query re-anchor via `partition_point`
+    /// (the hint is a heuristic, never the answer), so the shared map is
+    /// `Send + Sync` and one `LineIndex`/`RenderCtx` may hand its
+    /// `char_prefixes` to parallel workers — see
+    /// [`RenderCtx::preload_line_index`](crate::diagnostics::render::RenderCtx::preload_line_index).
+    char_prefixes: Arc<crate::diagnostics::render::CharPrefixMap>,
+    /// Process-wide monotonic id, assigned in [`LineIndex::new`] and carried
+    /// through [`from_shared`](Self::from_shared).  Paired with the
+    /// `(index_id, source_id, len)` memo key in [`LAST_CHAR_COL`] it makes
+    /// the thread-local memo's ABA hazard (a later batch's index and source
+    /// recycled at the same heap addresses) impossible, not just
+    /// "unreachable in practice": a fresh `new()` always takes a generation
+    /// no prior index ever held.
+    generation: u64,
+}
+
+/// Source of [`LineIndex`]'s generation ids.  One relaxed `fetch_add` per
+/// index construction — `LineIndex::new` runs once per source per batch, so
+/// this is never on the span-conversion hot path.
+static LINE_INDEX_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fused newline-start collection and ASCII predicate in one `u64`-chunk
+/// pass, replacing the two `memchr_iter` scans plus `is_ascii` the old
+/// `LineIndex::new` ran.  Each 8-byte lane is tested for any high bit
+/// (non-ASCII) and any `0x0A` (newline) via the standard `has_zero` SWAR
+/// primitive (`(x ^ NL).wrapping_sub(ONES) & !(x ^ NL) & HI`).  The `Vec`
+/// starts at `with_capacity(16)` and grows amortised — the previous
+/// exact-capacity count pass is dropped because the combined scan already
+/// sees every newline, so the win is one fewer full pass over the source
+/// (the `is_ascii` SIMD scan), not a capacity saving.  For a ≥ 1 MB source
+/// this is measurable; for small files the difference is noise.
+///
+/// Newline starts are `u32`: a diagnostic source over 4 GiB is not a real
+/// input, and the halved table halves `line_of`'s binary-search cache
+/// footprint (the table is read on every span conversion).  The `debug_assert`
+/// guards the cast; sources are ≤ 4 GiB in every supported configuration.
+fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool) {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+
+    let bytes = source.as_bytes();
+    debug_assert!(
+        bytes.len() <= u32::MAX as usize,
+        "scan_line_starts_and_ascii: source exceeds u32 offsets ({} bytes)",
+        bytes.len()
+    );
+    // Pre-size for large sources so the 16→2× growth chain doesn't pay ~16
+    // reallocations (and megabytes of copies) on a 50 MB / 1M-line file.  The
+    // 1 MB gate keeps typical small sources from paying the one extra `memchr`
+    // scan the counting pass requires.
+    const LARGE_SOURCE_THRESHOLD: usize = 1 << 20;
+    let capacity = if bytes.len() >= LARGE_SOURCE_THRESHOLD {
+        memchr::memchr_iter(b'\n', bytes).count() + 1
+    } else {
+        16
+    };
+    let mut starts = Vec::with_capacity(capacity);
+    starts.push(0);
+    let mut ascii = true;
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        let x = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        ascii &= (x & HI) == 0;
+        let q = x ^ NL;
+        // Exact newline mask: `(q | HI)` is exactly 0x80 at a newline and
+        // ≥ 0x81 elsewhere, so the `- 1` never borrows across lanes and every
+        // flagged lane is a genuine `\n` — no per-candidate verification
+        // branch (the old `has_zero` mask flagged `0x0B` after a newline).
+        let mut mask = !((q | HI).wrapping_sub(ONES)) & HI;
+        while mask != 0 {
+            let off = i + (mask.trailing_zeros() as usize / 8);
+            starts.push((off + 1) as u32);
+            mask &= mask - 1;
+        }
+        i += 8;
+    }
+    while i < bytes.len() {
+        let b = bytes[i];
+        ascii &= b < 0x80;
+        if b == b'\n' {
+            starts.push((i + 1) as u32);
+        }
+        i += 1;
+    }
+    (starts, ascii)
+}
+
+/// Soft cap on `LineIndex::char_prefixes` growth: the map gains one entry per
+/// queried non-ASCII line and never evicts, so a long-lived process rendering
+/// a very large CJK-heavy source would creep toward ~10 MB per cached index.
+/// Past the cap the map clears wholesale — a query then rebuilds one line's
+/// sparse table, the same cost as the first query for that line, so the
+/// regression is bounded and only reaches files that genuinely have thousands
+/// of distinct non-ASCII lines.
+const CHAR_PREFIXES_CAP: usize = 4 * 1024;
+
+/// Per-thread memo of the last [`LineIndex::char_col`] lookup, so a run of
+/// span conversions on the same line of the same index skips the
+/// `char_prefixes` `RwLock` read entirely (the lock is uncontended in the
+/// per-worker render shape, but it is still an atomic acquire per span on
+/// non-ASCII sources).
+///
+/// The key is `(index identity, source identity, line)`: index identity is
+/// the `char_prefixes` `Arc`'s allocation address, source identity is the
+/// indexed `str`'s address and length.  **Invariant:** the indexed source
+/// text is immutable for the whole render batch (each `RenderCtx` carries one
+/// immutable source), so a cached per-line prefix table is a pure function of
+/// the line and can never go stale within a batch.  Both address components
+/// guard against cross-batch ABA: after one index is dropped, a later index
+/// for *different* content could have its `Arc` (or its source buffer)
+/// allocated at the recycled address, and a single-address key would then
+/// serve a stale table for another source.  Requiring both addresses *and*
+/// the length to match makes that collision unreachable in practice for a
+/// long-lived process (two independent allocations must both be recycled at
+/// the same addresses between batches); `char_col` recomputes from the
+/// shared map whenever the memo misses.  Thread-local is per render worker,
+/// so the parallel renderer needs no extra synchronization.
+thread_local! {
+    static LAST_CHAR_COL: std::cell::RefCell<
+        Option<(
+            usize,     // index_id: `char_prefixes` Arc address
+            usize,     // source_id: source buffer address
+            usize,     // source length
+            u64,       // LineIndex generation (rules out ABA reuse)
+            usize,     // line index
+            Option<std::sync::Arc<[(u32, u32)]>>,
+            usize,     // hinted partition_point position
+        )>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+fn cap_char_prefixes(
+    cache: &mut FxHashMap<
+        usize,
+        Option<(std::sync::Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>,
+    >,
+) {
+    if cache.len() >= CHAR_PREFIXES_CAP {
+        cache.clear();
+    }
 }
 
 impl<'a> LineIndex<'a> {
     pub(crate) fn new(source: &'a str) -> Self {
-        let mut starts = Vec::with_capacity(source.len() / 40 + 1);
-        starts.push(0);
-        for i in memchr::memchr_iter(b'\n', source.as_bytes()) {
-            starts.push(i + 1);
-        }
+        let (starts, ascii) = scan_line_starts_and_ascii(source);
         Self {
             starts: Arc::from(starts),
             source,
-            ascii: source.is_ascii(),
-            char_prefixes: Arc::new(RefCell::new(FxHashMap::default())),
+            ascii,
+            char_prefixes: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
+            generation: LINE_INDEX_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -2297,27 +3387,49 @@ impl<'a> LineIndex<'a> {
     /// [`char_prefixes_arc`](Self::char_prefixes_arc) of a freshly-built index.
     pub(crate) fn from_shared(
         source: &'a str,
-        starts: Arc<[usize]>,
+        starts: Arc<[u32]>,
         ascii: bool,
-        char_prefixes: Arc<RefCell<FxHashMap<usize, Arc<[(u32, u32)]>>>>,
+        char_prefixes: Arc<crate::diagnostics::render::CharPrefixMap>,
+        generation: u64,
     ) -> Self {
+        debug_assert_eq!(
+            ascii,
+            source.is_ascii(),
+            "from_shared: ascii flag does not match source"
+        );
+        debug_assert_eq!(
+            starts.first().copied(),
+            Some(0),
+            "from_shared: starts[0] must be 0"
+        );
         Self {
             starts,
             source,
             ascii,
             char_prefixes,
+            generation,
         }
     }
 
+    /// The index's generation id — the [`LAST_CHAR_COL`] memo-key component
+    /// that rules out cross-batch address-reuse collisions.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// The shared line-start table, for caching by an O(1) `Arc` clone.
-    pub(crate) fn starts_arc(&self) -> &Arc<[usize]> {
+    pub(crate) fn starts_arc(&self) -> &Arc<[u32]> {
         &self.starts
     }
 
     /// The shared char-prefix cache, for caching by an O(1) `Arc` clone so a
     /// batch of diagnostics over one non-ASCII source reuses the per-line
-    /// prefixes instead of rebuilding them per render.
-    pub(crate) fn char_prefixes_arc(&self) -> &Arc<RefCell<FxHashMap<usize, Arc<[(u32, u32)]>>>> {
+    /// prefixes instead of rebuilding them per render.  The cache is
+    /// `Send + Sync` (the hint is an `AtomicUsize`, the map behind a
+    /// `RwLock`), so the parallel render path shares one map across workers.
+    pub(crate) fn char_prefixes_arc(
+        &self,
+    ) -> &Arc<crate::diagnostics::render::CharPrefixMap> {
         &self.char_prefixes
     }
 
@@ -2328,7 +3440,10 @@ impl<'a> LineIndex<'a> {
 
     /// 0-based line containing `offset` (clamped to the source length).
     pub(crate) fn line_of(&self, offset: usize) -> usize {
-        match self.starts.binary_search(&offset.min(self.source.len())) {
+        match self
+            .starts
+            .binary_search(&(offset.min(self.source.len()) as u32))
+        {
             Ok(line) => line,
             Err(0) => 0,
             Err(next) => next - 1,
@@ -2341,7 +3456,7 @@ impl<'a> LineIndex<'a> {
         let line = self.line_of(clamped);
         label::SourcePos {
             line,
-            col: clamped - self.starts[line],
+            col: clamped - self.starts[line] as usize,
         }
     }
 
@@ -2383,31 +3498,103 @@ impl<'a> LineIndex<'a> {
     /// Memory is `O(K)` (8 bytes per non-ASCII char) vs the old dense
     /// prefix's `O(line.len())`.
     fn char_col(&self, line_idx: usize, byte_col: usize) -> usize {
-        // Cache check *first*: a cached entry — empty for ASCII lines, sparse
-        // for non-ASCII — avoids the O(line_len) `is_ascii()` scan on every
-        // call.  Without this hoist, ASCII lines in a non-ASCII source re-scan
-        // `is_ascii()` per span because they never populated the cache (the
-        // per-source `ascii` flag only short-circuits all-ASCII sources).
-        {
-            let cache = self.char_prefixes.borrow();
-            if let Some(sparse) = cache.get(&line_idx) {
-                let line = self.line(line_idx);
-                let b = byte_col.min(line.len());
-                return char_col_from_sparse(sparse, b);
-            }
-        }
+        // `line` (and the clamped `b`) are hoisted above both the cache-hit
+        // and cache-miss paths: both need them, `line` is a pure function of
+        // immutable state, and the compiler cannot merge two calls across the
+        // lock boundary.
         let line = self.line(line_idx);
         let b = byte_col.min(line.len());
-        // An ASCII line inside a non-ASCII source: char count equals byte
-        // count, so skip the build.  Cache an *empty* sparse table so future
-        // calls for this line hit the cache above and skip the O(line_len)
-        // `is_ascii()` rescan — `char_col_from_sparse(&[], b)` returns `b`.
-        if line.is_ascii() {
-            self.char_prefixes
-                .borrow_mut()
-                .insert(line_idx, Arc::from([]));
-            return byte_col;
+        // Identity of this index's shared prefix map (see `LAST_CHAR_COL`).
+        let index_id = std::sync::Arc::as_ptr(&self.char_prefixes) as usize;
+        // Identity of the indexed buffer: the second half of the memo key,
+        // guarding against cross-batch address reuse (see `LAST_CHAR_COL`).
+        let source_id = self.source.as_ptr() as usize;
+        let source_len = self.source.len();
+        let generation = self.generation;
+        // Thread-local memo first: repeated queries on the same line — the
+        // dominant shape, spans arriving in ascending order per line — skip
+        // the lock below entirely.
+        use std::sync::atomic::Ordering as _AtomicOrdering;
+        let memo_hit = LAST_CHAR_COL.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            match slot.as_mut() {
+                Some((id, sid, slen, g, l, table, hint))
+                    if *id == index_id
+                        && *sid == source_id
+                        && *slen == source_len
+                        && *g == generation
+                        && *l == line_idx =>
+                match table {
+                    // ASCII line: char col == byte col.
+                    None => Some(b),
+                    Some(t) => {
+                        // The shared map's hint cannot be updated through the
+                        // memo (it is a snapshot), but the hint is a heuristic
+                        // — carry the advanced position inside the memo so a
+                        // same-line run stays O(1) per step.
+                        let hint_cell = std::sync::atomic::AtomicUsize::new(*hint);
+                        let answer = char_col_from_sparse_hinted(t, &hint_cell, b);
+                        *hint = hint_cell.load(_AtomicOrdering::Relaxed);
+                        Some(answer)
+                    }
+                },
+                _ => None,
+            }
+        });
+        if let Some(answer) = memo_hit {
+            return answer;
         }
+        // Cache check *first*: a cached entry — `None` for ASCII lines, `Some`
+        // sparse for non-ASCII — avoids the O(line_len) `is_ascii()` scan on
+        // every call.  Without this hoist, ASCII lines in a non-ASCII source
+        // re-scan `is_ascii()` per span because they never populated the cache
+        // (the per-source `ascii` flag only short-circuits all-ASCII sources).
+        // The map is behind a `RwLock` (shared across parallel workers); the
+        // read lock is uncontended for the per-thread render shape.
+        {
+            let cache = self.char_prefixes.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = cache.get(&line_idx) {
+                let answer = match entry {
+                    Some((table, hint)) => {
+                        let a = char_col_from_sparse_hinted(table, hint, b);
+                        LAST_CHAR_COL.with(|cell| {
+                            *cell.borrow_mut() = Some((
+                                index_id,
+                                source_id,
+                                source_len,
+                                generation,
+                                line_idx,
+                                Some(table.clone()),
+                                hint.load(_AtomicOrdering::Relaxed),
+                            ));
+                        });
+                        a
+                    }
+                    None => {
+                        LAST_CHAR_COL.with(|cell| {
+                            *cell.borrow_mut() = Some((
+                                index_id,
+                                source_id,
+                                source_len,
+                                generation,
+                                line_idx,
+                                None,
+                                0,
+                            ));
+                        });
+                        b // ASCII line — char col == byte col
+                    }
+                };
+                return answer;
+            }
+        }
+        // Non-ASCII source (the all-ASCII case never reaches `char_col`:
+        // `linecol_display` short-circuits on the per-source `ascii` flag).
+        // Build the sparse table directly — the SWAR walk
+        // discovers "this line is actually pure ASCII" for free when it finds
+        // no non-ASCII byte, so a separate `line.is_ascii()` SIMD pre-pass
+        // over the line would be a redundant scan on exactly the lines this
+        // cache-miss path exists for.
         // Build the sparse table: one `(start_byte, cumulative_extra)` pair
         // per non-ASCII char.  `cumulative_extra` is the running sum of
         // `len_utf8 − 1` — the extra bytes beyond what a 1-byte char would
@@ -2415,21 +3602,72 @@ impl<'a> LineIndex<'a> {
         // `floor_char_boundary`), every non-ASCII char either starts before
         // `b` (its full extra counts) or at/after `b` (none of it counts),
         // so `char_col = b − cumulative_extra` for chars with `start < b`.
-        // O(K) writes + O(K) memory (K = non-ASCII char count).
-        let mut sparse: Vec<(u32, u32)> = Vec::new();
+        // O(K) writes + O(K) memory (K = non-ASCII char count).  Starts
+        // inline: the dominant shape (a handful of CJK chars in an otherwise
+        // ASCII line) never touches the heap; a genuinely CJK-heavy line
+        // spills once and amortises the growth.
+        let mut sparse: SmallVec<[(u32, u32); 8]> = SmallVec::new();
         let mut extra = 0u32;
-        for (start, ch) in line.char_indices() {
-            let len = ch.len_utf8();
-            if len > 1 {
-                extra += (len - 1) as u32;
-                sparse.push((start as u32, extra));
-            }
+        // Jump the ASCII runs with one SWAR probe per non-ASCII char
+        // (`next_non_ascii_byte`) instead of decoding every character: for
+        // the dominant mixed shape (mostly-ASCII line, occasional CJK) the
+        // build is O(#non_ascii · chunk) rather than O(line_len) char decodes.
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        while let Some(off) = ascii::next_non_ascii_byte(&bytes[i..]) {
+            let start = i + off;
+            // `i` only ever sits on a char boundary (0, or just past a
+            // decoded char), and in valid UTF-8 the first high byte after a
+            // boundary is a lead byte — so this decode never fails.
+            debug_assert!(line.is_char_boundary(start));
+            let ch = line[start..].chars().next().unwrap();
+            extra += (ch.len_utf8() - 1) as u32;
+            sparse.push((start as u32, extra));
+            i = start + ch.len_utf8();
         }
-        let arc: Arc<[(u32, u32)]> = Arc::from(sparse);
-        self.char_prefixes
-            .borrow_mut()
-            .insert(line_idx, Arc::clone(&arc));
-        char_col_from_sparse(&arc, b)
+        if sparse.is_empty() {
+            // An ASCII line inside a non-ASCII source: cache `None` so future
+            // calls hit the cache above (`char_col_from_sparse(None, b)`
+            // returns `b`), exactly as the old `is_ascii()` pre-pass did.
+            let mut cache = self
+                .char_prefixes
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cap_char_prefixes(&mut cache);
+            cache.insert(line_idx, None);
+            drop(cache);
+            LAST_CHAR_COL.with(|cell| {
+                *cell.borrow_mut() =
+                    Some((index_id, source_id, source_len, generation, line_idx, None, 0))
+            });
+            return b;
+        }
+        let hint = std::sync::atomic::AtomicUsize::new(0);
+        let answer = char_col_from_sparse_hinted(&sparse, &hint, b);
+        let hint_val = hint.load(_AtomicOrdering::Relaxed);
+        // Share one heap allocation between the cache and the memo: the old
+        // `sparse.clone()` paid an O(K) copy on every non-ASCII line
+        // transition.
+        let table: std::sync::Arc<[(u32, u32)]> = sparse.into_vec().into();
+        let mut cache = self
+            .char_prefixes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cap_char_prefixes(&mut cache);
+        cache.insert(line_idx, Some((std::sync::Arc::clone(&table), hint)));
+        drop(cache);
+        LAST_CHAR_COL.with(|cell| {
+            *cell.borrow_mut() = Some((
+                index_id,
+                source_id,
+                source_len,
+                generation,
+                line_idx,
+                Some(table),
+                hint_val,
+            ))
+        });
+        answer
     }
 
     /// `(start_line, end_line)` for a span: the lines of the first and last
@@ -2451,7 +3689,7 @@ impl<'a> LineIndex<'a> {
         (start_line, end_line)
     }
 
-    pub(crate) fn starts(&self) -> &[usize] {
+    pub(crate) fn starts(&self) -> &[u32] {
         &self.starts[..]
     }
 
@@ -2469,7 +3707,7 @@ impl<'a> LineIndex<'a> {
         if self.source.is_empty() {
             return 0;
         }
-        let last = self.starts.last().copied().unwrap_or(0);
+        let last = self.starts.last().copied().unwrap_or(0) as usize;
         if last == self.source.len() && self.source.ends_with('\n') {
             self.starts.len() - 1
         } else {
@@ -2479,12 +3717,11 @@ impl<'a> LineIndex<'a> {
 
     /// Return the content of line `line_idx` (0-based), with the trailing `\n` / `\r\n` removed.
     pub(crate) fn line(&self, line_idx: usize) -> &'a str {
-        let start = self.starts[line_idx];
+        let start = self.starts[line_idx] as usize;
         let end = self
             .starts
             .get(line_idx + 1)
-            .copied()
-            .unwrap_or(self.source.len());
+            .map_or(self.source.len(), |&e| e as usize);
         let raw = &self.source[start..end];
         match raw.as_bytes().last() {
             Some(b'\n') => {
@@ -2509,6 +3746,31 @@ mod tests {
             .with_suggestion("try using `as` to cast");
         assert!(diag.is_error());
         assert_eq!(diag.code.as_ref().unwrap().code(), "E030");
+    }
+
+    /// C1/C2: identity must follow the *canonical* spelling.  A verbatim
+    /// `unknown("e030")` equals `new("e030")` under `PartialEq`, so it must
+    /// also hash to the same `stable_id` and be matched by `--allow e030`.
+    #[test]
+    fn stable_id_and_filter_use_canonical_code() {
+        let known = Diagnostic::error("same").with_code(ErrCode::new("e030"));
+        let verbatim = Diagnostic::error("same").with_code(ErrCode::unknown("e030"));
+        assert_eq!(known.code(), verbatim.code(), "unknown() must echo verbatim");
+        assert_eq!(
+            known.stable_id(),
+            verbatim.stable_id(),
+            "stable_id must hash the canonical code, not the verbatim spelling"
+        );
+
+        let opts = DiagOpts {
+            allow_codes: vec!["e030".to_string()],
+            ..DiagOpts::default()
+        };
+        assert!(!known.matches_filter(&opts));
+        assert!(
+            !verbatim.matches_filter(&opts),
+            "--allow e030 must suppress unknown(\"e030\")"
+        );
     }
 
     #[test]
@@ -2576,6 +3838,41 @@ mod tests {
         ));
     }
 
+    /// A genuine C0 control byte sitting in the lane *after* a `\t`/`\n` must
+    /// not be swallowed by the SWAR tab/newline exclusion's borrow
+    /// propagation: `has_zero`'s mask is not position-exact, so a backspace
+    /// adjacent to a tab used to be masked away and the sanitizer returned
+    /// the raw control byte borrowed.
+    #[test]
+    fn multiline_sanitizer_catches_control_adjacent_to_layout_control() {
+        for s in [
+            "\t\x08abcdef", // backspace right after tab
+            "\n\x08abcdef", // backspace right after newline
+            "ab\t\x08cd",   // mid-string, chunk-interior
+            "\x08\tabcdef", // backspace right *before* tab (borrow source)
+            "ab\x7F\tcd",   // DEL adjacent to tab
+            "ab\t\x7Fcd",   // tab adjacent to DEL
+        ] {
+            let out = sanitize_for_terminal_multiline(s);
+            assert!(
+                matches!(out, std::borrow::Cow::Owned(_)),
+                "raw control byte leaked as Borrowed for {s:?}"
+            );
+            assert!(out.contains('\u{FFFD}'), "control not replaced: {out:?}");
+            assert!(!out.contains('\x08') && !out.contains('\x7F'), "{out:?}");
+        }
+        // Layout controls themselves survive, alone or adjacent to each other.
+        for s in ["\t\n", "a\t\nb", "\t\ta\n\n"] {
+            assert!(
+                matches!(
+                    sanitize_for_terminal_multiline(s),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "layout controls forced owned for {s:?}"
+            );
+        }
+    }
+
     /// The non-ASCII no-op fast path must borrow (not allocate) for
     /// localized text with no control characters — the dominant i18n case.
     /// Pure-CJK / Cyrillic / accented text contains no controls, so the
@@ -2619,26 +3916,26 @@ mod tests {
     #[test]
     fn test_suggest_code_osa_distance() {
         // Single substituted digit — same-length typo the old heuristic missed.
-        let s = suggest_code("E031");
+        let s = suggest_code("E031", true);
         assert!(s.contains("E030"), "expected E030 suggestion, got: {s}");
 
         // Missing trailing digit.
-        let s = suggest_code("E03");
+        let s = suggest_code("E03", true);
         assert!(s.contains("E030"), "expected E030 suggestion, got: {s}");
 
         // Lowercase typo still matches the canonical code.
-        let s = suggest_code("e030");
+        let s = suggest_code("e030", true);
         assert!(s.contains("E030"), "expected E030 suggestion, got: {s}");
 
         // Transposed digits: `E300`↔`E030` is OSA-distance 1, so the
         // radius-1 scan must now suggest `E030` (plain Levenshtein scored 2
         // and silently dropped it).  `E300` is not a known code, so this
         // exercises the real unknown-code suggestion path.
-        let s = suggest_code("E300");
+        let s = suggest_code("E300", true);
         assert!(s.contains("E030"), "expected E030 suggestion, got: {s}");
 
         // Complete garbage — no suggestions, fall back to generic help.
-        let s = suggest_code("????");
+        let s = suggest_code("????", true);
         assert!(s.contains("valid error codes include"), "got: {s}");
     }
 
@@ -2758,7 +4055,7 @@ mod tests {
     fn test_adorn_with_suppressed_warning_does_not_panic() {
         use crate::diagnostics::EmissionGuaranteed;
         let mut ctxt = DiagCtxt::new();
-        ctxt.can_emit_warnings = false;
+        ctxt.set_can_emit_warnings(false);
         let result: Result<(), EmissionGuaranteed> = adorn_with_span(
             &mut ctxt,
             Span::new(FileId::DUMMY, 0, 5),
@@ -2898,7 +4195,7 @@ mod tests {
         diag.humanize();
         assert_eq!(diag.help, None);
         assert!(
-            diag.message.contains("no field `z` on type `Point`"),
+            diag.message.contains("no field `z` found on type `Point`"),
             "message: {}",
             diag.message
         );
@@ -2967,6 +4264,91 @@ mod tests {
         assert_eq!(diag.spans.primary().as_slice(), &[kind_span][..]);
     }
 
+    /// `allow_codes` is a *suppress* list (rustc `-A` semantics): a code in
+    /// the set is dropped, everything else passes.  Pins the direction of the
+    /// filter so the branch can never be "fixed" into the opposite silently.
+    #[test]
+    fn allow_codes_suppresses_matching_diagnostics() {
+        let mut opts = DiagOpts::default();
+        opts.allow_codes = vec!["E030".to_string()];
+        let suppressed = Diagnostic::error("x").with_code_str("E030");
+        let kept = Diagnostic::error("y").with_code_str("E031");
+        let no_code = Diagnostic::error("z");
+        assert!(!suppressed.matches_filter(&opts), "E030 must be suppressed");
+        assert!(kept.matches_filter(&opts), "E031 must pass");
+        assert!(no_code.matches_filter(&opts), "code-less diagnostics pass");
+        // Empty list: no-op.
+        let unfiltered = DiagOpts::default();
+        assert!(suppressed.matches_filter(&unfiltered));
+    }
+
+    /// Filter codes resolve case-insensitively, like every other code API:
+    /// `--allow e030` must suppress the canonical `E030` diagnostic instead
+    /// of silently matching nothing.
+    #[test]
+    fn filter_codes_resolve_case_insensitively() {
+        let mut opts = DiagOpts::default();
+        opts.allow_codes = vec!["e030".to_string()];
+        let suppressed = Diagnostic::error("x").with_code_str("E030");
+        assert!(
+            !suppressed.matches_filter(&opts),
+            "lowercase allow pattern must suppress E030"
+        );
+
+        let mut only = DiagOpts::default();
+        only.only_codes = vec!["e031".to_string()];
+        assert!(
+            Diagnostic::error("x")
+                .with_code_str("E031")
+                .matches_filter(&only),
+            "lowercase only-code must match E031"
+        );
+        assert!(
+            !Diagnostic::error("x")
+                .with_code_str("E030")
+                .matches_filter(&only),
+            "only-code still excludes other codes"
+        );
+    }
+
+    /// Regression: the SWAR newline mask is a *candidate* set, not exact — a
+    /// `\n` followed by `0x0B` (VT) makes the borrow out of the zero lane set
+    /// the next lane's high bit, and the old code pushed a fake line start.
+    /// Line numbers after that point were off by one.
+    #[test]
+    fn line_scan_does_not_invent_newlines_after_vt() {
+        // Lay the poison pattern across every 8-byte lane alignment.
+        let mut src = String::new();
+        for pad in 0..8 {
+            src.push_str(&"x".repeat(pad));
+            src.push_str("a\n\u{0B}b\n");
+        }
+        let idx = LineIndex::new(&src);
+        // A `0x0B` is valid UTF-8 but never a line break: the only newlines
+        // in `src` are the two per repetition.
+        let mut expected = vec![0u32];
+        let mut off = 0usize;
+        for pad in 0..8 {
+            // "xxx…a\n" — the `\n` after `a` sits at `off + pad + 1`, so the
+            // poisoned line (`\x0Bb`) starts at `off + pad + 2`.
+            expected.push((off + pad + 2) as u32);
+            // "\x0Bb\n" — the `\n` after `b` sits at `off + pad + 4`, so the
+            // next repetition's line starts at `off + pad + 5`.  The `0x0B`
+            // itself must NOT have produced a start.
+            off += pad + 5;
+            expected.push(off as u32);
+        }
+        // Exactly 2 starts per repetition + the initial 0: a `0x0B` never
+        // contributes a line start.
+        assert_eq!(expected.len(), 1 + 2 * 8);
+        assert_eq!(idx.starts(), expected.as_slice(), "src = {src:?}");
+        // And the mapping round-trips for every line.
+        for i in 0..idx.line_count() {
+            let pos = idx.to_linecol(idx.starts()[i] as usize);
+            assert_eq!((pos.line, pos.col), (i, 0));
+        }
+    }
+
     /// Boundary matrix for `LineIndex`: empty input, single byte, with and
     /// without trailing newlines, multi-byte leading char, and CRLF. All
     /// conversions (including EOF and past-EOF offsets) must stay panic-free
@@ -2992,7 +4374,7 @@ mod tests {
             let (first, last) = idx.span_lines(over);
             assert!(first <= last && last < idx.line_count(), "over {src:?}");
             for i in 0..idx.line_count() {
-                let pos = idx.to_linecol(idx.starts()[i]);
+                let pos = idx.to_linecol(idx.starts()[i] as usize);
                 assert_eq!((pos.line, pos.col), (i, 0), "start of line {i} in {src:?}");
             }
         }
@@ -3054,9 +4436,38 @@ mod tests {
             std::sync::Arc::clone(idx.starts_arc()),
             idx.ascii(),
             std::sync::Arc::clone(idx.char_prefixes_arc()),
+            idx.generation(),
         );
         assert_eq!(shared.linecol_display(3), (0, 1));
         assert_eq!(shared.linecol_display(14), (2, 1));
+    }
+
+    /// The hinted lookup must agree with the simple reference implementation
+    /// on every offset, including an ABA-style shrink that forces the hint to
+    /// re-anchor.  This is the differential oracle the doc comment on
+    /// `char_col_from_sparse` promises.
+    #[test]
+    fn char_col_hinted_matches_reference() {
+        // (start_byte, cumulative_extra) for chars that are 2–4 bytes wide,
+        // interleaved with ASCII gaps.
+        let table: &[(u32, u32)] = &[
+            (2, 1),   // 2-byte char at byte 2
+            (5, 3),   // 2-byte char at 5 (+1), then 4-byte (+3)
+            (12, 4),  // another 2-byte char
+            (20, 6),
+        ];
+        let hint = std::sync::atomic::AtomicUsize::new(0);
+        // Ascending, descending, and repeated offsets: every path (advance,
+        // overshoot re-anchor, unchanged) must agree with the reference.
+        for b in (0..30).chain((0..30).rev()).chain([0, 3, 3, 12, 12, 28]) {
+            let want = char_col_from_sparse(Some(table), b);
+            let got = char_col_from_sparse_hinted(table, &hint, b);
+            assert_eq!(got, want, "b={b}");
+        }
+        // `None` (ASCII line) is the identity on both.
+        for b in 0..30 {
+            assert_eq!(char_col_from_sparse(None, b), b);
+        }
     }
 
     /// A non-empty span's end is exclusive: an end sitting exactly on a line
@@ -3237,6 +4648,54 @@ mod tests {
         println!("[perf] LineIndex.to_linecol x200 on 220KB: {ms:.2} ms/iter");
     }
 
+    /// Micro-isolation of the wrap fast paths: (1) short ASCII messages hit
+    /// the `len <= max_width` guard without a grapheme walk; (2) long
+    /// printable-ASCII prose exercises `ascii_break_opportunities`'s `memchr`
+    /// space scan.  Run: `cargo test perf_wrap_optimal -- --nocapture`.
+    #[test]
+    fn perf_wrap_optimal() {
+        // (1) Short ASCII: the len guard makes this ~O(1) per call.
+        let short_msgs: Vec<String> = (0..200)
+            .map(|i| format!("error code E{i:03} in module mod_{i}"))
+            .collect();
+        for _ in 0..2 {
+            for m in &short_msgs {
+                std::hint::black_box(wrap::wrap_optimal(m, 100, 4));
+            }
+        }
+        let iters = 1000;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            for m in &short_msgs {
+                std::hint::black_box(wrap::wrap_optimal(m, 100, 4));
+            }
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("[perf] wrap_optimal short ASCII x200: {ms:.4} ms/iter");
+
+        // (2) Long prose: ~80 words repeated, wraps to several lines,
+        // exercises the ascii_break_opportunities memchr space scan.
+        let long_prose = "the quick brown fox jumps over the lazy dog and then \
+            runs through the forest looking for a place to sleep but finds only \
+            rocks and trees and a small stream that flows down the mountain side \
+            into a valley where the wind blows cold and the leaves rustle loudly \
+            while a distant owl hoots twice before falling silent again forever"
+            .repeat(4);
+        for _ in 0..2 {
+            std::hint::black_box(wrap::wrap_optimal(&long_prose, 60, 4));
+        }
+        let iters = 2000;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(wrap::wrap_optimal(&long_prose, 60, 4));
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!(
+            "[perf] wrap_optimal long prose ({} bytes): {ms:.4} ms/iter",
+            long_prose.len()
+        );
+    }
+
     #[test]
     fn multispan_push_dedup_and_sort() {
         let f1 = FileId::from_raw(1);
@@ -3341,9 +4800,14 @@ mod tests {
         println!(
             "[size] Diagnostic={sz}  MultiSpan={multi}  DiagnosticKind={kind}  \
              Box<DiagnosticKind>={}",
-            std::mem::size_of::<Option<Box<DiagnosticKind<'static>>>>()
+            std::mem::size_of::<Option<std::sync::Arc<DiagnosticKind<'static>>>>()
         );
-        assert!(sz <= 384, "Diagnostic grew to {sz} bytes");
+        assert!(sz <= 416, "Diagnostic grew to {sz} bytes");
+        // 416 = the historical 384-byte bound + 16 B for `MultiSpan`'s
+        // sorted-view cache (`OnceLock<Box<[Span]>>`, added so a dirty
+        // `MultiSpan` sorts once per dirty epoch instead of on every
+        // `primary()` read) + 8 B of padding for the `kind_derived_labels`
+        // bookkeeping field that makes `humanize` preserve user labels.
     }
 
     #[test]
@@ -3368,7 +4832,293 @@ mod tests {
         let mut d = base.clone();
         d.set_level(DiagnosticLevel::Warning);
         d.set_source(Some("ignored"));
+        // C9: `stable_id` hashes the file NAME, so a rename must invalidate
+        // the cache and yield a new id (the old code returned the stale id,
+        // reintroducing cross-file collisions).
+        let before_rename = d.stable_id();
         d.set_file_name("ignored.pn");
-        assert_eq!(d.stable_id(), base_id);
+        assert_ne!(d.stable_id(), before_rename);
+        assert_ne!(d.stable_id(), base_id);
+
+        // `with_kind` changes the eventual (humanized) message, so a cached
+        // id computed before it must be invalidated, not returned stale.
+        let kind_a = DiagnosticKind::NameNotFound {
+            name: std::borrow::Cow::Borrowed("a"),
+            span: Span::new(FileId::DUMMY, 0, 1),
+            suggestions: Vec::new(),
+        };
+        let kind_b = DiagnosticKind::NameNotFound {
+            name: std::borrow::Cow::Borrowed("b"),
+            span: Span::new(FileId::DUMMY, 0, 1),
+            suggestions: Vec::new(),
+        };
+        let mut d = base.clone().with_kind(kind_a);
+        d.humanize();
+        let id_a = d.stable_id();
+        // `with_kind` invalidates the cache; the id only changes once the new
+        // kind is materialized, which is what `humanize` does.
+        d = d.with_kind(kind_b);
+        d.humanize();
+        assert_ne!(d.stable_id(), id_a);
+    }
+
+    /// The direct-address neighbourhood enumeration must produce the same
+    /// top-3 as the full table scan for: every valid registry code (distance
+    /// 0), single-edit typos of them, the corner codes E000/E999/W000/W999,
+    /// cross-prefix typos, 5-digit insertions, and unrelated noise.
+    #[test]
+    fn suggest_code_direct_matches_scan() {
+        let table_codes: Vec<&str> = crate::diagnostics::error_code::CODE_TABLE
+            .iter()
+            .map(|e| e.code)
+            .collect();
+        let mut inputs: Vec<String> = table_codes.iter().map(|c| c.to_string()).collect();
+        // Lowercase spellings, corners, cross-prefix, insertions, noise.
+        for c in table_codes.iter().step_by(17) {
+            inputs.push(c.to_ascii_lowercase());
+        }
+        for c in ["E000", "E999", "W000", "W999", "E0000", "W1234", "E12345"] {
+            inputs.push(c.to_string());
+        }
+        // Digit-corrupted typos of a sample of codes (all four lanes, plus
+        // transpositions) and non-shaped noise.
+        for c in table_codes.iter().step_by(5) {
+            let b = c.as_bytes();
+            for lane in 1..4 {
+                for d in b'0'..=b'9' {
+                    if d != b[lane] {
+                        let mut t = b.to_vec();
+                        t[lane] = d;
+                        inputs.push(String::from_utf8(t).unwrap());
+                    }
+                }
+            }
+            let mut t = b.to_vec();
+            t.swap(1, 2);
+            inputs.push(String::from_utf8(t).unwrap());
+        }
+        inputs.push("????".into());
+        inputs.push("E".into());
+        inputs.push("ERR0123".into());
+        for input in &inputs {
+            // The scan reference needs the same uppercased needle.
+            let mut needle = input.as_str().to_owned();
+            needle.make_ascii_uppercase();
+            let needle_len = needle.chars().count();
+            let max_dist = std::cmp::max(1, needle_len / 3);
+            let direct = suggest_top3_direct(&needle);
+            let scan = suggest_top3_scan(&needle, max_dist, needle_len);
+            assert_eq!(
+                direct.as_slice(),
+                scan.as_slice(),
+                "input {input:?} (needle {needle:?})"
+            );
+        }
+    }
+
+    /// Plain (`use_color == false`) explain output for an unknown/typo'd code
+    /// must contain no ANSI escapes — `suggest_code` used to hard-code its
+    /// `\x1b[1;34m` help label into both color modes.
+    #[test]
+    fn plain_explain_of_unknown_code_has_no_ansi() {
+        assert!(!suggest_code("E031", false).contains('\x1b'));
+        assert!(suggest_code("E031", true).contains('\x1b'));
+        for code in ["zzz", "E03", "????"] {
+            let out = explain_error_code(code, false);
+            assert!(!out.contains('\x1b'), "plain explain of {code}: {out:?}");
+        }
+    }
+
+    /// `sanitize_filename` composes `sanitize_for_terminal`, which already
+    /// removes bidi overrides/isolates.  Pin that composed contract: the
+    /// (removed) second filter in `sanitize_filename` was unreachable, so
+    /// this test is the guard if `sanitize_for_terminal` ever weakens.
+    #[test]
+    fn sanitize_filename_removes_bidi_overrides() {
+        let spoof = "evil.code\u{202E}exe";
+        assert_eq!(&*sanitize_filename(spoof), "evil.codeexe");
+        // Controls are replaced by the same composed pass.
+        assert_eq!(&*sanitize_filename("a\x07b"), "a\u{FFFD}b");
+        // Clean ASCII stays borrowed (no extra scan cost).
+        assert!(matches!(sanitize_filename("src/main.rs"), Cow::Borrowed(_)));
+    }
+
+    /// Bidi overrides/isolates must not survive any terminal sanitizer: they
+    /// are invisible, so the control scans cannot see them (`evil.code\u{202E}exe`
+    /// used to leak through with a spoofed extension).
+    #[test]
+    fn sanitizers_strip_bidi_overrides_and_isolates() {
+        let spoof = "evil.code\u{202E}exe";
+        for out in [
+            sanitize_for_terminal(spoof).to_string(),
+            sanitize_for_terminal_multiline(spoof).to_string(),
+            sanitize_for_terminal_flatten(spoof).to_string(),
+        ] {
+            assert_eq!(out, "evil.codeexe", "spoof survived: {out:?}");
+            assert!(!out.contains('\u{202E}'));
+        }
+        // Isolates (U+2066–U+2069) are removed too.
+        let isolates = "a\u{2066}b\u{2067}c\u{2068}d\u{2069}e";
+        let out = sanitize_for_terminal(isolates);
+        assert_eq!(&*out, "abcde");
+        // i18n text without bidi/controls still borrows.
+        let clean = "тип: тип（中文）";
+        assert!(matches!(
+            sanitize_for_terminal(clean),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            sanitize_for_terminal_multiline(clean),
+            Cow::Borrowed(_)
+        ));
+        // Layout controls survive their respective sanitizers alongside
+        // bidi removal.
+        let mixed = "a\u{202E}b\nc\td";
+        assert_eq!(&*sanitize_for_terminal_multiline(mixed), "ab\nc\td");
+        let mixed_cr = "a\u{202E}b\nc\rd";
+        assert_eq!(&*sanitize_for_terminal_flatten(mixed_cr), "ab\nc\rd");
+    }
+
+    /// The flatten scanner excludes `\t`/`\n`/`\r` from the dirty set, so a
+    /// multi-line message with no other controls stays `Cow::Borrowed` — and
+    /// the SWAR flags must agree with the scalar predicate over random
+    /// tab/newline/CR-heavy slices.
+    #[test]
+    fn flatten_scan_borrows_layout_only_controls() {
+        for s in ["a\nb\rc\td", "\n\r\t", "line one\nline two\r\n\tthree"] {
+            assert!(matches!(
+                sanitize_for_terminal_flatten(s),
+                Cow::Borrowed(_)
+            ));
+        }
+        // Still replaced: DEL, VT, ESC, C1.
+        for s in ["a\x7Fb", "a\x0Bb", "a\x1Bb", "a\u{0085}b"] {
+            assert!(matches!(
+                sanitize_for_terminal_flatten(s),
+                Cow::Owned(_)
+            ));
+        }
+        let reference = |s: &[u8]| {
+            s.iter()
+                .any(|&b| (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F)
+        };
+        let mut seed: u64 = 0xDEAD_BEEF_CAFE_0001;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(7);
+            seed
+        };
+        for _ in 0..10_000 {
+            let len = (next() % 48) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = next() & 0xFF;
+                    if r < 180 {
+                        [b'\t', b'\n', b'\r'][(next() % 3) as usize]
+                    } else {
+                        r as u8
+                    }
+                })
+                .collect();
+            let (has_high, dirty) = scan_terminal_control_flags_flatten(&bytes);
+            let _ = has_high;
+            assert_eq!(dirty, reference(&bytes), "{bytes:?}");
+        }
+    }
+
+    /// Alternating pushes and reads: the sorted-view cache must never serve a
+    /// stale view, and every `primary()` result stays sorted + deduped.
+    #[test]
+    fn multispan_push_primary_interleave_stays_sorted() {
+        let mut rng: u64 = 0xC0FF_EE00_0000_0001;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(11);
+            rng
+        };
+        let mut ms = MultiSpan::default();
+        let mut expect: Vec<Span> = Vec::new();
+        for _ in 0..2_000 {
+            let start = (next() % 64) as u32;
+            let span = Span::new(FileId::DUMMY, start, start + 1 + (next() % 8) as u32);
+            if next() & 1 == 0 {
+                ms.push(span);
+                if !expect.contains(&span) {
+                    expect.push(span);
+                }
+            } else if !expect.is_empty() {
+                expect.sort_unstable();
+                expect.dedup();
+                let mut got = ms.primary();
+                got.dedup();
+                assert_eq!(got.as_slice(), expect.as_slice());
+                match ms.primary_ref() {
+                    Cow::Borrowed(s) => assert_eq!(s, expect.as_slice()),
+                    Cow::Owned(s) => assert_eq!(s, expect.as_slice()),
+                }
+            }
+            if next() % 97 == 0 {
+                ms.clear();
+                expect.clear();
+            }
+        }
+    }
+
+    /// A kind-built diagnostic enriched with `with_label` keeps BOTH the
+    /// kind-derived labels and the user label across humanize, and
+    /// re-humanizing after a language change does not duplicate either.
+    #[test]
+    fn humanize_preserves_user_labels_alongside_kind_derived() {
+        let kind_span = Span::new(FileId::DUMMY, 0, 3);
+        let user_span = Span::new(FileId::DUMMY, 40, 45);
+        let mut diag = Diagnostic::error("placeholder")
+            .with_kind(DiagnosticKind::TypeMismatch {
+                expected: Cow::Borrowed("Int<32>"),
+                found: Cow::Borrowed("Str"),
+                span: kind_span,
+                found_span: None,
+                reason: None,
+                context: None,
+            })
+            .with_label(user_span, "user context");
+        diag.humanize();
+        assert_eq!(diag.labels.len(), 2, "kind + user label");
+        assert_eq!(diag.labels[0].span, kind_span);
+        assert_eq!(diag.labels[1].span, user_span);
+        // Re-humanize (latch cleared, same language): no duplication, order
+        // stable — the derived block is rebuilt, the user label kept.
+        diag.humanized = false;
+        diag.humanize();
+        assert_eq!(diag.labels.len(), 2);
+        assert_eq!(diag.labels[0].span, kind_span);
+        assert_eq!(diag.labels[1].span, user_span);
+    }
+
+    /// Regression: a closure that pushes a *suppressed* warning and returns
+    /// `Err` must not corrupt an earlier, unrelated diagnostic via
+    /// `last_mut()`.
+    #[test]
+    fn adorn_with_span_does_not_augment_unrelated_prior_diagnostic() {
+        use crate::diagnostics::EmissionGuaranteed;
+        let mut ctxt = DiagCtxt::new();
+        ctxt.set_can_emit_warnings(false);
+        // Pre-existing unreported diagnostic — `last_mut()` would return this
+        // if the guard were missing.
+        ctxt.push(Diagnostic::error("prior").with_span(Span::new(FileId::DUMMY, 100, 105)));
+        let result: Result<(), EmissionGuaranteed> = adorn_with_span(
+            &mut ctxt,
+            Span::new(FileId::DUMMY, 0, 5),
+            Some("hello"),
+            |ctxt| {
+                // Suppressed (records nothing), then fail without pushing.
+                Err(ctxt.push(Diagnostic::warning("suppressed")).into())
+            },
+        );
+        assert!(result.is_err());
+        let prior = &ctxt.into_inner()[0];
+        assert_eq!(
+            prior.spans.primary().as_slice(),
+            &[Span::new(FileId::DUMMY, 100, 105)][..],
+            "the prior diagnostic's span must be untouched"
+        );
+        assert_eq!(prior.source, None);
     }
 }

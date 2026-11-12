@@ -11,6 +11,7 @@ use super::{
     AggregateKind, BasicBlock, BlockId, BorrowKind, Callee, CastKind, LocalDecl, LocalId, MirBody,
     MirConst, Operand, Place, Rvalue, Statement, SwitchTarget, Terminator,
 };
+use as_variant::as_variant;
 use crate::ast::{BinOp, Literal, Span, UnaryOp};
 use crate::hir::hir::{HirExpr, HirMatchArm, HirPattern, HirStmt};
 use crate::hir::types::TypeId;
@@ -495,10 +496,7 @@ fn lower_match(b: &mut MirBuilder, scrutinee: &HirExpr<'_>, arms: &[HirMatchArm<
     // Enum-scrutinee matches without guards lower to a variant switch.
     let all_enum: Vec<(&HirMatchArm<'_>, Symbol)> = arms
         .iter()
-        .filter_map(|arm| match (&arm.pattern, &arm.guard) {
-            (HirPattern::Enum { variant, .. }, None) => Some((arm, *variant)),
-            _ => None,
-        })
+        .filter_map(|arm| as_variant!((&arm.pattern, &arm.guard), (HirPattern::Enum { variant, .. }, None) => (arm, *variant)))
         .collect();
 
     if !all_enum.is_empty() && all_enum.len() == arms.len() {
@@ -980,10 +978,7 @@ fn lower_expr_match(
 
     let all_enum: Vec<(&HirMatchArm<'_>, Symbol)> = arms
         .iter()
-        .filter_map(|arm| match (&arm.pattern, &arm.guard) {
-            (HirPattern::Enum { variant, .. }, None) => Some((arm, *variant)),
-            _ => None,
-        })
+        .filter_map(|arm| as_variant!((&arm.pattern, &arm.guard), (HirPattern::Enum { variant, .. }, None) => (arm, *variant)))
         .collect();
 
     if !all_enum.is_empty() && all_enum.len() == arms.len() {

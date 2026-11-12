@@ -82,6 +82,8 @@ fn ctx(opts: &DiagOpts) -> RenderCtx<'_> {
 /// [`HumanRenderer`] appends.
 #[test]
 fn human_plain_kitchen_sink() {
+    let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+    crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
     let opts = DiagOpts::default();
     let mut r = HumanRenderer::plain();
     let out = r.render(&kitchen_sink(), &ctx(&opts));
@@ -95,6 +97,8 @@ fn human_plain_kitchen_sink() {
 /// diff.
 #[test]
 fn human_colored_kitchen_sink() {
+    let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+    crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
     let opts = DiagOpts::default();
     let mut r = HumanRenderer::colored();
     let out = r.render(&kitchen_sink(), &ctx(&opts));
@@ -114,6 +118,8 @@ fn human_colored_kitchen_sink() {
 /// the existing `streams_full_document` test).
 #[test]
 fn html_kitchen_sink() {
+    let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+    crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
     let opts = DiagOpts::default();
     let mut r = HtmlRenderer::new();
     let out = r.render(&kitchen_sink(), &ctx(&opts));
@@ -127,6 +133,8 @@ fn html_kitchen_sink() {
 /// display cell — a byte- or char-counted column would land one space short.
 #[test]
 fn html_cjk_columns() {
+    let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+    crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
     const SRC: &str = "set a = \"中\" + b;\n";
     let diag = Diagnostic::error("wide char")
         .with_code_str(ErrCode::E030)
@@ -143,11 +151,39 @@ fn html_cjk_columns() {
 /// fails with a parse error rather than a useless text diff.
 #[test]
 fn json_kitchen_sink() {
+    let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+    crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
     let opts = DiagOpts::default();
     let mut r = JsonRenderer::new_pretty();
     let out = r.render(&kitchen_sink(), &ctx(&opts));
     let _: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
     insta::assert_snapshot!("json_kitchen_sink", out);
+}
+
+/// CRLF source must render without U+FFFD artifacts.
+///
+/// The glyph sanitizer deliberately keeps only `\t`/`\n`; if `LineIndex`
+/// failed to strip the `\r` of a CRLF terminator, every line would end in a
+/// visible replacement char and every underline column after it would shift
+/// by one.  `LineIndex::line` strips `\r\n`, so this pins the combination.
+#[test]
+fn crlf_source_renders_without_replacement_chars() {
+    let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+    crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
+    const SRC: &str = "set a = 1;\r\nset b = a;\r\n";
+    let diag = Diagnostic::error("crlf source")
+        .with_code_str(ErrCode::E030)
+        .with_span(Span::new(FileId::DUMMY, 0, 3))
+        .with_source(SRC);
+    let opts = DiagOpts::default();
+    let mut r = HumanRenderer::plain();
+    let out = r.render(&diag, &ctx(&opts));
+    assert!(
+        !out.contains('\u{FFFD}'),
+        "CRLF line endings leaked into the render as U+FFFD: {out:?}"
+    );
+    assert!(out.contains("set a = 1;"), "first line missing: {out:?}");
+    assert!(out.contains("set b = a;"), "second line missing: {out:?}");
 }
 
 /// Summary-line pluralization, all combinations in one snapshot so a

@@ -31,6 +31,15 @@ use crate::sync::{Condvar, Mutex};
 #[cfg(not(feature = "shuttle"))]
 const PARK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Millisecond default for the injectable park deadline.  Under shuttle the
+/// deadline is wall-clock machinery and is compiled out (`park_deadline` does
+/// not exist), so the field defaults to a dead 0 — `set_park_timeout` is
+/// likewise non-shuttle only.
+#[cfg(not(feature = "shuttle"))]
+const PARK_TIMEOUT_MS_DEFAULT: u64 = PARK_TIMEOUT.as_millis() as u64;
+#[cfg(feature = "shuttle")]
+const PARK_TIMEOUT_MS_DEFAULT: u64 = 0;
+
 /// A scheduling observation point inside the query system.
 ///
 /// Each variant documents the exact program position it replaces from the
@@ -38,8 +47,9 @@ const PARK_TIMEOUT: Duration = Duration::from_secs(2);
 /// assertions in the defense tests depend on it.
 #[derive(Clone, Copy, Debug)]
 pub enum SchedulePoint {
-    /// `finish_task_and_publish`: after the in-section color judgment, with
-    /// no shard lock held, before the rev-edge flush.
+    /// `finish_task_and_publish`: after the ENTIRE in-section work — the
+    /// color judgment AND the deferred fan-out flush (`mark_dirty_batch`)
+    /// — with no shard lock held, before the rev-edge flush.
     /// (Replaces the D23/D24/D26 static triples.)
     FinishWindow { node: u32 },
     /// `verify_green_transitive_with_dirty`: after the fast-path verdict,
@@ -114,6 +124,17 @@ struct PlanInner {
     /// Signalled whenever a park is entered; `wait_parked` re-checks the
     /// counter.
     state_cv: Condvar,
+    /// Park deadline in milliseconds (`PARK_TIMEOUT`'s injectable face,
+    /// millis).  The default mirrors the old 2 s hook; tests exercising
+    /// the degrade path shrink it — the path is otherwise unreachable in
+    /// a test that must finish well under 2 s.
+    park_timeout_ms: AtomicU64,
+    /// Degrade-event counter: incremented every time a parked suspend is
+    /// released by deadline expiry instead of a `release_all` (see
+    /// `degraded_count`).  Observable, deliberately NOT asserted inside
+    /// the scheduler — the `deadline_degrade_*` tests legitimately trip
+    /// it, so the signal stays consumable.
+    degraded_count: AtomicU64,
 }
 
 /// Per-test window gate scheduler (parking_lot backend over plain
@@ -133,6 +154,15 @@ struct PlanInner {
 /// `wait_parked`s use [`release_then_arm`](Self::release_then_arm), which
 /// releases the current park and installs the next gate atomically so the
 /// retried suspend cannot slip through ungated.
+///
+/// KNOWN INTERACTION — a predicate panic inside the finalize window
+/// (`SchedulePoint::AfterPublish`) is deliberately evaluated inside the
+/// finalize `catch_unwind`, so it is routed to `abort_with_poison` and
+/// surfaces as key POISON rather than the raw test panic (moving the
+/// suspend out would reintroduce d14-style latch stranding on unwind).
+/// If a test fails with an unexpected "Poisoned" error and the predicate
+/// panics, look here first — the retract-on-panic park bookkeeping is
+/// handled; only the error's classification changes.
 #[derive(Clone)]
 pub struct TestScheduler {
     inner: Arc<PlanInner>,
@@ -159,8 +189,48 @@ impl TestScheduler {
                 gates: Mutex::new(Vec::new()),
                 open_cv: Condvar::new(),
                 state_cv: Condvar::new(),
+                park_timeout_ms: AtomicU64::new(
+                    PARK_TIMEOUT_MS_DEFAULT
+                ),
+                degraded_count: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Shrink the park deadline (test-only): the degrade path
+    /// (`suspend`'s deadline-expiry early release) is otherwise
+    /// unreachable in a test that must finish well under 2 s.
+    ///
+    /// NOT to be unified with [`PARK_TIMEOUT`]: the constant is the
+    /// default this injects over, and the `deadline_degrade_*` tests rely
+    /// on shrinking it at runtime — see the cross-reference comment on
+    /// `PARK_TIMEOUT` itself.
+    #[cfg(all(test, not(feature = "shuttle")))]
+    pub fn set_park_timeout(&self, d: Duration) {
+        self.inner
+            .park_timeout_ms
+            .store(d.as_millis() as u64, Ordering::Release);
+    }
+
+    /// The effective park deadline as an `Instant` offset from now.
+    #[cfg(not(feature = "shuttle"))]
+    fn park_deadline(&self) -> Instant {
+        Instant::now()
+            + Duration::from_millis(
+                self.inner.park_timeout_ms.load(Ordering::Acquire),
+            )
+    }
+
+    /// How many parks were released by DEADLINE EXPIRY (degrade) instead
+    /// of a `release_all` / generation bump.  A nonzero count after a test
+    /// that does not shrink the deadline is a choreography smell: the test
+    /// proceeded while its target was no longer parked.  Consumable by
+    /// design — the scheduler itself never asserts on it (the
+    /// `deadline_degrade_*` tests legitimately drive the path); assert
+    /// `== 0` from the tests that mean it.
+    #[cfg(not(feature = "shuttle"))]
+    pub fn degraded_count(&self) -> u64 {
+        self.inner.degraded_count.load(Ordering::Acquire)
     }
 
     /// Arm a gate: suspends whose `point` matches `pred` park until
@@ -175,8 +245,14 @@ impl TestScheduler {
         // double-arm silently re-baselines `arm_mark` while window 1's gate
         // stays installed — the choreography then parks on the WRONG gate
         // and the test fails with a timeout that points at the predicate.
-        // A debug assert catches the choreography error at its source.
-        debug_assert!(
+        // Unconditional assert, NOT debug_assert: TestScheduler is
+        // test-only infrastructure (the cost of the check is irrelevant)
+        // and shuttle CI runs are `--release --features shuttle`, where
+        // `debug_assertions` are OFF — a debug_assert would compile this
+        // guard out in exactly the configuration that needs it, resurfacing
+        // the documented failure mode silently.  Same principle `check`
+        // already applies to its own asserts.
+        assert!(
             gates.is_empty(),
             "TestScheduler::arm called twice without an intervening \
              wait_parked: a second arm re-baselines `arm_mark` while the \
@@ -200,10 +276,57 @@ impl TestScheduler {
     /// observation). Panics after [`PARK_TIMEOUT`] — mirroring the old
     /// test-side guard timeouts — if no park arrives (usually a predicate
     /// that matches no schedule point).
+    ///
+    /// DEADLINE SPLIT (deliberate, do not "unify"): `wait_parked` hardcodes
+    /// [`PARK_TIMEOUT`], while `suspend`'s degrade path uses the INJECTABLE
+    /// knob (`set_park_timeout` / `park_deadline`).  The two answer
+    /// different questions — how long a test waits for its choreography to
+    /// land (test-harness constant) vs how long a parked suspend may hold
+    /// the window before degrading (per-test scenario timing).  The
+    /// `deadline_degrade_*` test probes with a 500 ms shrink precisely
+    /// BECAUSE this wait stays at the full 2 s; unifying the knobs would
+    /// break that shape.  If they are ever unified deliberately, shrink
+    /// that test's probe with it.
+    ///
+    /// NOTE: a successful return does NOT guarantee the park SURVIVES the
+    /// window — the parked suspend can still hit its deadline and degrade
+    /// afterwards, silently revoking its count.  Non-degrade tests that
+    /// care assert `degraded_count() == 0` after `release_all`.
+    ///
+    /// Requires an ARMED gate.  Calling this without a pending `arm` (the
+    /// `arm → park → release_all → wait_parked` shape — the window was
+    /// released but never re-armed) is a choreography error: the stale
+    /// count from the released window can satisfy the floor check against
+    /// an unparked target, silently passing where this scheduler's whole
+    /// job is to fail loudly.  The assert converts that silent pass into a
+    /// pointed failure at the call site.
     pub fn wait_parked(&self) {
+        assert!(
+            self.inner.armed.load(Ordering::Acquire),
+            "TestScheduler::wait_parked called with no armed gate — arm a \
+             window first (a released-but-not-re-armed window leaves a \
+             stale park count that would silently satisfy this wait)"
+        );
         let mut gates = self.inner.gates.lock();
         #[cfg(not(feature = "shuttle"))]
         let deadline = Instant::now() + PARK_TIMEOUT;
+        #[cfg(feature = "shuttle")]
+        // No wall clock exists under shuttle, so the deadline is a yield
+        // BUDGET: each wake-without-park costs one unit.  The bound only
+        // exists to convert the documented failure mode (a predicate typo
+        // matching no schedule point) from a model-check HANG into this
+        // panic — any correct choreography observes its park in a handful
+        // of wakes.  Smaller than the old 1M so a typo'd predicate surfaces
+        // in bounded steps instead of burning 100 × 1M yields per
+        // `check_random` iteration; `set_park_timeout` does NOT control this
+        // (it is wall-clock only), so the constant is the single knob.
+        let mut yield_budget = 100_000u64;
+        // NOTE (test-author contract): a test that legitimately needs more
+        // than 100k yields (very large HIT_ROUNDS, deep schedules) will trip
+        // the assert below spuriously — that is the trade this constant
+        // buys (a typo'd predicate becomes a bounded panic instead of a
+        // model-check hang).  If a future stress test needs a bigger
+        // budget, raise the constant here and say why in the test.
         loop {
             // A park left over from an earlier window (released without an
             // intervening wait_parked, or ended by the PARK_TIMEOUT degrade)
@@ -229,6 +352,16 @@ impl TestScheduler {
             }
             #[cfg(feature = "shuttle")]
             {
+                // Off-by-one fix: assert BEFORE the decrement,
+                // so exactly 100_000 iterations are allowed — the constant
+                // above documents the budget, and the old shape only
+                // permitted 99_999.
+                assert!(
+                    yield_budget > 0,
+                    "TestScheduler::wait_parked: yield budget exhausted waiting \
+                     for a park; no armed gate predicate matched a schedule point"
+                );
+                yield_budget -= 1;
                 self.inner.state_cv.wait(&mut gates);
             }
         }
@@ -238,6 +371,14 @@ impl TestScheduler {
 
     /// Open every gate and disarm: parked threads proceed (the old
     /// "`PARK = false`" release). Subsequent suspends pass through.
+    ///
+    /// Choreography note: a `suspend` that matched its predicate but has
+    /// not yet incremented `parked` when `release_all` bumps `generation`
+    /// is released WITHOUT incrementing `parked` — `wait_parked` will
+    /// therefore not observe that park.  This is why the orchestration
+    /// rule is arm-BEFORE-spawn: a thread spawned after `release_all`
+    /// re-arms fresh; one released mid-park was never counted and must
+    /// not be waited for.
     pub fn release_all(&self) {
         let mut gates = self.inner.gates.lock();
         gates.clear();
@@ -316,13 +457,44 @@ impl Scheduler for TestScheduler {
         };
         let bound_gen = self.inner.generation.load(Ordering::Acquire);
         #[cfg(not(feature = "shuttle"))]
-        let deadline = Instant::now() + PARK_TIMEOUT;
+        let deadline = self.park_deadline();
         let mut counted = false;
+        // The predicate depends only on `point` (fixed for this call) and
+        // the installed gate list, which can only change when `generation`
+        // bumps (already re-checked).  So the verdict is computed ONCE and
+        // remembered: re-wakes re-check `generation == bound_gen` and skip
+        // the catch_unwind setup entirely.
+        let mut matched = false;
         loop {
-            let matching = self.inner.generation.load(Ordering::Acquire) == bound_gen
-                && gates.iter().any(|gate| (gate.pred)(&point));
-            if !matching {
+            // Predicate evaluation is panic-isolated: a test-authored
+            // predicate that panics on a re-check (after this thread has
+            // already counted its park) must RETRACT before resuming the
+            // panic — an unwinding skip past the explicit retract arms
+            // below would leave a phantom count that a same-window
+            // `wait_parked` returns against, i.e. the exact "prep races an
+            // unparked target" failure this scheduler exists to kill.
+            // (First-iteration panics are clean anyway — nothing counted
+            // yet.)  Normal returns keep their existing retract/stale-park
+            // semantics untouched; only the unwind path is patched.
+            if self.inner.generation.load(Ordering::Acquire) != bound_gen {
                 return;
+            }
+            if !matched {
+                matched = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || gates.iter().any(|gate| (gate.pred)(&point)),
+                )) {
+                    Ok(m) => m,
+                    Err(payload) => {
+                        if counted {
+                            self.inner.parked.fetch_sub(1, Ordering::Release);
+                            self.inner.state_cv.notify_all();
+                        }
+                        std::panic::resume_unwind(payload);
+                    }
+                };
+                if !matched {
+                    return;
+                }
             }
             #[cfg(not(feature = "shuttle"))]
             {
@@ -346,8 +518,31 @@ impl Scheduler for TestScheduler {
             {
                 let now = Instant::now();
                 if now >= deadline {
-                    // Deadline degrades to early release — the exact semantics
-                    // of the old test_finish_hook spin deadline.
+                    // Deadline degrades to early release — the exact
+                    // semantics of the old test_finish_hook spin deadline.
+                    // The count MUST be revoked: leaving it would let a
+                    // same-window `wait_parked` (floor = max(observed,
+                    // arm_mark) from before the park) return against a
+                    // target that is no longer parked — the `arm_mark`
+                    // baseline covers cross-window leftovers only, this
+                    // is the same-window leak.
+                    if counted {
+                        self.inner.parked.fetch_sub(1, Ordering::Release);
+                        self.inner.state_cv.notify_all();
+                        // OBSERVABILITY, not enforcement: a degrade after
+                        // `wait_parked` returned means the test proceeded
+                        // against an unparked target — a choreography
+                        // break the park count alone no longer shows.
+                        // Recorded (counted + one-line stderr) rather
+                        // than asserted, because the `deadline_degrade_*`
+                        // tests deliberately drive this path.
+                        self.inner.degraded_count.fetch_add(1, Ordering::Release);
+                        eprintln!(
+                            "TestScheduler: park DEGRADED on deadline expiry \
+                             (count revoked) — choreography must not rely on \
+                             the target staying parked past its deadline"
+                        );
+                    }
                     return;
                 }
                 self.inner.open_cv.wait_for(&mut gates, deadline - now);
@@ -405,7 +600,60 @@ mod tests {
         });
     }
 
-    /// Shuttle-variant of the stale-park regression — NOT a copy of the
+    /// Regression (): the deadline degrade must REVOKE the park
+    /// count.  Same-window leak: a thread parks (counted, `parked` lifts
+    /// above `arm_mark`), the deadline expires mid-wait, and the degrade
+    /// returned WITHOUT decrementing — a `wait_parked` issued after the
+    /// degrade (same window, so `arm_mark` doesn't cover it) would then
+    /// return against a target that is no longer parked: the exact
+    /// "prep races an unparked target" race this scheduler kills.
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn deadline_degrade_revokes_the_park_count_same_window() {
+        let ts = TestScheduler::new();
+        // Shrink the deadline so the degrade fires quickly but AFTER the
+        // park lands (the park happens within microseconds; the degrade
+        // needs the deadline to expire while parked).
+        ts.set_park_timeout(Duration::from_millis(120));
+        ts.arm(|_| true);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| ts.suspend(SchedulePoint::CachedHit { query: "x" }));
+            // Observe the park through the RAW counter (wait_parked here
+            // would be the pre-fix correct path — the bug is what a
+            // LATER same-window wait sees).
+            while ts.parked_count() == 0 {
+                std::hint::spin_loop();
+            }
+            // The degrade fires while parked; joining proves the
+            // suspend returned early WITHOUT release_all.
+            h.join().unwrap();
+            assert!(
+                ts.parked_count() == 0,
+                "degraded park must be revoked from the counter"
+            );
+            // The same-window wait_parked after the degrade must BLOCK
+            // for a fresh park, not return on the leaked count.  Give it
+            // the rest of a normal window: it must time out (no parker
+            // will come), which under the pre-fix code never happens.
+            let next = ts.clone();
+            let w = s.spawn(move || next.wait_parked());
+            // wait_parked's own deadline is PARK_TIMEOUT (2s) — a leaked
+            // count returns instantly, a revoked one blocks.  Detect the
+            // leak by timing: allow 500ms; the fixed path is still
+            // blocked there.
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(!w.is_finished(), "wait_parked returned on the leaked count");
+            // Clean up: a FRESH park satisfies the (correctly blocked)
+            // wait, then release it.
+            let parked_once = ts.clone();
+            let p = s.spawn(move || parked_once.suspend(SchedulePoint::CachedHit { query: "y" }));
+            let _ = w.join();
+            ts.release_all();
+            p.join().unwrap();
+        });
+    }
+
+
     /// OS-thread twin above.  Under `feature = "shuttle"` `PlanInner`'s
     /// `Mutex`/`Condvar` come from `crate::sync`, i.e. shuttle's, and they
     /// require an `ExecutionState` installed by the `shuttle::check`

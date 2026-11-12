@@ -17,6 +17,7 @@
 use super::fmt;
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::render::{RenderCtx, Renderer};
+use std::borrow::Cow;
 
 /// One-line `file:line:col: level[code]: message` renderer.
 ///
@@ -49,53 +50,72 @@ impl Default for ShortRenderer {
     }
 }
 
-/// Append `msg` with every line break removed — one pass, zero allocation.
+/// Append `msg` with every layout byte removed — one pass, zero allocation.
 ///
-/// A maximal run of `\n`/`\r` (so also `\r\n`) collapses to a single space;
-/// runs at the very start or end of the message are dropped outright, so a
-/// message that arrives with a trailing newline does not leave a dangling
-/// space before the output's own `\n`.  This is what keeps the one-line
-/// contract: a bare `\r` would otherwise make a terminal redraw the line,
-/// and some line-oriented parsers would truncate it.
+/// A maximal run of `\n`/`\r`/`\t` (so also `\r\n`) collapses to a single
+/// space; runs at the very start or end of the message are dropped outright,
+/// so a message that arrives with a trailing newline does not leave a
+/// dangling space before the output's own `\n`.  A tab is treated as a break
+/// run too: the one-line short format is a flat, field-delimited text stream,
+/// and a literal tab reaching the output could be misparsed as a field
+/// separator by tab-splitting consumers (editor error lists).  This is what
+/// keeps the one-line contract: a bare `\r` would otherwise make a terminal
+/// redraw the line, and some line-oriented parsers would truncate it.
 #[inline]
 fn push_flattened(out: &mut String, msg: &str) {
     let bytes = msg.as_bytes();
 
     // Fast path: no break byte — straight copy.
-    if memchr::memchr2(b'\n', b'\r', bytes).is_none() {
+    let Some(first) = memchr::memchr3(b'\n', b'\r', b'\t', bytes) else {
         out.push_str(msg);
         return;
-    }
+    };
 
     // Empty segments are exactly the interior/edges of a break run, so
     // skipping them *is* the run-collapsing rule — no second buffer needed.
-    let mut first = true;
+    // Seed the loop with the offset the fast path already found instead of
+    // re-scanning the prefix.
+    let mut first_seg = true;
     let mut start = 0;
+    let mut offset = Some(first);
     while start < bytes.len() {
-        let offset = memchr::memchr2(b'\n', b'\r', &bytes[start..]);
         let end = match offset {
             Some(o) => start + o,
             None => bytes.len(),
         };
         let seg = &msg[start..end];
         if !seg.is_empty() {
-            if !first {
+            if !first_seg {
                 out.push(' ');
             }
             out.push_str(seg);
-            first = false;
+            first_seg = false;
         }
         if offset.is_none() {
             break;
         }
         start = end + 1;
+        offset = memchr::memchr3(b'\n', b'\r', b'\t', &bytes[start..]);
     }
 }
 
 impl Renderer for ShortRenderer {
     fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
-        let file = diag.file_name();
-        let level = diag.level().as_str();
+        let file_raw = diag.file_name();
+        // File names are untrusted (`set_file_name` / `with_file_name` are
+        // public): route through the terminal sanitizer like the code below,
+        // closing the only renderer without this guard.
+        let file_owned = super::super::sanitize_for_terminal(file_raw);
+        let file = file_owned.as_ref();
+        // The machine vocabulary follows rustc: fatal errors are spelled
+        // `error` so CI summarisers gating on the `error` token do not
+        // silently ignore them.  The human/JSON renderers keep the `fatal`
+        // distinction.
+        let level = if matches!(diag.level(), crate::diagnostics::DiagnosticLevel::Fatal) {
+            "error"
+        } else {
+            diag.level().as_str()
+        };
         // Borrow the code string directly; the `[E030]` framing and the
         // coloured tag are written straight into the output below, so no
         // intermediate `CompactString` is built.
@@ -107,19 +127,31 @@ impl Renderer for ShortRenderer {
         let span = diag.spans().first();
         let linecol: Option<(usize, usize)> = match (span, diag.source()) {
             (Some(span), Some(source)) => {
-                let (line, col) = cx.line_index(source).linecol_display(span.start_as_usize());
+                let (line, col) = cx
+                    .line_index(source)
+                    .linecol_display(span.start_as_usize().min(source.len()));
                 Some((line + 1, col + 1))
             }
             _ => None,
         };
 
-        // ---- Size the reservation to the byte ----------------------------
-        //   location + tag + ": " + message + "\n"
-        // Flattening only ever shrinks the message (break runs collapse to
-        // one space), so `raw_msg.len()` is a safe upper bound and the
-        // caller's buffer never reallocates.
+        // Sanitize both untrusted strings once, *before* reserving: the
+        // sanitized lengths are an exact bound (flattening only shrinks; the
+        // sanitizer's U+FFFD growth is already included), so there is no
+        // scalar growth pre-scan and no possibility of under-booking.  Unused
+        // in release?  No: both are written below.
         let raw_msg = diag.message();
-        let mut len = raw_msg.len() + 2 /* ": " */ + 1 /* "\n" */;
+        let sanitized = super::super::sanitize_for_terminal_flatten(raw_msg);
+        // `code` is untrusted input (`with_code_str` accepts arbitrary
+        // strings): route it through the terminal sanitizer like every other
+        // renderer, so an ESC/BEL in a code cannot inject terminal escapes.
+        let code_display: Option<Cow<'_, str>> = code
+            .filter(|c| !c.is_empty())
+            .map(super::super::sanitize_for_terminal);
+
+        // ---- Size the reservation to the exact bytes ---------------------
+        //   location + tag + ": " + message + "\n"
+        let mut len = sanitized.len() + 2 /* ": " */ + 1 /* "\n" */;
         match (linecol, span) {
             (Some((line, col)), _) => {
                 if !file.is_empty() {
@@ -140,12 +172,12 @@ impl Renderer for ShortRenderer {
         }
         if self.use_color {
             len += 4 + level.len() + 4; // "\x1b[1m" level "\x1b[0m"
-            if let Some(code) = code {
+            if let Some(code) = code_display.as_deref() {
                 len += 5 + code.len() + 5; // "\x1b[2m[" code "]\x1b[0m"
             }
         } else {
             len += level.len();
-            if let Some(code) = code {
+            if let Some(code) = code_display.as_deref() {
                 len += code.len() + 2; // "[code]"
             }
         }
@@ -169,8 +201,9 @@ impl Renderer for ShortRenderer {
                     out.push_str(file);
                     out.push(':');
                 }
-                use std::fmt::Write as _;
-                let _ = write!(out, "{span}");
+                fmt::push_uint(out, span.start_as_usize() as u64);
+                out.push_str("..");
+                fmt::push_uint(out, span.end_as_usize() as u64);
                 out.push_str(": ");
             }
             (None, None) => {}
@@ -185,14 +218,14 @@ impl Renderer for ShortRenderer {
             out.push_str("\x1b[1m");
             out.push_str(level);
             out.push_str("\x1b[0m");
-            if let Some(code) = code {
+            if let Some(code) = code_display.as_deref() {
                 out.push_str("\x1b[2m[");
                 out.push_str(code);
                 out.push_str("]\x1b[0m");
             }
         } else {
             out.push_str(level);
-            if let Some(code) = code {
+            if let Some(code) = code_display.as_deref() {
                 out.push('[');
                 out.push_str(code);
                 out.push(']');
@@ -202,9 +235,9 @@ impl Renderer for ShortRenderer {
 
         // ---- Message, flattened in a single pass -------------------------
         // A multi-line message would break the one-line format, and a stray
-        // `\r` would make a terminal redraw the line.  Flatten both, with no
-        // `Cow`, no `replace`, and no scratch `String`.
-        push_flattened(out, raw_msg);
+        // `\r` would make a terminal redraw the line.  `push_flattened`
+        // consumes the break runs the sanitizer preserved as layout bytes.
+        push_flattened(out, &sanitized);
         out.push('\n');
     }
 
@@ -218,6 +251,13 @@ impl Renderer for ShortRenderer {
     // `:make` output would treat it as a bogus diagnostic.
     fn render_summary(&self, _errors: usize, _warnings: usize) -> String {
         String::new()
+    }
+
+    /// Every short render already ends in `'\n'`, so the batch separator is
+    /// the empty string — otherwise a batch of short diagnostics would be
+    /// double-spaced and the "one greppable line each" contract would break.
+    fn render_separator(&self) -> &str {
+        ""
     }
 
     fn render_suppressed_note(&self, _count: usize) -> String {
@@ -235,6 +275,60 @@ mod tests {
 
     fn ctx(opts: &DiagOpts) -> RenderCtx<'_> {
         RenderCtx::new(opts, None)
+    }
+
+    /// The reservation now uses the sanitized lengths directly, so the only
+    /// property it relies on is that `push_flattened` never grows its input.
+    /// Pin that over a random corpus in both sanitizer modes — a future
+    /// "improvement" to `push_flattened` that grows output would otherwise
+    /// make the reserve under-book.
+    #[test]
+    fn flattening_never_grows() {
+        // xorshift64*, deterministic across runs and platforms.
+        let mut x: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                // Bias toward the dirty ranges: C0, DEL, C1 lead/continuation,
+                // tab/newline/CR, plain ASCII, non-ASCII lead.
+                let c = match next() % 8 {
+                    0 => (next() % 0x20) as u8,
+                    1 => 0x7F,
+                    2 => 0xC2,
+                    3 => 0x80 + (next() % 0x20) as u8,
+                    4 => [b'\t', b'\n', b'\r'][(next() % 3) as usize],
+                    5..=6 => 0x20 + (next() % 0x5F) as u8,
+                    _ => 0xC0 + (next() % 0x20) as u8,
+                };
+                bytes.push(c);
+            }
+            let Ok(s) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            for keep_breaks in [true, false] {
+                let sanitized = if keep_breaks {
+                    crate::diagnostics::sanitize_for_terminal_flatten(s)
+                } else {
+                    crate::diagnostics::sanitize_for_terminal(s)
+                };
+                let mut out = String::new();
+                push_flattened(&mut out, &sanitized);
+                assert!(
+                    out.len() <= sanitized.len(),
+                    "push_flattened grew {s:?} (keep_breaks={keep_breaks}): \
+                     {} > {}",
+                    out.len(),
+                    sanitized.len()
+                );
+            }
+        }
     }
 
     #[test]
@@ -301,6 +395,34 @@ mod tests {
         let out = ShortRenderer::new().render(&diag, &ctx(&opts));
         assert_eq!(out.matches('\n').count(), 1, "must be one line: {out:?}");
         assert!(out.contains("line one line two"), "{out}");
+    }
+
+    // ── Tab normalization: the one-line format is a flat field stream ──
+
+    /// A tab in a message must never reach the one-line output verbatim:
+    /// tab-splitting consumers (editor error lists) would treat it as a
+    /// field separator.  `push_flattened` consumes `\t` as a break run,
+    /// collapsing it to a single space exactly like `\n`/`\r`.
+    #[test]
+    fn tabs_are_flattened_to_spaces() {
+        let src = "x\n";
+        for (raw, expect) in [
+            ("a\tb", "a b"),
+            ("a\t\tb", "a b"),
+            ("a\t b", "a  b"),
+            ("\ta", "a"),
+            ("a\t", "a"),
+            ("a\n\tb", "a b"),
+        ] {
+            let diag = Diagnostic::error(raw)
+                .with_code_str(ErrCode::E030)
+                .with_span(Span::new(FileId::DUMMY, 0, 1))
+                .with_source(src);
+            let opts = DiagOpts::default();
+            let out = ShortRenderer::new().render(&diag, &ctx(&opts));
+            assert_eq!(out.matches('\t').count(), 0, "tab survived: {out:?}");
+            assert!(out.contains(expect), "{raw:?} → {out:?}, want …{expect:?}");
+        }
     }
 
     // ── CR / CRLF / consecutive newline folding ─────────────────────

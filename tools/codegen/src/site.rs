@@ -22,9 +22,7 @@ pub fn render_site(root: &Path, out_dir: &Path) -> Result<SiteReport, String> {
 
     let mut pages = 0;
     for entry in &registry.entries {
-        let md_path = root.join("error_codes").join(&entry.explain);
-        let md = fs::read_to_string(&md_path).map_err(|e| format!("{}: {e}", md_path.display()))?;
-        let body = markdown_html(&preprocess(&md));
+        let body = markdown_html(&preprocess(&entry.content));
         let page = page_html(entry, &body);
         let dest = out_dir.join(format!("{}.html", entry.code));
         fs::write(&dest, &page).map_err(|e| format!("{}: {e}", dest.display()))?;
@@ -45,6 +43,9 @@ fn preprocess(md: &str) -> String {
     let mut out = String::new();
     let mut in_code = false;
     for line in md.lines() {
+        // #11: normalize CRLF input to LF so code blocks never carry a stray
+        // `\r` (the rest of the file emits `\n`).
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let is_code = line.starts_with("  ") && !line.trim().is_empty();
         if is_code != in_code {
             out.push_str("```\n");

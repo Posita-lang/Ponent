@@ -124,6 +124,36 @@ impl<'input> TraitEnv<'input> {
             impl_generic_cache: RwLock::new(HashMap::default()),
         }
     }
+
+    /// Reset a pooled worker env (2b of the query-layer perf pass) back to
+    /// the state [`Self::clone_for_worker`] would produce, REUSING its
+    /// allocations where the data provably did not change:
+    ///
+    /// * `impls` / `inherent_methods` are registration tables the resolver
+    ///   only ever APPENDS to (`add_impl` / inherent-method registration);
+    ///   there is no mutation of an existing entry.  A same-length check
+    ///   against the origin therefore certifies the contents are identical —
+    ///   the pooled copy is skipped entirely and the old allocation is kept.
+    ///   Any length drift (a re-resolution registered more impls) falls back
+    ///   to a full re-copy, same as `clone_for_worker`.
+    /// * `impl_generic_cache` is the worker's own read-mostly memo: cleared
+    ///   (capacity retained inside the `RwLock`) so entries never leak
+    ///   across bodies — the same isolation contract `clone_for_worker`
+    ///   upholds by starting empty.
+    ///
+    /// Callers must hold the pool stamp (same origin identity); this method
+    /// only restores CONTENT.
+    pub fn reset_for_worker_reuse(&mut self, origin: &Self) {
+        if self.impls.len() != origin.impls.len() {
+            self.impls.clear();
+            self.impls.extend_from_slice(&origin.impls);
+        }
+        if self.inherent_methods.len() != origin.inherent_methods.len() {
+            self.inherent_methods.clone_from(&origin.inherent_methods);
+        }
+        // Memo reset: drop the lock and install an empty map in its place.
+        *self.impl_generic_cache.write() = HashMap::default();
+    }
 }
 
 impl<'input> Default for TraitEnv<'input> {

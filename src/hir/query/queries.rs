@@ -1,5 +1,11 @@
 //! The compiler's query definitions.
 //!
+//! MSRV NOTE: this module (and the query system generally) uses
+//! `slice::is_sorted` (stable since Rust 1.82) and let-chains (edition
+//! 2024 / Rust 1.88+).  If `cargo build` fails on either, the toolchain is
+//! older than the crate's effective MSRV — update the toolchain, do not
+//! rewrite the code.
+//!
 //! This is where the query system stops being infrastructure and starts
 //! being used.  Each item here is a `Key -> Value` mapping computed on
 //! demand, cached, and dep-tracked for incremental re-use.
@@ -37,9 +43,10 @@
 // attribute is supposed to surface, not hide.)
 
 use super::{
-    Arena, ContentClass, DefaultCache, Owned, Query, QueryDescriptor, QueryProvider, Scheduler,
-    StableHash, Stored, TaggedQueryKey,
+    Arena, BodyWorkerSlot, ContentClass, DefaultCache, Owned, Query, QueryDescriptor,
+    QueryProvider, Scheduler, StableHash, Stored, TaggedQueryKey,
 };
+use as_variant::as_variant;
 use crate::ast::FileId;
 use crate::ast::{Item, Stmt};
 use crate::hir::polonius::{count_return_refs_ast, extract_borrow_signature, signature_facts};
@@ -98,6 +105,16 @@ impl StableHash for TypeDefSummary {
 /// The first query wired into the real pipeline.  It reads only
 /// `SymbolTable`, so it needs no `&mut TypeContext` — which is why it can
 /// land before the `&mut TypeContext` sharing problem is solved.
+///
+/// ARENA ORPHANING — explicit design decision: `Arena` storage never
+/// reclaims a slot (see `erase.rs`), so every invalidation + recompute of
+/// a hot key allocates a fresh `&'q TypeDefSummary` and orphans the old
+/// one until the session ends.  Accepted deliberately: the value is small,
+/// the invalidation rate is low, and the orphaned memory is bounded by
+/// `(recompute count) × (value size)` over one session.  If this query
+/// ever becomes invalidation-hot (e.g. a watch-mode editor driving
+/// per-keystroke rebuilds), revisit the storage choice — the arena WILL
+/// grow unboundedly under that regime.
 pub struct TypeDefShape;
 
 impl<'q, 'src: 'q> Query<'q, 'src> for TypeDefShape {
@@ -106,6 +123,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for TypeDefShape {
     type Value = &'q TypeDefSummary;
     type Cache = DefaultCache<DefId, Stored<'q, 'src, Self>>;
 
+    #[inline]
     fn descriptor() -> QueryDescriptor {
         QueryDescriptor::new(
             "type_def_shape",
@@ -118,10 +136,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for TypeDefShape {
     }
 
     fn from_tagged(tag: &TaggedQueryKey) -> Option<DefId> {
-        match tag {
-            TaggedQueryKey::TypeDefShape(key) => Some(*key),
-            _ => None,
-        }
+        as_variant!(tag, TaggedQueryKey::TypeDefShape(key) => *key)
     }
 
     fn compute<S: Scheduler>(
@@ -241,6 +256,15 @@ impl StableHash for FnSignatureFacts {
 ///
 /// Shared by the free-function and impl-method arms so the two cannot
 /// drift the way the duplicated bodies in `pre_register_signatures` did.
+///
+/// ASSUMPTION: parameter names are unique within a function.  The borrow
+/// signature keys input borrows by `Symbol` (`extract_borrow_signature`
+/// pushes `(name, mutable)` per reference param), while `input_positions`
+/// is positional; with two same-named reference params the name-keyed and
+/// positional views diverge (the call-site mapping resolves borrows by
+/// name).  Duplicate value-param names are diagnosed as redefinitions in
+/// the same scope (E019 class) — if that check ever stops covering
+/// params, this query needs a positional key instead.
 fn signature_facts_of(
     params: &[crate::ast::Param<'_>],
     return_type: Option<&crate::ast::Type<'_>>,
@@ -280,6 +304,14 @@ fn signature_facts_of(
 /// (via `par_get`) instead of registering them one at a time while walking
 /// the item list.  It reads only `Program`, so it needs no `&mut` state —
 /// the reason it can run on rayon at all.
+///
+/// ARENA ORPHANING — explicit design decision: like [`TypeDefShape`], this
+/// query uses `Arena` storage, so one allocation is orphaned per key per
+/// epoch and is only released by `clear_all`/`clear::<Self>`.  Untracked
+/// queries recompute rarely; the notable exception is a driver-rebuilt
+/// `Program` (bumping `program_epoch`), which re-allocates EVERY key —
+/// accepted because the values are small and the rebuild is a session-scale
+/// event, but a per-keystroke driver would grow the arena without bound.
 pub struct CheckFnSignature;
 
 impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnSignature {
@@ -288,6 +320,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnSignature {
     type Value = &'q FnSignatureFacts;
     type Cache = DefaultCache<FnId, Stored<'q, 'src, Self>>;
 
+    #[inline]
     fn descriptor() -> QueryDescriptor {
         QueryDescriptor::new(
             "check_fn_signature",
@@ -299,17 +332,23 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnSignature {
         // capacity (4096) with evict-one overflow (no working-set cliff),
         // which is the deliberate capacity decision for this query: a
         // crate with more functions keeps AT MOST that many entries and
-        // pays deterministic recomputes for evicted ones.  The victim is
-        // `FxHashMap::keys().next()` — ARBITRARY bucket order, not
-        // recency and not FIFO: the untracked memo is a plain map with no
-        // CLOCK chain, so do not read tracked-cache admission quality
-        // into it.
+        // pays deterministic recomputes for evicted ones.  Eviction is FIFO
+        // by FIRST insertion via the `VecDeque` queue beside the memo map
+        // — not bucket order and not recency.  Do not read
+        // tracked-cache CLOCK admission quality into it.
         //
-        // Driver obligation: `clear_all` between Programs (or
-        // `clear::<CheckFnSignature>` between iterations).  A FnId is
-        // meaningless across sessions and the memo carries no generation
-        // stamp — clear_all's registry replace kills the vtable (and the
-        // memo with it); nothing structural enforces the call.
+        // Cross-program binding: entries in the untracked memo are stamped
+        // with the provider's `program_epoch` (the DRIVER bumps it per
+        // rebuilt Program — `SessionQueryProvider::with_program_epoch`), and
+        // a memo hit from a different epoch is treated as a miss (never
+        // served — a FnId is meaningless across sessions, and these facts
+        // drive the A(ρ) registry).  A driver that reuses one `QuerySystem`
+        // across Programs has TWO sanctioned escape hatches: `clear_all`
+        // (strong: the memo generation discards stale entries outright)
+        // or an epoch bump (graceful: stale entries recompute).  A rebuild
+        // with NEITHER is the one uncovered hazard — the shared epoch makes
+        // the aliasing indistinguishable from a current-program hit, so it
+        // is the driver's contract to uphold (see `program_epoch`'s doc).
         .with_untracked(true)
     }
 
@@ -318,10 +357,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnSignature {
     }
 
     fn from_tagged(tag: &TaggedQueryKey) -> Option<FnId> {
-        match tag {
-            TaggedQueryKey::CheckFnSignature(key) => Some(key.clone()),
-            _ => None,
-        }
+        as_variant!(tag, TaggedQueryKey::CheckFnSignature(key) => key.clone())
     }
 
     fn compute<S: Scheduler>(key: &FnId, provider: &dyn QueryProvider<'q, 'src, S>) -> Self::Value {
@@ -394,7 +430,11 @@ pub struct FnBodyCheck<'input> {
     /// error type without the same lifetime obligations.
     pub hir: crate::hir::hir::HirStmt<'input>,
     pub runtime_checks: Vec<(Symbol, Vec<crate::hir::hir::HirStmt<'input>>)>,
-    pub function_finally: std::collections::HashMap<Symbol, Vec<crate::hir::hir::HirStmt<'input>>>,
+    /// `BTreeMap`, not `HashMap`: iteration is deterministic by construction,
+    /// so `stable_hash` needs no per-call sort and no future reader can
+    /// accidentally iterate it in an unspecified order.
+    pub function_finally:
+        std::collections::BTreeMap<Symbol, Vec<crate::hir::hir::HirStmt<'input>>>,
     pub pending_gadt: Vec<crate::hir::checker::PendingGadtConstruct>,
     pub residual_obligations: Vec<(
         crate::ast::Span,
@@ -432,6 +472,1222 @@ fn hash_opt<T>(h: &mut FxHasher, o: &Option<T>, mut f: impl FnMut(&mut FxHasher,
 /// `AssociatedType`, `ImplMethod`).
 fn hash_debug(h: &mut FxHasher, x: &impl std::fmt::Debug) {
     let _ = std::fmt::write(&mut HashWriter(h), format_args!("{x:?}"));
+}
+
+/// Structured hash for an `ast::Expr` LEAF (literal-type expressions,
+/// `with default` / `validate` modifiers, array sizes).  These positions
+/// previously went through `hash_debug`, whose `Debug` output embeds spans,
+/// so a comment-only edit inside the leaf flipped the type's fingerprint —
+/// a real false-invalidation source in editor-driven sessions.  The typed
+/// fast paths here hash NO span; every remaining shape is handed to the
+/// fully span-free [`hash_ast_expr`] walker, so no leaf position can smuggle
+/// a span into the fingerprint.
+fn hash_ast_expr_leaf(h: &mut FxHasher, e: &crate::ast::Expr<'_>) {
+    match e {
+        crate::ast::Expr::Literal(lit, span) => {
+            h.write_u8(0);
+            hash_literal(h, lit);
+        }
+        crate::ast::Expr::Ident(sym, span) => {
+            h.write_u8(1);
+            sym.hash(h);
+        }
+        crate::ast::Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => {
+            h.write_u8(2);
+            hash_ast_expr_leaf(h, left);
+            h.write_u8(*op as u8);
+            hash_ast_expr_leaf(h, right);
+        }
+        crate::ast::Expr::UnaryOp { op, expr, span } => {
+            h.write_u8(3);
+            h.write_u8(*op as u8);
+            hash_ast_expr_leaf(h, expr);
+        }
+        crate::ast::Expr::Path(syms, span) => {
+            h.write_u8(4);
+            hash_seq(h, syms, |h, s| s.hash(h));
+        }
+        // #5: `hash_ast_expr` is span-free for every shape, so the fallback
+        // no longer reintroduces span sensitivity; `hash_debug` did.
+        other => hash_ast_expr(h, other),
+    }
+}
+
+// ── Typed leaf hashers ───────────────────────────────────────────────
+//
+// Type-driven replacements for `hash_debug` on the leaf types that only
+// occur as nested items (`Attribute`, `Contract`, `TypeParam`,
+// `TraitMethod`, `AssociatedType`, `ImplMethod`) and on `ast::Type`.
+// `hash_debug` paid fmt vtable dispatch + a `Debug`-format round trip and
+// hashed structural padding fields; these walk the fields directly.
+//
+// SPANS ARE NOT HASHED: every `Span` field of these AST shapes is
+// diagnostic-only, so the typed hashers skip them entirely.
+// A comment/whitespace edit that merely shifts byte offsets cannot flip a
+// fingerprint through this layer — the two-channel trivia invariance the
+// `CheckFnBody` hash achieves for HIR bodies now holds here too.  The only
+// remaining span sensitivity is the `hash_debug` fallback, whose `Debug`
+// output embeds spans; it is sound-direction only (forces a recompute,
+// never suppresses one).
+//
+// Any change to the hashed field set or its ORDER is
+// a fingerprint change for every value carrying these types (sound
+// direction: one bulk recompute, never a suppressed one).
+//
+// NOT FULLY SPAN-FREE, deliberately: `hash_ast_type`'s
+// `T::Expr` arm routes through `hash_ast_expr_leaf`, which covers
+// `Literal`/`Ident`/`BinaryOp`/`UnaryOp`/`Path` span-free but falls back to
+// `hash_debug` for anything more complex.  That fallback is sound-direction
+// (over-invalidation) — do not claim `hash_ast_type` is span-free for
+// arbitrary `T::Expr` leaves, and do not try to "fix" it without a typed
+// expression walker (which this module deliberately does not have).
+//
+// Deliberately NOT typed here: `ast::Expr` — walking it would duplicate the
+// expression grammar into hashers for no measured win, so `Expr` internals
+// stay on the `hash_debug` fallback wherever they appear as a leaf.
+// `TypeDefinition` HAS since been typed (`hash_type_definition` below): type
+// definitions are frequent in real programs, and a comment/whitespace edit
+// inside a definition body must not invalidate dependents (the two-channel
+// story `CheckFnBody`'s hash already achieves for functions).
+
+fn hash_ast_type(h: &mut FxHasher, ty: &crate::ast::Type<'_>) {
+    use crate::ast::Type as T;
+    match ty {
+        T::Path(syms, span) => {
+            h.write_u8(0);
+            hash_seq(h, syms, |h, s| s.hash(h));
+        }
+        T::Generic(base, args, span) => {
+            h.write_u8(1);
+            hash_ast_type(h, base);
+            hash_seq(h, args, hash_generic_arg);
+        }
+        T::Reference {
+            inner,
+            mutable,
+            lifetime,
+            span,
+        } => {
+            h.write_u8(2);
+            hash_ast_type(h, inner);
+            h.write_u8(*mutable as u8);
+            hash_opt(h, lifetime, |h, s| s.hash(h));
+        }
+        T::Pointer(inner, span) => {
+            h.write_u8(3);
+            hash_ast_type(h, inner);
+        }
+        T::Slice(inner, span) => {
+            h.write_u8(4);
+            hash_ast_type(h, inner);
+        }
+        T::Array(inner, size, span) => {
+            h.write_u8(5);
+            hash_ast_type(h, inner);
+            hash_ast_expr_leaf(h, size);
+        }
+        T::Tuple(tys, span) => {
+            h.write_u8(6);
+            hash_seq(h, tys, hash_ast_type);
+        }
+        T::Function { params, ret, span } => {
+            h.write_u8(7);
+            hash_seq(h, params, hash_ast_type);
+            hash_ast_type(h, ret);
+        }
+        T::Projection {
+            impl_type,
+            trait_path,
+            assoc_name,
+            span,
+        } => {
+            h.write_u8(8);
+            hash_ast_type(h, impl_type);
+            hash_ast_type(h, trait_path);
+            assoc_name.hash(h);
+        }
+        T::DynTrait(ts, span) => {
+            h.write_u8(9);
+            hash_seq(h, ts, hash_ast_type);
+        }
+        T::Forall {
+            lifetime,
+            body,
+            span,
+        } => {
+            h.write_u8(10);
+            lifetime.hash(h);
+            hash_ast_type(h, body);
+        }
+        T::Exists {
+            name,
+            base,
+            invariant,
+            span,
+        } => {
+            h.write_u8(11);
+            name.hash(h);
+            hash_ast_type(h, base);
+            hash_ast_expr_leaf(h, invariant);
+        }
+        T::WhereShorthand {
+            base,
+            invariant,
+            span,
+        } => {
+            h.write_u8(12);
+            hash_ast_type(h, base);
+            hash_ast_expr_leaf(h, invariant);
+        }
+        T::Literal(e, span) => {
+            h.write_u8(13);
+            hash_ast_expr_leaf(h, e);
+        }
+        T::Never(span) => {
+            h.write_u8(14);
+        }
+        T::Union(ts, span) => {
+            h.write_u8(15);
+            hash_seq(h, ts, hash_ast_type);
+        }
+        T::Expr(e, span) => {
+            h.write_u8(16);
+            hash_ast_expr_leaf(h, e);
+        }
+        T::Regex(s, span) => {
+            h.write_u8(17);
+            s.hash(h);
+        }
+        T::Error(span) => {
+            h.write_u8(18);
+        }
+    }
+}
+
+fn hash_generic_arg(h: &mut FxHasher, ga: &crate::ast::GenericArg<'_>) {
+    use crate::ast::GenericArg as G;
+    match ga {
+        G::Positional(ty) => {
+            h.write_u8(0);
+            hash_ast_type(h, ty);
+        }
+        G::Named(name, ty) => {
+            h.write_u8(1);
+            name.hash(h);
+            hash_ast_type(h, ty);
+        }
+        G::Const(ac) => {
+            h.write_u8(2);
+            // `ast::Expr` leaf: span-free on covered shapes.
+            hash_ast_expr_leaf(h, ac.value);
+        }
+    }
+}
+
+/// Hash one AST attribute.
+///
+/// Precondition: `Attribute` never carries doc payloads.  Doc text lives in
+/// the separate `doc` field (stripped by the checker); if a future parser
+/// routes `#[doc]`-style text here, a doc-only edit would flip the semantic
+/// fingerprint through this path and defeat the two-channel invariance.
+fn hash_attribute(h: &mut FxHasher, a: &crate::ast::Attribute<'_>) {
+    a.name.hash(h);
+    hash_seq(h, &a.args, |h, e| hash_ast_expr_leaf(h, e));
+    hash_seq(h, &a.named_args, |h, (name, e)| {
+        name.hash(h);
+        hash_ast_expr_leaf(h, e);
+    });
+}
+
+fn hash_ast_pattern(h: &mut FxHasher, p: &crate::ast::Pattern<'_>) {
+    use crate::ast::Pattern as P;
+    match p {
+        P::Wildcard(span) => {
+            h.write_u8(0);
+        }
+        P::Ident(name, span) => {
+            h.write_u8(1);
+            name.hash(h);
+        }
+        P::Literal(e, span) => {
+            h.write_u8(2);
+            // Literal patterns are expression leaves: span-free where the
+            // leaf hasher covers the shape.
+            hash_ast_expr_leaf(h, e);
+        }
+        P::Tuple(ps, span) => {
+            h.write_u8(3);
+            hash_seq(h, ps, hash_ast_pattern);
+        }
+        P::Struct {
+            path,
+            fields,
+            rest,
+            span,
+        } => {
+            h.write_u8(4);
+            hash_seq(h, path, |h, s| s.hash(h));
+            hash_seq(h, fields, |h, (name, sub)| {
+                name.hash(h);
+                hash_ast_pattern(h, sub);
+            });
+            h.write_u8(*rest as u8);
+        }
+        P::Enum {
+            path,
+            variant,
+            inner,
+            span,
+        } => {
+            h.write_u8(5);
+            hash_seq(h, path, |h, s| s.hash(h));
+            variant.hash(h);
+            hash_opt(h, inner, |h, p| hash_ast_pattern(h, p));
+        }
+        P::Annotated { inner, ty, span } => {
+            h.write_u8(6);
+            hash_ast_pattern(h, inner);
+            hash_ast_type(h, ty);
+        }
+        P::Or(ps, span) => {
+            h.write_u8(7);
+            hash_seq(h, ps, hash_ast_pattern);
+        }
+        P::Slice(before, mid, after, span) => {
+            h.write_u8(8);
+            hash_seq(h, before, hash_ast_pattern);
+            hash_opt(h, mid, |h, p| hash_ast_pattern(h, p));
+            hash_seq(h, after, hash_ast_pattern);
+        }
+        P::Error(span) => {
+            h.write_u8(9);
+        }
+    }
+}
+
+fn hash_ensures_target(h: &mut FxHasher, t: &crate::ast::EnsuresTarget<'_>) {
+    use crate::ast::EnsuresTarget as E;
+    match t {
+        E::Unconditional => h.write_u8(0),
+        E::OnOk(p) => {
+            h.write_u8(1);
+            hash_opt(h, p, hash_ast_pattern);
+        }
+        E::OnErr(p) => {
+            h.write_u8(2);
+            hash_opt(h, p, hash_ast_pattern);
+        }
+        E::OnTimeout => h.write_u8(3),
+        E::OnCancel => h.write_u8(4),
+    }
+}
+
+fn hash_contract(h: &mut FxHasher, c: &crate::ast::Contract<'_>) {
+    use crate::ast::Contract as C;
+    match c {
+        C::Requires(e, span) => {
+            h.write_u8(0);
+            hash_ast_expr_leaf(h, e);
+        }
+        C::Ensures {
+            expr,
+            span,
+            target,
+            labels,
+        } => {
+            h.write_u8(1);
+            hash_ast_expr_leaf(h, expr);
+            hash_ensures_target(h, target);
+            hash_seq(h, labels, |h, s| s.hash(h));
+        }
+        C::Invariant(e, span) => {
+            h.write_u8(2);
+            hash_ast_expr_leaf(h, e);
+        }
+        C::Decreases(e, span) => {
+            h.write_u8(3);
+            hash_ast_expr_leaf(h, e);
+        }
+        C::Terminates(e, span) => {
+            h.write_u8(4);
+            hash_ast_expr_leaf(h, e);
+        }
+    }
+}
+
+fn hash_type_param(h: &mut FxHasher, tp: &crate::ast::TypeParam<'_>) {
+    tp.name.hash(h);
+    hash_seq(h, tp.bounds, hash_ast_type);
+    match tp.kind {
+        crate::ast::TypeParamKind::Type => h.write_u8(0),
+        crate::ast::TypeParamKind::Lifetime => h.write_u8(1),
+        crate::ast::TypeParamKind::Const { ty, default } => {
+            h.write_u8(2);
+            hash_ast_type(h, &ty);
+            hash_opt(h, &default, |h, e| hash_ast_expr_leaf(h, e));
+        }
+    }
+}
+
+fn hash_ast_param(h: &mut FxHasher, p: &crate::ast::Param<'_>) {
+    p.name.hash(h);
+    hash_opt(h, &p.ty, hash_ast_type);
+    hash_opt(h, &p.default, |h, e| hash_ast_expr_leaf(h, e));
+}
+
+fn hash_trait_method(h: &mut FxHasher, m: &crate::ast::TraitMethod<'_>) {
+    // COVERAGE NOTE: if `TraitMethod` gains a default body, where-clause, or
+    // any field beyond name/params/return_type/span, that field MUST be
+    // hashed here — otherwise a change to a trait method's default
+    // implementation would not invalidate dependent queries.  The
+    // destructuring pattern below makes such an addition a compile error.
+    let crate::ast::TraitMethod {
+        name,
+        params,
+        return_type,
+        span: _,
+    } = m;
+    name.hash(h);
+    hash_seq(h, params, hash_ast_param);
+    hash_ast_type(h, return_type);
+}
+
+fn hash_associated_type(h: &mut FxHasher, a: &crate::ast::AssociatedType<'_>) {
+    // COVERAGE NOTE: same obligation as `hash_trait_method` — if
+    // `AssociatedType` gains a where-clause or other field beyond
+    // name/lifetime_params/default/span, hash it here.  The destructuring
+    // pattern makes that a compile error.
+    let crate::ast::AssociatedType {
+        name,
+        lifetime_params,
+        default,
+        span: _,
+    } = a;
+    name.hash(h);
+    hash_seq(h, lifetime_params, |h, s| s.hash(h));
+    hash_opt(h, default, hash_ast_type);
+}
+
+/// Typed, span-free hasher for [`crate::ast::Item`] — the AST counterpart of
+/// the HIR item walkers, reached from `hash_ast_stmt`'s `Stmt::Item` arm.
+///
+/// This replaces the former `hash_debug(item)` fallback,
+/// whose `Debug` output embeds spans: a comment or whitespace edit inside a
+/// nested `def`/`type` used to flip the enclosing body fingerprint, which
+/// made the "two-channel trivia invariance" claim untrue for any body
+/// containing a nested item.
+///
+/// COVERAGE NOTE: the match is EXHAUSTIVE over `Item`, so a new variant is a
+/// compile error here (forcing a hashing decision).  Within each arm every
+/// semantic field is hashed; `span` and `doc` are trivia and are skipped.
+fn hash_ast_item(h: &mut FxHasher, item: &crate::ast::Item<'_>) {
+    use crate::ast::Item as I;
+    match item {
+        I::FunctionDef {
+            span: _,
+            attributes,
+            contracts,
+            doc: _,
+            name,
+            params,
+            return_type,
+            body,
+            type_params,
+            where_clause,
+            finally,
+            is_comptime,
+            is_async,
+        } => {
+            h.write_u8(0);
+            hash_seq(h, attributes, hash_attribute);
+            hash_seq(h, contracts, hash_contract);
+            name.hash(h);
+            hash_seq(h, params, hash_ast_param);
+            hash_opt(h, return_type, hash_ast_type);
+            hash_opt(h, body, |h, b| hash_ast_stmts(h, b));
+            hash_seq(h, type_params, hash_type_param);
+            hash_where_clause(h, where_clause);
+            hash_opt(h, finally, |h, b| hash_ast_stmts(h, b));
+            h.write_u8(*is_comptime as u8);
+            h.write_u8(*is_async as u8);
+        }
+        I::TypeDef {
+            span: _,
+            attributes,
+            doc: _,
+            name,
+            params,
+            definition,
+            contracts,
+        } => {
+            h.write_u8(1);
+            hash_seq(h, attributes, hash_attribute);
+            name.hash(h);
+            hash_seq(h, params, hash_type_param);
+            hash_type_definition(h, definition);
+            hash_seq(h, contracts, hash_contract);
+        }
+        I::TraitDef {
+            span: _,
+            attributes,
+            doc: _,
+            name,
+            methods,
+            associated_types,
+        } => {
+            h.write_u8(2);
+            hash_seq(h, attributes, hash_attribute);
+            name.hash(h);
+            hash_seq(h, methods, hash_trait_method);
+            hash_seq(h, associated_types, hash_associated_type);
+        }
+        I::ImplBlock {
+            span: _,
+            attributes,
+            trait_path,
+            for_type,
+            methods,
+            associated_types,
+            where_clause,
+            type_params,
+        } => {
+            h.write_u8(3);
+            hash_seq(h, attributes, hash_attribute);
+            hash_opt(h, trait_path, |h, t| hash_ast_type(h, t));
+            hash_ast_type(h, for_type);
+            hash_seq(h, methods, hash_impl_method);
+            hash_seq(h, associated_types, hash_associated_type);
+            hash_where_clause(h, where_clause);
+            hash_seq(h, type_params, hash_type_param);
+        }
+        I::Import {
+            path,
+            items,
+            alias,
+            span: _,
+        } => {
+            h.write_u8(4);
+            hash_seq(h, path, |h, s| s.hash(h));
+            hash_opt(h, items, |h, xs| hash_seq(h, xs, |h, s| s.hash(h)));
+            hash_opt(h, alias, |h, s| s.hash(h));
+        }
+        I::ExternFunction {
+            abi,
+            name,
+            params,
+            return_type,
+            span: _,
+            attributes,
+        } => {
+            h.write_u8(5);
+            abi.hash(h);
+            name.hash(h);
+            hash_seq(h, params, hash_ast_param);
+            hash_ast_type(h, return_type);
+            hash_seq(h, attributes, hash_attribute);
+        }
+        I::Constraint {
+            name,
+            params,
+            predicates,
+            span: _,
+        } => {
+            h.write_u8(6);
+            name.hash(h);
+            hash_seq(h, params, hash_type_param);
+            hash_seq(h, predicates, hash_where_predicate);
+        }
+        I::Edition(name, _) => {
+            h.write_u8(7);
+            name.hash(h);
+        }
+        I::LayoutDef {
+            name,
+            attributes,
+            span: _,
+        } => {
+            h.write_u8(8);
+            name.hash(h);
+            hash_seq(h, attributes, hash_attribute);
+        }
+        I::ComptimeBlock {
+            captures,
+            trusted,
+            attributes,
+            body,
+            span: _,
+        } => {
+            h.write_u8(9);
+            hash_seq(h, captures, |h, (sym, _)| sym.hash(h));
+            h.write_u8(*trusted as u8);
+            hash_seq(h, attributes, hash_attribute);
+            hash_ast_stmts(h, body);
+        }
+        I::Generate {
+            attributes,
+            for_type,
+            body,
+            span: _,
+        } => {
+            h.write_u8(10);
+            hash_seq(h, attributes, hash_attribute);
+            hash_ast_type(h, for_type);
+            hash_ast_stmts(h, body);
+        }
+        I::Error(_) => h.write_u8(11),
+    }
+}
+
+fn hash_where_predicate(h: &mut FxHasher, p: &crate::ast::WherePredicate<'_>) {
+    hash_ast_type(h, &p.ty);
+    hash_seq(h, p.bounds, hash_ast_type);
+}
+
+/// Hash a where-clause span-free.  `None` and an empty clause hash
+/// differently on purpose: the parse shape is part of the semantic
+/// fingerprint (it is what the E104 generality exemption keys off).
+fn hash_where_clause(h: &mut FxHasher, wc: &Option<crate::ast::WhereClause<'_>>) {
+    match wc {
+        None => h.write_u8(0),
+        Some(wc) => {
+            h.write_u8(1);
+            hash_seq(h, wc.predicates, hash_where_predicate);
+            hash_seq(h, wc.equalities, |h, e| {
+                hash_ast_type(h, &e.left);
+                hash_ast_type(h, &e.right);
+            });
+            hash_seq(h, wc.lifetime_outlives, |h, (a, bs)| {
+                a.hash(h);
+                hash_seq(h, *bs, |h, s| s.hash(h));
+            });
+        }
+    }
+}
+
+/// AST analogue of [`hash_stmt`] (which walks checked HIR).  Raw
+/// impl-method bodies are un-checked `ast::Stmt`, so the HIR walker cannot
+/// be reused.  Every span is skipped, including inside nested items
+///: the whole
+/// walker is now trivia-invariant.
+fn hash_ast_stmts(h: &mut FxHasher, ss: &[crate::ast::Stmt<'_>]) {
+    hash_seq(h, ss, hash_ast_stmt);
+}
+
+fn hash_ast_stmt(h: &mut FxHasher, s: &crate::ast::Stmt<'_>) {
+    use crate::ast::Stmt as S;
+    match s {
+        S::VariableDef {
+            kind,
+            mutable,
+            name,
+            pattern,
+            ty,
+            value,
+            else_branch,
+            span: _,
+            attributes,
+            // `doc` is trivia: the two-channel invariant forbids hashing it.
+            doc: _,
+            type_captures,
+            type_modifiers,
+        } => {
+            h.write_u8(0);
+            h.write_u8(*kind as u8);
+            h.write_u8(*mutable as u8);
+            hash_opt(h, name, |h, n| n.hash(h));
+            hash_opt(h, pattern, hash_ast_pattern);
+            hash_opt(h, ty, hash_ast_type);
+            hash_opt(h, value, hash_ast_expr);
+            hash_opt(h, else_branch, |h, b| hash_ast_stmts(h, b));
+            hash_seq(h, attributes, hash_attribute);
+            hash_seq(h, type_captures, hash_type_param);
+            hash_seq(h, type_modifiers, hash_type_modifier);
+        }
+        S::Item(item) => {
+            h.write_u8(1);
+            hash_ast_item(h, item);
+        }
+        S::Expression(e) => {
+            h.write_u8(2);
+            hash_ast_expr(h, e);
+        }
+        S::If {
+            cond,
+            then_branch,
+            else_branch,
+            span: _,
+        } => {
+            h.write_u8(3);
+            hash_ast_expr(h, cond);
+            hash_ast_stmts(h, then_branch);
+            hash_opt(h, else_branch, |h, b| hash_ast_stmts(h, b));
+        }
+        S::IfLet {
+            pattern,
+            scrutinee,
+            then_branch,
+            else_branch,
+            span: _,
+        } => {
+            h.write_u8(4);
+            hash_ast_pattern(h, pattern);
+            hash_ast_expr(h, scrutinee);
+            hash_ast_stmts(h, then_branch);
+            hash_opt(h, else_branch, |h, b| hash_ast_stmts(h, b));
+        }
+        S::While {
+            label,
+            cond,
+            body,
+            invariant,
+            decreases,
+            span: _,
+        } => {
+            h.write_u8(5);
+            hash_opt(h, label, |h, l| l.hash(h));
+            hash_ast_expr(h, cond);
+            hash_ast_stmts(h, body);
+            hash_opt(h, invariant, hash_ast_expr);
+            hash_opt(h, decreases, hash_ast_expr);
+        }
+        S::WhileLet {
+            label,
+            pattern,
+            scrutinee,
+            body,
+            invariant,
+            decreases,
+            span: _,
+        } => {
+            h.write_u8(6);
+            hash_opt(h, label, |h, l| l.hash(h));
+            hash_ast_pattern(h, pattern);
+            hash_ast_expr(h, scrutinee);
+            hash_ast_stmts(h, body);
+            hash_opt(h, invariant, hash_ast_expr);
+            hash_opt(h, decreases, hash_ast_expr);
+        }
+        S::For {
+            label,
+            pattern,
+            iterable,
+            body,
+            invariant,
+            decreases,
+            span: _,
+        } => {
+            h.write_u8(7);
+            hash_opt(h, label, |h, l| l.hash(h));
+            hash_ast_pattern(h, pattern);
+            hash_ast_expr(h, iterable);
+            hash_ast_stmts(h, body);
+            hash_opt(h, invariant, hash_ast_expr);
+            hash_opt(h, decreases, hash_ast_expr);
+        }
+        S::Loop { label, body, span: _ } => {
+            h.write_u8(8);
+            hash_opt(h, label, |h, l| l.hash(h));
+            hash_ast_stmts(h, body);
+        }
+        S::Leave { label, span: _ } => {
+            h.write_u8(9);
+            hash_opt(h, label, |h, l| l.hash(h));
+        }
+        S::Continue { label, span: _ } => {
+            h.write_u8(10);
+            hash_opt(h, label, |h, l| l.hash(h));
+        }
+        S::Return {
+            value,
+            labels,
+            span: _,
+        } => {
+            h.write_u8(11);
+            hash_opt(h, value, hash_ast_expr);
+            hash_seq(h, labels, |h, l| l.hash(h));
+        }
+        S::Assign {
+            target,
+            op,
+            value,
+            span: _,
+        } => {
+            h.write_u8(12);
+            hash_ast_expr(h, target.expr());
+            h.write_u8(op.is_some() as u8);
+            if let Some(op) = op {
+                h.write_u8(*op as u8);
+            }
+            hash_ast_expr(h, value);
+        }
+        S::ScopeCleanup {
+            name,
+            when_condition,
+            body,
+            propagates,
+            overrides,
+            span: _,
+        } => {
+            h.write_u8(13);
+            name.hash(h);
+            hash_opt(h, when_condition, |h, e| hash_ast_expr(h, e));
+            hash_ast_stmts(h, body);
+            h.write_u8(*propagates as u8);
+            h.write_u8(*overrides as u8);
+        }
+        S::Trigger { name, span: _ } => {
+            h.write_u8(14);
+            name.hash(h);
+        }
+        S::Unsafe { body, span: _ } => {
+            h.write_u8(15);
+            hash_ast_stmts(h, body);
+        }
+        S::GhostVariableDef { inner, span: _ } => {
+            h.write_u8(16);
+            hash_ast_stmt(h, inner);
+        }
+        S::Isolate {
+            attributes,
+            body,
+            span: _,
+        } => {
+            h.write_u8(17);
+            hash_seq(h, attributes, hash_attribute);
+            hash_ast_stmts(h, body);
+        }
+        S::Error(_) => h.write_u8(18),
+    }
+}
+
+fn hash_ast_expr(h: &mut FxHasher, e: &crate::ast::Expr<'_>) {
+    use crate::ast::Expr as E;
+    match e {
+        E::Literal(lit, _) => {
+            h.write_u8(0);
+            hash_literal(h, lit);
+        }
+        E::Ident(sym, _) => {
+            h.write_u8(1);
+            sym.hash(h);
+        }
+        E::TypeAnnotated { expr, ty, span: _ } => {
+            h.write_u8(2);
+            hash_ast_expr(h, expr);
+            hash_ast_type(h, ty);
+        }
+        E::BinaryOp {
+            left,
+            op,
+            right,
+            span: _,
+        } => {
+            h.write_u8(3);
+            hash_ast_expr(h, left);
+            h.write_u8(*op as u8);
+            hash_ast_expr(h, right);
+        }
+        E::UnaryOp { op, expr, span: _ } => {
+            h.write_u8(4);
+            h.write_u8(*op as u8);
+            hash_ast_expr(h, expr);
+        }
+        E::Call {
+            callee,
+            args,
+            comptime,
+            span: _,
+        } => {
+            h.write_u8(5);
+            hash_ast_expr(h, callee);
+            hash_seq(h, args, hash_ast_expr);
+            h.write_u8(*comptime as u8);
+        }
+        E::Index {
+            base,
+            index,
+            span: _,
+        } => {
+            h.write_u8(6);
+            hash_ast_expr(h, base);
+            hash_ast_expr(h, index);
+        }
+        E::FieldAccess {
+            base,
+            field,
+            span: _,
+        } => {
+            h.write_u8(7);
+            hash_ast_expr(h, base);
+            field.hash(h);
+        }
+        E::AttrAccess {
+            base,
+            attr,
+            span: _,
+        } => {
+            h.write_u8(8);
+            hash_ast_expr(h, base);
+            attr.hash(h);
+        }
+        E::Cast {
+            expr,
+            ty,
+            safe,
+            rounding,
+            span: _,
+        } => {
+            h.write_u8(9);
+            hash_ast_expr(h, expr);
+            hash_ast_type(h, ty);
+            h.write_u8(*safe as u8);
+            h.write_u8(rounding.is_some() as u8);
+            if let Some(r) = rounding {
+                h.write_u8(*r as u8);
+            }
+        }
+        E::Range {
+            start,
+            end,
+            inclusive,
+            span: _,
+        } => {
+            h.write_u8(10);
+            hash_opt(h, start, |h, e| hash_ast_expr(h, e));
+            hash_opt(h, end, |h, e| hash_ast_expr(h, e));
+            h.write_u8(*inclusive as u8);
+        }
+        E::StructLit { path, fields, span: _ } => {
+            h.write_u8(11);
+            hash_seq(h, path, |h, s| s.hash(h));
+            hash_seq(h, fields, |h, (name, e)| {
+                name.hash(h);
+                hash_ast_expr(h, e);
+            });
+        }
+        E::EnumLit {
+            path,
+            variant,
+            payload,
+            span: _,
+        } => {
+            h.write_u8(12);
+            hash_seq(h, path, |h, s| s.hash(h));
+            variant.hash(h);
+            hash_opt(h, payload, |h, e| hash_ast_expr(h, e));
+        }
+        E::Move(expr, _) => {
+            h.write_u8(13);
+            hash_ast_expr(h, expr);
+        }
+        E::Path(syms, _) => {
+            h.write_u8(14);
+            hash_seq(h, syms, |h, s| s.hash(h));
+        }
+        E::Tuple(es, _) => {
+            h.write_u8(15);
+            hash_seq(h, es, hash_ast_expr);
+        }
+        E::Array(es, _) => {
+            h.write_u8(16);
+            hash_seq(h, es, hash_ast_expr);
+        }
+        E::Closure {
+            params,
+            return_type,
+            captures,
+            body,
+            span: _,
+        } => {
+            h.write_u8(17);
+            hash_seq(h, params, hash_ast_param);
+            hash_opt(h, return_type, hash_ast_type);
+            hash_seq(h, captures, hash_capture);
+            hash_ast_stmts(h, body);
+        }
+        E::Try { expr, span: _ } => {
+            h.write_u8(18);
+            hash_ast_expr(h, expr);
+        }
+        E::UnsafeBlock { body, span: _ } => {
+            h.write_u8(19);
+            hash_ast_stmts(h, body);
+        }
+        E::Catch {
+            expr,
+            branches,
+            span: _,
+        } => {
+            h.write_u8(20);
+            hash_ast_expr(h, expr);
+            hash_seq(h, branches, hash_ast_catch_branch);
+        }
+        E::LeaveWith {
+            expr,
+            is_return,
+            span: _,
+        } => {
+            h.write_u8(21);
+            hash_ast_expr(h, expr);
+            h.write_u8(*is_return as u8);
+        }
+        E::Await { expr, span: _ } => {
+            h.write_u8(22);
+            hash_ast_expr(h, expr);
+        }
+        E::If {
+            cond,
+            then_branch,
+            else_branch,
+            is_expression,
+            span: _,
+        } => {
+            h.write_u8(23);
+            hash_ast_expr(h, cond);
+            hash_ast_stmts(h, then_branch);
+            hash_opt(h, else_branch, |h, b| hash_ast_stmts(h, b));
+            h.write_u8(*is_expression as u8);
+        }
+        E::IfLet {
+            pattern,
+            scrutinee,
+            then_branch,
+            else_branch,
+            is_expression,
+            span: _,
+        } => {
+            h.write_u8(24);
+            hash_ast_pattern(h, pattern);
+            hash_ast_expr(h, scrutinee);
+            hash_ast_stmts(h, then_branch);
+            hash_opt(h, else_branch, |h, b| hash_ast_stmts(h, b));
+            h.write_u8(*is_expression as u8);
+        }
+        E::Match {
+            scrutinee,
+            arms,
+            span: _,
+        } => {
+            h.write_u8(25);
+            hash_ast_expr(h, scrutinee);
+            hash_seq(h, arms, hash_ast_match_arm);
+        }
+        E::Block(stmts, _) => {
+            h.write_u8(26);
+            hash_ast_stmts(h, stmts);
+        }
+        E::PolyBox {
+            expr,
+            scheme,
+            span: _,
+        } => {
+            h.write_u8(27);
+            hash_ast_expr(h, expr);
+            hash_opt(h, scheme, hash_ast_type_scheme);
+        }
+        E::PolyUnbox {
+            expr,
+            scheme,
+            span: _,
+        } => {
+            h.write_u8(28);
+            hash_ast_expr(h, expr);
+            hash_opt(h, scheme, hash_ast_type_scheme);
+        }
+        E::Quantified {
+            quantifier,
+            binder,
+            range,
+            body,
+            span: _,
+        } => {
+            h.write_u8(29);
+            h.write_u8(*quantifier as u8);
+            binder.hash(h);
+            hash_ast_expr(h, range);
+            hash_ast_expr(h, body);
+        }
+        E::Old(expr, _) => {
+            h.write_u8(30);
+            hash_ast_expr(h, expr);
+        }
+        E::Task { body, span: _ } => {
+            h.write_u8(31);
+            hash_ast_stmts(h, body);
+        }
+        E::TypeInfo(ty, _) => {
+            h.write_u8(32);
+            hash_ast_type(h, ty);
+        }
+        E::LayoutOf(ty, _) => {
+            h.write_u8(33);
+            hash_ast_type(h, ty);
+        }
+        E::CompileError(msg, _) => {
+            h.write_u8(34);
+            msg.hash(h);
+        }
+        E::Error(_) => h.write_u8(35),
+    }
+}
+
+fn hash_ast_catch_branch(h: &mut FxHasher, b: &crate::ast::CatchBranch<'_>) {
+    hash_ast_pattern(h, &b.pattern);
+    hash_opt(h, &b.bind, |h, s| s.hash(h));
+    hash_ast_stmts(h, b.body);
+}
+
+fn hash_ast_match_arm(h: &mut FxHasher, a: &crate::ast::MatchArm<'_>) {
+    hash_ast_pattern(h, &a.pattern);
+    hash_opt(h, &a.guard, |h, e| hash_ast_expr(h, e));
+    hash_ast_expr(h, &a.body);
+}
+
+fn hash_ast_type_scheme(h: &mut FxHasher, s: &crate::ast::TypeScheme<'_>) {
+    // Quantifier SPANS are diagnostic-only; hash the bound names.
+    hash_seq(h, s.quantifiers, |h, (_, sym)| sym.hash(h));
+    hash_ast_type(h, s.body);
+}
+
+fn hash_impl_method(h: &mut FxHasher, m: &crate::ast::ImplMethod<'_>) {
+    // COVERAGE NOTE: the destructuring pattern below is
+    // INTENTIONAL — adding a field to `ImplMethod` becomes a compile error
+    // here instead of a silently unhashed semantic field.  Only `span` is
+    // skipped (trivia).  Verified against the current AST definition
+    // (name, attributes, params, return_type, body, span); there is no
+    // where-clause / type-param / contract set on an impl method today.
+    let crate::ast::ImplMethod {
+        name,
+        attributes,
+        params,
+        return_type,
+        body,
+        span: _,
+    } = m;
+    name.hash(h);
+    hash_seq(h, attributes, hash_attribute);
+    hash_seq(h, params, hash_ast_param);
+    hash_ast_type(h, return_type);
+    // Raw impl-method bodies are AST (not HIR): use the span-free AST
+    // walker above.
+    hash_opt(h, body, |h, b| hash_ast_stmts(h, b));
+}
+
+/// Typed hasher for `ast::TypeDefinition` — replaces the previous
+/// `hash_debug(definition)` fallback, whose `Debug` output embedded spans
+/// and defeated the two-channel trivia invariance for every type
+/// definition (a comment/whitespace edit inside a definition body flipped
+/// the fingerprint).  This walker hashes NO span, so definition bodies are
+/// now trivia-invariant — the same win `CheckFnBody`'s hash achieves for
+/// function bodies.
+///
+/// `ast::Expr` leaves (field defaults, `Default`/`Validate` modifiers) go
+/// through `hash_ast_expr_leaf` — span-free on its covered shapes,
+/// `hash_debug` fallback otherwise (see the typed-leaf block note above).
+///
+/// Impl-method bodies are hashed SPAN-FREE via `hash_ast_stmts`
+/// (`hash_impl_method` above) — the previous "KNOWN GAP" note claiming they
+/// went through `hash_debug` was stale: do not "restore"
+/// `hash_debug` there, that would regress trivia invariance for every type
+/// definition containing an impl block.  Nested items inside a body now go
+/// through `hash_ast_item` as well, so the walker is fully span-free.
+///
+/// SPANS ARE NOT HASHED, as for every typed AST hasher.
+fn hash_type_definition(h: &mut FxHasher, d: &crate::ast::TypeDefinition<'_>) {
+    use crate::ast::TypeDefinition as TD;
+    match d {
+        TD::Struct(fields, modifiers) => {
+            h.write_u8(0);
+            hash_seq(h, fields, hash_struct_field);
+            hash_seq(h, modifiers, hash_type_modifier);
+        }
+        TD::Enum(variants, repr, modifiers) => {
+            h.write_u8(1);
+            hash_seq(h, variants, hash_enum_variant);
+            hash_opt(h, repr, |h, s| s.hash(h));
+            hash_seq(h, modifiers, hash_type_modifier);
+        }
+        TD::TraitDef {
+            methods,
+            associated_types,
+        } => {
+            h.write_u8(2);
+            hash_seq(h, methods, hash_trait_method);
+            hash_seq(h, associated_types, hash_associated_type);
+        }
+        TD::ImplBlock {
+            trait_path,
+            for_type,
+            methods,
+        } => {
+            h.write_u8(3);
+            hash_opt(h, &trait_path, |h, s| hash_seq(h, s, |h, s| s.hash(h)));
+            hash_ast_type(h, for_type);
+            hash_seq(h, methods, hash_impl_method);
+        }
+        TD::Constraint(tys) => {
+            h.write_u8(4);
+            hash_seq(h, tys, hash_ast_type);
+        }
+        TD::Alias(ty, modifiers) => {
+            h.write_u8(5);
+            hash_ast_type(h, ty);
+            hash_seq(h, modifiers, hash_type_modifier);
+        }
+        TD::Opaque(ty, modifiers) => {
+            h.write_u8(6);
+            hash_ast_type(h, ty);
+            hash_seq(h, modifiers, hash_type_modifier);
+        }
+    }
+}
+
+fn hash_struct_field(h: &mut FxHasher, f: &crate::ast::StructField<'_>) {
+    // COVERAGE NOTE: field set verified against the current AST definition;
+    // `default` is an `ast::Expr` leaf, hashed with the span-free leaf
+    // hasher — a comment/whitespace edit in a default no
+    // longer flips the enclosing type definition's fingerprint.
+    f.name.hash(h);
+    hash_ast_type(h, &f.ty);
+    hash_opt(h, &f.default, |h, e| hash_ast_expr_leaf(h, e));
+}
+
+fn hash_enum_variant(h: &mut FxHasher, v: &crate::ast::EnumVariant<'_>) {
+    // COVERAGE NOTE: field set verified against the current AST definition
+    // (GADT `eq_spec` and `exists_params` are semantic — they MUST be
+    // hashed, a `when` clause edit flips the fingerprint).
+    v.name.hash(h);
+    hash_opt(h, &v.payload, hash_ast_type);
+    h.write_usize(v.eq_spec.len());
+    for (name, ty) in &v.eq_spec {
+        name.hash(h);
+        hash_ast_type(h, ty);
+    }
+    hash_seq(h, &v.exists_params, |h, s| s.hash(h));
+}
+
+fn hash_type_modifier(h: &mut FxHasher, m: &crate::ast::TypeModifier<'_>) {
+    use crate::ast::TypeModifier as M;
+    match m {
+        M::Overflow(p) => {
+            h.write_u8(0);
+            h.write_u8(*p as u8);
+        }
+        M::Default(e) => {
+            h.write_u8(1);
+            hash_ast_expr_leaf(h, e); // `ast::Expr` leaf
+        }
+        M::Validate(e) => {
+            h.write_u8(2);
+            hash_ast_expr_leaf(h, e); // `ast::Expr` leaf
+        }
+        M::NoDefault => h.write_u8(3),
+    }
 }
 
 fn hash_literal(h: &mut FxHasher, lit: &crate::ast::Literal) {
@@ -489,8 +1745,10 @@ fn hash_literal(h: &mut FxHasher, lit: &crate::ast::Literal) {
 fn hash_hir_param(h: &mut FxHasher, p: &crate::hir::hir::HirParam<'_>) {
     p.name.hash(h);
     p.ty.hash(h);
-    // `default` is an AST fragment: span-sensitive leaf (see `hash_debug`).
-    hash_opt(h, &p.default, |h, e| hash_debug(h, e));
+    // `default` is an AST fragment: the typed leaf hasher covers the
+    // trivially-walkable shapes span-free; complex exprs fall back to
+    // `hash_debug` (sound-direction over-invalidation only).
+    hash_opt(h, &p.default, |h, e| hash_ast_expr_leaf(h, e));
 }
 
 fn hash_capture(h: &mut FxHasher, c: &crate::ast::Capture) {
@@ -554,6 +1812,14 @@ fn hash_pattern(h: &mut FxHasher, p: &crate::hir::hir::HirPattern<'_>) {
     }
 }
 
+/// Fingerprint one statement list.
+///
+/// The walk is exhaustive by design: a missed field is the unsound
+/// (stale-serve) direction, so a cheap shape prefilter that skips the walk
+/// would trade correctness for speed.  Defer such a prefilter until a
+/// deterministic miss-path benchmark (`bench_miss_chain_hash`) shows the walk
+/// dominates `stage`; the safe direction then is memoizing the hash on the
+/// value, not weakening the walker.
 fn hash_stmts(h: &mut FxHasher, ss: &[crate::hir::hir::HirStmt<'_>]) {
     hash_seq(h, ss, hash_stmt);
 }
@@ -862,9 +2128,12 @@ fn hash_expr(h: &mut FxHasher, e: &crate::hir::hir::HirExpr<'_>) {
             ty.hash(h);
         }
         E::LayoutOf(ty, _) => {
-            // `ast::Type`: span-sensitive leaf (see `hash_debug`).
+            // Typed leaf hasher (`hash_ast_type` — spans skipped, so this
+            // arm is trivia-invariant).  Do NOT "restore" `hash_debug`
+            // here: that would reintroduce the fmt round-trip the typed
+            // leaf hashers removed; see the typed-leaf note above.
             h.write_u8(33);
-            hash_debug(&mut *h, ty);
+            hash_ast_type(&mut *h, ty);
         }
         E::CompileError(msg, _) => {
             h.write_u8(34);
@@ -897,7 +2166,7 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
             hash_opt(&mut *h, value, |h, e| hash_expr(h, e));
             hash_opt(&mut *h, else_branch, |h, b| hash_stmts(h, b));
             // `TypeParam`s only occur on nested items: span-sensitive leaf.
-            hash_debug(&mut *h, type_captures);
+            hash_seq(&mut *h, type_captures, hash_type_param);
         }
         S::FunctionDef {
             span: _,
@@ -918,15 +2187,54 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
             generated_by_comptime,
         } => {
             h.write_u8(1);
-            hash_debug(&mut *h, attributes);
-            hash_debug(&mut *h, contracts);
+            hash_seq(&mut *h, attributes, hash_attribute);
+            hash_seq(&mut *h, contracts, hash_contract);
+            // NOTE: `doc` should be `None` in the checked HIR (the checker
+            // strips doc comments into the doc channel before body-checking).
+            // If it can be `Some`, hashing it here would break the
+            // two-channel invariance (a doc-only edit would flip the
+            // fingerprint).  The doc channel is `DocTokens`' responsibility;
+            // this hash is the body's SEMANTIC identity.
+            // Fail loudly at the moment the invariant is first violated,
+            // not later when a doc-only edit silently reinvalidates every
+            // function body.
+            debug_assert!(
+                doc.is_none(),
+                "checker leaked a doc comment into the HIR FunctionDef body; \
+                 hashing it breaks two-channel invariance (doc edits would invalidate)"
+            );
+            // Release arm: ignore `doc` unconditionally.  The invariant is
+            // "the checker strips doc"; a release build that violates it
+            // must degrade memoization NOT AT ALL rather than flipping every
+            // fingerprint on a doc-only edit (the debug assert above fires
+            // first in debug builds).
+            // Hash `doc` uniformly in every profile: `hash_opt` writes the
+            // presence byte even for `None`, so the old debug-only arm made
+            // debug and release fingerprints diverge.  The debug_assert above
+            // still enforces "checked HIR has doc == None".
             hash_opt(&mut *h, doc, |h, d| d.hash(h));
             name.hash(&mut *h);
             hash_seq(&mut *h, params, hash_hir_param);
             hash_opt(&mut *h, return_type, |h, t| t.hash(h));
             hash_opt(&mut *h, body, |h, b| hash_stmts(h, b));
-            hash_debug(&mut *h, type_params);
-            h.write_u8(where_clause.is_some() as u8);
+            hash_seq(&mut *h, type_params, hash_type_param);
+            // Hash the CONTENTS, not just presence: editing the bounds
+            // inside the clause (e.g. `where T: Foo` → `where T: Bar`)
+            // must flip the fingerprint.  `hash_debug` is the safe
+            // fallback (sound direction only — it over-hashes spans, never
+            // under-hashes semantics), matching the treatment of other
+            // AST fragments in this walker.
+            // (Note: in the CHECKED HIR the clause is `Option<()>` — the
+            // resolver strips bounds — so today this hashes presence only;
+            // the comment keeps the contract for any future AST-level
+            // variant of this walker.)
+            match where_clause {
+                None => h.write_u8(0),
+                Some(w) => {
+                    h.write_u8(1);
+                    hash_debug(&mut *h, w);
+                }
+            }
             hash_opt(&mut *h, finally, |h, b| hash_stmts(h, b));
             h.write_u8(*is_comptime as u8);
             h.write_u8(*is_async as u8);
@@ -945,12 +2253,29 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
             contracts,
         } => {
             h.write_u8(2);
-            hash_debug(&mut *h, attributes);
+            hash_seq(&mut *h, attributes, hash_attribute);
+            // Same two-channel invariant as `S::FunctionDef`'s `doc` above:
+            // fail loudly at the first violation, not later when a doc-only
+            // edit flips every type definition's fingerprint.
+            debug_assert!(
+                doc.is_none(),
+                "checker leaked a doc comment into the HIR TypeDef body; \
+                 hashing it breaks two-channel invariance (doc edits would invalidate)"
+            );
+            // Release arm: same rule as `S::FunctionDef`'s `doc` above.
+            // Hash `doc` uniformly in every profile: `hash_opt` writes the
+            // presence byte even for `None`, so the old debug-only arm made
+            // debug and release fingerprints diverge.  The debug_assert above
+            // still enforces "checked HIR has doc == None".
             hash_opt(&mut *h, doc, |h, d| d.hash(h));
             name.hash(&mut *h);
-            hash_debug(&mut *h, params);
-            hash_debug(&mut *h, definition);
-            hash_debug(&mut *h, contracts);
+            hash_seq(&mut *h, params, hash_type_param);
+            // `definition` is a `TypeDefinition` body: typed hasher (see
+            // `hash_type_definition`) — restores the two-channel trivia
+            // invariance that `hash_debug` defeated for all type
+            // definitions.
+            hash_type_definition(&mut *h, definition);
+            hash_seq(&mut *h, contracts, hash_contract);
         }
         S::TraitDef {
             span: _,
@@ -961,11 +2286,24 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
             associated_types,
         } => {
             h.write_u8(3);
-            hash_debug(&mut *h, attributes);
+            hash_seq(&mut *h, attributes, hash_attribute);
+            // Same two-channel invariant as `S::FunctionDef`'s `doc` above:
+            // the checker strips doc into the doc channel; hashing a leaked
+            // doc here would flip every trait's fingerprint on a doc-only
+            // edit.  Fail loudly at the first violation.
+            debug_assert!(
+                doc.is_none(),
+                "checker leaked a doc comment into the HIR TraitDef body; \
+                 hashing it breaks two-channel invariance (doc edits would invalidate)"
+            );
+            // Hash `doc` uniformly in every profile: `hash_opt` writes the
+            // presence byte even for `None`, so the old debug-only arm made
+            // debug and release fingerprints diverge.  The debug_assert above
+            // still enforces "checked HIR has doc == None".
             hash_opt(&mut *h, doc, |h, d| d.hash(h));
             name.hash(&mut *h);
-            hash_debug(&mut *h, methods);
-            hash_debug(&mut *h, associated_types);
+            hash_seq(&mut *h, methods, hash_trait_method);
+            hash_seq(&mut *h, associated_types, hash_associated_type);
         }
         S::Import {
             path,
@@ -991,7 +2329,7 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
             name.hash(&mut *h);
             hash_seq(&mut *h, params, hash_hir_param);
             return_type.hash(&mut *h);
-            hash_debug(&mut *h, attributes);
+            hash_seq(&mut *h, attributes, hash_attribute);
         }
         S::Constraint {
             name,
@@ -1132,7 +2470,13 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
         } => {
             h.write_u8(19);
             // Capture-list spans point at the capture list for errors;
-            // only the names are semantic.
+            // only the names (+ mode) are semantic.  The tuple's second
+            // element is a `Span`, NOT a type — a type there would make
+            // this a silent under-hash.
+            const _: () = {
+                fn assert_second_is_span<'i>(c: &(Symbol, crate::ast::Span)) {}
+                let _ = assert_second_is_span;
+            };
             hash_seq(&mut *h, captures, |h, (name, _)| name.hash(h));
             h.write_u8(*trusted as u8);
             hash_stmts(&mut *h, body);
@@ -1176,7 +2520,7 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
         } => {
             h.write_u8(25);
             name.hash(&mut *h);
-            hash_debug(&mut *h, attributes);
+            hash_seq(&mut *h, attributes, hash_attribute);
         }
         S::ImplBlock {
             span: _,
@@ -1187,11 +2531,14 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
             associated_types,
         } => {
             h.write_u8(26);
-            hash_debug(&mut *h, attributes);
+            // NOTE: `HirStmt::ImplBlock` carries NO `doc` field (unlike
+            // FunctionDef/TypeDef/TraitDef), so there is nothing to guard
+            // here — the two-channel doc invariant is vacuously upheld.
+            hash_seq(&mut *h, attributes, hash_attribute);
             hash_opt(&mut *h, trait_path, |h, d| d.hash(h));
             for_type.hash(&mut *h);
-            hash_debug(&mut *h, methods);
-            hash_debug(&mut *h, associated_types);
+            hash_seq(&mut *h, methods, hash_impl_method);
+            hash_seq(&mut *h, associated_types, hash_associated_type);
         }
         S::Generate {
             for_type,
@@ -1208,18 +2555,23 @@ fn hash_stmt(h: &mut FxHasher, s: &crate::hir::hir::HirStmt<'_>) {
 }
 
 impl<'input> StableHash for FnBodyCheck<'input> {
-    /// Span-free structural hash (report item #3).  The previous
+    /// Span-free structural hash at the walker level.  The previous
     /// implementation `Debug`-formatted the whole `HirStmt`, so every span
     /// in the body fed the fingerprint: a comment-only edit changed the
     /// fingerprint and fanned out into a full recompute (measured 100%
     /// false-invalidation on trivia edits, ~10ns per hashed byte).  This
-    /// walker hashes semantic content only and skips every `Span`.
+    /// walker matches every `Span` with `span: _` and never hashes it
+    /// directly; the typed AST hashers it calls (`hash_attribute`,
+    /// `hash_contract`, `hash_type_param`, `hash_ast_type`, ...) also skip
+    /// spans.
     ///
     /// Every variant match above is exhaustive (no wildcards): a new HIR
     /// variant breaks compilation here and forces a hashing decision, so a
     /// missed field cannot silently become a stale cache hit.  The only
-    /// span-sensitive leaves left are enumerated on `hash_debug` — each is
-    /// sound-direction (forces a recompute, never suppresses one).
+    /// span-sensitive leaves left are the `hash_debug` fallbacks (nested
+    /// `ast::Expr` fragments and impl-method bodies, whose `Debug` output
+    /// embeds spans) — each is sound-direction (forces a recompute, never
+    /// suppresses one).
     ///
     /// Beyond the body, every other field is hashed: `function_finally`
     /// keys are sorted first (`HashMap` order is nondeterministic), the
@@ -1228,30 +2580,38 @@ impl<'input> StableHash for FnBodyCheck<'input> {
     /// message alone, so two diagnostics differing only in severity
     /// collided).
     fn stable_hash(&self) -> u64 {
-        let mut h = FxHasher::default();
-        hash_stmt(&mut h, &self.hir);
-        hash_seq(&mut h, &self.runtime_checks, |h, (name, checks)| {
+        // Stack guard: `hash_stmt`/`hash_expr` recurse to HIR depth and run
+        // on every `stage`.  The enclosing `get_shared` frame carries a
+        // `stacker::maybe_grow`, but that check happened at FRAME ENTRY —
+        // a pathological HIR can blow through the red zone INSIDE the
+        // guarded compute (an overflow here would poison the key:
+        // recoverable, but avoidable).  Mirror the checker's red-zone
+        // discipline at the recursion entry.
+        stacker::maybe_grow(256 * 1024, 16 * 1024 * 1024, || {
+            let mut h = FxHasher::default();
+            hash_stmt(&mut h, &self.hir);
+            hash_seq(&mut h, &self.runtime_checks, |h, (name, checks)| {
             name.hash(&mut *h);
             hash_stmts(&mut *h, checks);
         });
-        // Deterministic order: `HashMap` iteration is unspecified.  A
-        // `SmallVec` keeps the typical 0-8 `finally` keys entirely on the
-        // stack: this runs on every `CheckFnBody::compute` (the value is
-        // `stable_hash`ed before it is staged), and the old `Vec` paid a
-        // heap allocation whenever the map was non-empty.
-        let mut finally_keys: SmallVec<[Symbol; 8]> =
-            self.function_finally.keys().copied().collect();
-        finally_keys.sort();
-        h.write_usize(finally_keys.len());
-        for k in finally_keys {
+        // `function_finally` is a `BTreeMap`, so iteration order is
+        // deterministic by construction — no sort, no SmallVec.
+        h.write_usize(self.function_finally.len());
+        for (k, checks) in &self.function_finally {
             k.hash(&mut h);
-            if let Some(checks) = self.function_finally.get(&k) {
-                hash_stmts(&mut h, checks);
-            }
+            hash_stmts(&mut h, checks);
         }
         hash_seq(&mut h, &self.pending_gadt, |h, g| {
-            g.enum_ty.hash(&mut *h);
-            g.variant.hash(&mut *h);
+            // Struct-pattern destructuring: a new field on
+            // `PendingGadtConstruct` becomes a compile error here rather
+            // than a silently unhashed semantic input.  `span` is trivia.
+            let crate::hir::checker::PendingGadtConstruct {
+                enum_ty,
+                variant,
+                span: _,
+            } = g;
+            enum_ty.hash(&mut *h);
+            variant.hash(&mut *h);
         });
         hash_seq(&mut h, &self.residual_obligations, |h, (_, pred)| {
             pred.hash(&mut *h)
@@ -1265,6 +2625,7 @@ impl<'input> StableHash for FnBodyCheck<'input> {
             hash_opt(&mut *h, &d.code().map(|c| c.code()), |h, c| c.hash(h));
         });
         h.finish()
+        })
     }
 }
 
@@ -1282,17 +2643,11 @@ pub(crate) static FN_BODY_COMPUTES: std::sync::atomic::AtomicU64 =
 /// test counting it races with every other test running `check_program`
 /// on another thread (the digest-gate test saw `4 -> 6` instead of
 /// `3 -> 4` for exactly this reason).  Tagging each entry with the
-/// driving `QuerySystem`'s address lets a test filter to its own system
-/// and count deterministically under `cargo test` parallelism.
-///
-/// LATENT: the tag is the system's ADDRESS, while the rest of this
-/// module deliberately keys on the monotonic `NEXT_SYSTEM_ID` (mod.rs)
-/// because an address is reused after the system is dropped.  Harmless
-/// today because every `QuerySystem` in the test suite is leaked (they
-/// hold `&'static` handles), so no two are ever live at once; a test
-/// that dropped a system and allocated another would alias.  If one
-/// ever needs to, filter on `system.system_id()` instead and widen the
-/// tuple to `(usize, usize)`.
+/// Tagged by the query system's MONOTONIC id (`system_id()`), so driving
+/// `QuerySystem`'s identity lets a test filter to its own system and
+/// count deterministically under `cargo test` parallelism.  Never an
+/// address — addresses are reused after the system is dropped (the old
+/// LATENT note's hazard; `NEXT_SYSTEM_ID` exists for exactly this).
 #[cfg(test)]
 pub(crate) static FN_BODY_COMPUTE_LOG: std::sync::Mutex<Vec<(usize, FnId)>> =
     std::sync::Mutex::new(Vec::new());
@@ -1303,16 +2658,29 @@ pub(crate) fn fn_body_compute_mark() -> usize {
     FN_BODY_COMPUTE_LOG.lock().map(|log| log.len()).unwrap_or(0)
 }
 
-/// Test-only helper: number of `CheckFnBody` computes logged for the
-/// query system at `system_addr` since `mark`.
+/// Test-only helper: reset the compute log.  The log is process-global
+/// and append-only (the mark/count helpers above rely on stable indices),
+/// so a long CI session would otherwise grow it without bound.  Callers
+/// must not run concurrently with tests that hold a mark across the
+/// reset — take a fresh mark afterwards.
 #[cfg(test)]
-pub(crate) fn fn_body_compute_count_for(system_addr: usize, mark: usize) -> usize {
+pub(crate) fn clear_fn_body_compute_log() {
+    FN_BODY_COMPUTE_LOG
+        .lock()
+        .map(|mut log| log.clear())
+        .ok();
+}
+
+/// Test-only helper: number of `CheckFnBody` computes logged for the
+/// query system with id `system_id` since `mark`.
+#[cfg(test)]
+pub(crate) fn fn_body_compute_count_for(system_id: usize, mark: usize) -> usize {
     FN_BODY_COMPUTE_LOG
         .lock()
         .map(|log| {
             log.iter()
                 .skip(mark)
-                .filter(|(addr, _)| *addr == system_addr)
+                .filter(|(id, _)| *id == system_id)
                 .count()
         })
         .unwrap_or(0)
@@ -1342,6 +2710,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
     type Value = FnBodyCheck<'q>;
     type Cache = DefaultCache<FnId, Stored<'q, 'src, Self>>;
 
+    #[inline]
     fn descriptor() -> QueryDescriptor {
         QueryDescriptor::new(
             "check_fn_body",
@@ -1354,10 +2723,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
     }
 
     fn from_tagged(tag: &TaggedQueryKey) -> Option<FnId> {
-        match tag {
-            TaggedQueryKey::CheckFnBody(key) => Some(key.clone()),
-            _ => None,
-        }
+        as_variant!(tag, TaggedQueryKey::CheckFnBody(key) => key.clone())
     }
 
     fn compute<S: Scheduler>(key: &FnId, provider: &dyn QueryProvider<'q, 'src, S>) -> Self::Value {
@@ -1386,36 +2752,142 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
              SessionQueryProvider::with_body_check",
         );
         // Session-lifetime tripwire: the harness must be the one built
-        // against THIS context.  `with_body_check` stamps the ctx address
-        // into the harness; a provider pairing a stale harness from another
-        // session with this session's ctx view fails loudly here in debug
-        // builds instead of silently checking against the wrong context.
-        debug_assert_eq!(
-            harness.session_stamp, ctx_borrow as *const _ as usize,
-            "CheckFnBody driven with a BodyCheckHarness from a different session \
-             (harness stamp != ctx address)"
-        );
+        // against THIS context.  The harness stamps its context's
+        // monotonic session id (`TypeContext::session_id`); a provider
+        // pairing a stale harness from another session with this session's
+        // ctx view must fail LOUDLY in every build, not just debug — in
+        // release a silent pass would run `TypeChecker::new_with_source`
+        // against the wrong symbol table / trait env and publish the
+        // result as if correct.  Deliberately NOT an address — addresses
+        // are reused after the old context drops, which would let a stale
+        // harness pass silently (the same ban as `NEXT_SYSTEM_ID` /
+        // `NEXT_STAT_ARENA_ID`).
+        //
+        // `compute` cannot return `Result`, so a mismatch folds to the
+        // rejected-body shape (the same arm the item-kind guard uses): the
+        // release build degrades loudly instead of silently.
+        if harness.session_stamp != ctx_borrow.session_id {
+            return FnBodyCheck {
+                hir: crate::hir::hir::HirStmt::Error,
+                runtime_checks: Vec::new(),
+                function_finally: Default::default(),
+                pending_gadt: Vec::new(),
+                residual_obligations: Vec::new(),
+                trait_obligations: Vec::new(),
+                // The failure is value-shaped but must also be OBSERVABLE:
+                // a caller that only inspects the diagnostics (or the
+                // driver's error tally) sees this error instead of silently
+                // proceeding with an empty poisoned body.
+                diagnostics: vec![crate::diagnostics::Diagnostic::error(format!(
+                    "CheckFnBody session/harness mismatch: harness stamp {} != ctx session id {}",
+                    harness.session_stamp, ctx_borrow.session_id
+                ))],
+            };
+        }
         #[cfg(test)]
         {
             FN_BODY_COMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let system_addr = provider.query_system() as *const _ as usize;
+            // Tag = the system's MONOTONIC id (`system_id()`), not its
+            // address — the address-reuse hazard the LATENT note below
+            // used to carry is gone.
+            let system_id = provider.query_system().system_id();
             if let Ok(mut log) = FN_BODY_COMPUTE_LOG.lock() {
-                log.push((system_addr, *key));
+                log.push((system_id, *key));
             }
         }
-        // Fresh worker per compute — the per-item shape the profile
-        // priced at ~0.65ms of construction, amortised on real bodies.
+        // Key-shape totality guard (runs BEFORE any worker-pool work): the
+        // key must address a FREE function.  A mis-minted/stale
+        // `FnId { item: <free fn>, method: Some(_) }` must not be silently
+        // treated as a free-function body check by the kind guard below
+        // (which only inspects the item kind and the comptime flag) — it
+        // folds to the rejected-body shape, the same totality doctrine
+        // stated at TypeDefShape / CheckFnSignature / DocTokens.  Folding
+        // here also avoids constructing a worker the guard would discard.
+        if key.method.is_some() {
+            return FnBodyCheck {
+                hir: crate::hir::hir::HirStmt::Error,
+                runtime_checks: Vec::new(),
+                function_finally: Default::default(),
+                pending_gadt: Vec::new(),
+                residual_obligations: Vec::new(),
+                trait_obligations: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+        }
+        // Worker pool (2b): the pieces of worker construction that are pure
+        // repeated allocation — the sharing `TypeContext` and the worker
+        // `TraitEnv` — are pooled per `(thread, session, program)` and reset
+        // in place instead of rebuilt.  The `TypeChecker` itself is still
+        // constructed fresh per compute: it borrows `wctx`/`env` mutably for
+        // its whole lifetime, so pooling it would be self-referential; its
+        // construction is small compared to the table copies the pool kills.
+        // On a compute panic the taken halves drop with the frame and the
+        // slot's `None`s make the next compute rebuild — no poisoned reuse.
         let program = view.program();
-        let mut wctx = crate::hir::types::TypeContext::new_sharing(ctx_borrow);
-        // Worker clone: the env's lookup memo starts empty (the worker
-        // re-fills its own entries) — the O(cache) deep copy under the
-        // env's read lock drops out of the per-function compute path.
-        let mut env = view.trait_env().clone_for_worker();
+        // Use the driver-maintained monotonic program epoch, NOT the
+        // program address.  Addresses are reused after drop; within one
+        // session a rebuilt `Program` reallocated at the recycled address
+        // would alias the stale pool stamp — exactly the address-as-identity
+        // failure class `NEXT_SYSTEM_ID` / `NEXT_STAT_ARENA_ID` exist to ban.
+        let pool_stamp = (ctx_borrow.session_id, view.program_epoch());
+        let pool_slot = provider
+            .query_system()
+            .body_worker_pool
+            .get_or_default();
+        let (mut wctx, mut env) = {
+            let mut slot = pool_slot.borrow_mut();
+            match slot.as_mut() {
+                // Session match: the `TypeContext` is
+                // session-scoped and only shares the interner, so a PROGRAM
+                // change does not invalidate it — reuse it and rebuild only
+                // the `TraitEnv` (whose table copies are the expensive half).
+                // A program match reuses both; a dropped `env` (panic
+                // residue) rebuilds only the env, keeping the ctx.
+                Some(s) if s.stamp.0 == pool_stamp.0 && s.ctx.is_some() => {
+                    let mut ctx = s.ctx.take().unwrap();
+                    ctx.reset_for_worker_reuse(ctx_borrow);
+                    let mut env = match (s.stamp.1 == pool_stamp.1, s.env.take()) {
+                        (true, Some(env)) => {
+                            let mut env = env;
+                            env.reset_for_worker_reuse(view.trait_env());
+                            env
+                        }
+                        // Program changed, or the env half was dropped:
+                        // rebuild the trait environment only.
+                        _ => view.trait_env().clone_for_worker(),
+                    };
+                    s.stamp = pool_stamp;
+                    (ctx, env)
+                }
+                _ => {
+                    // Stamp miss (new session, or dropped halves): rebuild
+                    // both from scratch and adopt the slot for the next
+                    // compute on this thread.
+                    *slot = Some(BodyWorkerSlot {
+                        stamp: pool_stamp,
+                        ctx: None,
+                        env: None,
+                    });
+                    (
+                        crate::hir::types::TypeContext::new_sharing(ctx_borrow),
+                        view.trait_env().clone_for_worker(),
+                    )
+                }
+            }
+        };
+        // Shared handle (2a): the checker only READS the resolution map, so
+        // hand the worker an `Arc::clone` — one refcount bump replaces the
+        // full map clone (five `FxHashMap`s) that used to run per function.
+        // Views that don't carry the Arc (bare test views) fall back to the
+        // by-value clone, which the checker constructor still accepts.
+        let resolution_map = view
+            .resolution_map_arc()
+            .unwrap_or_else(|| std::sync::Arc::new(view.resolution_map().clone()));
         let mut worker = crate::hir::checker::TypeChecker::new_with_source(
             &mut wctx,
             view.symbols(),
             &mut env,
-            view.resolution_map().clone(),
+            resolution_map,
             harness.strict_mode,
             harness.enable_experimental,
             harness.features.clone(),
@@ -1447,6 +2919,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
         ) = program.items.get(key.item)
         else {
             worker.pop_literal_scope();
+            restore_body_worker(pool_slot, wctx, env);
             return FnBodyCheck {
                 hir: crate::hir::hir::HirStmt::Error,
                 runtime_checks: Vec::new(),
@@ -1467,7 +2940,26 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
         // removes that requirement.
         let out = worker.check_function_def_salvaged(item);
         worker.pop_literal_scope();
+        restore_body_worker(pool_slot, wctx, env);
         out
+    }
+}
+
+/// Hand a finished body-check worker's `TypeContext`/`TraitEnv` back to the
+/// thread's pool slot (2b).  The stamp is already validated (the slot's
+/// owner is this thread and the stamp was set at construction); on a panic
+/// inside `compute` this never runs and the slot's `None` halves make the
+/// next compute rebuild from scratch — no poisoned state is ever served.
+#[inline]
+fn restore_body_worker<'input>(
+    slot: &std::cell::RefCell<Option<crate::hir::query::BodyWorkerSlot<'input>>>,
+    wctx: crate::hir::types::TypeContext<'input>,
+    env: crate::hir::traits::TraitEnv<'input>,
+) {
+    let mut slot = slot.borrow_mut();
+    if let Some(s) = slot.as_mut() {
+        s.ctx = Some(wctx);
+        s.env = Some(env);
     }
 }
 
@@ -1514,6 +3006,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for DocTokens {
     type Value = &'q DocLines;
     type Cache = DefaultCache<FnId, Stored<'q, 'src, Self>>;
 
+    #[inline]
     fn descriptor() -> QueryDescriptor {
         QueryDescriptor::new(
             "doc_tokens",
@@ -1527,10 +3020,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for DocTokens {
     }
 
     fn from_tagged(tag: &TaggedQueryKey) -> Option<FnId> {
-        match tag {
-            TaggedQueryKey::DocTokens(key) => Some(key.clone()),
-            _ => None,
-        }
+        as_variant!(tag, TaggedQueryKey::DocTokens(key) => key.clone())
     }
 
     fn compute<S: Scheduler>(key: &FnId, provider: &dyn QueryProvider<'q, 'src, S>) -> Self::Value {
@@ -1547,7 +3037,19 @@ impl<'q, 'src: 'q> Query<'q, 'src> for DocTokens {
             return arena.alloc(DocLines::default());
         };
         let lines = match (item, key.method) {
-            (Item::FunctionDef { span, .. }, None) => program
+            // `is_comptime: false`, mirroring CheckFnSignature: comptime
+            // free functions never exist at runtime (SYNTAX.md §const) and
+            // never get a `FnId` from the pre-pass, so a leaked/cross-session
+            // comptime FnId must answer empty rather than return docs for a
+            // function that does not exist at runtime.
+            (
+                Item::FunctionDef {
+                    span,
+                    is_comptime: false,
+                    ..
+                },
+                None,
+            ) => program
                 .doc_map
                 .doc_lines_anchored_in(span.start, span.end)
                 .map(String::from)
@@ -1956,6 +3458,143 @@ mod stable_hash_tests {
             sample_value(0).stable_hash(),
             sample_value(10_000).stable_hash()
         );
+    }
+
+    /// Impl-method bodies are raw AST statements.  The span-free AST
+    /// walker must ignore a comment/whitespace shift but still see a
+    /// semantic edit (literal change).
+    #[test]
+    fn impl_body_span_shift_keeps_fingerprint() {
+        use super::hash_ast_stmt;
+        use crate::ast::{Expr as AExpr, IntLit, Literal, Stmt as AStmt};
+        use crate::symbol::Symbol;
+        use rustc_hash::FxHasher;
+        use std::hash::Hasher;
+
+        fn hash_body(base: usize, value: i128) -> u64 {
+            let sp = |o: usize| {
+                let s = u32::try_from(base + o).unwrap_or(u32::MAX);
+                Span::new(FileId::DUMMY, s, s.saturating_add(1))
+            };
+            let callee = AExpr::Ident(Symbol::intern("f"), sp(1));
+            let args = [AExpr::Literal(Literal::Int(IntLit::Small(value)), sp(2))];
+            let call = AExpr::Call {
+                callee: &callee,
+                args: &args,
+                comptime: false,
+                span: sp(3),
+            };
+            let stmt = AStmt::Return {
+                value: Some(call),
+                labels: &[],
+                span: sp(4),
+            };
+            let mut h = FxHasher::default();
+            hash_ast_stmt(&mut h, &stmt);
+            h.finish()
+        }
+
+        assert_eq!(
+            hash_body(0, 7),
+            hash_body(10_000, 7),
+            "a span shift inside an impl-method body must not flip the fingerprint"
+        );
+        assert_ne!(
+            hash_body(0, 7),
+            hash_body(0, 8),
+            "a literal edit must flip the fingerprint"
+        );
+    }
+
+    /// E2 gap: the original trivia test used a body with NO attributes,
+    /// contracts, or type params, so a comment inserted before one of those
+    /// constructs could still flip the fingerprint.  Build a `FunctionDef`
+    /// carrying all three (plus a param default) at two span bases and
+    /// assert the fingerprint is identical.
+    #[test]
+    fn trivia_span_shift_keeps_fingerprint_with_nested_constructs() {
+        use crate::ast::{Attribute, Contract, EnsuresTarget, TypeParam, TypeParamKind};
+        use crate::hir::hir::HirParam;
+        use crate::symbol::Symbol;
+
+        fn fn_def(base: usize) -> HirStmt<'static> {
+            let sp = |o: usize| {
+                let s = u32::try_from(base + o).unwrap_or(u32::MAX);
+                Span::new(FileId::DUMMY, s, s.saturating_add(1))
+            };
+            let ty = TypeId::NONE;
+            let x = Symbol::intern("x");
+            let t = Symbol::intern("T");
+            let inline = Symbol::intern("inline");
+            HirStmt::FunctionDef {
+                span: sp(0),
+                attributes: vec![Attribute {
+                    name: inline,
+                    args: vec![crate::ast::Expr::Ident(x, sp(1))],
+                    named_args: vec![],
+                    span: sp(2),
+                }],
+                contracts: vec![Contract::Requires(
+                    crate::ast::Expr::Literal(
+                        Literal::Int(crate::ast::IntLit::Small(1)),
+                        sp(3),
+                    ),
+                    sp(4),
+                )],
+                doc: None,
+                name: Symbol::intern("f"),
+                params: vec![HirParam {
+                    name: x,
+                    ty,
+                    default: Some(crate::ast::Expr::Literal(
+                        Literal::Int(crate::ast::IntLit::Small(2)),
+                        sp(5),
+                    )),
+                    span: sp(7),
+                }],
+                return_type: None,
+                body: None,
+                type_params: vec![TypeParam {
+                    name: t,
+                    bounds: &[],
+                    kind: TypeParamKind::Type,
+                    span: sp(6),
+                }],
+                where_clause: None,
+                finally: None,
+                is_comptime: false,
+                is_async: false,
+                is_ieee_contracts: false,
+                hints: vec![],
+                generated_by_comptime: false,
+            }
+        }
+        let v = |base| FnBodyCheck {
+            hir: fn_def(base),
+            runtime_checks: vec![],
+            function_finally: Default::default(),
+            pending_gadt: vec![],
+            residual_obligations: vec![],
+            trait_obligations: vec![],
+            diagnostics: vec![],
+        };
+        assert_eq!(
+            v(0).stable_hash(),
+            v(10_000).stable_hash(),
+            "a comment-shifted span before an attribute/contract/type param \
+             must NOT flip the fingerprint"
+        );
+        // Semantic flip still detected: change the contract expression.
+        let mut w = v(0);
+        if let HirStmt::FunctionDef { contracts, .. } = &mut w.hir {
+            contracts[0] = Contract::Ensures {
+                expr: crate::ast::Expr::Ident(Symbol::intern("y"), Span::new(FileId::DUMMY, 0, 1)),
+                span: Span::new(FileId::DUMMY, 0, 1),
+                target: EnsuresTarget::Unconditional,
+                labels: vec![],
+            };
+        }
+        assert_ne!(v(0).stable_hash(), w.stable_hash());
     }
 
     /// Semantic edits must flip the fingerprint — a missed field here

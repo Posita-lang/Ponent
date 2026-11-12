@@ -51,6 +51,69 @@ fn d5_eval_always_parallel_same_key() {
     });
 }
 
+/// d5's CONCURRENT half: the sequential variant above joins the first get
+/// before issuing the second, so it proves no CROSS-request dedup but not
+/// that two CONCURRENT eval_always requesters fail to coalesce in flight
+/// (the more interesting case — that is exactly what a tracked query's
+/// wait-graph would do).  Two requesters run at once; each must compute
+/// (RUNS == 2) and both must observe their own key's value.
+///
+/// COVERAGE LIMIT (structural, under shuttle): the same-KEY concurrent
+/// shape is not expressible in this harness.  The active-set partitions
+/// are keyed by `thread_local::ThreadLocal` — an OS-THREAD key — and
+/// shuttle multiplexes every task onto one OS thread, so two concurrent
+/// same-key gets share one partition and the second is mis-reported as a
+/// `Cycle` (stack `[DKey(1), DKey(1)]`).  On real OS threads the
+/// partitions are separate and the same shape is legal (each requester
+/// computes its own value); a genuine same-key concurrent eval_always
+/// test needs the partition key to become task-aware under shuttle, which
+/// is a production-code change, not a test-harness one.
+#[test]
+fn d5_eval_always_concurrent_same_key_no_inflight_coalescing() {
+    run_check(|| {
+        static RUNS: AtomicU64 = AtomicU64::new(0);
+        RUNS.store(0, Ordering::SeqCst);
+
+        struct D5C;
+        impl<'q, 'src: 'q> Query<'q, 'src> for D5C {
+            type Storage = Owned;
+            type Key = DKey;
+            type Value = FpValue;
+            type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+            fn descriptor() -> QueryDescriptor {
+                QueryDescriptor::new("d5c", "eval-always concurrent query").with_eval_always(true)
+            }
+            fn compute<S: Scheduler>(key: &DKey, _: &dyn QueryProvider<'q, 'src, S>) -> FpValue {
+                RUNS.fetch_add(1, Ordering::SeqCst);
+                FpValue {
+                    raw: format!("{}", key.0),
+                    semantic: key.0 as u64,
+                }
+            }
+        }
+
+        let system = leak_system();
+        let provider = leak_provider(system);
+
+        let a = shuttle::thread::spawn(move || {
+            system.get::<D5C>(DKey(1), provider).map(|v| v.semantic)
+        });
+        let b = shuttle::thread::spawn(move || {
+            system.get::<D5C>(DKey(2), provider).map(|v| v.semantic)
+        });
+        let va = a.join().expect("d5c requester A must not panic").expect("d5c get A ok");
+        let vb = b.join().expect("d5c requester B must not panic").expect("d5c get B ok");
+        assert_eq!(
+            RUNS.load(Ordering::SeqCst),
+            2,
+            "two concurrent eval_always requesters must each compute their \
+             own value — in-flight coalescing is tracked-query-only"
+        );
+        assert_eq!(va, 1, "requester A must observe its own key's value");
+        assert_eq!(vb, 2, "requester B must observe its own key's value");
+    });
+}
+
 /// d9: `clear_all`'s quiescence and `reset`'s hygiene across the three
 /// windows a concurrent reader can occupy.
 ///
@@ -246,10 +309,10 @@ fn d9_clear_all_quiescence_and_reset_hygiene() {
 /// the other being broken too.
 ///
 /// The main task holds no `InFlightGuard` of its own, so a deferred
-/// closure parked from here has no drop to hang from: it stays unrun in
-/// this scope.  That is the starvation shape, legal by the
-/// same argument (lost work, never a mis-served value), so the
-/// assertion below tolerates "not yet delivered".
+/// closure parked from here has no drop to hang from inside the window:
+/// it stays unrun until the test's explicit `drain_deferred` after the
+/// getter joins.  That flush makes delivery REQUIRED (not a tolerated
+/// starvation outcome), so the ordering assertion below is unconditional.
 #[test]
 fn d9_window1_slow_compute_blocks_clear_all() {
     run_check(|| {
@@ -382,9 +445,19 @@ fn d9_window1_slow_compute_blocks_clear_all() {
         let served = getter.join().expect("getter must not panic");
         releaser.join().expect("releaser must not panic");
 
+        // Delivery, not starvation: the deferred closure has no drop to
+        // hang from in THIS scope (the main task holds no InFlightGuard),
+        // so the test flushes the deferred partition explicitly now that
+        // every task has joined — turning `CLEAR_SEQ == 0` from a legal
+        // outcome into a FAILURE, and making the ordering assertion below
+        // unconditional rather than vacuously true.  (On real OS threads
+        // the sessions are separate and the mutation ran inline; the
+        // drain is a no-op there.)
+        system.drain_deferred();
+
         assert_eq!(
             served, 4,
-            "the getter's recompute must be exact even though clear_all landed behind it"
+            "the getter's recompute must be exact even though the world mutation landed behind it"
         );
         assert_eq!(
             RUNS.load(Ordering::SeqCst),
@@ -399,26 +472,20 @@ fn d9_window1_slow_compute_blocks_clear_all() {
         // mechanisms order it the same way: the parked closure runs at the
         // outermost guard's drop (after `compute`), and the write lock
         // cannot be granted until that guard is gone.
-        // `CLEAR_SEQ == 0` is a LEGAL outcome here, not a gap: under
-        // shuttle the main task and the getter share one OS thread's
-        // `SESSION`, so `mutate_world` takes its DEFER branch and parks
-        // the closure on this thread's partition.  Nothing drains it in
-        // this scope because the MAIN task holds no `InFlightGuard` of its
-        // own - the deferral simply has no drop to hang from, which is
-        // starvation shape and is what `note_cross_system_defer`
-        // and the drain-at-drop contract make safe (lost work, never
-        // mis-served).  So the assertion accepts "not yet delivered" and
-        // requires only that, IF delivered, it was delivered strictly
-        // AFTER the compute returned.
+        // With the explicit drain above, delivery is REQUIRED here (the
+        // earlier "CLEAR_SEQ == 0 is a legal starvation outcome" tolerance
+        // was this test describing a weaker test than the one in the
+        // file); the assertion now pins both delivery AND ordering.
         assert!(
-            CLEAR_SEQ.load(Ordering::SeqCst) == 0
-                || COMPUTE_EXITED.load(Ordering::SeqCst) < CLEAR_SEQ.load(Ordering::SeqCst),
-            "a world mutation executed BEFORE the in-flight compute returned: compute finished at order {} but the mutation ran at order {}. It was delivered while a Started job's owner was still between acquire_key_slot and the publish tail, which is what makes the clear_all poison sweep unreachable-by-construction. A clear_all delivered this way could wipe a live job and strand its latch waiters forever.",
+            CLEAR_SEQ.load(Ordering::SeqCst) > 0
+                && COMPUTE_EXITED.load(Ordering::SeqCst) < CLEAR_SEQ.load(Ordering::SeqCst),
+            "a world mutation executed BEFORE the in-flight compute returned (or was never delivered): compute finished at order {} but the mutation ran at order {}. It was delivered while a Started job's owner was still between acquire_key_slot and the publish tail, which is what makes the clear_all poison sweep unreachable-by-construction. A clear_all delivered this way could wipe a live job and strand its latch waiters forever.",
             COMPUTE_EXITED.load(Ordering::SeqCst),
             CLEAR_SEQ.load(Ordering::SeqCst)
         );
-        // Post-clear consistency: the wipe took effect (no pre-clear value
-        // survives), and the system is usable again.
+        // Post-clear consistency: the deferred wipe has been delivered (the
+        // drain above proves the machinery, this get proves the system is
+        // still usable and serves the current content).
         let after = system
             .get::<W1Q>(DKey(9), provider)
             .expect("post-clear get must succeed");
@@ -432,7 +499,7 @@ fn d9_window1_slow_compute_blocks_clear_all() {
 
 #[test]
 fn d1_same_key_self_recursion() {
-    run_check(|| {
+    run_check_swept(|| {
         struct D1Q;
         impl<'q, 'src: 'q> Query<'q, 'src> for D1Q {
             type Storage = Owned;
@@ -483,7 +550,7 @@ fn d1_same_key_self_recursion() {
 
 #[test]
 fn d2_same_thread_cross_key_cycle() {
-    run_check(|| {
+    run_check_swept(|| {
         struct D2Q;
         impl<'q, 'src: 'q> Query<'q, 'src> for D2Q {
             type Storage = Owned;

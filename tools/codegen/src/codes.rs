@@ -1,7 +1,7 @@
 //! Validation of `error_codes/codes.toml` (+ referenced `error_codes/*.md`)
 //! and generation of the `error_codes_gen.rs` table source.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -32,6 +32,11 @@ pub struct RegistryEntry {
     /// The `ErrorCategory` variant name (e.g. `"Type"`).
     pub category_variant: String,
     pub explain: String,
+    /// Validated UTF-8 contents of `explain`, cached so the site renderer
+    /// does not re-open and re-read every file the registry just read.
+    pub content: String,
+    /// Codes this one links to in "see also" (validated against the table).
+    pub related: Vec<String>,
 }
 
 /// Result of loading the registry.
@@ -100,8 +105,8 @@ pub fn load_registry(dir: &Path) -> Registry {
     let mut errors: Vec<String> = Vec::new();
     let mut lints: Vec<String> = Vec::new();
     let mut entries: Vec<RegistryEntry> = Vec::new();
-    let mut titles: HashMap<&str, &str> = HashMap::new();
-    let mut referenced: Vec<&str> = Vec::new();
+    let mut titles: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut referenced: HashSet<&str> = HashSet::new();
 
     for (code, meta) in table {
         // Byte-wise so a non-ASCII code (e.g. "é12", 4 bytes) is rejected
@@ -128,17 +133,19 @@ pub fn load_registry(dir: &Path) -> Registry {
             errors.push(format!("{CTX}: [{code}] missing/non-string `title`"));
             continue;
         };
-        if let Some(prev) = titles.insert(title, code) {
-            lints.push(format!(
-                "{CTX}: duplicate title {title:?} used by both {prev} and {code}"
-            ));
-        }
+        titles.entry(title).or_default().push(code);
 
         let Some(explain) = entry.get("explain").and_then(toml::Value::as_str) else {
             errors.push(format!("{CTX}: [{code}] missing/non-string `explain`"));
             continue;
         };
-        referenced.push(explain);
+        let explain_path = dir.join(explain);
+        if explain.is_empty() {
+            // #8: `""` passes the byte-class check vacuously and then
+            // `dir.join("")` is the directory itself (EISDIR).
+            errors.push(format!("{CTX}: [{code}] `explain` must not be empty"));
+            continue;
+        }
         if explain.contains("..")
             || explain.starts_with('/')
             || !explain
@@ -148,7 +155,6 @@ pub fn load_registry(dir: &Path) -> Registry {
             errors.push(format!("{CTX}: [{code}] unsafe explain path {explain:?}"));
             continue;
         }
-        let explain_path = dir.join(explain);
         let bytes = match fs::read(&explain_path) {
             Ok(b) => b,
             Err(e) => {
@@ -156,10 +162,19 @@ pub fn load_registry(dir: &Path) -> Registry {
                 continue;
             }
         };
-        if bytes.len() < MIN_EXPLAIN_BYTES {
+        let content = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                errors.push(format!(
+                    "{CTX}: [{code}] explain file {explain:?} is not valid UTF-8"
+                ));
+                continue;
+            }
+        };
+        if content.len() < MIN_EXPLAIN_BYTES {
             errors.push(format!(
                 "{CTX}: [{code}] explain file {explain:?} is {} bytes (< {MIN_EXPLAIN_BYTES})",
-                bytes.len()
+                content.len()
             ));
             continue;
         }
@@ -176,12 +191,87 @@ pub fn load_registry(dir: &Path) -> Registry {
             continue;
         };
 
+        // `related` is optional; when present it must be an array of
+        // shape-valid codes.  Reference existence is checked after the
+        // whole table is loaded (a forward reference is legal).
+        let related: Vec<String> = match entry.get("related") {
+            None => Vec::new(),
+            Some(v) => {
+                let Some(items) = v.as_array() else {
+                    errors.push(format!("{CTX}: [{code}] `related` must be an array"));
+                    continue;
+                };
+                let mut out = Vec::with_capacity(items.len());
+                let mut bad = false;
+                for item in items {
+                    let Some(rel) = item.as_str() else {
+                        errors.push(format!(
+                            "{CTX}: [{code}] `related` entries must be strings"
+                        ));
+                        bad = true;
+                        break;
+                    };
+                    let rb = rel.as_bytes();
+                    if !(rb.len() == 4
+                        && matches!(rb[0], b'E' | b'W')
+                        && rb[1..].iter().all(u8::is_ascii_digit))
+                    {
+                        errors.push(format!(
+                            "{CTX}: [{code}] invalid related code {rel:?} (expected ^[EW]\\d{{3}}$)"
+                        ));
+                        bad = true;
+                        break;
+                    }
+                    out.push(rel.to_string());
+                }
+                if bad {
+                    continue;
+                }
+                out
+            }
+        };
+
+        referenced.insert(explain);
         entries.push(RegistryEntry {
             code: code.clone(),
             title: title.to_string(),
             category_variant: cat.to_string(),
             explain: explain.to_string(),
+            content,
+            related,
         });
+    }
+
+    // Every `related` target must exist in the registry.  Done after the
+    // loop so order-independent forward references are fine.
+    {
+        let known: std::collections::HashSet<&str> =
+            entries.iter().map(|e| e.code.as_str()).collect();
+        for e in &entries {
+            for rel in &e.related {
+                if !known.contains(rel.as_str()) {
+                    errors.push(format!(
+                        "{CTX}: [{}] `related` names unregistered code {rel:?}",
+                        e.code
+                    ));
+                }
+            }
+        }
+    }
+
+    // #15: report every user of a duplicated title in one lint, not just
+    // consecutive pairs (`A`, `B`, `C` used to yield `A/B` and `B/C` only).
+    let mut dup: Vec<(&str, &Vec<&str>)> = titles
+        .iter()
+        .filter(|(_, codes)| codes.len() > 1)
+        .map(|(title, codes)| (*title, codes))
+        .collect();
+    dup.sort_by_key(|(title, _)| *title);
+    for (title, codes) in dup {
+        lints.push(format!(
+            "{CTX}: duplicate title {title:?} used by {}",
+            codes.join(", ")
+        ));
     }
 
     // Every `*.md` beside the registry should be reachable from some
@@ -192,7 +282,11 @@ pub fn load_registry(dir: &Path) -> Registry {
         .flatten()
         .filter_map(|f| {
             let name = f.file_name().to_str()?.to_string();
-            (name.ends_with(".md") && !referenced.contains(&name.as_str())).then_some(name)
+            // #16: a *directory* named `foo.md` must not count as an orphan
+            // explain file (and must not be read as one by the site renderer).
+            let is_file = f.file_type().map(|t| t.is_file()).unwrap_or(false);
+            (is_file && name.ends_with(".md") && !referenced.contains(name.as_str()))
+                .then_some(name)
         })
         .collect();
     orphans.sort();
@@ -242,6 +336,21 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
             e.explain
         );
         let _ = writeln!(rs, "    }},");
+    }
+    rs.push_str("];\n");
+
+    // Generated "see also" table: previously a hand-maintained `PAIRS`
+    // slice in `error_code.rs`, which could drift from the registry.
+    rs.push_str("\npub(crate) const RELATED_CODES: &[(&str, &[&str])] = &[\n");
+    for e in entries.iter().filter(|e| !e.related.is_empty()) {
+        let _ = write!(rs, "    ({:?}, &[", e.code);
+        for (i, rel) in e.related.iter().enumerate() {
+            if i > 0 {
+                rs.push_str(", ");
+            }
+            let _ = write!(rs, "{rel:?}");
+        }
+        rs.push_str("]),\n");
     }
     rs.push_str("];\n");
 

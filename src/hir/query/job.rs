@@ -11,7 +11,7 @@
 
 use crate::sync::{Condvar, Mutex};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// A unique identifier for an active query job.
 ///
@@ -22,9 +22,29 @@ pub struct QueryJobId(pub u64);
 /// A counter for generating unique `QueryJobId` values.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Per-thread batch of job ids: `(next, remaining)`.  A global RMW per
+/// owner was a shared-line serialization point inside the active-shard
+/// write lock under a cold-miss storm.
+thread_local! {
+    static JOB_ID_LOCAL: std::cell::Cell<(u64, u32)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+const JOB_ID_BATCH: u64 = 1024;
+
 impl QueryJobId {
     pub fn fresh() -> Self {
-        QueryJobId(NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed))
+        JOB_ID_LOCAL.with(|c| {
+            let (next, left) = c.get();
+            if left == 0 {
+                let base = NEXT_JOB_ID.fetch_add(JOB_ID_BATCH, Ordering::Relaxed);
+                c.set((base + 1, (JOB_ID_BATCH - 1) as u32));
+                QueryJobId(base)
+            } else {
+                c.set((next + 1, left - 1));
+                QueryJobId(next)
+            }
+        })
     }
 }
 
@@ -82,13 +102,22 @@ pub fn current_exec_id() -> ExecId {
 /// until the result is ready.
 #[derive(Debug, Clone)]
 pub struct QueryJob {
-    pub id: QueryJobId,
+    pub(crate) id: QueryJobId,
     /// The task computing this job.  Used as a double-safety guard for
     /// same-task cycle detection and as the anchor of the cross-task wait
     /// graph.
-    pub owner: ExecId,
+    ///
+    /// Read-only by construction: the owner anchors the whole
+    /// cross-thread cycle-detection protocol (`WaitEdge.owner`,
+    /// `clear_waiters_of_me`, `poison_active`), so it is set once in
+    /// [`QueryJob::new`] and never mutated in production — a stray
+    /// assignment would make the walk follow a dead edge or miss a live
+    /// one. The field is `pub(crate)` so the crate can read it while external
+    /// code cannot reassign it; the raced-cycle test that needs a forged
+    /// owner lives in this crate and can still set it.
+    pub(crate) owner: ExecId,
     /// The latch that other threads can wait on.
-    pub latch: QueryLatch,
+    pub(crate) latch: QueryLatch,
 }
 
 impl QueryJob {
@@ -125,18 +154,23 @@ const LATCH_POISONED: u8 = 2;
 /// through to the condvar.  128, not 64: one spin iteration is a few ns,
 /// so the whole budget stays well under a microsecond.
 const LATCH_SPIN_LIMIT: u32 = 128;
+/// Iterations of a pure `spin_loop` hint before yielding.  On a
+/// single-core/oversubscribed CI runner a pure spin burns the only
+/// runnable thread's slice while the owner cannot progress.
+const LATCH_HOT_SPINS: u32 = 32;
+// Cheap invariant: the spin budget must be non-zero.  A zero value would
+// silently disable the bounded-spin path entirely and force EVERY wait
+// (even the sub-microsecond ones this budget exists for) through the
+// condvar park/wake syscall pair; a future edit that "simplifies" the
+// constant to 0 should trip here, not in a profiler.
+const _: () = assert!(LATCH_SPIN_LIMIT > 0);
 
 /// Park state of a [`QueryLatch`] — ONLY the count of threads currently
 /// parked.  The mutex guarding it (`LatchInner::park`) and the condvar
 /// the waiters park on (`LatchInner::cv`) both live in `LatchInner`,
 /// next to the latch state they synchronize.
 #[derive(Debug, Default)]
-struct LatchPark {
-    /// Threads currently parked on `cv`.  Read by `set`/`poison` so the
-    /// futex wake syscall is skipped entirely when every waiter was
-    /// still in its bounded spin.
-    waiters: u32,
-}
+struct LatchPark;
 
 /// Shared state of a [`QueryLatch`].  ONE heap allocation per latch
 /// (the `Arc`) and ZERO per waiter — there is no waiter object at all;
@@ -147,8 +181,11 @@ struct LatchInner {
     /// The canonical state: `LATCH_WAITING` while the query runs, then
     /// `LATCH_COMPLETED` or `LATCH_POISONED`, written exactly once.
     state: AtomicU8,
-    park: Mutex<LatchPark>,
-    cv: Condvar,
+    /// Threads currently parked on `cv`.  Kept OUTSIDE the park mutex so
+    /// the RAII decrement guard needs no raw pointer and does not borrow
+    /// `park` across `cv.wait(&mut park)`.
+    waiters: AtomicU32,
+    park: std::sync::OnceLock<(Mutex<LatchPark>, Condvar)>,
 }
 
 /// A latch that allows one thread to compute a query while others wait.
@@ -183,8 +220,8 @@ impl QueryLatch {
         QueryLatch {
             inner: Arc::new(LatchInner {
                 state: AtomicU8::new(LATCH_WAITING),
-                park: Mutex::new(LatchPark::default()),
-                cv: Condvar::new(),
+                waiters: AtomicU32::new(0),
+                park: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -192,16 +229,28 @@ impl QueryLatch {
     /// Block the current thread until the query completes.
     ///
     /// Returns `Ok(())` when the query has completed successfully.
-    /// Returns `Err(())` if the query was poisoned (panicked).
+    /// Returns `Err` if the query was poisoned (panicked).
     pub fn wait_on(&self) -> Result<(), ()> {
         // Fast path + bounded spin: one atomic load per iteration — no
         // lock, no allocation, no syscall.  `spin_loop` hints the core
         // to save power instead of burning full tilt.
-        for _ in 0..LATCH_SPIN_LIMIT {
+        for i in 0..LATCH_SPIN_LIMIT {
             match self.inner.state.load(Ordering::Acquire) {
                 LATCH_COMPLETED => return Ok(()),
                 LATCH_POISONED => return Err(()),
-                _ => std::hint::spin_loop(),
+                _ => {
+                    if i < LATCH_HOT_SPINS {
+                        std::hint::spin_loop();
+                    } else {
+                        // Yield after the hot sub-budget so a 1-core host
+                        // does not starve the owner.  Under shuttle the
+                        // scheduler models parking, so keep hinting there.
+                        #[cfg(not(feature = "shuttle"))]
+                        std::thread::yield_now();
+                        #[cfg(feature = "shuttle")]
+                        std::hint::spin_loop();
+                    }
+                }
             }
         }
 
@@ -217,24 +266,45 @@ impl QueryLatch {
             crate::hir::query::sync_order::Fam::LatchPark,
             "job.latch.wait_on",
         );
-        let mut park = self.inner.park.lock();
-        park.waiters += 1;
+        // The waiter count lives in its own atomic, so this RAII guard needs
+// no raw pointer and does not borrow `park` across `cv.wait(&mut park)`
+//.  A leaked increment would make every future
+// `set`/`poison` take the notify path forever; the guard decrements on
+// every exit path, including unwind.
+        // The waiter count is NOT a free-floating hint.  Consider a waiter that increments,
+        // takes the park lock and observes LATCH_WAITING BEFORE the
+        // resolver's CAS: if the resolver's subsequent `waiters` load does
+        // not observe that increment, it skips `notify_all` and the waiter
+        // parks with no wakeup — a lost-wakeup deadlock.  SeqCst is what
+        // rules that interleaving out (it makes the increment and the
+        // resolver's load part of one total order with the state CAS);
+        // `test_query_latch_set_poison_race` hangs under Relaxed.  This
+        // count is only touched by parked waiters, so the fence pair is
+        // off every hot path anyway.
+        struct WaitersGuard<'a>(&'a std::sync::atomic::AtomicU32);
+        impl Drop for WaitersGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.inner.waiters.fetch_add(1, Ordering::SeqCst);
+        let _guard = WaitersGuard(&self.inner.waiters);
+        // #3: the park primitives are created on the first cross-thread wait,
+        // not on every cold key.  If `resolve` runs before this `get_or_init`,
+        // it sees `None` and does not notify — safe, because this thread then
+        // checks `state` under the just-created mutex and sees the transition
+        // instead of parking.
+        let (park_mu, cv) = self
+            .inner
+            .park
+            .get_or_init(|| (Mutex::new(LatchPark::default()), Condvar::new()));
+        let mut park = park_mu.lock();
         loop {
             match self.inner.state.load(Ordering::Acquire) {
-                // Decrement on EVERY exit path: the count gates the
-                // notify_all in `resolve`, and a leaked increment makes
-                // every future `set`/`poison` take the notify path
-                // forever (perf-only, but the invariant must not depend
-                // on `Condvar::wait` never unwinding).
-                LATCH_COMPLETED => {
-                    park.waiters -= 1;
-                    return Ok(());
-                }
-                LATCH_POISONED => {
-                    park.waiters -= 1;
-                    return Err(());
-                }
-                _ => self.inner.cv.wait(&mut park),
+                LATCH_COMPLETED => return Ok(()),
+                LATCH_POISONED => return Err(()),
+                _ => cv.wait(&mut park),
             }
         }
     }
@@ -268,19 +338,37 @@ impl QueryLatch {
             // double signal) — whoever won did the waking.
             return;
         }
-        // Skip the futex wake entirely when nobody is parked: every
-        // waiter was still in its bounded spin and already observed the
-        // state word above.  Registration BEFORE the lock (single rule:
-        // register, then acquire) — the RAII guard drops at block end.
+        // Acquire the park mutex before inspecting `waiters` and notifying.  This
+        // is what closes BOTH lost-wakeup interleavings:
+        //
+        //  (a) racy skip: the waiter's `fetch_add` and the resolver's load are
+        //      now serialized by the mutex, so the resolver either observes
+        //      the increment (and notifies) or the waiter has not yet taken
+        //      the lock — and once it does, its state check sees `to` and it
+        //      never parks.  (SeqCst alone does not close this.)
+        //  (b) notify-before-register: a waiter that has locked `park` and
+        //      checked `WAITING` registers atomically with `cv.wait`'s
+        //      unlock; the resolver cannot slip a notify into the gap between
+        //      the check and the registration because it must hold the same
+        //      mutex.
+        //
+        // Notifying while holding the mutex means woken waiters briefly
+        // re-block on it (`hurry-up-and-wait`), but that is one lock/unlock
+        // round-trip per waiter — trivial next to a lost wakeup.
         let _tw = crate::hir::query::sync_order::Acquired::acquire(
             crate::hir::query::sync_order::Fam::LatchPark,
             "job.latch.resolve",
         );
-        let park = self.inner.park.lock();
-        if park.waiters > 0 {
-            self.inner.cv.notify_all();
+        // #3: only a waiter that has already initialized the park pair can be
+        // parked, so `None` means there is nothing to wake (the waiter's own
+        // state check under the mutex will observe `to`).
+        if let Some((park_mu, cv)) = self.inner.park.get() {
+            let park = park_mu.lock();
+            if self.inner.waiters.load(Ordering::SeqCst) > 0 {
+                cv.notify_all();
+            }
+            drop(park);
         }
-        drop(park);
     }
 
     /// Check whether the query has completed.

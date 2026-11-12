@@ -11289,7 +11289,7 @@ fn test_checker_probe_candidate_loop() {
                     chosen = Some(v);
                     probe.commit();
                 }
-                Err(()) => {} // probe dropped uncommitted → rollback
+                Err(()) => {}
             }
         }
         let v = chosen.expect("the second candidate must win");
@@ -11862,8 +11862,8 @@ fn test_digest_gate_recomputes_only_changed_function() {
     // Iteration 1: f0, f1 and main all compute (cold query system).
     // NOTE: FN_BODY computes are also triggered by OTHER tests running in
     // parallel in the same process (the counter/log is process-global), so
-    // this test filters the compute log by its own query-system address.
-    let system = &checker.query_system as *const _ as usize;
+    // this test filters the compute log by its own query-system id.
+    let system = checker.query_system.system_id();
     let mark1 = fn_body_compute_mark();
     checker
         .check_program(&program1)
@@ -11985,10 +11985,10 @@ fn test_check_fn_body_mismatched_key_folds_to_error_value() {
 
     let harness = crate::session::BodyCheckHarness {
         shared: std::sync::Arc::new(SharedCheckState::default()),
-        session_stamp: &*checker.ctx as *const _ as usize,
+        session_stamp: checker.ctx.session_id,
         strict_mode: false,
         enable_experimental: false,
-        features: vec![],
+        features: vec![].into(),
         debug: false,
         source: Some(src),
     };

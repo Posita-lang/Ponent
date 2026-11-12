@@ -96,7 +96,11 @@ fn d21_green_bit_never_outruns_cache_entry() {
             .get::<D21K>(DKey(0), provider)
             .map(|v| v.semantic)
             .unwrap();
-        assert_eq!(got, 20, "green serve returned the pre-recompute entry");
+        assert_eq!(
+            got, 20,
+            "green serve must return the post-recompute entry (got a stale \
+             value — the pre-recompute entry leaked through the green path)"
+        );
 
         sched.release_all();
         assert_eq!(

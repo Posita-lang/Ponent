@@ -41,11 +41,33 @@
 //! column-dependent and therefore *not* additive across the word/glue pieces
 //! the DP sums, so a tab forces the general path.
 //!
+//! # Known approximations
+//!
+//! * **Tab width is measured from column 0 within each measured string.**
+//!   [`measure_width`] threads the running column into the per-character
+//!   width, so a tab is charged `tab_width - (col % tab_width)` at its actual
+//!   column *inside the measured string* — but each call starts that column
+//!   at 0.  The DP sums per-word widths, so it cannot know the line column a
+//!   word lands at: tab-bearing text is over/under-measured by up to
+//!   `tab_width - 1` cells at word boundaries.  Correct handling would need
+//!   per-break-column arithmetic through the DP; diagnostic messages almost
+//!   never contain tabs, so forcing the general path is the deliberate
+//!   trade-off.
+//! * **A single grapheme wider than the measure wins.**  [`Word`] docs claim
+//!   `width ≤ max_width` "by construction" — that holds only when a
+//!   grapheme cluster is at most one cell.  [`push_split_oversized`] packs
+//!   graphemes up to `max_width` and never splits inside a cluster, so a
+//!   cluster wider than the measure itself (e.g. a 2-cell emoji at
+//!   `max_width = 1`) produces a piece whose width *exceeds* `max_width`.
+//!   No inner assertion may claim otherwise; the DP simply emits the
+//!   over-wide line, which is the best any cluster-respecting breaker can
+//!   do.
+//!
 //! [`GlyphRenderer`]: crate::diagnostics::GlyphRenderer
 //! [`explain_error_code`]: crate::diagnostics::explain_error_code
 
 use super::ascii::is_printable_ascii;
-use super::glyph::grapheme_width;
+use super::glyph::{grapheme_width_cached, WIDTH_CACHE};
 use crate::smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::ops::Range;
@@ -104,11 +126,33 @@ pub(crate) fn wrap_optimal<'a>(
     max_width: usize,
     tab_width: usize,
 ) -> SmallVec<[Cow<'a, str>; 4]> {
+    // Defend the division contract at the boundary: every other renderer
+    // clamps (`GlyphRenderer::with_opts`, `HtmlRenderer::with_opts`), but
+    // `explain_error_code_with_depth` is `pub` and takes the width directly,
+    // and `grapheme_width_cached` computes `tab_width - (col % tab_width)`.
+    let tab_width = tab_width.max(1);
+    // Every paragraph is a subslice of `text`, so bounding the whole text
+    // bounds every `Word` offset (`push_words` indexes into one paragraph).
+    // A 4 GiB diagnostic message is not a real input; a debug build catches
+    // it long before the `u32` casts below would silently wrap.
+    debug_assert!(
+        text.len() <= u32::MAX as usize,
+        "wrap_optimal: text exceeds u32 byte offsets ({} bytes)",
+        text.len()
+    );
     if text.is_empty() {
         return smallvec![Cow::Borrowed("")];
     }
     if max_width == 0 {
-        return text.split('\n').map(Cow::Borrowed).collect();
+        // The contract "at most `max_width` display columns per line" is
+        // unsatisfiable at 0 (any non-empty line violates it), so 0 means
+        // "no wrapping within paragraphs": each hard newline survives as a
+        // segment, paragraphs are emitted verbatim.  `DiagOpts` clamps
+        // `--width 0` up before this is reached; the guard stays as the
+        // direct-caller defence.  `split_terminator`, like every other path
+        // below: a trailing `\n` must not produce a phantom empty segment
+        // ("a\n" → ["a"], "\n" → [""], "\n\n" → ["", ""]).
+        return text.split_terminator('\n').map(Cow::Borrowed).collect();
     }
 
     // Single-line fast path: text with no hard newline (one optional trailing
@@ -120,49 +164,180 @@ pub(crate) fn wrap_optimal<'a>(
     // break opportunity, so the DP drops a leading space-only chunk (no
     // predecessor to fold into) and the trailing space of the last word
     // (`line_width` omits it).  Non-ASCII whitespace (NBSP, U+3000…) at the
-    // edges is rejected by [`edges_have_non_ascii_ws`]: leading NBSP is LB12
+    // edges is rejected by [`edges_have_whitespace`]: leading NBSP is LB12
     // glue the DP keeps inside the first word while trailing NBSP is stripped
     // by [`trimmed_len`]'s multi-byte fallback, and a leading NBSP run folded
     // with ASCII spaces is dropped as a whitespace-only chunk — in every case
     // a fast path emitting `trim_matches(' ')` would diverge, so we fall
     // through to the DP.
     //
-    // Tabs are excluded because their width is column-dependent and not
-    // additive across the word/glue pieces the DP sums.  `measure_width` is
+    // Tabs are excluded: their width is column-dependent, and — decisive —
+    // a tab is a UAX #14 break *opportunity*, so the DP can split
+    // tab-bearing text into separate lines even when the whole text
+    // measures within the measure (pinned by `fast_paths_match_dp` with
+    // `"a\tb"` at width 5 → ["a", "b"]).  A verbatim fast path would
+    // diverge, so any tab falls through to the DP.  `measure_width` is
     // SWAR for printable ASCII and a cached grapheme walk otherwise — both
     // far cheaper than UAX #14 + DP — so this gate covers short non-English
     // (CJK, kana, …) messages, not just ASCII.
     let single = text.strip_suffix('\n').unwrap_or(text);
-    let no_interior_newline = !single.contains('\n');
-    if no_interior_newline {
+    // One fused scan decides both fast-path gates: `memchr2` reports the
+    // first `\n` or `\t` in a single pass, so the "no interior newline"
+    // probe and the tab probe no longer cost two scans over the text.
+    // The pair is derived exactly, so the gates cannot disagree: no layout
+    // byte at all → no tab, no interior newline; a tab first → `has_tab` and
+    // the fast path is refused outright (a tab is a UAX #14 break
+    // opportunity, so the DP may split); a newline first → an interior
+    // newline exists.
+    //
+    // `has_tab` is therefore implied by `no_interior_newline` (the `match`
+    // derives both from one probe: `no_interior_newline` is true only in the
+    // `None` arm, where `has_tab` is false).  The invariant lives in this
+    // `match`, so the gate below does not repeat the `!has_tab` term — a
+    // future refactor that splits the pair must update this `match`, which is
+    // where the guard belongs.
+    let first_layout = memchr::memchr2(b'\n', b'\t', single.as_bytes());
+    let (has_tab, no_interior_newline) = match first_layout {
+        None => (false, true),
+        Some(p) if single.as_bytes()[p] == b'\t' => (true, false),
+        Some(_) => (false, false),
+    };
+    if no_interior_newline && !has_tab {
         let trimmed = single.trim_matches(' ');
-        if !trimmed.is_empty()
-            && memchr::memchr(b'\t', trimmed.as_bytes()).is_none()
-            && !edges_have_non_ascii_ws(trimmed)
-            && measure_width(trimmed, tab_width) <= max_width
-        {
+        // A tab-first text reports `no_interior_newline == false`, so tab
+        // expansion (and its UAX #14 break opportunity) can never reach this
+        // verbatim fast path.
+        let fits = if trimmed.len() <= max_width {
+            true
+        } else if is_printable_ascii(trimmed.as_bytes()) {
+            false
+        } else {
+            measure_width(trimmed, tab_width) <= max_width
+        };
+        if !trimmed.is_empty() && !edges_have_whitespace(trimmed) && fits {
             return smallvec![Cow::Borrowed(trimmed)];
         }
     }
 
-    // Paragraph count, without materialising the `split` items: a trailing
-    // '\n' leaves a phantom empty final paragraph, dropped so "a\n" → ["a"]
-    // and not ["a", ""].  When the fast-path probe above found no interior
-    // newline, there is exactly one paragraph and the `memchr_iter` count
-    // pass is redundant — reuse the probe result instead.
-    let n_paras = if no_interior_newline {
-        1
+    // `split_terminator` drops the phantom empty final paragraph a trailing
+    // '\n' would otherwise leave — exactly what the old count-then-take
+    // produced ("a\n" → ["a"], "a\n\nb" → ["a", "", "b"], "\n" → [""],
+    // "\n\n" → ["", ""]) — without the separate `memchr_iter(...).count()`
+    // scan pass.  `no_interior_newline` above remains in scope: the fast
+    // path still uses it.
+    // The badness/class tables and the DP scratch are fetched once for the
+    // whole message: one TLS access + one `Rc` clone and at most five
+    // allocations per *message*, instead of one set per paragraph.
+    let tables = wrap_tables(max_width);
+    // The DP scratch lives in a per-thread `thread_local!` (mirroring
+    // `WRAP_TABLES`): a diagnostic wraps a *dozen* labels/help/child
+    // messages, and each used to pay `WrapScratch::new()` — up to five
+    // heap-touching `SmallVec` growths — per wrapping message.  Reusing one
+    // scratch across the whole batch converts that to one-time growth per
+    // thread.  (A `RenderCtx`-threaded variant would need `wrap_msg`'s
+    // callers to pass ctx down; `chain.rs` wraps without a ctx, so the
+    // thread-local is the honest reuse point.)  The borrow is held only
+    // within this call; `wrap_optimal` never nests into itself, and the
+    // returned `Cow`s borrow `text`, not the scratch.
+    // [4] recursion guard: if a future caller nests `wrap_optimal` (or calls
+    // it from `wrap_dp`'s scoring), the TLS borrow would panic.  Fall back to
+    // a local scratch in that impossible-by-design case; the normal path stays
+    // allocation-free.
+    // #7: batch memo.  Identical static help/label strings recur across a batch;
+// hash them once and reuse the DP's segment ranges.  Hits are exact: the
+// stored content is compared byte-for-byte before ranges are applied, so a
+// hash collision can only miss, never mis-render.  Bounded, and a hit still
+// borrows the *current* text (no allocation).
+    let key = (wrap_text_hash(text), max_width, tab_width);
+    if let Some(hit) = wrap_memo_get(key, text) {
+        return hit;
+    }
+    let result = if WRAP_IN_USE.get() {
+        let mut local = WrapScratch::new();
+        wrap_optimal_with(text, max_width, tab_width, tables.as_deref(), &mut local)
     } else {
-        let n_newlines = memchr::memchr_iter(b'\n', text.as_bytes()).count();
-        if text.ends_with('\n') {
-            n_newlines
-        } else {
-            n_newlines + 1
+        WRAP_IN_USE.set(true);
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                WRAP_IN_USE.set(false);
+            }
         }
+        let _reset = ResetGuard;
+        WRAP_SCRATCH.with_borrow_mut(|scratch| {
+            wrap_optimal_with(text, max_width, tab_width, tables.as_deref(), scratch)
+        })
     };
+    wrap_memo_put(key, text, &result);
+    result
+}
 
+/// Hash used only as a memo bucket; exact content comparison disambiguates.
+fn wrap_text_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+thread_local! {
+    static WRAP_MEMO: std::cell::RefCell<
+        rustc_hash::FxHashMap<(u64, usize, usize), Vec<(std::sync::Arc<str>, SmallVec<[Range<usize>; 4]>)>>,
+    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+fn wrap_memo_get<'a>(
+    key: (u64, usize, usize),
+    text: &'a str,
+) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
+    WRAP_MEMO.with_borrow(|memo| {
+        let entries = memo.get(&key)?;
+        let (_, ranges) = entries.iter().find(|(content, _)| &**content == text)?;
+        Some(
+            ranges
+                .iter()
+                .map(|r| Cow::Borrowed(&text[r.clone()]))
+                .collect(),
+        )
+    })
+}
+
+fn wrap_memo_put(key: (u64, usize, usize), text: &str, result: &[Cow<'_, str>]) {
+    let ranges: SmallVec<[Range<usize>; 4]> = result
+        .iter()
+        .map(|seg| {
+            let s = seg.as_ref();
+            let off = (s.as_ptr() as usize).saturating_sub(text.as_ptr() as usize);
+            debug_assert!(
+                off + s.len() <= text.len(),
+                "wrap memo requires segments borrowed from the input text"
+            );
+            off..off + s.len()
+        })
+        .collect();
+    WRAP_MEMO.with_borrow_mut(|memo| {
+        if memo.len() >= 256 {
+            memo.clear();
+        }
+        let entries = memo.entry(key).or_default();
+        if !entries.iter().any(|(content, _)| &**content == text) {
+            entries.push((std::sync::Arc::from(text), ranges));
+        }
+    });
+}
+
+/// Shared body of [`wrap_optimal`] over a caller-supplied scratch buffer.
+/// Split out so the recursion fallback can pass a local scratch instead of the
+/// thread-local one.
+fn wrap_optimal_with<'a>(
+    text: &'a str,
+    max_width: usize,
+    tab_width: usize,
+    tables: Option<&WrapTables>,
+    scratch: &mut WrapScratch,
+) -> SmallVec<[Cow<'a, str>; 4]> {
     let mut out: SmallVec<[Cow<'a, str>; 4]> = SmallVec::new();
-    for para in text.split('\n').take(n_paras) {
+    for para in text.split_terminator('\n') {
         if para.is_empty() {
             out.push(Cow::Borrowed(""));
             continue;
@@ -172,21 +347,64 @@ pub(crate) fn wrap_optimal<'a>(
         // measure, so it costs > 0).  See the top-of-function fast path for
         // the trimming / tab / non-ASCII-whitespace rationale.
         let trimmed = para.trim_matches(' ');
-        if !trimmed.is_empty()
-            && memchr::memchr(b'\t', trimmed.as_bytes()).is_none()
-            && !edges_have_non_ascii_ws(trimmed)
-            && measure_width(trimmed, tab_width) <= max_width
-        {
+        // One printable-ASCII scan serves both the `fits` gate and
+        // `collect_words`'s ASCII dispatch: printable ASCII excludes the tab
+        // (0x09 < 0x20), so the old separate tab `memchr` is subsumed and the
+        // most frequent wrap path pays one SWAR pass instead of up to two.
+        // Derived from `trimmed` but applied to `para`: valid because
+        // `trim_matches(' ')` only strips bytes in the printable set (space is
+        // 0x20), so the two buffers have the same printable-ASCII verdict.  If
+        // the trim is ever widened (e.g. to `char::is_whitespace`), re-derive
+        // from `para` here or a leading tab would pass `Some(true)` for a
+        // non-printable buffer.
+        let ascii = is_printable_ascii(trimmed.as_bytes());
+        // #11: the derivation from `trimmed` is only sound while the trim is
+        // exactly `' '`; if it is ever widened to Unicode whitespace, this
+        // fires in debug instead of silently letting a leading tab through.
+        debug_assert_eq!(
+            is_printable_ascii(para.as_bytes()),
+            ascii,
+            "trim_matches(' ') must preserve the printable-ASCII verdict"
+        );
+        // `fits_and_clean`: a printable-ASCII paragraph fits exactly when its
+        // byte length fits (bytes == cells, no tab possible).  Otherwise the
+        // tab probe still matters (a tab is one byte but up to `tab_width`
+        // cells), and non-ASCII cells can exceed the byte count, so measure.
+        let fits_and_clean = if ascii {
+            trimmed.len() <= max_width
+        } else {
+            memchr::memchr(b'\t', trimmed.as_bytes()).is_none()
+                && measure_width(trimmed, tab_width) <= max_width
+        };
+        if !trimmed.is_empty() && !edges_have_whitespace(trimmed) && fits_and_clean {
             out.push(Cow::Borrowed(trimmed));
             continue;
         }
-        let words = collect_words(para, max_width, tab_width);
+        let mut words = std::mem::take(&mut scratch.words);
+        let mut breaks = std::mem::take(&mut scratch.breaks);
+        collect_words_into(
+            para,
+            max_width,
+            tab_width,
+            Some(ascii),
+            &mut words,
+            &mut breaks,
+        );
+        scratch.breaks = breaks;
         if words.is_empty() {
+            // A non-empty paragraph with no words is whitespace-only (spaces,
+            // tabs, NBSP runs…).  It is layout, not noise: keep it as an empty
+            // segment so a blank line between hard newlines survives and
+            // callers indexing the last segment (`chain.rs`) never see an
+            // empty result for non-empty input.
+            scratch.words = words;
+            out.push(Cow::Borrowed(""));
             continue;
         }
-        for range in wrap_dp(&words, max_width) {
+        for range in wrap_dp(&words, max_width, tables, scratch) {
             out.push(Cow::Borrowed(&para[range]));
         }
+        scratch.words = words;
     }
     out
 }
@@ -197,48 +415,102 @@ pub(crate) fn wrap_optimal<'a>(
 ///
 /// `trailing_space` is the glue Knuth-Plass stretches/shrinks: it is *included*
 /// between words on the same line and *dropped* at a line break.
+///
+/// Fields are `u32` rather than `usize`: a `Word` lives inside one
+/// `\n`-separated paragraph of a diagnostic message, and a paragraph that
+/// large (4 GiB of text) would OOM long before offset overflow.  The payoff
+/// is layout: the four `u32` fields make
+/// `Word` 16 B, halving `SmallVec<[Word; 16]>`'s inline footprint
+/// (512 B → 256 B) so the common ≤16-word paragraph stays in one or two
+/// cache lines and `wrap_dp`'s prefix-sum loop walks twice as many words
+/// per line fetch.
+///
+/// `width ≤ max_width` holds for every word produced by the ASCII splitter
+/// and by the ordinary path of [`push_split_oversized`] — but NOT
+/// unconditionally: a single grapheme cluster wider than the measure (a
+/// 2-cell emoji at `max_width = 1`) is emitted as one piece and exceeds the
+/// measure, because clusters are never split.  Nothing may debug-assert
+/// `width ≤ max_width` on `Word` in general.
 struct Word {
-    /// Byte range inside the paragraph (trailing whitespace excluded).
-    range: Range<usize>,
-    /// Display width of `range` in terminal cells.
-    width: usize,
-    /// Display width of the whitespace following `range`.
-    trailing_space: usize,
+    /// Start byte offset inside the paragraph (trailing whitespace excluded).
+    start: u32,
+    /// End byte offset inside the paragraph (trailing whitespace excluded).
+    end: u32,
+    /// Display width of `start..end` in terminal cells.
+    width: u32,
+    /// Display width of the whitespace following `end`.
+    trailing_space: u32,
 }
 
-/// Split `text` into words at the break opportunities of [`break_opportunities`],
-/// splitting any single word wider than `max_width` at grapheme boundaries.
+impl Word {
+    /// Byte range inside the paragraph (trailing whitespace excluded).
+    #[inline]
+    fn range(&self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
+}
+
+/// Split `text` into words, splitting any single word wider than `max_width`
+/// at grapheme boundaries.
+///
+/// Dispatches once on printable-ASCII: the ASCII path then measures every
+/// chunk by byte count (one cell per byte, and `ascii_break_opportunities`
+/// has already excluded tabs, so no SWAR scan or grapheme walk is repeated
+/// per word), and the UAX #14 path keeps the general measurement.
 ///
 /// Returns a [`SmallVec`] because a paragraph almost always has ≤16 words; the
-/// `Word` struct is 32 B so `[Word; 16]` fits inline (512 B) and the common
+/// `Word` struct is 16 B so `[Word; 16]` fits inline (256 B) and the common
 /// case skips the heap.
-fn collect_words(text: &str, max_width: usize, tab_width: usize) -> SmallVec<[Word; 16]> {
+/// * `known_ascii` — the caller's printable-ASCII verdict on `text`, when it
+///   already computed one (`Some(true)` skips the re-scan entirely;
+///   `Some(false)` declines straight to the UAX path; `None` re-derives it).
+fn collect_words(
+    text: &str,
+    max_width: usize,
+    tab_width: usize,
+    known_ascii: Option<bool>,
+) -> SmallVec<[Word; 16]> {
     let mut words: SmallVec<[Word; 16]> = SmallVec::new();
-    push_words(
-        text,
-        &break_opportunities(text),
-        max_width,
-        tab_width,
-        &mut words,
-    );
+    let mut breaks: SmallVec<[usize; 16]> = SmallVec::new();
+    collect_words_into(text, max_width, tab_width, known_ascii, &mut words, &mut breaks);
     words
 }
 
-/// Byte offsets at which `text` may be broken, always `[0, …, text.len()]`.
-fn break_opportunities(text: &str) -> SmallVec<[usize; 16]> {
-    if let Some(breaks) = ascii_break_opportunities(text) {
-        return breaks;
+/// Fill `words` (clearing it first) with [`collect_words`]'s result.
+///
+/// The buffer is owned by [`WrapScratch`] so a multi-paragraph message pays
+/// one `SmallVec` growth per message instead of one per paragraph.
+fn collect_words_into(
+    text: &str,
+    max_width: usize,
+    tab_width: usize,
+    known_ascii: Option<bool>,
+    words: &mut SmallVec<[Word; 16]>,
+    breaks: &mut SmallVec<[usize; 16]>,
+) {
+    words.clear();
+    if ascii_break_opportunities_into(text, known_ascii, breaks) {
+        push_words_ascii(text, breaks, max_width, words);
+    } else {
+        uax_break_opportunities_into(text, breaks);
+        push_words(text, breaks, max_width, tab_width, words);
     }
-    uax_break_opportunities(text)
 }
 
 /// The reference implementation: UAX #14 opportunities filtered by
 /// [`should_break_at`] (the code-token filter).
 fn uax_break_opportunities(text: &str) -> SmallVec<[usize; 16]> {
+    let mut breaks: SmallVec<[usize; 16]> = SmallVec::new();
+    uax_break_opportunities_into(text, &mut breaks);
+    breaks
+}
+
+fn uax_break_opportunities_into(text: &str, breaks: &mut SmallVec<[usize; 16]>) {
     // `linebreaks` yields the byte offset of the first character after the
     // break; `should_break_at` filters out positions that would split a code
     // token.
-    let mut breaks: SmallVec<[usize; 16]> = smallvec![0];
+    breaks.clear();
+    breaks.push(0);
     for (pos, op) in linebreaks(text) {
         if matches!(op, BreakOpportunity::Allowed | BreakOpportunity::Mandatory)
             && pos > *breaks.last().unwrap()
@@ -250,7 +522,6 @@ fn uax_break_opportunities(text: &str) -> SmallVec<[usize; 16]> {
     if *breaks.last().unwrap() < text.len() {
         breaks.push(text.len());
     }
-    breaks
 }
 
 /// Break opportunities for a paragraph of printable ASCII, without running the
@@ -268,52 +539,71 @@ fn uax_break_opportunities(text: &str) -> SmallVec<[usize; 16]> {
 /// break after spaces — LB13, LB14, LB15 — which [`ascii_break_after_space`]
 /// evaluates from ASCII bytes alone.  `ascii_fast_path_breaks_match_uax`
 /// checks this against `unicode_linebreak`.
-fn ascii_break_opportunities(text: &str) -> Option<SmallVec<[usize; 16]>> {
+///
+/// `known_ascii` is the caller's printable-ASCII verdict on `text`, when it
+/// has already computed one: `Some(true)` skips the re-scan (debug-asserted),
+/// `Some(false)` declines straight to the UAX path, `None` re-derives it.
+fn ascii_break_opportunities(
+    text: &str,
+    known_ascii: Option<bool>,
+) -> Option<SmallVec<[usize; 16]>> {
+    let mut breaks: SmallVec<[usize; 16]> = SmallVec::new();
+    ascii_break_opportunities_into(text, known_ascii, &mut breaks).then_some(breaks)
+}
+
+fn ascii_break_opportunities_into(
+    text: &str,
+    known_ascii: Option<bool>,
+    breaks: &mut SmallVec<[usize; 16]>,
+) -> bool {
     let b = text.as_bytes();
-    if !is_printable_ascii(b) {
-        return None;
+    match known_ascii {
+        Some(true) => debug_assert!(is_printable_ascii(b)),
+        Some(false) => return false,
+        None => {
+            if !is_printable_ascii(b) {
+                return false;
+            }
+        }
     }
-    let mut breaks: SmallVec<[usize; 16]> = smallvec![0];
+    breaks.clear();
+    breaks.push(0);
     let mut i = 0usize;
-    while i < b.len() {
-        if b[i] != b' ' {
-            i += 1;
-            continue;
+    while let Some(off) = memchr::memchr(b' ', &b[i..]) {
+        let run_start = i + off;
+        let mut end = run_start + 1;
+        while end < b.len() && b[end] == b' ' {
+            end += 1;
         }
-        let run_start = i;
-        while i < b.len() && b[i] == b' ' {
-            i += 1;
-        }
-        // `i` is the end of a maximal space run — the only candidate position
+        // `end` is the end of a maximal space run — the only candidate position
         // printable ASCII can offer.
-        if i < b.len() {
+        if end < b.len() {
             let prev = if run_start == 0 {
                 None
             } else {
                 Some(b[run_start - 1])
             };
-            match ascii_break_after_space(prev, b[i]) {
-                Some(true) => breaks.push(i),
-                Some(false) => {}
-                // Undecidable from ASCII alone: hand the paragraph back to
-                // UAX #14 instead of guessing.
-                None => return None,
+            if ascii_break_after_space(prev, b[end]) {
+                breaks.push(end);
             }
         }
+        i = end;
     }
     if *breaks.last().unwrap() < b.len() {
         breaks.push(b.len());
     }
-    Some(breaks)
+    true
 }
 
 /// May a line break at the end of a space run?  `prev` is the byte before the
 /// run (`None` at the start of the paragraph), `next` the byte after it.
 ///
-/// Returns `None` when the answer depends on an ASCII line-break class we do
-/// not pin down; the caller then defers to UAX #14.
+/// Total over printable ASCII: every path is decidable from ASCII alone
+/// (`ascii_fast_path_breaks_match_uax` proves the fast path is complete for
+/// printable ASCII), so there is no fallback arm — the UAX #14 path is taken
+/// *before* this is called, when the paragraph is not printable ASCII.
 #[inline]
-fn ascii_break_after_space(prev: Option<u8>, next: u8) -> Option<bool> {
+fn ascii_break_after_space(prev: Option<u8>, next: u8) -> bool {
     // LB13: `× CL | CP | EX | IS | SY` — never break before a closer, an
     // exclamation/interrogation, an infix separator or a symbol, *even after
     // spaces*: `}` `)` `]` `!` `?` `,` `.` `:` `;` `/`.
@@ -321,11 +611,11 @@ fn ascii_break_after_space(prev: Option<u8>, next: u8) -> Option<bool> {
         next,
         b'}' | b')' | b']' | b'!' | b'?' | b',' | b'.' | b':' | b';' | b'/'
     ) {
-        return Some(false);
+        return false;
     }
     // LB14: `OP SP* ×` — never break after an opening bracket plus spaces.
     if matches!(prev, Some(b'(') | Some(b'[') | Some(b'{')) {
-        return Some(false);
+        return false;
     }
     // LB15: `QU SP* × OP` — never break after a quote plus spaces into an
     // opener.  `"` and `'` are `QU`; the grave accent (U+0060) is `AL` in
@@ -334,12 +624,10 @@ fn ascii_break_after_space(prev: Option<u8>, next: u8) -> Option<bool> {
     // its spaces is allowed.  (LB16 `CP SP* × NS` and LB17 `B2 SP* × B2`
     // have no ASCII members on either side.)
     if matches!(next, b'(' | b'[' | b'{') {
-        return match prev {
-            Some(b'"') | Some(b'\'') => Some(false),
-            _ => Some(true),
-        };
+        !matches!(prev, Some(b'"') | Some(b'\''))
+    } else {
+        true
     }
-    Some(true)
 }
 
 /// Does this UAX #14 break opportunity survive the code-token filter?
@@ -397,9 +685,10 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
-/// Build the words between `breaks` — shared by the ASCII and UAX paths so the
-/// chunk→word rules (trailing-whitespace folding, oversized splitting) exist
-/// once.
+/// Build the words between UAX #14 `breaks` — the general path, used whenever
+/// [`ascii_break_opportunities`] declines (tabs, non-ASCII).  The chunk→word
+/// rules (trailing-whitespace folding, oversized splitting) live here and are
+/// mirrored, in byte-count form, by [`push_words_ascii`].
 fn push_words(
     text: &str,
     breaks: &[usize],
@@ -421,7 +710,9 @@ fn push_words(
         if content_end == chunk_start {
             // Whitespace-only chunk: fold it into the previous word's glue.
             if let Some(prev) = words.last_mut() {
-                prev.trailing_space += measure_width(chunk, tab_width);
+                // A realistic whitespace run is a handful of cells; the
+                // `u32` field only wraps on a multi-gigabyte run.
+                prev.trailing_space += measure_width(chunk, tab_width) as u32;
             }
             continue;
         }
@@ -436,11 +727,92 @@ fn push_words(
             push_split_oversized(words, content, chunk_start, max_width, tab_width, space);
         } else {
             words.push(Word {
-                range: chunk_start..content_end,
-                width: w_content,
-                trailing_space: space,
+                start: chunk_start as u32,
+                end: content_end as u32,
+                width: w_content as u32,
+                trailing_space: space as u32,
             });
         }
+    }
+}
+
+/// ASCII twin of [`push_words`]: for printable ASCII (no tabs — those decline
+/// [`ascii_break_opportunities`]) every byte is exactly one cell, so each
+/// `measure_width` call collapses to a byte count and the whole pass is
+/// `O(N)` integer arithmetic instead of `O(Σ ceil(len/8))` SWAR iterations
+/// plus a grapheme walk per word.
+fn push_words_ascii(
+    text: &str,
+    breaks: &[usize],
+    max_width: usize,
+    words: &mut SmallVec<[Word; 16]>,
+) {
+    debug_assert!(is_printable_ascii(text.as_bytes()));
+    for w in breaks.windows(2) {
+        let chunk_start = w[0];
+        let chunk_end = w[1];
+        if chunk_start >= chunk_end {
+            continue;
+        }
+
+        let content_len = trimmed_len(&text[chunk_start..chunk_end]);
+
+        if content_len == 0 {
+            // Whitespace-only chunk: fold it into the previous word's glue.
+            // Every byte here is a printable ASCII cell.
+            if let Some(prev) = words.last_mut() {
+                prev.trailing_space += (chunk_end - chunk_start) as u32;
+            }
+            continue;
+        }
+
+        let space = (chunk_end - chunk_start) - content_len;
+        if content_len > max_width {
+            push_split_oversized_ascii(words, chunk_start, content_len, max_width, space);
+        } else {
+            words.push(Word {
+                start: chunk_start as u32,
+                end: (chunk_start + content_len) as u32,
+                width: content_len as u32,
+                trailing_space: space as u32,
+            });
+        }
+    }
+}
+
+/// Append the pieces of a printable-ASCII over-wide word (starting at byte
+/// offset `offset`, byte length `len`) straight into `words`.  A grapheme
+/// boundary is every byte, so the grapheme walk of [`push_split_oversized`]
+/// reduces to fixed-width byte slicing.
+fn push_split_oversized_ascii(
+    words: &mut SmallVec<[Word; 16]>,
+    offset: usize,
+    len: usize,
+    max_width: usize,
+    trailing: usize,
+) {
+    let mut off = offset;
+    let mut rest = len;
+    // `max_width.max(1)` keeps the slice step positive (the grapheme walk in
+    // `push_split_oversized` makes progress per piece the same way).
+    let step = max_width.max(1);
+    while rest > max_width {
+        words.push(Word {
+            start: off as u32,
+            end: (off + step) as u32,
+            width: step as u32,
+            trailing_space: 0,
+        });
+        off += step;
+        rest -= step;
+    }
+    if rest > 0 {
+        words.push(Word {
+            start: off as u32,
+            end: (off + rest) as u32,
+            width: rest as u32,
+            trailing_space: trailing as u32,
+        });
     }
 }
 
@@ -448,6 +820,11 @@ fn push_words(
 /// `offset` inside the paragraph, so ranges stay paragraph-relative) straight
 /// into `words` — no intermediate `Vec`.  `trailing` is the glue that follows
 /// the word and belongs to its last piece.
+///
+/// Pieces are packed up to `max_width` cells, but a single grapheme cluster
+/// wider than the measure is emitted as one over-wide piece — clusters are
+/// never split, so `Word::width ≤ max_width` cannot be guaranteed here (see
+/// the module docs' "Known approximations").
 fn push_split_oversized(
     words: &mut SmallVec<[Word; 16]>,
     text: &str,
@@ -458,24 +835,29 @@ fn push_split_oversized(
 ) {
     let mut sub_start = 0usize;
     let mut sub_width = 0usize;
-    for (i, g) in text.grapheme_indices(true) {
-        let gw = grapheme_width(g, sub_width, tab_width);
-        if sub_width > 0 && sub_width + gw > max_width {
-            words.push(Word {
-                range: offset + sub_start..offset + i,
-                width: sub_width,
-                trailing_space: 0,
-            });
-            sub_start = i;
-            sub_width = 0;
+    WIDTH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        for (i, g) in text.grapheme_indices(true) {
+            let gw = grapheme_width_cached(g, sub_width, tab_width, &mut cache);
+            if sub_width > 0 && sub_width + gw > max_width {
+                words.push(Word {
+                    start: (offset + sub_start) as u32,
+                    end: (offset + i) as u32,
+                    width: sub_width as u32,
+                    trailing_space: 0,
+                });
+                sub_start = i;
+                sub_width = 0;
+            }
+            sub_width += gw;
         }
-        sub_width += gw;
-    }
+    });
     if sub_start < text.len() {
         words.push(Word {
-            range: offset + sub_start..offset + text.len(),
-            width: sub_width,
-            trailing_space: trailing,
+            start: (offset + sub_start) as u32,
+            end: (offset + text.len()) as u32,
+            width: sub_width as u32,
+            trailing_space: trailing as u32,
         });
     }
 }
@@ -492,9 +874,12 @@ fn measure_width(s: &str, tab_width: usize) -> usize {
         return s.len();
     }
     let mut w = 0;
-    for g in s.graphemes(true) {
-        w += grapheme_width(g, w, tab_width);
-    }
+    WIDTH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        for g in s.graphemes(true) {
+            w += grapheme_width_cached(g, w, tab_width, &mut cache);
+        }
+    });
     w
 }
 
@@ -529,7 +914,7 @@ fn trimmed_len(s: &str) -> usize {
 /// fast path rejects such edges and falls through to the DP.  Both char reads
 /// are O(1) (boundary scan from each end of a `&str`).
 #[inline]
-fn edges_have_non_ascii_ws(s: &str) -> bool {
+fn edges_have_whitespace(s: &str) -> bool {
     s.chars().next().map_or(false, |c| c.is_whitespace())
         || s.chars().next_back().map_or(false, |c| c.is_whitespace())
 }
@@ -554,7 +939,120 @@ fn edges_have_non_ascii_ws(s: &str) -> bool {
 ///
 /// Returns a [`SmallVec`] because a paragraph wraps to a handful of lines,
 /// so the common case stays inline.
-fn wrap_dp(words: &[Word], max_width: usize) -> SmallVec<[Range<usize>; 4]> {
+/// Tabulated badness/class lookup tables for the DP, keyed by `max_width`.
+///
+/// The tables depend only on `max_width`, which is fixed per render batch
+/// (`DiagOpts`), but `wrap_dp` runs once per paragraph per message.  So they
+/// live in a thread-local keyed by `max_width`: a batch of renders builds
+/// them once, and only a change of `max_width` rebuilds.  Hoisted out of
+/// `wrap_dp` so a multi-paragraph message does one TLS access + one `Rc`
+/// clone per *message* instead of one per *paragraph*; the `Rc` is handed
+/// down to every `wrap_dp` call.  Each table is ~7 KB (`[u8;801]` +
+/// `[f64;801]`), so the 8-slot TLS worst case is ~56 KB.
+const MAX_TABLE_WIDTH: usize = 800;
+struct WrapTables {
+    max_width: usize,
+    class: [u8; MAX_TABLE_WIDTH + 1],
+    badness: [f64; MAX_TABLE_WIDTH + 1],
+}
+thread_local! {
+    /// A small per-thread cache of badness/class tables, keyed by `max_width`.
+    /// Eight slots (≈56 KB TLS worst case): the *actual* key churn is
+    /// intra-render — one diagnostic wraps the header, label connector, note,
+    /// help and diff block at 5–6 distinct widths — so a two-slot cache
+    /// evicted and rebuilt the ~11 KB table several times per diagnostic.
+    /// Eviction is LRU-by-last-use.
+    static WRAP_TABLES: std::cell::RefCell<SmallVec<[std::rc::Rc<WrapTables>; 8]>> =
+        std::cell::RefCell::new(SmallVec::new());
+    /// Reentrancy flag for the scratch borrow (see `wrap_optimal`).
+    static WRAP_IN_USE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Per-thread `WrapScratch` reused across every `wrap_optimal` call on
+    /// this thread (see the call site): one-time growth per thread instead
+    /// of up to five `SmallVec` growths per wrapping message.
+    static WRAP_SCRATCH: std::cell::RefCell<WrapScratch> =
+        std::cell::RefCell::new(WrapScratch::new());
+}
+
+/// The badness/class tables for `max_width`, or `None` when the width
+/// exceeds the tabulation bound (the DP then computes inline).
+fn wrap_tables(max_width: usize) -> Option<std::rc::Rc<WrapTables>> {
+    if max_width > MAX_TABLE_WIDTH {
+        return None;
+    }
+    Some(WRAP_TABLES.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // LRU-by-last-use: move a hit to the back so the widths that recur
+        // within one render are the ones that survive eviction.
+        if let Some(pos) = slot.iter().position(|t| t.max_width == max_width) {
+            let t = slot.remove(pos);
+            slot.push(std::rc::Rc::clone(&t));
+            return t;
+        }
+        let inv_measure = 1.0 / (max_width.max(1) as f64);
+        // Built on the stack and moved into the `Rc` once: the old
+        // `Rc::from(Box::new(..))` allocated the heap box and then a
+        // second `Rc` cell, copying the ~4.6 KB table between them.
+        let mut t = WrapTables {
+            max_width,
+            class: [0; MAX_TABLE_WIDTH + 1],
+            badness: [0.0; MAX_TABLE_WIDTH + 1],
+        };
+        for lw in 0..=max_width {
+            t.class[lw] = fitness_class(lw, max_width);
+            t.badness[lw] = intrinsic_badness(lw, max_width, inv_measure, false);
+        }
+        let rc = std::rc::Rc::new(t);
+        if slot.len() >= 8 {
+            slot.remove(0);
+        }
+        slot.push(std::rc::Rc::clone(&rc));
+        rc
+    }))
+}
+
+/// Scratch buffers shared by every `wrap_dp` call of one `wrap_optimal`:
+/// each is cleared and re-sized per paragraph while its capacity — and its
+/// heap allocation, once a paragraph outgrows the inline store — is kept
+/// across paragraphs.  Turns 5 allocations per paragraph into at most 5 per
+/// message.
+struct WrapScratch {
+    pws: SmallVec<[usize; 8]>,
+    dp: SmallVec<[f64; 32]>,
+    prev: SmallVec<[u32; 32]>,
+    reachable: SmallVec<[bool; 32]>,
+    best_cost: SmallVec<[[f64; N_FITNESS]; 8]>,
+    best_src: SmallVec<[[u32; N_FITNESS]; 8]>,
+    /// Word buffer for one paragraph, reused across paragraphs.
+    words: SmallVec<[Word; 16]>,
+    /// Break-opportunity buffer for one paragraph, reused across paragraphs.
+    /// `ascii_break_opportunities` / `uax_break_opportunities` used to
+    /// allocate a fresh `SmallVec` per paragraph; a long message with many
+    /// paragraphs paid that allocator churn on every one.
+    breaks: SmallVec<[usize; 16]>,
+}
+
+impl WrapScratch {
+    fn new() -> Self {
+        WrapScratch {
+            pws: SmallVec::new(),
+            dp: SmallVec::new(),
+            prev: SmallVec::new(),
+            reachable: SmallVec::new(),
+            best_cost: SmallVec::new(),
+            best_src: SmallVec::new(),
+            words: SmallVec::new(),
+            breaks: SmallVec::new(),
+        }
+    }
+}
+
+fn wrap_dp(
+    words: &[Word],
+    max_width: usize,
+    tables: Option<&WrapTables>,
+    scratch: &mut WrapScratch,
+) -> SmallVec<[Range<usize>; 4]> {
     let n = words.len();
     if n == 0 {
         return SmallVec::new();
@@ -562,29 +1060,73 @@ fn wrap_dp(words: &[Word], max_width: usize) -> SmallVec<[Range<usize>; 4]> {
     if n == 1 {
         // One word, one line: exactly what the loop below computes, minus the
         // bookkeeping.
-        return smallvec![words[0].range.clone()];
+        return smallvec![words[0].range()];
     }
 
-    // Prefix sums over widths and inter-word spaces, so line width for any
-    // [i, j) slice is O(1).
-    let mut pw: SmallVec<[usize; 32]> = smallvec![0usize; n + 1];
-    let mut ps: SmallVec<[usize; 32]> = smallvec![0usize; n + 1];
+    // One fused prefix array: `pws[m] = Σ_{k<m} (width_k + trailing_space_k)`.
+    // The line covering `words[i..j)` then measures `base_j - pws[i]` where
+    // `base_j = pws[j] - trailing_space_{j-1}` (the last word's trailing space
+    // is dropped at the break) — one load and one subtract per candidate,
+    // vs. four loads and three ops over the two separate arrays.
+    let WrapScratch {
+        pws,
+        dp,
+        prev,
+        reachable,
+        best_cost,
+        best_src,
+        words: _,
+        breaks: _,
+    } = scratch;
+    pws.clear();
+    pws.resize(n + 1, 0);
     for (i, w) in words.iter().enumerate() {
-        pw[i + 1] = pw[i] + w.width;
-        ps[i + 1] = ps[i] + w.trailing_space;
+        pws[i + 1] = pws[i] + w.width as usize + w.trailing_space as usize;
     }
 
     // Hoisted once for the whole DP: `intrinsic_badness` would otherwise
     // recompute the `max` + `as f64` cast on every candidate line.
     let measure = max_width.max(1) as f64;
+    let inv_measure = 1.0 / measure;
+
+    // Precomputed lookup tables for the inner loop: `class_tab[lw]` =
+    // `fitness_class(lw, max_width)` and `badness_tab[lw]` =
+    // `intrinsic_badness(lw, max_width, inv_measure, false)` for every legal
+    // line width `lw <= max_width`.  The inner loop's div-and-multiply badness
+    // computation (~30 cycles) and 3-compare class computation collapse to
+    // two indexed loads (~4 cycles) — a 3–4× reduction of the hottest loop.
+    // Last-line badness for `lw <= max_width` is always 0, so the table stores
+    // only the non-last-line value; the `is_last_line` branch is uniform
+    // across every candidate for a fixed `j` and thus perfectly predicted.
+    // Over-wide lines (`lw > max_width`) fall back to inline computation —
+    // identical to the previous behavior.
+    //
+    // The tables are hoisted one level further: `wrap_optimal` fetches them
+    // once per message and passes `&WrapTables` down, so a multi-paragraph
+    // message pays one TLS access instead of one per paragraph.
+    let use_table = tables.is_some();
+    let (class_tab, badness_tab): (&[u8], &[f64]) = match tables {
+        Some(t) => (&t.class[..], &t.badness[..]),
+        None => (&[], &[]),
+    };
 
     let n_states = (n + 1) * N_FITNESS;
-    let mut dp: SmallVec<[f64; 128]> = smallvec![f64::INFINITY; n_states];
-    let mut prev: SmallVec<[u32; 128]> = smallvec![u32::MAX; n_states];
+    // All five buffers come from the shared `WrapScratch`: `clear` +
+    // `resize` keeps their capacity (and any heap allocation) across the
+    // paragraphs of one `wrap_optimal` call.  `dp`/`prev` are fully
+    // overwritten via resize-with-init below, so stale contents are
+    // harmless; `reachable` is reset to all-false the same way.
+    dp.clear();
+    dp.resize(n_states, f64::INFINITY);
+    prev.clear();
+    prev.resize(n_states, u32::MAX);
+    reachable.clear();
+    reachable.resize(n_states, false);
     // `j == 0` is the empty prefix: nothing sits above the first line, so all
     // entry classes are free.
     for c in 0..N_FITNESS {
         dp[c] = 0.0;
+        reachable[c] = true;
     }
 
     // Min-plus precomputation over fitness classes.  For each prefix end `i`
@@ -602,9 +1144,10 @@ fn wrap_dp(words: &[Word], max_width: usize) -> SmallVec<[Range<usize>; 4]> {
     // For `i == 0` the first line has no predecessor, so the jump term is
     // zero regardless of class: `best_cost[0][*] = 0.0`, `best_src[0][*] = 0`.
     // This unifies the old `i == 0` special case into the same lookup.
-    let mut best_cost: SmallVec<[[f64; N_FITNESS]; 32]> =
-        smallvec![[f64::INFINITY; N_FITNESS]; n + 1];
-    let mut best_src: SmallVec<[[u32; N_FITNESS]; 32]> = smallvec![[0; N_FITNESS]; n + 1];
+    best_cost.clear();
+    best_cost.resize(n + 1, [f64::INFINITY; N_FITNESS]);
+    best_src.clear();
+    best_src.resize(n + 1, [0; N_FITNESS]);
     for class in 0..N_FITNESS {
         best_cost[0][class] = 0.0;
     }
@@ -623,30 +1166,55 @@ fn wrap_dp(words: &[Word], max_width: usize) -> SmallVec<[Range<usize>; 4]> {
     let mut i_lo = 0usize;
     for j in 1..=n {
         let is_last_line = j == n;
-        let mut lw_lo = line_width(&pw, &ps, i_lo, j);
+        // Hoisted per `j`: every candidate line ending at `j` measures
+        // `base_j - pws[i]`, and `base_j` is independent of `i`.
+        let base_j = pws[j] - words[j - 1].trailing_space as usize;
+        let mut lw_lo = base_j - pws[i_lo];
         while i_lo + 1 < j && lw_lo > max_width {
             i_lo += 1;
-            lw_lo = line_width(&pw, &ps, i_lo, j);
+            lw_lo = base_j - pws[i_lo];
         }
         // First candidate reuses `lw_lo` from the window advance above,
         // avoiding a redundant `line_width` call per `j`.
         {
-            let class = fitness_class(lw_lo, max_width) as usize;
-            let base = intrinsic_badness(lw_lo, max_width, measure, is_last_line);
+            let (class, base) = if use_table && lw_lo <= max_width {
+                let c = class_tab[lw_lo] as usize;
+                let b = if is_last_line { 0.0 } else { badness_tab[lw_lo] };
+                (c, b)
+            } else {
+                (
+                    fitness_class(lw_lo, max_width) as usize,
+                    intrinsic_badness(lw_lo, max_width, inv_measure, is_last_line),
+                )
+            };
             let s = j * N_FITNESS + class;
             let cost = best_cost[i_lo][class] + base;
             if cost < dp[s] {
                 dp[s] = cost;
                 prev[s] = best_src[i_lo][class];
+                reachable[s] = true;
             }
         }
         for i in (i_lo + 1)..j {
-            // Width of the line covering words[i..j): word widths, plus the
-            // inter-word spaces, minus the *trailing* space of the last word
-            // (dropped at the break).
-            let lw = line_width(&pw, &ps, i, j);
-            let class = fitness_class(lw, max_width) as usize;
-            let base = intrinsic_badness(lw, max_width, measure, is_last_line);
+            // Width of the line covering words[i..j): `pws` is monotone and
+            // `trailing_space_{j-1} ≤ pws[j] - pws[i]` for `i < j`, so this
+            // is the same quantity the two-array form computed.  The `i_lo`
+            // window advance above guarantees `lw <= max_width` for every
+            // `i > i_lo` (`pws` is monotone, so larger `i` yields smaller
+            // `lw`; the first candidate — which *can* be over-wide — is
+            // handled separately before this loop).
+            let lw = base_j - pws[i];
+            debug_assert!(lw <= max_width, "i_lo window must guarantee legal-width lines");
+            let (class, base) = if use_table {
+                let c = class_tab[lw] as usize;
+                let b = if is_last_line { 0.0 } else { badness_tab[lw] };
+                (c, b)
+            } else {
+                (
+                    fitness_class(lw, max_width) as usize,
+                    intrinsic_badness(lw, max_width, inv_measure, is_last_line),
+                )
+            };
             let s = j * N_FITNESS + class;
             // `best_cost[i][class]` already folds the `min_pc` over the
             // predecessor's fitness class; `base` is independent of `pc`.
@@ -656,14 +1224,108 @@ fn wrap_dp(words: &[Word], max_width: usize) -> SmallVec<[Range<usize>; 4]> {
             if cost < dp[s] {
                 dp[s] = cost;
                 prev[s] = best_src[i][class];
+                reachable[s] = true;
             }
         }
         // `dp[j]` is now final — no future iteration writes it.  Precompute
         // the min-plus convolution for outer iterations `j' > j` that will
         // use `j` as a predecessor.  Skip `j == n`: its `best_prev` is never
         // read (there is no `j' > n`).
-        if j < n {
-            let j0 = j * N_FITNESS;
+        let j0 = j * N_FITNESS;
+        // Skip the min-plus precompute when no state at `j` is reachable —
+        // the inner loop would do 4×4 `INFINITY + JUMP` additions and
+        // comparisons only to leave `best_cost[j]` at `INFINITY` (its
+        // initial value).  Checking all four fitness classes at `j` is
+        // required: different classes can have different reachability.
+        // Reads the one-byte `reachable` mirror instead of four `f64`s.
+        if j < n
+            && (reachable[j0]
+                || reachable[j0 + 1]
+                || reachable[j0 + 2]
+                || reachable[j0 + 3])
+        {
+            // The full 4×4 `pc` scan is load-bearing — restricting the
+            // argmin to `pc ∈ {class-1, class, class+1}` is unsound.
+            //
+            // The argument for pruning only bounds the *jump* term:
+            // `JUMP[class][pc]` is zero for `|class - pc| ≤ 1` and
+            // ≥ FITNESS_STEP_DEMERIT otherwise. But the minimised quantity
+            // is `dp[j][pc] + JUMP[class][pc]`, and `dp[j][pc]` is not
+            // comparable across classes. Witness with `class = 0` (Tight)
+            // and FITNESS_STEP_DEMERIT = 1/16:
+            //
+            //     pc   class      dp[j][pc]   JUMP[0][pc]    total
+            //     0    Tight      0.20        0.0           0.20
+            //     1    Normal     0.18        0.0           0.18
+            //     2    Loose      0.05        0.0625        0.1125  ← min
+            //     3    VeryLoose  0.03        0.125         0.155
+            //
+            // `pc = 2` is two classes away from `class = 0` and pays a
+            // non-zero jump, yet wins because `dp[j][2]` is far cheaper
+            // than `dp[j][0]` or `dp[j][1]`. An adjacent-only band discards
+            // the true optimum.
+            //
+            // Reachability of the witness: `dp[j][0]` (last line Tight)
+            // can carry a large accumulated cost if reaching Tight required
+            // jumping out of a Loose/VeryLoose predecessor earlier, while
+            // `dp[j][2]` (last line Loose) can be cheaper if reached
+            // smoothly. Cumulative cost is unbounded in `n`, so the spread
+            // `dp[j][0] - dp[j][2]` can exceed `2·FITNESS_STEP_DEMERIT =
+            // 0.125` — no invariant bounds the cross-class gap. The only
+            // universal lower bound is `dp[j][class] ≥ intrinsic(last line
+            // of that class)`, and it goes the wrong way (Tight has the
+            // smallest intrinsic cost), so it cannot rescue pruning.
+            //
+            // The `adjacent_lines_resist_a_jagged_edge` test pins this
+            // tradeoff: the DP picks a slightly worse-intrinsic layout
+            // because the smoother jump sequence wins, and that decision
+            // depends on evaluating cross-class predecessors.
+            //
+            // Cost of the 4×4: ~16 adds + 12 compares per `j` (≈28 ops),
+            // dominated by the O(n·k) `(i, j)` transition for realistic `n`.
+            // (Monge/SMAWK note, since the structure is real and the
+            // pruning temptation above sometimes mutates into a SMAWK
+            // suggestion: for a fixed class `c` the `(i, j)` transition
+            // matrix is `M[i][j] = best_cost[i][c] + g(base_j - pws[i])`
+            // with `g` convex. Per-row offsets *preserve* Monge —
+            // `A[i] + A[i+1]` cancels exactly in the Monge inequality — so
+            // `best_cost[i][c]` being an arbitrary function of `i` does not
+            // break the structure, and `g`'s convexity (both branches, with
+            // `g'(M-) = g'(M+) = 0`) makes `C` Monge. SMAWK therefore
+            // applies in principle, but the matrix is revealed online —
+            // row `i` is only evaluable once `dp[i]` is finalised — so the
+            // applicable variant is Larmore-Schieber at O(n·α(n)), not
+            // classic offline SMAWK. The blocker is the constant factor:
+            // Larmore-Schieber's per-comparison cost is ~30-50 ops versus
+            // the current monotone-`i_lo` window's ~10-15, and for the
+            // `n ≈ 5-50`, `k ≈ 5-20` of diagnostic wrapping the asymptotic
+            // win is eaten by constants. The cheap middle ground — a
+            // monotone argmin pointer `max(i_lo, i_star_{j-1})` — is valid
+            // (column argmin of a Monge matrix is monotone in `j`, and the
+            // proof uses only the Monge condition, so the per-row offset
+            // does not break it) but gains nothing in practice: on a
+            // non-last line the optimum is the most-filled legal line,
+            // `i*(j) ≈ i_lo(j)`, so the pointer sits at `i_lo` and skips
+            // nothing. Larmore-Schieber does win decisively once
+            // `n ≳ 500` and `k ≳ 15` — roughly a 3-5× speedup — which
+            // the current `perf_wrap_optimal` long-prose case (~130
+            // words) does not yet reach. Realistic triggers:
+            // `explain_error_code` wrapping a multi-KB explanation body,
+            // a diagnostic whose message is a long prose paragraph of
+            // short 2-3-char words (large `n` and large `k` at once), or
+            // a future caller that wraps a whole file's contents.)
+            //
+            // Decision (recorded so this does not get "optimised" back):
+            // keep the naive monotone window.  Crossover is
+            // `n* ≈ 2·c_LS·α(n)/c_scan` ≈ 10-15 for the mid constants
+            // (c_scan 10-15, c_LS 30-50, α≈1-2), and the pointer pins to
+            // `i_lo` in this workload, so LS would pay its bookkeeping and
+            // prune nothing.  Revisit only with a measured `n ≳ 10²-10³`
+            // unclosed-window workload; the block-matrix LS variant is
+            // additionally invalid for a general jump matrix `J` (the
+            // lexicographic block order is Monge only for an additively
+            // separable `J`), so a future attempt must keep the 4 classes
+            // as 4 independent per-class recurrences.
             for class in 0..N_FITNESS {
                 let mut bc = f64::INFINITY;
                 let mut bp = 0u32;
@@ -692,24 +1354,31 @@ fn wrap_dp(words: &[Word], max_width: usize) -> SmallVec<[Range<usize>; 4]> {
     let mut ranges: SmallVec<[Range<usize>; 4]> = SmallVec::new();
     let mut s = n * N_FITNESS + c;
     loop {
+        let pj = prev[s];
+        debug_assert!(
+            pj != u32::MAX,
+            "wrap_dp backtracked into an unreachable terminal state"
+        );
+        // Release-mode guard: a renderer bug must never turn into a panic
+        // (or an OOB index via `u32::MAX / N_FITNESS`) over its own output.
+        if pj == u32::MAX {
+            // Fallback: one word per line, the always-valid layout.
+            ranges.clear();
+            for w in words {
+                ranges.push(w.start as usize..w.end as usize);
+            }
+            return ranges;
+        }
         let j = s / N_FITNESS;
-        let i = (prev[s] as usize) / N_FITNESS;
-        ranges.push(words[i].range.start..words[j - 1].range.end);
+        let i = (pj as usize) / N_FITNESS;
+        ranges.push(words[i].start as usize..words[j - 1].end as usize);
         if i == 0 {
             break;
         }
-        s = prev[s] as usize;
+        s = pj as usize;
     }
     ranges.reverse();
     ranges
-}
-
-/// Width of the line covering `words[i..j)`: the words' widths plus the glue
-/// between them — every `trailing_space` except the last word's, which is
-/// dropped at the break.
-#[inline]
-fn line_width(pw: &[usize], ps: &[usize], i: usize, j: usize) -> usize {
-    (pw[j] - pw[i]) + (ps[j - 1] - ps[i])
 }
 
 /// Cost of one line given the fitness class of the line directly above it.
@@ -735,26 +1404,24 @@ fn line_width(pw: &[usize], ps: &[usize], i: usize, j: usize) -> usize {
 #[inline]
 #[allow(dead_code)] // tests only
 fn badness(prev_class: Option<u8>, line_width: usize, max_width: usize, is_last_line: bool) -> f64 {
-    let measure = max_width.max(1) as f64;
-    intrinsic_badness(line_width, max_width, measure, is_last_line)
+    let inv_measure = 1.0 / (max_width.max(1) as f64);
+    intrinsic_badness(line_width, max_width, inv_measure, is_last_line)
         + fitness_jump(prev_class, fitness_class(line_width, max_width))
 }
 
 /// Single-line (pre-adjacency) badness: cubed slack, zero on the last line,
 /// cubic overflow with a large multiplier otherwise.
 ///
-/// `measure` is `max_width.max(1) as f64`, hoisted by the caller so the DP's
-/// inner loop does not recompute the `max` + cast per candidate.  Passing the
-/// reciprocal would let the slack ratio become a multiply, but the cubed slack
-/// still needs a divide-free form only if the whole expression is tabled; the
-/// hoist alone removes the redundant `max`/cast from the hottest path.
+/// `inv_measure` is `1.0 / (max_width.max(1) as f64)`, hoisted by the caller:
+/// the slack ratio becomes a multiply, so both the table build and the
+/// over-`MAX_TABLE_WIDTH` fallback are divide-free.
 #[inline]
-fn intrinsic_badness(line_width: usize, max_width: usize, measure: f64, is_last_line: bool) -> f64 {
+fn intrinsic_badness(line_width: usize, max_width: usize, inv_measure: f64, is_last_line: bool) -> f64 {
     if line_width <= max_width {
         if is_last_line {
             0.0
         } else {
-            let slack = (max_width - line_width) as f64 / measure;
+            let slack = (max_width - line_width) as f64 * inv_measure;
             slack * slack * slack
         }
     } else {
@@ -778,13 +1445,15 @@ fn intrinsic_badness(line_width: usize, max_width: usize, measure: f64, is_last_
 ///
 /// Integer comparisons instead of `f64` division: `4*empty < measure` ⇔
 /// `empty/measure < 0.25` when `measure > 0`, and so on for the 1/2 and 3/4
-/// boundaries.  `empty` and `measure` are at most a few thousand, so
-/// `4 * empty` cannot overflow `usize`.  The `max(1)` guard keeps `measure`
-/// nonzero and preserves the original `max_width == 0` behaviour.
+/// boundaries.  The comparisons run in `u128`: `max_width` is untrusted
+/// (it comes from `--width` / `COLUMNS`), and for `max_width > usize::MAX / 4`
+/// the naive `4 * empty` (or `3 * measure`) would wrap and silently produce
+/// the wrong fitness class on the one path (`wrap_optimal`'s inline DP) that
+/// still runs above `MAX_TABLE_WIDTH`.
 #[inline]
 fn fitness_class(line_width: usize, max_width: usize) -> u8 {
-    let measure = max_width.max(1);
-    let empty = max_width.saturating_sub(line_width);
+    let measure = max_width.max(1) as u128;
+    let empty = max_width.saturating_sub(line_width) as u128;
     if 4 * empty < measure {
         0
     } else if 2 * empty < measure {
@@ -828,6 +1497,15 @@ mod tests {
     /// `joined` relies on.
     fn concatenated(out: &[Cow<'_, str>]) -> String {
         out.concat()
+    }
+
+    /// The `SmallVec<[Word; 16]>` inline footprint depends on `Word` being
+    /// 16 bytes: one more `usize`-shaped field silently returns it to 24 or
+    /// 32 bytes, doubling the inline array back to 384–512 B and
+    /// reintroducing the cache pressure the `u32` packing removes.
+    #[test]
+    fn word_struct_is_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<Word>(), 16);
     }
 
     #[test]
@@ -962,15 +1640,25 @@ mod tests {
                 if text.is_empty() {
                     want = vec![""]; // `wrap_optimal`'s early return
                 } else if max_width == 0 {
-                    want = text.split('\n').collect();
+                    // Same `split_terminator` semantics as `wrap_optimal`'s
+                    // width-0 branch (trailing `\n` never adds a segment).
+                    want = text.split_terminator('\n').collect();
                 } else {
                     for &para in &paras[..n_paras] {
                         if para.is_empty() {
                             want.push("");
                             continue;
                         }
-                        let words = collect_words(para, max_width, tab_width);
-                        for r in wrap_dp(&words, max_width) {
+                        let words = collect_words(para, max_width, tab_width, None);
+                        if words.is_empty() {
+                            // Whitespace-only paragraph: `wrap_optimal`
+                            // preserves it as an empty segment (layout, not
+                            // noise); the DP has no words to lay out.
+                            want.push("");
+                            continue;
+                        }
+                        let mut scratch = WrapScratch::new();
+                        for r in wrap_dp(&words, max_width, wrap_tables(max_width).as_deref(), &mut scratch) {
                             want.push(&para[r]);
                         }
                     }
@@ -978,6 +1666,30 @@ mod tests {
                 assert_eq!(got, want, "text={text:?} max_width={max_width}");
             }
         }
+    }
+
+    /// Width 0 must use the same `split_terminator` paragraph semantics as
+    /// every other width: a trailing `\n` never creates a phantom empty
+    /// segment (regression: the width-0 branch used `split('\n')`, so
+    /// `"a\n"` yielded `["a", ""]` at width 0 but `["a"]` at width 80).
+    #[test]
+    fn zero_width_matches_split_terminator_semantics() {
+        fn w(t: &str) -> Vec<&str> {
+            // The width-0 branch only ever returns `Cow::Borrowed` segments
+            // (verbatim paragraphs), so borrowing the input is exact.
+            wrap_optimal(t, 0, 4)
+                .into_iter()
+                .map(|c| match c {
+                    Cow::Borrowed(s) => s,
+                    Cow::Owned(_) => panic!("width-0 path must borrow"),
+                })
+                .collect()
+        }
+        assert_eq!(w("a\n"), ["a"]);
+        assert_eq!(w("\n"), [""]);
+        assert_eq!(w("\n\n"), ["", ""]);
+        assert_eq!(w("a\nb"), ["a", "b"]);
+        assert_eq!(w(""), [""]);
     }
 
     /// Greedy fails when a run of short words lets it nearly fill an early
@@ -1127,7 +1839,7 @@ mod tests {
         let mut accepted = 0usize;
         for s in &shapes {
             let want = uax_break_opportunities(s);
-            match ascii_break_opportunities(s) {
+            match ascii_break_opportunities(s, None) {
                 Some(got) => {
                     accepted += 1;
                     assert_eq!(got, want, "break mismatch for {s:?}");
@@ -1142,13 +1854,13 @@ mod tests {
 
         // The grave accent is `AL`, so `` ` `` + spaces + opener does not
         // decline (LB15 does not fire).
-        assert!(ascii_break_opportunities("x ` (y").is_some());
-        assert!(ascii_break_opportunities("x ` [y").is_some());
+        assert!(ascii_break_opportunities("x ` (y", None).is_some());
+        assert!(ascii_break_opportunities("x ` [y", None).is_some());
 
         // Anything non-ASCII or with a tab must decline rather than guess.
-        assert!(ascii_break_opportunities("a\tb").is_none());
-        assert!(ascii_break_opportunities("a\u{3042}b").is_none());
-        assert!(ascii_break_opportunities("a\u{200B}b").is_none());
+        assert!(ascii_break_opportunities("a\tb", None).is_none());
+        assert!(ascii_break_opportunities("a\u{3042}b", None).is_none());
+        assert!(ascii_break_opportunities("a\u{200B}b", None).is_none());
     }
 
     /// `trimmed_len` must agree with the Unicode predicate it stands in for,
@@ -1296,7 +2008,7 @@ mod tests {
     /// Sum of each line's intrinsic badness only — what the pre-adjacency DP
     /// minimised, kept so tests can show the flip comes from adjacency alone.
     fn intrinsic_total(lines: &[String], max_width: usize, tab_width: usize) -> f64 {
-        let measure = max_width.max(1) as f64;
+        let inv_measure = 1.0 / (max_width.max(1) as f64);
         lines
             .iter()
             .enumerate()
@@ -1304,7 +2016,7 @@ mod tests {
                 intrinsic_badness(
                     measure_width(l, tab_width),
                     max_width,
-                    measure,
+                    inv_measure,
                     idx + 1 == lines.len(),
                 )
             })

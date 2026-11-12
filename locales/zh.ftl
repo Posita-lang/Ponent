@@ -1,6 +1,18 @@
 # Chinese messages. Slugs match en.ftl exactly; never translate a slug.
 
 comptime-error = 编译期错误：{ $e }
+comptime-step-limit = 超出编译期步数限制（可能存在无限循环）
+comptime-division-by-zero = 编译期表达式除以零
+comptime-overflow = 编译期表达式整数溢出
+comptime-type-error = 编译期类型错误：{ $e }
+comptime-assertion-failed = 编译期断言失败：{ $e }
+comptime-unknown-identifier = 编译期未知标识符：{ $e }
+comptime-not-allowed = 编译期不允许：{ $e }
+comptime-deferred = 表达式无法在编译期求值
+comptime-sandbox-violation = 编译期沙箱违规：{ $e }
+comptime-memory-limit = 编译期内存超限：{ $e }
+comptime-internal = 编译期内部错误：{ $e }
+comptime-call-stack-header = 编译期调用栈（最近调用在前）：
 trait-solver-error = trait 求解器错误：{ $msg }
 type-mismatch = 类型不匹配：期望 `{ $expected }`，得到 `{ $found }`
 argument-type-mismatch = 调用 `{ $callee }` 时实参类型不匹配：参数 `{ $param }` 期望 `{ $expected }`，得到 `{ $found }`
@@ -8,6 +20,7 @@ contract-non-bool = `{ $clause }` 子句必须为布尔值，得到 `{ $found }`
 impl-missing-method = `{ $trait }` 的 impl 缺少方法 `{ $method }`
 duplicate-definition = 重复定义 `{ $name }`
 field-not-found = 类型 `{ $type }` 中没有字段 `{ $field }`
+name-not-found = 未找到名称：`{ $name }`
 main-not-found = crate 中没有找到 `main` 函数
 set-no-destructuring = `set` 不支持解构，请使用 `let`
 let-requires-initializer = `let` 需要显式初始化
@@ -80,3 +93,8 @@ run-explain-hint-detail = 请使用有效的错误码运行 `ponent explain <COD
 run-explain-hint-example = 请使用有效的错误码运行 `ponent explain <CODE>`（例如 `ponent explain E030`）
 run-explain-detail = 运行 `ponent explain <CODE>` 以获取特定错误码的详细信息。
 unknown-error = 未知错误
+
+# Batch trailers / fold marker / call-chain header (renderers)
+suppressed-note = 抑制了 { $count } 个额外错误
+fold-marker-lines = 省略了 { $gap } 行
+chain-header = 被引用于:

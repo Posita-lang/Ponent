@@ -57,3 +57,17 @@ jobs:
         run: |
           cargo install cargo-deny --locked
           cargo deny check
+
+  lean:
+    name: Lean (UnderlineLanes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Lean witnesses live with the research note; lean-action reads the
+      # toolchain file and lakefile from that package directory and runs
+      # `lake build` (including the mathlib cache).
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: research/underline-lanes/lean
+          use-github-cache: true
+          use-mathlib-cache: true

@@ -3,7 +3,8 @@ use crate::ast::{Attribute, BinOp, Expr, Literal, UnaryOp};
 use crate::diagnostics::ErrCode;
 use crate::diagnostics::{DiagCtxt, Diagnostic};
 use crate::hir::target::Target;
-use crate::sat::{SolveResult, Solver};
+use crate::sat::puto::Solver;
+use crate::sat::SolveResult;
 use crate::symbol::Symbol;
 use std::collections::HashMap;
 
@@ -394,7 +395,7 @@ pub fn is_provably_reachable<'input>(
 
     match solver.solve() {
         SolveResult::Sat(_) => true,
-        SolveResult::Unsat => false,
+        SolveResult::Unsat { .. } => false,
         SolveResult::Unknown => {
             let msg = format!(
                 "@cfg condition is too complex for precise satisfiability checking — \
@@ -933,7 +934,7 @@ mod tests {
         let mut var_counter = 1;
         let mut var_keyvals = std::collections::HashMap::new();
 
-        let mut solver = crate::sat::Solver::new();
+        let mut solver = crate::sat::puto::Solver::new();
         let clauses = build_clauses(
             &expr,
             &mut var_map,

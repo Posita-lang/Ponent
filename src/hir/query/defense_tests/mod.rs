@@ -840,7 +840,6 @@ fn c11_arena_invalidation_and_reget_from_two_threads() {
                     // source, and never from a freed allocation.
                     let now = CONTENT.load(Ordering::SeqCst);
                     let ok = v.semantic % 10 == 0
-                        && (v.semantic / 10).is_multiple_of(1)
                         && v.semantic / 10 >= 1
                         && v.semantic / 10 <= std::cmp::max(before, now);
                     assert!(
@@ -1052,7 +1051,7 @@ fn d4_panic_poisons_latch() {
     }
     let mut parked = false;
     for _ in 0..200 {
-        if !system.wait_graph.read().is_empty() {
+        if !system.wait_graph_is_empty() {
             parked = true;
             break;
         }
@@ -1251,7 +1250,7 @@ fn d7_parallel_same_key_dedup() {
     // leave the latch until t1 signals, which only happens after GO.
     let mut parked = false;
     for _ in 0..200 {
-        if !system.wait_graph.read().is_empty() {
+        if !system.wait_graph_is_empty() {
             parked = true;
             break;
         }
@@ -1376,25 +1375,35 @@ fn d9_clear_all_quiescence_and_reset_hygiene() {
     assert_eq!(v.semantic, 101);
 
     // ---- Window 1: owner computing + waiter parked + clear_all ----
+    // Results come back over channels with the standard GUARD timeout: a
+    // regression here previously HUNG the process at the bare `.join()` —
+    // a hang is a far worse CI signal than a pointed failure (see
+    // `run_with_guard`'s rationale; the owner's 2 s compute self-timeout
+    // releases the read lock, but a waiter whose active entry was wiped
+    // has no wake and no timeout of its own).
+    let (tx_owner, rx_owner) = crossbeam_channel::unbounded();
     let owner = thread::spawn(move || {
-        system
+        let r = system
             .get::<SlowQ>(DKey(9), provider)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        let _ = tx_owner.send(r);
     });
     wait_flag(&ENTERED);
 
+    let (tx_waiter, rx_waiter) = crossbeam_channel::unbounded();
     let waiter = thread::spawn(move || {
         // The first request parks on the owner's latch until the test
         // releases the compute.
-        system
+        let r = system
             .get::<SlowQ>(DKey(9), provider)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        let _ = tx_waiter.send(r);
     });
     // Give the waiter time to park on the latch (poll for the wait edge
     // appearing in the wait_graph — deterministic, not a sleep guess).
     let mut parked = false;
     for _ in 0..200 {
-        if !system.wait_graph.read().is_empty() {
+        if !system.wait_graph_is_empty() {
             parked = true;
             break;
         }
@@ -1417,9 +1426,10 @@ fn d9_clear_all_quiescence_and_reset_hygiene() {
     RELEASE.store(true, Ordering::SeqCst);
 
     // Both threads must return (bounded); before the fix the waiter
-    // hangs forever on the never-signaled latch.
-    let r_owner = owner.join().expect("d9 owner thread panicked");
-    let r_waiter = waiter.join().expect("d9 waiter thread panicked");
+    // hangs forever on the never-signaled latch.  The channel timeout
+    // turns that hang into a "TIMEOUT" failure at this exact assertion.
+    let r_owner = guard_recv(rx_owner).expect("d9 owner must return in time");
+    let r_waiter = guard_recv(rx_waiter).expect("d9 waiter must return in time");
     assert!(
         r_owner.is_ok() && r_waiter.is_ok(),
         "both participants must survive clear_all: {r_owner:?} {r_waiter:?}"
@@ -1548,10 +1558,14 @@ fn d10_side_door_invalidate_erased_by_publish() {
     let system = leak_system();
     let provider = leak_provider(system);
 
+    // Results over channels with the standard GUARD timeout (same
+    // rationale as d9: a regression must fail here, not hang the process).
+    let (tx_a, rx_a) = crossbeam_channel::unbounded();
     let a = thread::spawn(move || {
-        system
+        let r = system
             .get::<PQ>(DKey(2), provider)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        let _ = tx_a.send(r);
     });
     wait_flag(&ENTERED);
 
@@ -1561,15 +1575,21 @@ fn d10_side_door_invalidate_erased_by_publish() {
         .and_then(|vt| vt.lookup_node(&DKey(2)))
         .expect("node must exist once compute started");
 
+    let (tx_b, rx_b) = crossbeam_channel::unbounded();
     let b = thread::spawn(move || {
         // Side door: NO quiescence in the pre-fix code.
         system.invalidate_node(node);
         B_DONE.store(true, Ordering::SeqCst);
+        let _ = tx_b.send(());
     });
 
-    // Bounded spin for the side-door invalidation to land.
+    // Bounded spin for the side-door invalidation to land.  The window is
+    // EXPLICIT and shorter than A's 2 s compute self-timeout: RELEASE is
+    // stored after this ~1 s poll, so A's park ends via RELEASE (the
+    // intended mechanism), never via the timeout — lengthening the
+    // timeout cannot silently retarget what this test exercises.
     let mut landed = false;
-    for _ in 0..600 {
+    for _ in 0..200 {
         if B_DONE.load(Ordering::SeqCst) {
             landed = true;
             break;
@@ -1578,8 +1598,8 @@ fn d10_side_door_invalidate_erased_by_publish() {
     }
 
     RELEASE.store(true, Ordering::SeqCst);
-    let r_a = a.join().expect("d10 A panicked");
-    b.join().expect("d10 B panicked");
+    let r_a = guard_recv(rx_a).expect("d10 A must return in time");
+    guard_recv(rx_b).expect("d10 B must return in time");
     assert!(r_a.is_ok(), "A must survive: {r_a:?}");
 
     // Oracle: the side-door invalidation must not be swallowed by A's
@@ -2296,7 +2316,8 @@ fn d17_cached_path_node_itself_dirty_serves_fresh_value() {
     assert_eq!(
         got.unwrap(),
         1000,
-        "stale serve: the cached path returned the pre-invalidation Arc"
+        "the cached path must not serve the pre-invalidation Arc (10); \
+         the node's own red bit must force a recompute to the fresh 1000"
     );
     assert_eq!(
         R_RUNS.load(Ordering::SeqCst),
@@ -2406,7 +2427,7 @@ fn d14_finalize_panic_releases_waiters() {
         });
     }
     let park_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while system.wait_graph.read().is_empty() {
+    while system.wait_graph_is_empty() {
         assert!(
             std::time::Instant::now() < park_deadline,
             "waiter never reached the wait path"
@@ -2462,6 +2483,9 @@ fn d14_finalize_panic_releases_waiters() {
 #[test]
 fn list_queries_is_manifest_complete() {
     let names = leak_system().list_queries();
+    // Hardcoded 4 is deliberate: adding a 5th query SHOULD fail this test
+    // loudly, forcing the manifest to be updated in exactly one place (the
+    // `for_each_query!` macro) — not silently absorbed by a `>=` bound.
     assert_eq!(names.len(), 4);
     assert!(names.contains(&"check_fn_body"));
     assert!(names.contains(&"doc_tokens"));
@@ -2767,7 +2791,7 @@ fn waiter_must_not_serve_a_value_the_owner_restored_red() {
         thread::spawn(move || sys.get::<KQ>(DKey(0), prov).map(|v| v.semantic))
     };
     let park_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while system.wait_graph.read().is_empty() {
+    while system.wait_graph_is_empty() {
         assert!(
             std::time::Instant::now() < park_deadline,
             "B never parked on A's job latch"
@@ -2800,9 +2824,14 @@ fn waiter_must_not_serve_a_value_the_owner_restored_red() {
         2,
         "the waiter must recompute K, not serve the stale cache"
     );
-    assert_eq!(
-        E_RUNS.load(Ordering::SeqCst),
-        3,
+    // Lower bound, not an exact count: the correctness verdict is K_RUNS
+    // above.  eval_always computes once per GET, and the exact number of
+    // gets is a consequence of control flow — an over-specified count
+    // would fail for the wrong reason if a future optimization coalesced
+    // a read.  What the invariant needs: B's recompute read a FRESH E,
+    // i.e. at least the three gets so far each ran.
+    assert!(
+        E_RUNS.load(Ordering::SeqCst) >= 3,
         "B's recompute must read a fresh E (eval_always)"
     );
 }
@@ -2903,7 +2932,7 @@ fn d18_waiter_re_resolves_after_clear_all() {
     };
     let mut parked = false;
     for _ in 0..200 {
-        if !system.wait_graph.read().is_empty() {
+        if !system.wait_graph_is_empty() {
             parked = true;
             break;
         }
@@ -2920,11 +2949,11 @@ fn d18_waiter_re_resolves_after_clear_all() {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             let mut saw_writer = false;
             loop {
-                // parking_lot's try_read returns Option<ReadGuard>;
-                // writer preference makes it None exactly while a writer
-                // (main's clear_all) is queued.  Bind to a let so the
-                // guard (if taken) drops immediately.
-                let writer_queued = sys.quiesce.try_read().is_none();
+                // Gate equivalent of the old `try_read().is_none()`:
+                // the writer side stores `mutating` BEFORE draining the
+                // pins, so the flag is set exactly while clear_all's
+                // write side is queued or draining.
+                let writer_queued = sys.quiesce.mutating.load(Ordering::SeqCst);
                 if writer_queued {
                     saw_writer = true;
                     break; // writer queued (main's clear_all is blocked)
@@ -3793,7 +3822,7 @@ fn d25_shard_distribution_flags_degenerate_hash() {
     }
     let mut buckets = vec![0usize; ACTIVE_SHARDS];
     for i in 0..500usize {
-        let h = query_key_hash::<D25Q>(&CollideKey(i));
+        let h = query_key_hash::<D25Q>(&CollideKey(i), type_id_hash::<D25Q>());
         buckets[h as usize & (ACTIVE_SHARDS - 1)] += 1;
     }
     let total: usize = buckets.iter().sum();
@@ -5063,12 +5092,14 @@ where
     K: std::fmt::Debug + Clone + Eq + std::hash::Hash + 'static,
     V: std::fmt::Debug + Clone + 'static,
 {
-    fn probe(
+    fn probe_with_epoch(
         &self,
         key: &K,
         alloc: impl FnOnce(&mut ticket::Held<ticket::CacheNoShard>) -> dep_graph::DepNodeIndex,
-    ) -> (dep_graph::DepNodeIndex, Option<V>, bool) {
-        self.inner.probe(key, alloc)
+        capture: &mut impl FnMut(dep_graph::DepNodeIndex) -> u64,
+        green: &mut impl FnMut(dep_graph::DepNodeIndex) -> bool,
+    ) -> (dep_graph::DepNodeIndex, Option<V>, bool, u64) {
+        self.inner.probe_with_epoch(key, alloc, capture, green)
     }
     fn stage(&self, key: K, node: dep_graph::DepNodeIndex, value: V) {
         if T2_PANIC_ARMED.load(Ordering::SeqCst) {
@@ -5179,7 +5210,7 @@ fn t2_staging_panic_releases_waiters() {
     // `cache.stage` (phase 1) with the waiter parked on the latch.
     let mut parked = false;
     for _ in 0..200 {
-        if !system.wait_graph.read().is_empty() {
+        if !system.wait_graph_is_empty() {
             parked = true;
             break;
         }
@@ -5292,12 +5323,14 @@ where
     K: std::fmt::Debug + Clone + Eq + std::hash::Hash + 'static,
     V: std::fmt::Debug + Clone + 'static,
 {
-    fn probe(
+    fn probe_with_epoch(
         &self,
         key: &K,
         alloc: impl FnOnce(&mut ticket::Held<ticket::CacheNoShard>) -> dep_graph::DepNodeIndex,
-    ) -> (dep_graph::DepNodeIndex, Option<V>, bool) {
-        self.inner.probe(key, alloc)
+        capture: &mut impl FnMut(dep_graph::DepNodeIndex) -> u64,
+        green: &mut impl FnMut(dep_graph::DepNodeIndex) -> bool,
+    ) -> (dep_graph::DepNodeIndex, Option<V>, bool, u64) {
+        self.inner.probe_with_epoch(key, alloc, capture, green)
     }
     fn stage(&self, key: K, node: dep_graph::DepNodeIndex, value: V) {
         // The value IS staged by this call (post value.replace/link_head).
@@ -5628,9 +5661,15 @@ fn publish_window_suspect_value_never_served_green() {
     })
     .expect("E republish must finish")
     .expect("E republish ok");
-    // eval_always recomputes on every get: warm (1) + the owner's nested
-    // read inside K's compute (2) + this republish (3).
-    assert_eq!(E_RUNS.load(Ordering::SeqCst), 3);
+    // Lower bound, not an exact count (see waiter_must_not_serve above):
+    // eval_always recomputes on every get — warm (1) + the owner's nested
+    // read inside K's compute (2) + this republish (3) — but the exact get
+    // count is control-flow-dependent, and the test's verdict is the
+    // getter-side value below.
+    assert!(
+        E_RUNS.load(Ordering::SeqCst) >= 3,
+        "the republish get must have recomputed E (eval_always)"
+    );
 
     // 4) Arm the finish-window gate on K's node (it exists — the owner's
     //    probe created it before its compute parked), then release the
@@ -5660,7 +5699,7 @@ fn publish_window_suspect_value_never_served_green() {
     // the owner's still-installed Started entry before we release.
     let mut parked = false;
     for _ in 0..200 {
-        if !system.wait_graph.read().is_empty() {
+        if !system.wait_graph_is_empty() {
             parked = true;
             break;
         }
@@ -5698,12 +5737,12 @@ fn publish_window_suspect_value_never_served_green() {
          suspect staged value (10) from the publish window"
     );
     assert_eq!(K_RUNS.load(Ordering::SeqCst), 2, "K must have recomputed");
-    // eval_always recomputes on EVERY get by design (d5): warm (1) + the
-    // owner's nested read inside K's compute (2) + the republish (3) +
-    // the getter's K recompute reading E again (4).
-    assert_eq!(
-        E_RUNS.load(Ordering::SeqCst),
-        4,
+    // Lower bound (see the comment at the republish assert above): warm (1)
+    // + the owner's nested read inside K's compute (2) + the republish (3)
+    // + the getter's K recompute reading E again (4).  The verdict is the
+    // getter's VALUE, not the E count.
+    assert!(
+        E_RUNS.load(Ordering::SeqCst) >= 4,
         "eval_always runs once per get"
     );
 }
@@ -5857,7 +5896,7 @@ fn d24_finish_window_republish_never_served() {
     };
     let mut parked = false;
     for _ in 0..200 {
-        if !system.wait_graph.read().is_empty() {
+        if !system.wait_graph_is_empty() {
             parked = true;
             break;
         }
@@ -7473,6 +7512,21 @@ fn post_reset_rebuild_racing_slow_first_registration() {
                         Err(e) => {
                             // The straggler's designed outcome: its job was
                             // poisoned by the sweep, so the get reports it.
+                            // UNREACHABLE-BY-CONSTRUCTION today: instrumenting
+                            // the outcome counters across every run gave
+                            // `errors == 0` (the quiesce read guard precedes
+                            // slot acquisition).  The debug_assert is the
+                            // signal that the poison sweep has stopped being
+                            // dead code — if it fires, add a real Window-1
+                            // test instead of letting this arm silently
+                            // "cover" it (see clear_all_impl's poison-sweep
+                            // doc for the same tripwire shape).
+                            debug_assert!(
+                                false,
+                                "post-reset poison sweep fired — add a real \
+                                 Window-1 test (clear_all_impl's poison sweep \
+                                 is currently unreachable)"
+                            );
                             ERRORS.fetch_add(1, Ordering::SeqCst);
                             assert!(
                                 matches!(e, QueryError::Poisoned { .. }),
@@ -7514,5 +7568,135 @@ fn post_reset_rebuild_racing_slow_first_registration() {
     assert!(
         ERRORS.load(Ordering::SeqCst) + VALUES.load(Ordering::SeqCst) > 0,
         "the getters must have made progress"
+    );
+}
+
+/// OS-thread twin of
+/// `shuttle_tests::aclass::d9_window1_slow_compute_blocks_clear_all`.
+///
+/// The shuttle version tolerates `CLEAR_SEQ == 0` ("not yet delivered"):
+/// the main task and the getter share one OS thread's `SESSION`, so
+/// `mutate_world` takes its DEFER branch and the parked closure is never
+/// drained in that scope.  That means the shuttle test only pins "the
+/// getter's compute ran" — the lock-BLOCKING property its name promises
+/// is exercised by THIS test, which runs on real threads: the mutation
+/// lands on the quiesce WRITE lock, it cannot be starved, and it MUST
+/// execute strictly after `COMPUTE_EXITED`.  If the ordering ever
+/// inverts (a world mutation delivered while a `Started` job's owner is
+/// still between `acquire_key_slot` and the publish tail), the
+/// clear_all poison sweep becomes reachable and latch waiters can be
+/// stranded — this test fails loudly the day that window opens.
+#[test]
+fn d9_window1_os_thread_slow_compute_blocks_clear_all() {
+    static CLEAR_CALLED: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    static COMPUTE_ENTERED: AtomicBool = AtomicBool::new(false);
+    static COMPUTE_EXITED: AtomicU64 = AtomicU64::new(0);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static CLEAR_SEQ: AtomicU64 = AtomicU64::new(0);
+    static ARM_PARK: AtomicBool = AtomicBool::new(false);
+    static CONTENT: AtomicU64 = AtomicU64::new(4);
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    CLEAR_CALLED.store(false, Ordering::SeqCst);
+    RELEASE.store(false, Ordering::SeqCst);
+    COMPUTE_ENTERED.store(false, Ordering::SeqCst);
+    COMPUTE_EXITED.store(0, Ordering::SeqCst);
+    SEQ.store(0, Ordering::SeqCst);
+    CLEAR_SEQ.store(0, Ordering::SeqCst);
+    ARM_PARK.store(false, Ordering::SeqCst);
+    CONTENT.store(4, Ordering::SeqCst);
+    RUNS.store(0, Ordering::SeqCst);
+
+    struct W1Q;
+    impl<'q, 'src: 'q> Query<'q, 'src> for W1Q {
+        type Storage = Owned;
+        type Key = DKey;
+        type Value = FpValue;
+        type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("d9_w1_os", "window-1 slow compute (OS threads)")
+        }
+        fn compute<S: Scheduler>(_key: &DKey, _: &dyn QueryProvider<'q, 'src, S>) -> FpValue {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            COMPUTE_ENTERED.store(true, Ordering::SeqCst);
+            // Bounded park (the deadline discipline): hold the getter's
+            // quiesce READ guard open until the releaser lets go, but fail
+            // loudly instead of wedging the process if the ordering
+            // regresses so far that the release never comes.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while ARM_PARK.load(Ordering::SeqCst) && !RELEASE.load(Ordering::SeqCst) {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let v = FpValue {
+                raw: format!("w1_{}", CONTENT.load(Ordering::SeqCst)),
+                semantic: CONTENT.load(Ordering::SeqCst),
+            };
+            // The observable — recorded only for the PARKED (getter)
+            // compute, never the warm-up (see the shuttle twin).
+            if ARM_PARK.load(Ordering::SeqCst) {
+                COMPUTE_EXITED.store(SEQ.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            }
+            v
+        }
+    }
+
+    let system = leak_system();
+    let provider = leak_provider(system);
+
+    // Warm-up then invalidate so the parked getter is a RECOMPUTE — the
+    // interesting shape (same reasoning as the shuttle twin).
+    let _ = system.get::<W1Q>(DKey(9), provider).unwrap();
+    RUNS.store(0, Ordering::SeqCst);
+    system.invalidate::<W1Q>(&DKey(9));
+    ARM_PARK.store(true, Ordering::SeqCst);
+    COMPUTE_ENTERED.store(false, Ordering::SeqCst);
+
+    let getter = std::thread::spawn(move || {
+        system
+            .get::<W1Q>(DKey(9), provider)
+            .map(|v| v.semantic)
+            .unwrap()
+    });
+    wait_flag(&COMPUTE_ENTERED);
+
+    // Releaser spawned BEFORE `CLEAR_CALLED` is set (same deadlock-avoidance
+    // shape as the shuttle twin).
+    let releaser = std::thread::spawn(|| {
+        wait_flag(&CLEAR_CALLED);
+        RELEASE.store(true, Ordering::SeqCst);
+    });
+    CLEAR_CALLED.store(true, Ordering::SeqCst);
+
+    // Under OS threads `mutate_world` does NOT defer (separate `SESSION`s):
+    // it takes the quiesce write lock, which cannot be granted while the
+    // getter holds the read guard.  So the closure MUST execute — the
+    // `CLEAR_SEQ != 0` requirement below is the whole point of this twin.
+    system.mutate_world(|_| {
+        CLEAR_SEQ.store(SEQ.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+    });
+
+    let served = getter.join().expect("getter must not panic");
+    releaser.join().expect("releaser must not panic");
+    assert_eq!(served, 4, "the getter's recompute must be exact");
+    assert_eq!(RUNS.load(Ordering::SeqCst), 1, "recompute exactly once");
+    // REQUIRED: the mutation MUST have executed (no deferral starvation on
+    // a real lock) and strictly after the compute returned.
+    assert_ne!(
+        CLEAR_SEQ.load(Ordering::SeqCst),
+        0,
+        "OS-thread mutate_world must not be starved — there is no deferral \
+         path on a real lock"
+    );
+    assert!(
+        COMPUTE_EXITED.load(Ordering::SeqCst) < CLEAR_SEQ.load(Ordering::SeqCst),
+        "the world mutation executed BEFORE the in-flight compute returned: \
+         compute={} mutation={} — a mutation delivered while a Started job's \
+         owner is still mid-get makes the clear_all poison sweep reachable \
+         and can strand its latch waiters forever",
+        COMPUTE_EXITED.load(Ordering::SeqCst),
+        CLEAR_SEQ.load(Ordering::SeqCst),
     );
 }

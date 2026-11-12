@@ -47,16 +47,23 @@ use crate::hir::types::TypeContext;
 #[derive(Clone)]
 pub struct BodyCheckHarness<'input> {
     pub shared: std::sync::Arc<SharedCheckState<'input>>,
-    /// Session-lifetime tripwire: the identity (address) of the
-    /// `TypeContext` this harness was built against.  `CheckFnBody::compute`
-    /// asserts that the provider's `ctx_sharing` borrow carries the SAME
-    /// address — a harness paired with a context from another session (the
-    /// "shorter session lifetime drives CheckFnBody" UB mode) fails the
-    /// assert loudly in debug builds instead of silently transmuting.
+    /// Session-lifetime tripwire: the monotonic session id
+    /// (`TypeContext::session_id`, minted by
+    /// `crate::hir::types::NEXT_SESSION_ID` and propagated by
+    /// `new_sharing`) of the context this harness was built against.
+    /// `CheckFnBody::compute` asserts that the provider's `ctx_sharing`
+    /// borrow carries the SAME id — a harness paired with a context from
+    /// another session (the "shorter session lifetime drives CheckFnBody"
+    /// UB mode) fails the assert loudly in debug builds instead of
+    /// silently transmuting.  Deliberately NOT an address: addresses are
+    /// reused after the old context drops, so a stale harness from a dead
+    /// session could pass an address tripwire silently — the same
+    /// address-identity ban as `NEXT_SYSTEM_ID` /
+    /// `NEXT_STAT_ARENA_ID` / `DepGraph::next_owner_id`.
     pub session_stamp: usize,
     pub strict_mode: bool,
     pub enable_experimental: bool,
-    pub features: Vec<String>,
+    pub features: std::sync::Arc<[String]>,
     pub debug: bool,
     pub source: Option<&'input str>,
 }
@@ -67,7 +74,7 @@ pub struct CompilerSession<'input, 'src> {
     pub ctx: TypeContext<'input>,
     pub symbols: SymbolTable<'input>,
     pub trait_env: TraitEnv<'input>,
-    pub resolution_map: ResolutionMap<'input>,
+    pub resolution_map: std::sync::Arc<ResolutionMap<'input>>,
     pub target: Target,
 }
 
@@ -76,7 +83,7 @@ impl<'input, 'src> CompilerSession<'input, 'src> {
         ctx: TypeContext<'input>,
         symbols: SymbolTable<'input>,
         trait_env: TraitEnv<'input>,
-        resolution_map: ResolutionMap<'input>,
+        resolution_map: impl Into<std::sync::Arc<ResolutionMap<'input>>>,
         target: Target,
     ) -> Self {
         CompilerSession {
@@ -84,7 +91,9 @@ impl<'input, 'src> CompilerSession<'input, 'src> {
             ctx,
             symbols,
             trait_env,
-            resolution_map,
+            // `Arc` here (not a bare map) is what lets each checker receive
+            // `Arc::clone` instead of an O(crate) `ResolutionMap::clone`.
+            resolution_map: resolution_map.into(),
             target,
         }
     }
@@ -103,6 +112,12 @@ pub struct SessionQueryProvider<'a, 'input, 'src> {
     symbols: &'a SymbolTable<'input>,
     trait_env: &'a TraitEnv<'input>,
     resolution_map: &'a ResolutionMap<'input>,
+    /// Lazily-built shared handle over `resolution_map` (2a of the
+    /// query-layer perf pass): `CheckFnBody::compute` hands the worker an
+    /// `Arc::clone` of this instead of cloning the full map per function.
+    /// `OnceLock` keeps the provider `Sync` and pays the one clone per
+    /// provider build, not per body check.
+    resolution_map_arc: std::sync::OnceLock<std::sync::Arc<ResolutionMap<'input>>>,
     program: &'a Program<'input, 'src>,
     /// Read-only borrow of the session's `TypeContext`, opt-in via
     /// [`SessionQueryProvider::with_body_check`]: a body-check compute
@@ -118,6 +133,13 @@ pub struct SessionQueryProvider<'a, 'input, 'src> {
     /// query's `compute` allocates its value here and the cache stores the
     /// bare reference (`&'q V`) — no `Arc`, no clone on the hit path.
     arena: Option<&'a crate::arena::SyncArena<'input>>,
+    /// Monotonic identity of the Program this provider serves (see
+    /// [`crate::hir::query::CompilerSessionView::program_epoch`]).  The
+    /// DRIVER bumps it per rebuilt program; an untracked-memo entry from a
+    /// different epoch is treated as a miss, so a reused query system
+    /// cannot serve the old program's `FnId`-indexed facts.  Defaults to
+    /// 0: every existing caller (one program per system) is identical.
+    program_epoch: usize,
 }
 
 impl<'a, 'input, 'src> SessionQueryProvider<'a, 'input, 'src> {
@@ -133,11 +155,22 @@ impl<'a, 'input, 'src> SessionQueryProvider<'a, 'input, 'src> {
             symbols,
             trait_env,
             resolution_map,
+            resolution_map_arc: std::sync::OnceLock::new(),
             program,
             ctx: None,
             body_check: None,
             arena: None,
+            program_epoch: 0,
         }
+    }
+
+    /// Stamp this provider with the program's monotonic identity (bump
+    /// per rebuilt Program).  Builder on top of [`SessionQueryProvider::new`]
+    /// so existing call sites keep their shape; the untracked memos key
+    /// their entries on it (see `CompilerSessionView::program_epoch`).
+    pub fn with_program_epoch(mut self, epoch: usize) -> Self {
+        self.program_epoch = epoch;
+        self
     }
 
     /// Opt in to body-check worker construction: attach the read-only
@@ -197,8 +230,22 @@ impl<'a, 'input, 'src> CompilerSessionView<'input, 'src>
         self.resolution_map
     }
 
+    fn resolution_map_arc(
+        &self,
+    ) -> Option<std::sync::Arc<ResolutionMap<'input>>> {
+        Some(
+            self.resolution_map_arc
+                .get_or_init(|| std::sync::Arc::new(self.resolution_map.clone()))
+                .clone(),
+        )
+    }
+
     fn program(&self) -> &Program<'input, 'src> {
         self.program
+    }
+
+    fn program_epoch(&self) -> usize {
+        self.program_epoch
     }
 
     fn ctx_sharing(&self) -> Option<&TypeContext<'input>> {

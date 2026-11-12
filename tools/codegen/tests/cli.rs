@@ -21,11 +21,24 @@ fn check_passes_on_the_real_repo() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stderr:\n{stderr}\nstdout:\n{stdout}");
-    assert!(stdout.contains("en: 19/19"), "stdout:\n{stdout}");
-    assert!(stdout.contains("ru: 19/19"), "stdout:\n{stdout}");
-    assert!(stdout.contains("zh: 19/19"), "stdout:\n{stdout}");
+    // Counts drift as messages/codes are added; assert the *shape* (every
+    // locale covers the full en set) instead of freezing today's numbers.
+    for locale in ["en", "ru", "zh"] {
+        let prefix = format!("{locale}: ");
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("missing locale line {locale:?} in:\n{stdout}"));
+        let (present, total) = line[prefix.len()..]
+            .split_once('/')
+            .unwrap_or_else(|| panic!("malformed coverage line: {line:?}"));
+        assert_eq!(
+            present, total,
+            "locale {locale} does not cover every message: {line:?}"
+        );
+    }
     assert!(
-        stdout.contains("codegen check OK (89 codes)"),
+        stdout.contains("codegen check OK ("),
         "stdout:\n{stdout}"
     );
 }

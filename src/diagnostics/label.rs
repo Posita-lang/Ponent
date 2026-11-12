@@ -94,6 +94,9 @@ impl AnnotationKind {
 /// line, *not* a display column: on lines containing tabs or wide characters
 /// (CJK/emoji) the visual column is smaller.  Emitters that need display
 /// columns must use the grapheme/width helpers instead.
+///
+/// Note: [`Snippet::line_start`](crate::diagnostics::label::Snippet::line_start)
+/// is **1-based**, unlike `line` here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourcePos {
     /// 0-based line index.

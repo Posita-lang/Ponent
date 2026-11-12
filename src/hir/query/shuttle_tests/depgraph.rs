@@ -66,6 +66,16 @@ fn dur_prop_seqlock_seals_green_verdict_against_inflight_lowering() {
         assert!(vl_before > 0);
         assert_eq!(dg.durability_of(x), Durability::HIGH);
 
+        // Force the SEQLOCK path, not the global fast path (see the unit
+        // twin in `dep_graph::tests`): an unrelated LOW-durability mark
+        // bumps `dirty_generation` past x's closure stamp so the seqlock
+        // loop runs, while leaving `rev[HIGH]` untouched so the per-level
+        // stamp still passes inside the walk.
+        let unverified = dg.allocate_node_index(ContentClass::SEMANTIC);
+        dg.set_node_durability(unverified, Durability::LOW);
+        dg.invalidate(unverified, &q());
+        assert!(dg.verified_lvl_of(x) > 0);
+
         sched.arm(move |p| matches!(p, SchedulePoint::VerifyWindow { node } if *node == x.0));
         let h = shuttle::thread::spawn(move || dg.verify_green_transitive_with_dirty(x));
         sched.wait_parked();

@@ -60,10 +60,11 @@ use std::sync::Arc;
 // rustc makes for its own query/dep-graph maps.
 use crate::sync::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallbox::SmallBox;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 pub mod dep_graph;
 pub mod erase;
@@ -120,7 +121,24 @@ struct WaitEdge {
     /// leave a completed job's edges walker-visible with unresolved
     /// latches.
     latch: job::QueryLatch,
+    /// Monotonic install order (`WAIT_INSTALL_SEQ`), the retraction
+    /// tiebreak for `register_wait` phase 3: a raced cycle is retracted
+    /// by the waiter whose edge was installed FIRST (my_seq < pred_seq),
+    /// which keeps retraction asymmetric — the old global lock
+    /// serialized the pair so exactly one side retracted while the other
+    /// blocked; two simultaneous retractions can livelock the recovery
+    /// handshake.
+    seq: u64,
 }
+
+/// Phase-1 witness fingerprint of a successful (no-cycle) walk from
+/// `owner` in [`QuerySystem::register_wait`]: the exact sequence of
+/// `(node, edge_seq)` hops taken, ending with a terminal `(node, 0)`
+/// sentinel (`0` is reserved — `WAIT_INSTALL_SEQ` starts at 1, so a real
+/// seq is never `0`). Used by [`QuerySystem::witness_unchanged`] to skip
+/// the redundant phase-3 full walk when the topology along the phase-1
+/// path is unchanged.
+type WitnessFingerprint = SmallVec<[(job::ExecId, u64); 8]>;
 
 /// Outcome of active-key acquisition in `QuerySystem::acquire_key_slot`.
 enum KeySlot<'q, 'src, Q: Query<'q, 'src>> {
@@ -200,6 +218,11 @@ pub(crate) enum EnterError<'q, 'src, Q: Query<'q, 'src>> {
 }
 
 /// Maximum recursive query depth before a depth-limited query returns an error.
+/// ORDERING COUPLED to `MAX_GLOBAL_DEPTH` below: this per-type limit is only
+/// the one that fires when `MAX_GLOBAL_DEPTH > MAX_QUERY_DEPTH` (as today,
+/// 8192 > 128).  `test_depth_limit` pins its expected failure key against
+/// THIS limit — if the global backstop is ever lowered below it, that
+/// test's sentinel silently changes meaning.  Change them together.
 const MAX_QUERY_DEPTH: usize = 128;
 
 /// Runaway-recursion diagnostic: cap on nested `get_shared` frames per
@@ -216,7 +239,18 @@ const MAX_QUERY_DEPTH: usize = 128;
 /// consumption with no error.  8192 is diagnostic headroom, not a
 /// tuning knob: genuine workloads deeper than this do not exist, and
 /// anything that reaches it is a runaway.
+///
+/// ORDERING COUPLED to `MAX_QUERY_DEPTH` above: this global backstop only
+/// stays silent while it exceeds the per-type limit (8192 > 128 today).
+/// Lowering it below `MAX_QUERY_DEPTH` would make the backstop fire first
+/// and change `test_depth_limit`'s expected failure key.  Change them
+/// together.
 const MAX_GLOBAL_DEPTH: usize = 8192;
+
+// Machine-check the ORDERING COUPLED invariant the two docs above describe:
+// the global backstop must stay strictly above the per-type limit, or
+// `test_depth_limit`'s expected failure key silently changes meaning.
+const _: () = assert!(MAX_GLOBAL_DEPTH > MAX_QUERY_DEPTH);
 
 /// Compute a 64-bit hash for a `(query_type, key)` pair.
 /// Used to select the `active_keys` shard only: `active_shard` masks the
@@ -224,10 +258,37 @@ const MAX_GLOBAL_DEPTH: usize = 8192;
 /// use the full `ActiveKey` (exact `Eq`, keyed by `(TypeId, Q::Key)`),
 /// so a hash collision can never alias two distinct keys — it only
 /// routes two keys to the same shard lock, which is benign contention.
-fn query_key_hash<'src, 'q, Q: Query<'q, 'src>>(key: &Q::Key) -> u64 {
+/// Purity fence shared by the red-green mutation entry points.  An
+/// untracked compute must be a pure function of `(key, immutable data)`;
+/// mutating the served world from inside one silently corrupts that
+/// contract (and, because `get_untracked` holds no quiesce pin, can run
+/// inline against a live graph).  Same-thread only, like the other
+/// untracked fences.
+fn assert_not_in_untracked(what: &str) {
+    if UNTRACKED_DEPTH.with(|d| d.get()) != 0 {
+        panic!(
+            "{what} called from inside an untracked computation — untracked \
+             queries must be pure functions of (key, immutable data)"
+        );
+    }
+}
+
+fn query_key_hash<'src, 'q, Q: Query<'q, 'src>>(key: &Q::Key, type_hash: u64) -> u64 {
+    let mut h = rustc_hash::FxHasher::default();
+    // The TypeId half is invariant per query type, so it is hashed ONCE at
+    // vtable registration (`QueryVTable::type_hash`) and mixed in here as a
+    // single `write_u64` instead of re-hashing the 128-bit `TypeId` on
+    // every miss.  Still a full `(type, key)` digest — just
+    // with a precomputed left half.
+    h.write_u64(type_hash);
+    key.hash(&mut h);
+    h.finish()
+}
+
+/// Hash a query type's `TypeId` into the cached per-vtable `type_hash`.
+fn type_id_hash<Q: 'static>() -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     TypeId::of::<Q>().hash(&mut h);
-    key.hash(&mut h);
     h.finish()
 }
 
@@ -238,7 +299,17 @@ trait ErasedQueryKey: Send + Sync + 'static {
     fn as_any(&self) -> &dyn std::any::Any;
     fn hash_dyn(&self, state: &mut dyn Hasher);
     fn eq_dyn(&self, other: &dyn ErasedQueryKey) -> bool;
+    /// Clone through the erase boundary, into an inline-capable storage
+    /// (`SmallBox`): `ActiveKey` is cloned on several active-map paths,
+    /// and the clone must preserve the no-heap property of a small key.
+    fn clone_dyn(&self) -> SmallBox<dyn ErasedQueryKey, KEY_INLINE_SPACE>;
 }
+
+/// Inline capacity for an erased query key: 4 words (32 bytes) covers the
+/// identity-key shapes the query system actually stores (`DefId`,
+/// symbol pairs, small tuples); larger keys spill to the heap exactly as
+/// the old `Arc` did.
+type KEY_INLINE_SPACE = smallbox::space::S4;
 
 impl<K: QueryKey> ErasedQueryKey for K {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -254,42 +325,83 @@ impl<K: QueryKey> ErasedQueryKey for K {
     fn eq_dyn(&self, other: &dyn ErasedQueryKey) -> bool {
         other.as_any().downcast_ref::<K>() == Some(self)
     }
+    fn clone_dyn(&self) -> SmallBox<dyn ErasedQueryKey, KEY_INLINE_SPACE> {
+        // `smallbox!` is the stable-rust path for building a `dyn`
+        // SmallBox from a sized value (`SmallBox::new` is `T: Sized`
+        // only; the unsize coercion needs the nightly `coerce` feature).
+        smallbox::smallbox!(self.clone())
+    }
 }
 
 /// Exact map key of an `active_keys` entry: query type + the REAL key.
 /// `shard_hash` (from [`query_key_hash`]) selects the shard only; the
 /// `Hash`/`Eq` impls delegate to the concrete key, so lookups never
-/// collide across distinct keys.  One `Arc` allocation per cache-miss
-/// acquisition (the `get_shared` hit path constructs no `ActiveKey` at
-/// all) — noise next to the compute it precedes.
-#[derive(Clone)]
+/// collide across distinct keys.  The key lives in a 4-word-inline
+/// `SmallBox`: a miss previously paid one `Arc` allocation per key; a
+/// small identity key now stores inline and only a genuinely large key
+/// spills to the heap.  (`get_shared`'s hit path constructs no
+/// `ActiveKey` at all — noise next to the compute it precedes.)
+/// (`Debug` is a manual impl below — `SmallBox<dyn …>` is not `Debug`.)
+///
+/// KEY-CLONE BUDGET (documented, deliberate): a full MISS path clones the
+/// key THREE times plus one erase-boundary clone — `ActiveKey::of`'s
+/// `key.clone()` (the only clone a small-key miss pays today),
+/// `stage(key.clone(), …)`, `into_tagged`, and the active-map paths'
+/// `akey.clone()` (which clones the ERASED key, inline for `S4`-sized
+/// keys — not a fourth `Q::Key` clone).  For the identity keys the system
+/// is designed around (`DefId`, symbol pairs) each is a 4-word inline
+/// copy; if a query ever carries a FAT key, the fix is `Arc<K>`
+/// end-to-end on the miss path, NOT per-site patches —
+/// the four sites above are the complete list.
 struct ActiveKey {
     shard_hash: u64,
     type_id: TypeId,
-    key: Arc<dyn ErasedQueryKey>,
+    key: SmallBox<dyn ErasedQueryKey, KEY_INLINE_SPACE>,
 }
 
 impl ActiveKey {
     #[inline]
-    fn of<'src, 'q, Q: Query<'q, 'src>>(key: &Q::Key) -> Self {
+    fn of<'src, 'q, Q: Query<'q, 'src>>(key: &Q::Key, type_hash: u64) -> Self {
         ActiveKey {
-            shard_hash: query_key_hash::<Q>(key),
+            shard_hash: query_key_hash::<Q>(key, type_hash),
             type_id: TypeId::of::<Q>(),
-            key: Arc::new(key.clone()),
+            key: smallbox::smallbox!(key.clone()),
+        }
+    }
+}
+
+impl Clone for ActiveKey {
+    fn clone(&self) -> Self {
+        ActiveKey {
+            shard_hash: self.shard_hash,
+            type_id: self.type_id,
+            // Clone through the erase boundary so a small key stays
+            // inline (an `Arc` bump no longer applies — there is no
+            // shared allocation to bump).
+            key: self.key.clone_dyn(),
         }
     }
 }
 
 impl Hash for ActiveKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.type_id.hash(state);
-        self.key.hash_dyn(state);
+        // PREHASH: `shard_hash` is already the full FxHash digest of
+        // (TypeId, key) — `query_key_hash` computed it once at
+        // construction, and the active_keys map is itself an FxHashMap.
+        // Writing the precomputed digest instead of re-hashing type_id +
+        // key through the erased vtable (`hash_dyn` costs a dyn call per
+        // field) halves the hashing on the miss path: one hash per key
+        // instead of two.  Collisions on the digest still fall through to
+        // the EXACT `PartialEq` below, so a 64-bit collision can never
+        // alias two distinct keys — the same contract the shard-index use
+        // of this digest already relies on.
+        state.write_u64(self.shard_hash);
     }
 }
 
 impl PartialEq for ActiveKey {
     fn eq(&self, other: &Self) -> bool {
-        self.type_id == other.type_id && self.key.eq_dyn(other.key.as_ref())
+        self.type_id == other.type_id && self.key.eq_dyn(&*other.key)
     }
 }
 
@@ -312,11 +424,32 @@ impl std::fmt::Debug for ActiveKey {
 /// marker for it — and a fresh system is later allocated at that address.
 static NEXT_SYSTEM_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// Monotonic wait-edge install order — the retraction tiebreak of
+/// `register_wait` phase 3 (see `WaitEdge::seq`).  u64 wraps only after
+/// ~585 years of one-install-per-nanosecond.
+static WAIT_INSTALL_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Number of shards for the `active_keys` map. Power of 2 for fast modulo.
 ///
 /// 64, not 8: `rayon` uses every core, and with 8 shards a 32-thread miss
 /// storm averages 4 threads per lock word.  64 padded locks is 4 KiB.
 const ACTIVE_SHARDS: usize = 64;
+
+/// Shard count for the wait graph (see `wait_graph`): matches the other
+/// query-engine contention domains so a thread's waiter lock word lands on
+/// its own cache line.
+const WAIT_SHARDS: usize = 64;
+
+/// Shard index for a wait edge, keyed by the WAITER's `ExecId` (same
+/// striping discipline as `active_shard`): every waiter touches exactly
+/// its own shard for insert/remove, so the two per-wait mutations never
+/// contend.
+#[inline]
+fn wait_shard_of(id: job::ExecId) -> usize {
+    let mut h = rustc_hash::FxHasher::default();
+    id.hash(&mut h);
+    h.finish() as usize & (WAIT_SHARDS - 1)
+}
 
 /// Compute the shard index for an active key: the 64-bit hash selects
 /// the SHARD only — map lookups are exact (see [`ActiveKey`]).
@@ -360,6 +493,13 @@ pub struct QueryDescriptor {
     /// 512 default spends most of its time recomputing).  Best-effort
     /// bound: for a finite capacity below the shard count the effective
     /// Floor is one entry per shard, and `0` means unlimited.
+    ///
+    /// DUAL SEMANTICS (shared field name, different meanings): for a
+    /// TRACKED query this is the node-ful shard budget handed to
+    /// `DefaultCache::from_capacity`; for an UNTRACKED query there are no
+    /// shards or nodes — the same number bounds the thread-local memo map,
+    /// whose victim is chosen FIFO by first insertion from the `VecDeque`
+    /// queue beside the map, never by `keys()` order.
     pub cache_capacity: usize,
     /// Untracked memo query: skips dep-graph recording entirely (no node
     /// index, no active-set entry, no read edges, no durability/fingerprint
@@ -547,11 +687,51 @@ where
     /// threads `Held<CacheShardHeld>` through `take`/`release` (an
     /// explicit pairing the single-lock caches express as a scoped
     /// `Acquired` guard).  Both are correct; neither is a gap.
+    /// The two-phase cache lookup (register + candidate), returning the
+    /// value's epoch captured UNDER THE SAME SHARD LOCK as the value read.
+    ///
+    /// C1's capture contract lives here, not in the caller: the previous
+    /// shape (caller calls `epoch_of` AFTER `probe` returns) left a
+    /// (value-read .. epoch-load) window in which a changed-fingerprint
+    /// publish's [stage → bump] could complete — the caller then captured
+    /// the POST-bump epoch against the PRE-change value, the finish-side
+    /// re-check compared equal, and the stale value served green
+    /// permanently.  The double-read "seal" only detected bumps between
+    /// its own two loads, never the (value-read .. first-load) gap.
+    /// Capturing inside the critical section (before `value.clone()`, on
+    /// every value-returning path) closes it: the capture happens-before
+    /// the publisher's `stage` in lock order, so any later bump yields
+    /// `captured < live` at finish — a suspect, the safe direction.  A
+    /// bump between the capture and the value clone costs bounded
+    /// over-invalidation only.
+    fn probe_with_epoch(
+        &self,
+        key: &K,
+        alloc: impl FnOnce(&mut ticket::Held<ticket::CacheNoShard>) -> dep_graph::DepNodeIndex,
+        capture: &mut impl FnMut(dep_graph::DepNodeIndex) -> u64,
+        // Green verdict for the slot's node, consulted BEFORE the value
+        // clone.  A red node's value is never served, so cloning it only
+        // to discard it is pure waste on the invalidation-storm path
+        //.  The caller reuses this verdict instead of
+        // re-checking green after the probe, so the check is not
+        // duplicated.
+        green: &mut impl FnMut(dep_graph::DepNodeIndex) -> bool,
+    ) -> (dep_graph::DepNodeIndex, Option<V>, bool, u64);
+
+    /// Epoch-ignoring wrapper: identical lookup, capture result dropped.
+    /// Production callers that serve a cached value MUST use
+    /// [`Self::probe_with_epoch`] — the capture is part of the C1
+    /// soundness contract.  (Kept for the many test call sites that only
+    /// exercise cache mechanics.)
     fn probe(
         &self,
         key: &K,
         alloc: impl FnOnce(&mut ticket::Held<ticket::CacheNoShard>) -> dep_graph::DepNodeIndex,
-    ) -> (dep_graph::DepNodeIndex, Option<V>, bool);
+    ) -> (dep_graph::DepNodeIndex, Option<V>, bool) {
+        let (node, cached, fresh, _) =
+            self.probe_with_epoch(key, alloc, &mut |_| 0, &mut |_| true);
+        (node, cached, fresh)
+    }
 
     /// Publish a freshly computed value under `key` (was: `insert`).
     /// The `node` must be the one a prior `probe` returned for this key
@@ -646,6 +826,11 @@ struct ThreadStats {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    /// Per-`(thread, cache)` TinyLFU sampling counter (see
+    /// `note_access_hash`): the old PROCESS-WIDE `ADMIT_SAMPLE_COUNTER`
+    /// let a thread alternating between caches systematically over- or
+    /// under-sample one of them depending on global alignment.
+    admit_sample: AtomicU32,
 }
 
 /// Which counter of a thread's slot a stat bump increments.
@@ -674,6 +859,11 @@ thread_local! {
     /// no `const` constructor.
     static STAT_SLOTS: std::cell::RefCell<FxHashMap<usize, Arc<ThreadStats>>> =
         std::cell::RefCell::new(FxHashMap::default());
+    /// One-entry cache in front of `STAT_SLOTS`: a thread
+    /// usually hammers one cache, so the hot path becomes a single id
+    /// compare instead of a TLS borrow + FxHash probe.
+    static LAST_STAT: std::cell::RefCell<Option<(usize, Arc<ThreadStats>)>> =
+        std::cell::RefCell::new(None);
 }
 
 /// Nesting depth inside untracked computations.  Nonzero while an
@@ -681,6 +871,15 @@ thread_local! {
 /// there is a purity violation (hard panic at the entries below).
 /// `Cell<u32>` (`const`-constructible) — depth only ever reaches 1,
 /// the panic fires before a second frame can form.
+///
+/// KNOWN BYPASS: this fence is per-THREAD. An untracked
+/// compute that spawns a thread (`std::thread::spawn`, `rayon::spawn`,
+/// `tokio::spawn`, crossbeam scoped threads) gets a fresh depth of 0 on
+/// that thread, and any nested query's dep edges record into the spawned
+/// thread's (empty) `TASK_STACK` — silently lost. The untracked purity
+/// contract ("pure functions of (key, immutable data)") is the author's
+/// obligation for any compute that crosses a thread boundary; the fence
+/// catches only same-thread violations.
 thread_local! {
     static UNTRACKED_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
 }
@@ -709,40 +908,89 @@ fn bump(slot: &ThreadStats, f: StatField) {
     c.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Batched `bump`: ONE `fetch_add(n)` instead of n per-unit RMWs — the
+/// eviction tail of a stage can evict several values in one sweep, and
+/// each would otherwise pay a full TLS probe + atomic RMW.
+#[inline]
+fn bump_n(slot: &ThreadStats, f: StatField, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let c = match f {
+        StatField::Hit => &slot.hits,
+        StatField::Miss => &slot.misses,
+        StatField::Eviction => &slot.evictions,
+    };
+    c.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 // ── DefaultCache (sharded, merged node+value storage, O(1) CLOCK) ──
 
-/// Per-shard state of the merged `DefaultCache`.  One map holds BOTH
-/// halves of every key: the never-evicted `DepNodeIndex` (the old
-/// per-vtable `node_map`'s job) and the evictable `Option<V>` (the
-/// old cache's job) — one shard read lock serves the whole hit path.
+/// Sentinel slab index meaning "no slot" for the LRU chain links.
+/// `u32::MAX` is chosen because a real slot index can never reach it
+/// (the slab grows one slot per distinct key, bounded by memory long
+/// before 2^32 entries).
+const NONE: u32 = u32::MAX;
+
+/// Per-shard state of the index-based `DefaultCache`.  An index map
+/// (`key → slab slot`) plus an append-only slab holds BOTH halves of
+/// every key: the never-evicted `DepNodeIndex` (the old per-vtable
+/// `node_map`'s job) and the evictable `Option<V>` (the old cache's
+/// job) — one shard read lock serves the whole hit path.  LRU links are
+/// `u32` slab indices, halving link memory and making splices integer
+/// swaps instead of key clones.
+///
+/// Slots are never freed: a node is never removed from the registry
+/// except by `clear_all` (which drops the whole vtable), so the slab
+/// grows with the number of distinct keys ever seen — same as the map
+/// did before.
 #[derive(Debug)]
 struct CacheShard<K, V> {
-    map: FxHashMap<K, MergedEntry<K, V>>,
-    /// LRU chain over the STAGED entries only (`value.is_some()`), doubly
-    /// linked by key (query keys are small identity types, `K: Clone`).
-    /// `head` = most recent, `tail` = CLOCK sweep start.
-    head: Option<K>,
-    tail: Option<K>,
+    /// key → slab slot.  A missing entry means "never registered"
+    /// (`probe` allocates the node and inserts it); the entry survives
+    /// value eviction, `unstage` and `clear` (trait contract 1).
+    map: FxHashMap<K, u32>,
+    /// Append-only slab; one slot per distinct key ever registered.
+    slots: Vec<Slot<K, V>>,
+    /// Persistent CLOCK hand: where the previous sweep stopped.
+    hand: u32,
+    /// head = most recent, tail = CLOCK sweep start.
+    head: u32,
+    tail: u32,
     /// Staged-entry count == chain length, maintained by stage/unstage/
     /// evict; `len()` sums it across shards instead of walking the maps.
     valued: usize,
 }
 
-/// One merged entry.  The node half is registration-once — NEVER evicted,
-/// NEVER re-created (dropping it would orphan the old node's fingerprint,
-/// dep edges and epoch history behind a stale `node_to_key` entry, the
-/// d9 Window-3 class, and a re-registered fresh node starts green with no
-/// fingerprint, cutting the invalidation history).  The value half is
-/// evictable.  `prev`/`next` are the LRU links and are only meaningful
-/// while `value.is_some()` (valueless entries are chain-detached).
+/// One slab slot of the merged cache.  The key lives HERE (not only in
+/// the index map) so the LRU chain can be walked and spliced without a
+/// second lookup; the links are `u32` slab indices instead of
+/// `Option<K>` (`Option<DefId>` is 16 B with no niche), so a link pair
+/// costs 8 B instead of 32 B and every splice is an integer swap, not a
+/// key clone.
+///
+/// Node half is registration-once — NEVER evicted, NEVER re-created
+/// (trait contract 1: dropping it would orphan the old node's
+/// fingerprint, dep edges and epoch history behind a stale
+/// `node_to_key` entry, the d9 Window-3 class, and a re-registered
+/// fresh node starts green with no fingerprint, cutting the
+/// invalidation history).  Value half is evictable.  `prev`/`next` are
+/// only meaningful while `value.is_some()` (valueless slots are
+/// chain-detached and keep both links `NONE`).
 #[derive(Debug)]
-struct MergedEntry<K, V> {
+struct Slot<K, V> {
+    key: K,
     node: dep_graph::DepNodeIndex,
     value: Option<V>,
     /// CLOCK second-chance bit, set by probe hits, consumed by the sweep.
     referenced: AtomicBool,
-    prev: Option<K>,
-    next: Option<K>,
+    prev: u32,
+    next: u32,
+    /// Precomputed `hash_key(key)` digest, read by `evict_one` for the
+    /// TinyLFU victim estimate — recomputing it on every sweep iteration
+    /// would undo the one-hash-per-op design.  Never recomputed — K is
+    /// immutable while registered.
+    hash: u64,
 }
 
 /// HashMap-backed cache with O(1) CLOCK eviction, SHARDED 64 ways and
@@ -801,6 +1049,32 @@ const ADMIT_SKETCH_WIDTH: usize = 2048;
 const ADMIT_SKETCH_ROWS: usize = 2;
 const ADMIT_SKETCH_SIZE: usize = ADMIT_SKETCH_WIDTH * ADMIT_SKETCH_ROWS;
 
+/// Sketch sampling period (4a of the perf pass): only every N-th access on
+/// a thread reaches the sketch (see `note_access_hash`).  4 cuts the atomic
+/// RMW traffic per hit 4× while keeping the newcomer-vs-victim ordering
+/// TinyLFU admission needs.
+const ADMIT_SAMPLE_PERIOD: u32 = 4;
+
+/// Per-thread access counter driving the sampling gate.
+thread_local! {
+    static ADMIT_SAMPLE_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Counters an aging pass drains per `admit_tick` (see `admit_tick`): a
+/// full 4096-counter halving completes within 128 stages of its boundary
+/// instead of stalling one tick with a full scan.
+const ADMIT_AGING_CHUNK: usize = 32;
+
+/// Number of cache-line-padded counters behind `staged_global` (5 of the
+/// perf pass).  Power of two; the counter index IS the mutating shard's
+/// index (`shard_idx & (STAGED_GLOBAL_SHARDS - 1)`).  An earlier version
+/// derived the index from the shard's ADDRESS (`addr >> 4 & 7`), which is
+/// degenerate: `CachePadded<RwLock<CacheShard>>` is 64-byte aligned with a
+/// 64-multiple stride, so consecutive shards' addresses differ by `64·k`
+/// and `(addr >> 4) & 7` only ever lands on `{0, 4}` — the "8-way" sharding
+/// was really 2 counters shared by 32 shards each.
+const STAGED_GLOBAL_SHARDS: usize = 8;
+
 /// Debug-only occupancy snapshot across a cache's shards — the raw data
 /// behind the degenerate-`Hash` audit (`DefaultCache::shard_distribution`).
 #[cfg(debug_assertions)]
@@ -842,13 +1116,19 @@ pub struct DefaultCache<K, V> {
     /// rounding makes `per_shard_capacity * shards != capacity` (e.g.
     /// capacity 10 → per-shard 1 → 16 if back-multiplied).
     capacity: usize,
-    /// Global staged-value count, mirrored across every `shard.valued`
-    /// mutation (stage/insert ++, evict/unstage --, clear snapshots to 0)
-    /// under that shard's own write lock.  Relaxed throughout: transient
-    /// skew only over- or under-evicts, and over-eviction is pure perf
-    /// loss (direction-safe — the node half is never evicted, contract 1).
-    /// Read only on the eviction path, never the hit path.
-    staged_global: AtomicUsize,
+    /// Global staged-value count, SHARDED across `STAGED_GLOBAL_SHARDS`
+    /// cache-line-padded atomics (5 of the perf pass): mirrored across every
+    /// `shard.valued` mutation (stage/insert ++, evict/unstage --, clear
+    /// snapshots to 0) under that shard's own write lock.  A single shared
+    /// line was the one remaining hot line under a multi-threaded stage
+    /// storm — coherence traffic, not ordering (all Relaxed).  The shard
+    /// counter is derived from the held shard's address, so every mutation
+    /// of one shard lands on the same (far-apart) line and different shards
+    /// almost never share one.  Reads are cold (eviction gate, `len()`),
+    /// writes hot: an N-way sum on read is the right trade.  Transient skew
+    /// only over- or under-evicts, and over-eviction is pure perf loss
+    /// (direction-safe — the node half is never evicted, contract 1).
+    staged_global: [CachePadded<AtomicUsize>; STAGED_GLOBAL_SHARDS],
     /// TinyLFU admission sketch (see `ADMIT_SKETCH_*`): per-key access
     /// frequencies estimating "how hot is this key".  The eviction loop
     /// admits a newcomer only when it is at least as hot as the CLOCK
@@ -859,9 +1139,14 @@ pub struct DefaultCache<K, V> {
     /// only blur frequencies, never correctness.
     admit: Vec<AtomicU8>,
     /// Stage/insert tick driving periodic sketch halving (TinyLFU
-    /// aging): every `capacity.max(64)` ticks all counters halve, so
-    /// yesterday's hot keys decay and today's newcomers can win.
-    admit_clock: AtomicUsize,
+    /// aging): every `capacity.max(64)` ticks an aging pass becomes due;
+    /// `admit_tick` drains it in `ADMIT_AGING_CHUNK`-sized chunks from the
+    /// rotating cursor (see `admit_tick`).
+    admit_clock: CachePadded<AtomicUsize>,
+    /// Counters still owed a halve in the current aging pass (0 = none).
+    admit_aging_left: AtomicUsize,
+    /// Rotating cursor into the `admit` sketch for the in-progress pass.
+    admit_aging_cursor: AtomicUsize,
     /// Monotonic instance id keying this cache's entries in the
     /// thread-local stat-slot map (`STAT_SLOTS`).  Never an address —
     /// see `NEXT_STAT_ARENA_ID`.
@@ -870,6 +1155,15 @@ pub struct DefaultCache<K, V> {
     /// in TLS: an exited thread leaves a finalized slot that `stats()`
     /// still sums.  Only the HANDLE is thread-local.
     stat_shards: Mutex<Vec<Arc<ThreadStats>>>,
+    /// Count of node indices minted by a phase-2 RACE LOSER and then
+    /// discarded.  Each one already grew the dep graph's
+    /// per-slot vectors, so a cold-key thundering herd burns memory that
+    /// lives until `clear_all`.  The count makes that cost observable
+    /// instead of silent; the full fix (a reserve-then-allocate tri-state
+    /// slot that parks losers on the winner) is deliberately deferred —
+    /// it makes a cold miss non-lock-free and changes the two-phase
+    /// protocol's panic paths, for a workload the gauge can now justify.
+    orphan_nodes: AtomicU64,
 }
 
 impl<K, V> DefaultCache<K, V>
@@ -882,12 +1176,36 @@ where
     }
     /// Build a cache with a GLOBAL soft budget of `max_entries` staged
     /// values (`0` = unlimited).  The per-shard share is
-    /// `(max_entries / DEFAULT_CACHE_SHARDS).max(1)`, so a finite request
-    /// below the shard count is effectively rounded UP to
-    /// `DEFAULT_CACHE_SHARDS` (64) entries; the `capacity` field still
-    /// holds the raw request.  See the type docs for why the share is
-    /// soft (a hot shard borrows idle shards' budget).
+    /// `(max_entries / DEFAULT_CACHE_SHARDS).max(1)`, so requests below
+    /// the shard count are floored at one entry per shard (effective
+    /// budget `DEFAULT_CACHE_SHARDS` = 64); requests in `[64, 128)` get a
+    /// share of 1 and an effective budget of exactly `max_entries` (e.g.
+    /// 65 settles at 65, not 64 — the floor does not bite and the raw
+    /// request is honored).  The `capacity` field still holds the raw
+    /// request.  See the type docs for why the share is soft (a hot shard
+    /// borrows idle shards' budget).
+    ///
+    /// *For `max_entries < DEFAULT_CACHE_SHARDS` the effective GLOBAL cap
+    /// is `DEFAULT_CACHE_SHARDS` (one per shard), not `max_entries`: the
+    /// `staged_global > capacity` gate reads the RAW request, but the
+    /// per-shard floor lets each shard stage its one entry first.*
     pub fn with_capacity(max_entries: usize) -> Self {
+        // Per-shard floor (documented): a request below the shard count is
+        // rounded UP to one entry per shard — the EFFECTIVE budget is at
+        // least `DEFAULT_CACHE_SHARDS`.  Debug builds say so out loud, ONCE
+        // per process: every LRU/TinyLFU test constructs a small cache, so
+        // a per-construction note is spam in a `cargo test` run; a
+        // `debug_assert!` would break those (legitimate) constructions.
+        #[cfg(debug_assertions)]
+        if max_entries > 0 && max_entries < DEFAULT_CACHE_SHARDS {
+            static NOTE: std::sync::Once = std::sync::Once::new();
+            NOTE.call_once(|| {
+                eprintln!(
+                    "NOTE: DefaultCache::with_capacity({max_entries}) is rounded up \
+                     to {DEFAULT_CACHE_SHARDS} entries (one per shard floor)"
+                );
+            });
+        }
         let per_shard = if max_entries == 0 {
             0
         } else {
@@ -898,19 +1216,24 @@ where
                 .map(|_| {
                     CachePadded(RwLock::new(CacheShard {
                         map: FxHashMap::default(),
-                        head: None,
-                        tail: None,
+                        slots: Vec::new(),
+                        head: NONE,
+                        tail: NONE,
+                        hand: NONE,
                         valued: 0,
                     }))
                 })
                 .collect(),
             per_shard_capacity: per_shard,
             capacity: max_entries,
-            staged_global: AtomicUsize::new(0),
+            staged_global: std::array::from_fn(|_| CachePadded(AtomicUsize::new(0))),
             admit: (0..ADMIT_SKETCH_SIZE).map(|_| AtomicU8::new(0)).collect(),
-            admit_clock: AtomicUsize::new(0),
+            admit_clock: CachePadded(AtomicUsize::new(0)),
+            admit_aging_left: AtomicUsize::new(0),
+            admit_aging_cursor: AtomicUsize::new(0),
             arena_id: NEXT_STAT_ARENA_ID.fetch_add(1, Ordering::Relaxed),
             stat_shards: Mutex::new(Vec::new()),
+            orphan_nodes: AtomicU64::new(0),
         }
     }
 
@@ -920,7 +1243,31 @@ where
     /// state and zero coherence traffic (the whole point of the arena;
     /// a shared counter would serialize every hit on one line).
     #[inline]
+    fn with_last_stat<R>(&self, f: impl FnOnce(&ThreadStats) -> R) -> Option<R> {
+        LAST_STAT.with(|last| {
+            let b = last.borrow();
+            match b.as_ref() {
+                Some((id, slot)) if *id == self.arena_id => Some(f(slot)),
+                _ => None,
+            }
+        })
+    }
+
+    #[inline]
+    fn remember_stat_slot(&self, slot: &Arc<ThreadStats>) {
+        LAST_STAT.with(|last| {
+            let mut b = last.borrow_mut();
+            if b.as_ref().is_none_or(|(id, _)| *id != self.arena_id) {
+                *b = Some((self.arena_id, Arc::clone(slot)));
+            }
+        });
+    }
+
+    #[inline]
     fn stat_bump(&self, f: StatField) {
+        if self.with_last_stat(|s| bump(s, f)).is_some() {
+            return;
+        }
         STAT_SLOTS.with(|m| {
             let fast = {
                 // Borrow scoped to the probe so the cold path below can
@@ -929,6 +1276,7 @@ where
                 match m.get(&self.arena_id) {
                     Some(slot) => {
                         bump(slot, f);
+                        self.remember_stat_slot(slot);
                         true
                     }
                     None => false,
@@ -940,11 +1288,62 @@ where
         });
     }
 
-    /// First-touch registration.  MAY run while holding a cache shard
-    /// write lock (the eviction loops in `stage`/`insert` bump under the
-    /// lock) — so the lock-order rule is: cache-shard lock →
-    /// stat-registry lock is legal, the REVERSE is forbidden.  `stats()`
-    /// obeys by taking `len()` (shard read locks) BEFORE the registry.
+    /// Batched [`Self::stat_bump`]: ONE atomic RMW for `n` increments of
+    /// the same counter — the eviction tail of a stage can evict several
+    /// values in one sweep, and each would otherwise pay a full TLS probe
+    /// plus RMW.  Same lock-order contract as `stat_bump`.
+    fn stat_bump_n(&self, f: StatField, n: usize) {
+        if self.with_last_stat(|s| bump_n(s, f, n)).is_some() {
+            return;
+        }
+        STAT_SLOTS.with(|m| {
+            // One borrow, not two.
+            if let Ok(m) = m.try_borrow() {
+                if let Some(slot) = m.get(&self.arena_id) {
+                    bump_n(slot, f, n);
+                    self.remember_stat_slot(slot);
+                    return;
+                }
+            }
+            self.stat_bump_cold_n(f, n);
+        });
+    }
+
+    /// Cold path of [`Self::stat_bump_n`] — first touch of this arena id on
+    /// the thread, registering the slot then applying the whole batch.
+    fn stat_bump_cold_n(&self, f: StatField, n: usize) {
+        STAT_SLOTS.with(|m| {
+            let hit = {
+                let m = m.borrow();
+                match m.get(&self.arena_id) {
+                    Some(slot) => {
+                        bump_n(slot, f, n);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if hit {
+                return;
+            }
+            let _tw =
+                sync_order::Acquired::acquire(sync_order::Fam::StatRegistry, "stat_bump_cold");
+            let slot = Arc::new(ThreadStats::default());
+            self.stat_shards.lock().push(Arc::clone(&slot));
+            bump_n(&slot, f, n);
+            m.borrow_mut().insert(self.arena_id, Arc::clone(&slot));
+            self.remember_stat_slot(&slot);
+        });
+    }
+
+    /// First-touch registration.  MAY still run while holding a cache
+    /// shard write lock — `stage_inner`'s in-section accounting keeps the
+    /// CacheShard→StatRegistry edge live (§0 #8) even though the
+    /// EVICTION-COUNT bumps themselves moved POST-lock (their cold path
+    /// no longer stretches the critical section).  The lock-order rule
+    /// stands: cache-shard lock → stat-registry lock is legal, the
+    /// REVERSE is forbidden.  `stats()` obeys by taking `len()` (shard
+    /// read locks) BEFORE the registry.
     fn stat_bump_cold(&self, f: StatField) {
         STAT_SLOTS.with(|m| {
             let hit = {
@@ -968,7 +1367,8 @@ where
             let slot = Arc::new(ThreadStats::default());
             self.stat_shards.lock().push(Arc::clone(&slot));
             bump(&slot, f);
-            m.borrow_mut().insert(self.arena_id, slot);
+            m.borrow_mut().insert(self.arena_id, Arc::clone(&slot));
+            self.remember_stat_slot(&slot);
         });
     }
 
@@ -1015,18 +1415,80 @@ where
     /// per row (saturation at 255 only compresses the top end — estimates
     /// are relative).  Lock-free; call on hits AND stages.
     ///
-    /// The `fetch_update` CAS loop is deliberate and must NOT be "fixed"
+    /// The `try_update` CAS loop is deliberate and must NOT be "fixed"
     /// to a wrapping `fetch_add`: `admit` is `AtomicU8`, so 256 accesses
     /// to one key would wrap its row counter to 0 and drop a genuinely
     /// hot key to the coldest estimate — TinyLFU would then admit every
     /// newcomer and the cache degenerates to CLOCK.  `checked_add` inside
     /// the loop is what makes it saturate instead.
+    ///
+    /// Sampled (4a of the perf pass): only every `ADMIT_SAMPLE_PERIOD`-th
+    /// access on this thread reaches the sketch.  The counter is per-THREAD
+    /// and key-independent, so each thread's samples land on the keys it
+    /// touches in proportion to their access rate — the estimate reads
+    /// "actual / period" with no systematic bias across the key population,
+    /// and newcomer-vs-victim admission compares two identically-sampled
+    /// quantities, so the relative ordering TinyLFU needs is preserved.
+    /// Two CAS loops per hit was the classic shared-line ping-pong under a
+    /// multi-core hit storm; sampling cuts that traffic
+    /// `ADMIT_SAMPLE_PERIOD`-fold.  Very cold keys (a couple of accesses)
+    /// may not sample at all and estimate 0 — the same direction a race or
+    /// an aging halve already blurs, and the safe one: a cold estimate only
+    /// makes admission slightly stricter.
     #[inline]
     fn note_access_hash(&self, h: u64) {
+        // Unlimited caches never consult the sketch (eviction never runs),
+        // so the sampled RMW is pure waste on their hit path.
+        if self.per_shard_capacity == 0 {
+            return;
+        }
+        // Sampling counter is per (thread, cache): the per-thread stat slot
+        // (one FxHashMap probe, lock-free) carries the counter; the process-
+        // wide `ADMIT_SAMPLE_COUNTER` is only the fallback for a thread that
+        // has not touched this cache's stat slot yet (the cold path
+        // registers it a moment later anyway).
+        let n = STAT_SLOTS.with(|m| {
+            let m = m.borrow();
+            match m.get(&self.arena_id) {
+                Some(slot) => slot.admit_sample.fetch_add(1, Ordering::Relaxed),
+                None => ADMIT_SAMPLE_COUNTER.with(|c| {
+                    let n = c.get();
+                    c.set(n.wrapping_add(1));
+                    n
+                }),
+            }
+        });
+        if n % ADMIT_SAMPLE_PERIOD != 0 {
+            return;
+        }
         for (r, i) in Self::admit_rows_of_hash(h).into_iter().enumerate() {
             let c = &self.admit[r * ADMIT_SKETCH_WIDTH + i];
-            let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1));
+            let _ = c.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1));
         }
+    }
+
+    /// The sharded `staged_global` counter line for a mutation happening
+    /// under a given shard's lock (5 of the perf pass): indexed by the
+    /// SHARD INDEX, so shard i's mutations always land on counter
+    /// `i & 7` — a true 8-way striping (see `STAGED_GLOBAL_SHARDS` for why
+    /// the address-derivation this replaced was degenerate).
+    #[inline]
+    fn staged_add(&self, shard_idx: usize, d: isize) {
+        let cell = &self.staged_global[shard_idx & (STAGED_GLOBAL_SHARDS - 1)];
+        if d >= 0 {
+            cell.0.fetch_add(d as usize, Ordering::Relaxed);
+        } else {
+            cell.0.fetch_sub((-d) as usize, Ordering::Relaxed);
+        }
+    }
+
+    /// Read the (transiently skewed, Relaxed) sharded `staged_global` sum.
+    #[inline]
+    fn staged_total(&self) -> usize {
+        self.staged_global
+            .iter()
+            .map(|c| c.0.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Estimated access frequency from a precomputed digest: row minimum,
@@ -1040,15 +1502,84 @@ where
         m
     }
 
-    /// TinyLFU aging: every `capacity.max(64)` stages halve all
-    /// counters so decayed hot keys stop vetoing newcomers.  Races
-    /// with concurrent increments only blur frequencies.
+    /// TinyLFU aging: every `capacity.max(64)` stages a halving pass over
+    /// all counters becomes due, so decayed hot keys stop vetoing
+    /// newcomers.  AMORTIZED: the pass is not run as one full scan — that
+    /// touched all 4096 counters in a single tick — but drained in chunks
+    /// of `ADMIT_AGING_CHUNK` per stage/insert from a rotating cursor
+    /// (`admit_aging_cursor`), with `admit_aging_left` tracking how much
+    /// of the current pass is still owed.  A full pass completes within
+    /// `ADMIT_SKETCH_SIZE / ADMIT_AGING_CHUNK` ticks after the boundary —
+    /// negligible skew next to the `capacity.max(64)`-tick period.  Races
+    /// with concurrent increments, or two threads draining the same pass,
+    /// only blur frequencies (the same contract as the sketch itself).
+    #[inline]
+    /// TinyLFU aging: every `capacity.max(ADMIT_SKETCH_SIZE /
+    /// ADMIT_AGING_CHUNK)` stages a halving pass over all counters becomes
+    /// due, so decayed hot keys stop vetoing newcomers.  AMORTIZED: the
+    /// pass is not run as one full scan — that touched all 4096 counters
+    /// in a single tick — but drained in chunks of `ADMIT_AGING_CHUNK`
+    /// per stage/insert from a rotating cursor (`admit_aging_cursor`),
+    /// with `admit_aging_left` tracking how much of the current pass is
+    /// still owed.  A full pass completes within
+    /// `ADMIT_SKETCH_SIZE / ADMIT_AGING_CHUNK` ticks after the boundary,
+    /// and the period is floored at exactly that many ticks, so the pass
+    /// ALWAYS completes before the next boundary resets
+    /// `admit_aging_left` — for every capacity, ≤ 1 chunk (32 counter
+    /// RMWs) of aging work per stage.  Races with concurrent increments,
+    /// or two threads draining the same pass, only blur frequencies (the
+    /// same contract as the sketch itself).
     #[inline]
     fn admit_tick(&self) {
-        let n = self.admit_clock.fetch_add(1, Ordering::Relaxed);
-        if n % self.capacity.max(64) == 0 {
-            for c in self.admit.iter() {
-                let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x / 2));
+        let n = self.admit_clock.0.fetch_add(1, Ordering::Relaxed);
+        if n % self
+            .capacity
+            .max(ADMIT_SKETCH_SIZE / ADMIT_AGING_CHUNK)
+            == 0
+        {
+            // `fetch_max`, not `store`: a concurrent chunk claim
+            // that decremented between this decision and the reset must not
+            // have its owed work discarded.  Over-restoring is the
+            // conservative direction (one extra aging pass).
+            self.admit_aging_left
+                .fetch_max(ADMIT_SKETCH_SIZE, Ordering::Relaxed);
+        }
+        // ONE chunk per call — the boundary reset above re-arms the pass,
+        // and the period floor guarantees the previous pass drained fully
+        // before that, so a chunk-per-tick always finishes on schedule.
+        // (The original loop drained until `left == 0` in a single call:
+        // the exact full-scan spike the amortization was meant to remove.)
+        let mut left = self.admit_aging_left.load(Ordering::Relaxed);
+        while left != 0 {
+            let chunk = left.min(ADMIT_AGING_CHUNK);
+            // Claim the chunk with a retry loop, not a single CAS: under a
+            // stage storm many ticks can lose the CAS in a row, and the old
+            // "loser does nothing" shape let the boundary reset discard owed
+            // aging work (the pass would never finish, so admission quality
+            // decayed exactly when contention was highest).  Each retry
+            // re-reads `left`; either we claim a chunk, or another thread
+            // drained toward 0 — the loop is bounded by the remaining work,
+            // and the one-chunk-per-call amortization is kept for the
+            // winner.
+            match self.admit_aging_left.compare_exchange(
+                left,
+                left - chunk,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let start = self
+                        .admit_aging_cursor
+                        .fetch_add(chunk, Ordering::Relaxed)
+                        % ADMIT_SKETCH_SIZE;
+                    for i in 0..chunk {
+                        let idx = (start + i) % ADMIT_SKETCH_SIZE;
+                        let _ = self.admit[idx]
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x / 2));
+                    }
+                    return;
+                }
+                Err(actual) => left = actual,
             }
         }
     }
@@ -1086,53 +1617,90 @@ where
         distribution_flagged(d.total, d.max, d.min)
     }
 
-    /// Detach `key`'s entry from the LRU chain: splice its neighbors
-    /// together and fix head/tail.  `prev`/`next` are the entry's links
-    /// read by the caller BEFORE this call (the entry's own links are
-    /// cleared separately — a chain-detached entry keeps None links).
-    fn unlink_entry(shard: &mut CacheShard<K, V>, key: &K, prev: Option<K>, next: Option<K>) {
-        if let Some(p) = &prev {
-            if let Some(pe) = shard.map.get_mut(p) {
-                pe.next = next.clone();
+    /// Debug-only chain-integrity validator (pins `unlink_entry`'s
+    /// "a chain-detached slot keeps NONE links" contract): walk
+    /// head→tail, check every forward/backward pairing, the tail
+    /// endpoint, the `valued` count, and that valueless slots carry
+    /// no links.  Gated on an eviction actually having run — the call
+    /// site sits at the end of `evict_with_admission`, which every
+    /// `stage_inner` reaches, and an unconditional O(shard) walk on
+    /// every debug-build stage would tax the hot path for nothing (the
+    /// loop body is the only code that mutates the chain).
+    #[cfg(debug_assertions)]
+    fn debug_chain_intact(shard: &CacheShard<K, V>) -> bool {
+        let mut chain_len = 0usize;
+        let mut prev: u32 = NONE;
+        let mut cur = shard.head;
+        let mut guard = 0usize;
+        while cur != NONE {
+            guard += 1;
+            if guard > shard.map.len() {
+                return false; // cycle
             }
-        }
-        if let Some(n) = &next {
-            if let Some(ne) = shard.map.get_mut(n) {
-                ne.prev = prev.clone();
+            let Some(slot) = shard.slots.get(cur as usize) else {
+                return false; // dangling index
+            };
+            if slot.value.is_none() {
+                return false; // chain member without a value (contract 2)
             }
+            if slot.prev != prev {
+                return false; // backward link broken
+            }
+            prev = cur;
+            chain_len += 1;
+            cur = slot.next;
         }
-        if shard.head.as_ref() == Some(key) {
+        if shard.tail != prev {
+            return false; // tail endpoint wrong
+        }
+        if chain_len != shard.valued {
+            return false; // count drift
+        }
+        // Detached slots carry no links.
+        shard
+            .slots
+            .iter()
+            .all(|s| s.value.is_some() || (s.prev == NONE && s.next == NONE))
+    }
+
+    /// Detach slot `idx` from the LRU chain: splice its neighbors
+    /// together and fix head/tail.  `prev`/`next` are the slot's links
+    /// read by the caller BEFORE this call (the slot's own links are
+    /// cleared separately — a chain-detached slot keeps NONE links).
+    fn unlink_entry(shard: &mut CacheShard<K, V>, idx: u32, prev: u32, next: u32) {
+        if prev != NONE {
+            shard.slots[prev as usize].next = next;
+        }
+        if next != NONE {
+            shard.slots[next as usize].prev = prev;
+        }
+        if shard.head == idx {
             shard.head = next;
         }
-        if shard.tail.as_ref() == Some(key) {
+        if shard.tail == idx {
             shard.tail = prev;
         }
     }
 
-    /// Link `key`'s entry at the chain head.  The entry must exist in the
-    /// map and be chain-detached (`prev == next == None`).
-    fn link_head(shard: &mut CacheShard<K, V>, key: &K) {
-        let old_head = shard.head.clone();
+    /// Link slot `idx` at the chain head.  The slot must exist and be
+    /// chain-detached (`prev == next == NONE`).
+    fn link_head(shard: &mut CacheShard<K, V>, idx: u32) {
+        let old_head = shard.head;
         {
-            let entry = shard
-                .map
-                .get_mut(key)
-                .expect("link_head: entry must be registered");
-            entry.prev = None;
-            entry.next = old_head.clone();
+            let slot = &mut shard.slots[idx as usize];
+            slot.prev = NONE;
+            slot.next = old_head;
         }
-        if let Some(oh) = &old_head {
-            if let Some(he) = shard.map.get_mut(oh) {
-                he.prev = Some(key.clone());
-            }
+        if old_head != NONE {
+            shard.slots[old_head as usize].prev = idx;
         }
-        shard.head = Some(key.clone());
-        if shard.tail.is_none() {
-            shard.tail = Some(key.clone());
+        shard.head = idx;
+        if shard.tail == NONE {
+            shard.tail = idx;
         }
     }
 
-    /// Link a FRESHLY staged entry at the chain head with a SWEEP-LOCAL
+    /// Link a FRESHLY staged slot at the chain head with a SWEEP-LOCAL
     /// CLOCK second chance.
     ///
     /// `evict_with_admission` clears the bit again when the sweep ends, so
@@ -1143,7 +1711,7 @@ where
     /// after insertion, but it must also not be evicted by its OWN stage.
     ///
     /// Why the chance is needed at all: `evict_one` sweeps from the tail,
-    /// promoting every referenced entry to the head.  If every PRE-EXISTING
+    /// promoting every referenced slot to the head.  If every PRE-EXISTING
     /// resident is referenced, the promotions push the newcomer to the tail
     /// and the sweep selects IT as the victim.  The TinyLFU gate then
     /// compares `estimate(key) < estimate(victim)` with `victim == key`,
@@ -1158,27 +1726,24 @@ where
     /// path also calls it for a victim whose chance was just consumed by
     /// the sweep, and re-setting it there would make the restored victim
     /// survive the very next sweep for free.
-    fn link_head_fresh(shard: &mut CacheShard<K, V>, key: &K) {
-        Self::link_head(shard, key);
-        if let Some(entry) = shard.map.get_mut(key) {
-            entry.referenced.store(true, Ordering::Relaxed);
-        }
+    fn link_head_fresh(shard: &mut CacheShard<K, V>, idx: u32) {
+        Self::link_head(shard, idx);
+        shard.slots[idx as usize]
+            .referenced
+            .store(true, Ordering::Relaxed);
     }
 
     /// Promote a CHAIN member to the head (no-op if already head).
-    fn move_to_head(shard: &mut CacheShard<K, V>, key: &K) {
-        if shard.head.as_ref() == Some(key) {
+    fn move_to_head(shard: &mut CacheShard<K, V>, idx: u32) {
+        if shard.head == idx {
             return;
         }
         let (prev, next) = {
-            let entry = shard
-                .map
-                .get(key)
-                .expect("move_to_head: entry must be registered");
-            (entry.prev.clone(), entry.next.clone())
+            let slot = &shard.slots[idx as usize];
+            (slot.prev, slot.next)
         };
-        Self::unlink_entry(shard, key, prev, next);
-        Self::link_head(shard, key);
+        Self::unlink_entry(shard, idx, prev, next);
+        Self::link_head(shard, idx);
     }
 
     /// CLOCK sweep: detach ONE staged entry's value — the node half
@@ -1191,36 +1756,78 @@ where
     /// a referenced entry is demoted-and-promoted (its bit is consumed by
     /// the swap), and no reader can set bits while this write lock is
     /// held, so the sweep ends within one revolution.
-    fn evict_one(shard: &mut CacheShard<K, V>) -> Option<(K, Option<V>)> {
-        let mut cur = shard.tail.clone();
-        while let Some(key) = cur {
-            let (referenced, prev, next) = {
-                let entry = shard.map.get(&key).expect("chain entry must exist");
+    fn evict_one(shard: &mut CacheShard<K, V>) -> Option<(u32, u64, Option<V>)> {
+        // Resume at the persisted hand when it still points at a staged
+        // (chained) slot — a detached/unstaged slot falls back to the tail.
+        // The hand is taken (cleared) up front so a bail-out below never
+        // leaves a stale resume point.
+        let hand = shard.hand;
+        shard.hand = NONE;
+        let mut cur = if hand != NONE && shard.slots[hand as usize].value.is_some() {
+            hand
+        } else {
+            shard.tail
+        };
+        while cur != NONE {
+            let (referenced, prev, next, hash) = {
+                let slot = &shard.slots[cur as usize];
                 (
-                    entry.referenced.swap(false, Ordering::Relaxed),
-                    entry.prev.clone(),
-                    entry.next.clone(),
+                    slot.referenced.swap(false, Ordering::Relaxed),
+                    slot.prev,
+                    slot.next,
+                    slot.hash,
                 )
             };
             if referenced {
                 // Second chance: promote and continue the sweep from the
-                // (unchanged) tail — the promoted entry now sits at the
+                // (unchanged) tail — the promoted slot now sits at the
                 // head, so the tail is its former predecessor.
-                Self::unlink_entry(shard, &key, prev, next);
-                Self::link_head(shard, &key);
-                cur = shard.tail.clone();
+                Self::unlink_entry(shard, cur, prev, next);
+                Self::link_head(shard, cur);
+                cur = shard.tail;
                 continue;
             }
-            // Victim: detach the VALUE, keep the node and the key.
+            // Victim: detach the VALUE, keep the node and the slot.
             let old = {
-                let entry = shard.map.get_mut(&key).expect("chain entry must exist");
-                entry.prev = None;
-                entry.next = None;
-                entry.value.take()
+                let slot = &mut shard.slots[cur as usize];
+                slot.prev = NONE;
+                slot.next = NONE;
+                slot.value.take()
             };
-            Self::unlink_entry(shard, &key, prev, next);
-            shard.valued -= 1;
-            return Some((key, old));
+            Self::unlink_entry(shard, cur, prev, next);
+            // Decrement ONLY for a value actually taken, symmetric with the
+            // victim-restore path's `victim_hot` gate: if contract 2 (chain
+            // members hold values) ever breaks, both sides err in the SAME
+            // direction instead of opposing ones.  Today the gate is a
+            // no-op — chain members always have values.
+            if old.is_some() {
+                shard.valued -= 1;
+            }
+            // The next sweep resumes just past the victim (toward the
+            // head) instead of re-walking from the tail — the amortized
+            // CLOCK hand.  `next` may be NONE (victim was head); then the
+            // next sweep restarts at the tail.
+            //
+            // On the TinyLFU REJECT path the victim is restored at the
+            // head while `hand` still points past its old position — the
+            // restored slot is skipped by the next sweep.  Benign and
+            // deliberate: the restore already re-promoted it (fresh head
+            // link), and letting the hand skip it just means the next
+            // sweep judges colder residents first.  Do not "fix" the hand
+            // on the reject path.
+            //
+            // CONSEQUENCE, stated explicitly: the restored victim gets ONE
+            // extra sweep of grace, not zero.  After the rejection,
+            // `tail` is the restored victim and `hand` points toward the
+            // head from the victim's old position; the next sweep starts
+            // at `hand` and walks backward, and if it reaches `tail` again
+            // it re-judges the restored victim — whose reference bit was
+            // consumed above, so a second strike evicts it.  That is the
+            // legitimate CLOCK second chance; "the next sweep judges
+            // colder residents first" describes the sweep AFTER the
+            // skipped one, not immunity for the victim.
+            shard.hand = next;
+            return Some((cur, hash, old));
         }
         None
     }
@@ -1234,7 +1841,7 @@ where
     /// MUST run while holding `shard`'s write lock, after the caller has
     /// staged the new value and updated `shard.valued`, the chain, and
     /// `staged_global`.  `key_hash` is the caller's single hash pass
-    /// (3.3) — hoisted out of the loop so one operation compares against
+    /// — hoisted out of the loop so one operation compares against
     /// ONE estimate for the newcomer, instead of re-reading a sketch other
     /// threads may bump between iterations.  `fresh` is the caller's
     /// `shard.valued > valued_before`.  Evicted/rejected payloads are
@@ -1242,12 +1849,26 @@ where
     /// lock releases (trait contract 4).
     fn evict_with_admission(
         &self,
+        shard_idx: usize,
         shard: &mut CacheShard<K, V>,
-        key: &K,
+        newcomer_idx: u32,
         key_hash: u64,
         fresh: bool,
-        dropped: &mut Vec<V>,
+        dropped: &mut SmallVec<[V; 1]>,
+        // Eviction count, accumulated LOCALLY: `stat_bump`'s cold path
+        // (stat-registry mutex + `Arc` alloc) must not stretch the shard
+        // write lock's critical section — the caller bumps once per
+        // eviction AFTER the lock releases (same counting semantics as
+        // the old in-lock bump, including restored victims).
+        evictions: &mut usize,
     ) {
+        // NOTE: the sketch-aging tick deliberately does NOT run here.  It
+        // lives in `stage_inner` BEFORE this function's shard write lock is
+        // taken: `admit_tick` touches only sketch atomics and its own
+        // cursor — no shard state — and running the (occasionally
+        // full-chunk) aging drain inside this hot write critical section
+        // bought nothing.  This function is reached from exactly one
+        // caller, so the tick still fires exactly once per stage.
         // Evict while over the shard's share AND the GLOBAL budget is
         // exceeded (hot shard borrows idle shards' share).  The
         // `per_shard_capacity > 0` guard must stay: with
@@ -1268,27 +1889,76 @@ where
         // overshoot as "transient" — there is no overshoot to decay.
         // Re-stage-over-staged never gates: an admitted resident keeps
         // its seat.
+        // The global-budget question is hoisted out of the loop: reading
+        // `staged_total()` costs 8 Relaxed atomic loads per sweep iteration,
+        // and the answer can only CHANGE when this loop itself evicts (its
+        // own `staged_add(-1)`).  The newcomer's stage is already counted in
+        // the first read, and concurrent `stage`s can only raise the total —
+        // i.e. only ever keep us over budget — so re-reading after each real
+        // eviction is exact for the "are we still over budget" question.
+        let mut over_budget = self.per_shard_capacity > 0 && self.staged_total() > self.capacity;
+        // Set when this sweep mutated the LRU chain in ANY way (eviction,
+        // victim restore, newcomer unlink) — the admission-REJECT path
+        // mutates the chain (victim re-linked at head, newcomer detached)
+        // while leaving `*evictions == 0`, so the `evictions > 0` gate
+        // below would skip the chain-integrity validation on exactly the
+        // subtlest accounting branch.
+        let mut chain_touched = false;
         while self.per_shard_capacity > 0
             && shard.valued > self.per_shard_capacity
-            && self.staged_global.load(Ordering::Relaxed) > self.capacity
+            && over_budget
         {
-            let Some((victim, victim_value)) = Self::evict_one(shard) else {
+            let Some((victim_idx, victim_hash, victim_value)) = Self::evict_one(shard) else {
                 break;
             };
-            // The victim's own hash is computed ONCE per eviction and then
-            // compared by number (re-hashing `&victim` on every
-            // loop iteration, plus probing the sketch twice per iteration,
-            // quietly undoes the one-hash-per-op refactor on this path).
-            let victim_hash = Self::hash_key(&victim);
-            self.staged_global.fetch_sub(1, Ordering::Relaxed);
-            self.stat_bump(StatField::Eviction);
-            if fresh && self.estimate_hash(key_hash) < self.estimate_hash(victim_hash) {
-                let victim_hot = victim_value.is_some();
-                if let Some(entry) = shard.map.get_mut(&victim) {
-                    entry.value = victim_value;
+            chain_touched = true;
+            // The victim's hash is the slot's CACHED digest (see
+            // `Slot::hash`) — zero re-hashing per sweep iteration.
+            // Gated on `victim_hot` like the reject path below: the chain
+            // discipline says every chain member holds a value, but keeping
+            // the accounting local (not borrowed from that discipline)
+            // prevents `staged_global`/`shard.valued` divergence if the
+            // invariant ever breaks.
+            let victim_hot = victim_value.is_some();
+            if victim_hot {
+                self.staged_add(shard_idx, -1);
+                *evictions += 1;
+            }
+            // Only THIS loop's own decrement can change the verdict: concurrent
+            // stages can only raise the total, and a valueless victim
+            // decremented nothing.  Re-read only when we actually took a
+            // value out — one 8-atomic sum per real eviction,
+            // not per sweep iteration.
+            if victim_hot {
+                over_budget = self.staged_total() > self.capacity;
+            }
+            // The newcomer's admission estimate is FIXED for this call (the
+            // doc above calls the newcomer "colder than the victim" as a
+            // property of the STAGE, not of the loop): hoisting it out of
+            // the loop is pure — WRONG, and the comment used to say so on a
+            // false premise.  `note_access_hash` runs on the HIT path
+            // WITHOUT any shard write lock, so a concurrent hit on the
+            // newcomer's key CAN bump its sketch rows between loop
+            // iterations; re-reading per iteration (the code below) is the
+            // safe shape.  Do not "hoist" this load based on the shard lock.
+            // Cost note: the read is two sketch row loads per eviction
+            // iteration and CAN be contended under a publish storm —
+            // accepted because the estimate is SAMPLED
+            // (`ADMIT_SAMPLE_PERIOD`), so a hoisted stale read would only
+            // make admission stricter or looser by one sample bucket; if
+            // that slack ever matters, the rejection argument above (hit
+            // path has no shard lock) is what to revisit, not this load.
+            let newcomer_est = if fresh { self.estimate_hash(key_hash) } else { 0 };
+            if fresh && newcomer_est < self.estimate_hash(victim_hash) {
+                // Reuse the outer `victim_hot`: shadowing it
+                // with an identical value only obscured the accounting
+                // pairing below.
+                // Restore the victim's value and re-link it at the head.
+                if let Some(v) = victim_value {
+                    shard.slots[victim_idx as usize].value = Some(v);
                 }
                 if victim_hot {
-                    Self::link_head(shard, &victim);
+                    Self::link_head(shard, victim_idx);
                 }
                 // Both counter bumps are gated on `victim_hot` rather than
                 // being unconditional.  Today `victim_value` is
@@ -1302,16 +1972,37 @@ where
                 // borrowed from the chain discipline.
                 if victim_hot {
                     shard.valued += 1;
-                    self.staged_global.fetch_add(1, Ordering::Relaxed);
+                    self.staged_add(shard_idx, 1);
                 }
-                if let Some(entry) = shard.map.get_mut(key) {
-                    if let Some(v) = entry.value.take() {
-                        let (prev, next) = (entry.prev.clone(), entry.next.clone());
-                        Self::unlink_entry(shard, key, prev, next);
-                        shard.valued -= 1;
-                        self.staged_global.fetch_sub(1, Ordering::Relaxed);
-                        dropped.push(v);
-                    }
+                // Unstage the newcomer: take its value, chain-detach it
+                // (`.take()` on the links, not a copy — `unlink_entry`'s
+                // contract says a detached slot keeps NONE links; the old
+                // copy-left-stale-links shape was benign only while every
+                // walk starts at head/tail and the hand validates
+                // `value.is_some()`), and drop the value post-lock (trait
+                // contract 4).
+                if let Some(v) = shard.slots[newcomer_idx as usize].value.take() {
+                    let (prev, next) = {
+                        let slot = &mut shard.slots[newcomer_idx as usize];
+                        let links = (slot.prev, slot.next);
+                        slot.prev = NONE;
+                        slot.next = NONE;
+                        links
+                    };
+                    Self::unlink_entry(shard, newcomer_idx, prev, next);
+                    shard.valued -= 1;
+                    self.staged_add(shard_idx, -1);
+                    dropped.push(v);
+                }
+                // The victim was RESTORED, so this sweep iteration did not
+                // evict anything: undo the count — only if it was bumped,
+                // which (like the increment above) is gated on `victim_hot`.
+                // `stats().evictions` means "values that actually left the
+                // cache" — consumers doing rate math on eviction pressure
+                // must not see sweep iterations that the admission gate
+                // cancelled.
+                if victim_hot {
+                    *evictions -= 1;
                 }
                 break;
             }
@@ -1320,13 +2011,21 @@ where
         // The newcomer's bit was a SWEEP-LOCAL second chance (see
         // `link_head_fresh`): if this stage's sweep did not consume it
         // (an unreferenced victim was found first, or no eviction ran at
-        // all), drop it now so the next stage's sweep judges the entry by
+        // all), drop it now so the next stage's sweep judges the slot by
         // its real recency.  `fresh` is exactly "this call linked the
-        // entry", and only that call set the bit.
+        // slot", and only that call set the bit.
         if fresh {
-            if let Some(entry) = shard.map.get_mut(key) {
-                entry.referenced.store(false, Ordering::Relaxed);
-            }
+            shard.slots[newcomer_idx as usize]
+                .referenced
+                .store(false, Ordering::Relaxed);
+        }
+        #[cfg(debug_assertions)]
+        if chain_touched {
+            debug_assert!(
+                Self::debug_chain_intact(shard),
+                "LRU chain broken after evict_with_admission (see unlink_entry's \
+                 detached-entry contract)"
+            );
         }
     }
 
@@ -1342,15 +2041,29 @@ where
     pub fn lookup(&self, key: &K) -> Option<V> {
         let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "cache.lookup");
         let h = Self::hash_key(key);
-        let shard = self.shards[Self::shard_of_hash(h)].read();
-        let entry = shard.map.get(key)?;
-        if let Some(v) = &entry.value {
-            entry.referenced.store(true, Ordering::Relaxed);
-            let out = v.clone();
-            self.note_access_hash(h);
-            return Some(out);
-        }
-        None
+        // The sketch bump runs AFTER the read guard drops: `note_access_hash`
+        // performs TLS work plus up to two CAS loops on the (shared) TinyLFU
+        // sketch, and spinning those inside the shard's read critical section
+        // is the exact pattern `probe_with_epoch` deliberately avoids.
+        // Semantics are unchanged: the bump only feeds the admission
+        // heuristic, and a miss still skips it (same as before).
+        let out = {
+            let shard = self.shards[Self::shard_of_hash(h)].read();
+            let idx = shard.map.get(key).copied()?;
+            let slot = &shard.slots[idx as usize];
+            let v = slot.value.as_ref()?;
+            // R-W reference-bit idiom (same as `probe_with_epoch`): after
+            // the first store since the last sweep, concurrent readers only
+            // load — the hot entry's line stays shared instead of being
+            // invalidated by a store on every hit.  The racy pair is
+            // harmless: `referenced` is a CLOCK hint.
+            if !slot.referenced.load(Ordering::Relaxed) {
+                slot.referenced.store(true, Ordering::Relaxed);
+            }
+            v.clone()
+        };
+        self.note_access_hash(h);
+        Some(out)
     }
 
     /// See [`DefaultCache::lookup`] — the node-less `insert` twin of
@@ -1358,53 +2071,231 @@ where
     /// sentinel.  Replaced payloads drop after the shard lock releases
     /// (the same contract-4 discipline).
     pub fn insert(&self, key: K, value: V) {
-        // (3.3) ONE hash pass feeds the shard index, the sketch bump and
-        // the admission estimate below.
-        let h = Self::hash_key(&key);
+        // Sentinel node: the value-cache surface carries no dep node (the
+        // `DepNodeIndex(0)` contract; index 0 is never allocated, so no
+        // registered node can alias it).  No node-match assert — the
+        // caller owns the whole entry.
+        self.stage_inner(&key, dep_graph::DepNodeIndex(0), value, false, "cache.insert");
+    }
+
+    /// The shared insert-or-update tail of [`Self::insert`] and
+    /// [`QueryCacheType::stage`] — the subtlest accounting in the file
+    /// was line-for-line DUPLICATED between the two (only the eviction
+    /// loop itself had been factored into `evict_with_admission`), and
+    /// that duplication is exactly where the restored-victim gating bugs
+    /// lived: a fix applied to one was easy to miss in the other.  One
+    /// body; the copies cannot drift.
+    ///
+    /// Sequence (order is load-bearing): ONE hash pass feeds the
+    /// shard index, the sketch bump and the admission estimate;
+    /// insert-or-update with the chain bookkeeping (`move_to_head` /
+    /// `link_head_fresh` / `valued` / `staged_global` mirroring); then
+    /// eviction + TinyLFU admission.  Replaced/evicted payloads drop
+    /// AFTER the shard lock releases (trait contract 4), and the eviction
+    /// stat bumps run post-lock too (see `evict_with_admission`).
+    ///
+    /// `assert_node` pins the probe-registered entry's node half to the
+    /// caller's (`stage`'s contract); the value-cache surface passes the
+    /// sentinel with no assert.
+    fn stage_inner(
+        &self,
+        key: &K,
+        node: dep_graph::DepNodeIndex,
+        value: V,
+        assert_node: bool,
+        site: &'static str,
+    ) {
+        // ONE hash pass feeds the shard index, the sketch bump and
+        // the admission estimate below.  The sketch AGING tick runs here
+        // too — BEFORE this shard's write lock: `admit_tick` touches only
+        // sketch atomics and its own cursor, no shard state, so running it
+        // inside the eviction path's critical section (the previous
+        // placement) stretched the hottest write lock with an aging drain
+        // that shares nothing with it.  Concurrent drains only blur
+        // frequencies, which the sketch's own contention contract already
+        // tolerates.  Gated on a bounded cache: an unlimited cache
+        // (`per_shard_capacity == 0`) never runs the eviction loop, never
+        // consults the sketch, and would grow/age it forever for nothing.
+        if self.per_shard_capacity > 0 {
+            self.admit_tick();
+        }
+        let h = Self::hash_key(key);
         let s = Self::shard_of_hash(h);
-        self.note_access_hash(h);
-        self.admit_tick();
-        let mut dropped: Vec<V> = Vec::new();
-        // #8: the eviction loop's `stat_bump` may take the stat registry
-        // UNDER this shard write lock — the tripwire must see CacheShard
-        // held to validate that edge.
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "cache.insert");
+        // Same gate as `admit_tick`: an unlimited cache never consults the
+        // sketch, so the sampled RMW is wasted traffic on this path.
+        if self.per_shard_capacity > 0 {
+            self.note_access_hash(h);
+        }
+        // SmallVec inline (1 payload): eviction usually yields one value, and
+        // inline slots for a potentially large `V` would be a big stack
+        // slot; a wider sweep spills to the heap like `Vec`.
+        let mut dropped: SmallVec<[V; 1]> = SmallVec::new();
+        let mut evictions: usize = 0;
+        // The raw shard write lock below is registered under
+        // `Fam::CacheShard` so the tripwire sees it (the §0 #8 edge
+        // CacheShard→StatRegistry is still exercised by
+        // `stat_bump_cold`'s first-touch path; the eviction-COUNT bumps
+        // themselves run POST-lock — see the tail below — so they no
+        // longer stretch this critical section).
+        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, site);
         {
             let mut shard = self.shards[s].write();
             let valued_before = shard.valued;
-            if let Some(entry) = shard.map.get_mut(&key) {
-                let old = entry.value.replace(value);
-                let was_staged = old.is_some();
-                if let Some(old) = old {
-                    dropped.push(old);
+            let idx = match shard.map.get(key).copied() {
+                Some(idx) => {
+                    let (old_value, was_staged) = {
+                        let slot = &mut shard.slots[idx as usize];
+                        if assert_node {
+                            // Unconditional (not debug-only): the stored node is the
+                            // entry's permanent identity (trait contract 1).  In
+                            // release a silent mismatch would corrupt `node_of`
+                            // lookups and feed the dep graph a node whose value was
+                            // never published under it.  `stage` is a cold path —
+                            // one call per fresh compute — so the check costs
+                            // nothing measurable.
+                            assert_eq!(
+                                slot.node, node,
+                                "stage: node must match the probe-registered entry"
+                            );
+                        }
+                        let old = slot.value.replace(value);
+                        let was_staged = old.is_some();
+                        (old, was_staged)
+                    };
+                    if let Some(old) = old_value {
+                        // The replaced payload drops post-lock (trait
+                        // contract 4).
+                        dropped.push(old);
+                    }
+                    if was_staged {
+                        // Re-stage over a staged value (a red node's suspect
+                        // entry replaced by the recompute): already chained —
+                        // just promote.
+                        Self::move_to_head(&mut shard, idx);
+                    } else {
+                        // Fresh registration, unstaged, or evicted entry:
+                        // (re-)join the chain with its second chance already
+                        // granted (see `link_head_fresh`).
+                        Self::link_head_fresh(&mut shard, idx);
+                        shard.valued += 1;
+                        self.staged_add(s, 1);
+                    }
+                    idx
                 }
-                if was_staged {
-                    Self::move_to_head(&mut shard, &key);
-                } else {
-                    Self::link_head_fresh(&mut shard, &key);
-                    shard.valued += 1;
-                    self.staged_global.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                shard.map.insert(
-                    key.clone(),
-                    MergedEntry {
-                        node: dep_graph::DepNodeIndex(0),
+                None => {
+                    // Defensive totality (reachable only from `stage`):
+                    // staging without a prior probe registration.  Upstream
+                    // never does this (probe precedes staging in
+                    // `get_shared`), but the slot carries the caller's node
+                    // so the map stays consistent.
+                    let idx = shard.slots.len() as u32;
+                    shard.slots.push(Slot {
+                        key: key.clone(),
+                        node,
                         value: Some(value),
                         referenced: AtomicBool::new(false),
-                        prev: None,
-                        next: None,
-                    },
-                );
-                Self::link_head_fresh(&mut shard, &key);
-                shard.valued += 1;
-                self.staged_global.fetch_add(1, Ordering::Relaxed);
-            }
+                        prev: NONE,
+                        next: NONE,
+                        hash: h,
+                    });
+                    shard.map.insert(key.clone(), idx);
+                    Self::link_head_fresh(&mut shard, idx);
+                    shard.valued += 1;
+                    self.staged_add(s, 1);
+                    idx
+                }
+            };
             // Eviction + TinyLFU admission — see `evict_with_admission`.
             let fresh = shard.valued > valued_before;
-            self.evict_with_admission(&mut shard, &key, h, fresh, &mut dropped);
+            self.evict_with_admission(s, &mut shard, idx, h, fresh, &mut dropped, &mut evictions);
         } // shard lock released — payload Drops run from here on
+        // Eviction stats bump AFTER the lock: `stat_bump`'s cold path takes
+        // the stat-registry mutex (the legal #8 edge, but it stretched this
+        // critical section); the counting semantics are unchanged.  ONE
+        // `fetch_add(n)` for the whole sweep instead of one RMW per evicted
+        // value.  The bumps stay under `_tw` (the ORD #8 testing intent),
+        // then `_tw` releases EXPLICITLY before `drop(dropped)`: payload
+        // Drops must not run with the CacheShard family marked held — a
+        // future `V::drop` that recursed into the query system would
+        // otherwise fire the re-held assert (the same structural constraint
+        // `clear` upholds by scoping `_tw` per iteration).
+        if evictions > 0 {
+            self.stat_bump_n(StatField::Eviction, evictions);
+        }
+        drop(_tw);
         drop(dropped);
+    }
+}
+
+/// Undo for the `held_inc(CacheShard)` registration taken by
+/// `take_cache_shard_r/w`.  It exists solely to make that registration
+/// panic-safe: the probe's critical section invokes the
+/// caller's `capture`/`green` closures, and an unwind there must not leak
+/// the held count — a leak poisons the tripwire for the rest of the
+/// thread's life, turning every later legal acquisition into a phantom
+/// "re-held" report.
+struct CacheShardRegistration;
+
+impl Drop for CacheShardRegistration {
+    #[inline]
+    fn drop(&mut self) {
+        sync_order::held_dec(sync_order::Fam::CacheShard);
+    }
+}
+
+/// Read guard for a cache shard that carries the tripwire registration.
+///
+/// Field/drop order is the whole point: `guard` is `Option` so `Drop::drop`
+/// can release the `RwLock` FIRST, and the `_reg` field is dropped
+/// afterwards by the compiler — so the held count decrements strictly
+/// after the lock is released, matching `DepShardR` ("dec after release").
+/// A panic inside the critical section unwinds through the same path
+/// instead of leaking the registration.
+struct CacheShardRead<'a, K, V> {
+    guard: Option<crate::sync::RwLockReadGuard<'a, CacheShard<K, V>>>,
+    _reg: CacheShardRegistration,
+}
+
+impl<K, V> std::ops::Deref for CacheShardRead<'_, K, V> {
+    type Target = CacheShard<K, V>;
+    #[inline]
+    fn deref(&self) -> &CacheShard<K, V> {
+        self.guard.as_deref().expect("cache shard guard taken twice")
+    }
+}
+
+impl<K, V> Drop for CacheShardRead<'_, K, V> {
+    #[inline]
+    fn drop(&mut self) {
+        self.guard.take();
+    }
+}
+
+/// Write twin of [`CacheShardRead`] (same unlock-then-dec ordering).
+struct CacheShardWrite<'a, K, V> {
+    guard: Option<crate::sync::RwLockWriteGuard<'a, CacheShard<K, V>>>,
+    _reg: CacheShardRegistration,
+}
+
+impl<K, V> std::ops::Deref for CacheShardWrite<'_, K, V> {
+    type Target = CacheShard<K, V>;
+    #[inline]
+    fn deref(&self) -> &CacheShard<K, V> {
+        self.guard.as_deref().expect("cache shard guard taken twice")
+    }
+}
+
+impl<K, V> std::ops::DerefMut for CacheShardWrite<'_, K, V> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut CacheShard<K, V> {
+        self.guard.as_mut().expect("cache shard guard taken twice")
+    }
+}
+
+impl<K, V> Drop for CacheShardWrite<'_, K, V> {
+    #[inline]
+    fn drop(&mut self) {
+        self.guard.take();
     }
 }
 
@@ -1428,23 +2319,27 @@ where
         &self,
         s: usize,
         _t: ticket::Held<ticket::CacheNoShard>,
-    ) -> (
-        crate::sync::RwLockReadGuard<'_, CacheShard<K, V>>,
-        ticket::Held<ticket::CacheShardHeld>,
-    ) {
+    ) -> (CacheShardRead<'_, K, V>, ticket::Held<ticket::CacheShardHeld>) {
         sync_order::check(sync_order::Fam::CacheShard, "cache.take_r");
         // Unlike the dep family's RAII guards, this inc/dec pair is
-        // explicit: the critical sections between take and release must
-        // stay panic-free (they are — map ops + Arc clones + stores).
-        // Without the inc, `check`'s row scan never sees CacheShard held
-        // and every ORD[CacheShard][*] cell is untestable in principle.
-        // Inc BEFORE the grant ("register, then acquire" — the single rule
-        // stated in job.rs::resolve and vtable_or_init): a buggy re-entrant
-        // take then trips the re-held assert with a good diagnostic instead
-        // of deadlocking raw on the lock.
+        // explicit: Inc BEFORE the grant ("register, then acquire" — the
+        // single rule stated in job.rs::resolve and vtable_or_init): a
+        // buggy re-entrant take then trips the re-held assert with a good
+        // diagnostic instead of deadlocking raw on the lock.
+        //
+        // The registration is owned by the returned `CacheShardRead`
+        //: the critical section runs caller `capture`/`green`
+        // closures, so the undo must be RAII — a panic there used to leak
+        // the held count and poison the tripwire.
         sync_order::held_inc(sync_order::Fam::CacheShard);
         let guard = self.shards[s].read();
-        (guard, ticket::Held::<ticket::CacheShardHeld>::of())
+        (
+            CacheShardRead {
+                guard: Some(guard),
+                _reg: CacheShardRegistration,
+            },
+            _t.take_cache_shard(),
+        )
     }
 
     /// cache shard write lock for the same probe/two-phase shape as
@@ -1455,38 +2350,40 @@ where
         &self,
         s: usize,
         _t: ticket::Held<ticket::CacheNoShard>,
-    ) -> (
-        crate::sync::RwLockWriteGuard<'_, CacheShard<K, V>>,
-        ticket::Held<ticket::CacheShardHeld>,
-    ) {
+    ) -> (CacheShardWrite<'_, K, V>, ticket::Held<ticket::CacheShardHeld>) {
         sync_order::check(sync_order::Fam::CacheShard, "cache.take_w");
         // Inc BEFORE the grant — same "register, then acquire" rule as
-        // take_cache_shard_r above.
+        // take_cache_shard_r above; the registration moves into the
+        // returned guard so the probe's closure calls stay panic-safe.
         sync_order::held_inc(sync_order::Fam::CacheShard);
         let guard = self.shards[s].write();
-        (guard, ticket::Held::<ticket::CacheShardHeld>::of())
+        (
+            CacheShardWrite {
+                guard: Some(guard),
+                _reg: CacheShardRegistration,
+            },
+            _t.take_cache_shard(),
+        )
     }
 
-    /// Explicit release: return the ticket to CacheNoShard (normal path; Drop
-    /// covers panic).
+    /// Explicit release: return the ticket to CacheNoShard (normal path; the
+    /// guard's Drop covers panic).
     #[inline]
     fn release_cache_shard_r(
-        g: crate::sync::RwLockReadGuard<'_, CacheShard<K, V>>,
+        g: CacheShardRead<'_, K, V>,
         _t: ticket::Held<ticket::CacheShardHeld>,
     ) -> ticket::Held<ticket::CacheNoShard> {
-        sync_order::held_dec(sync_order::Fam::CacheShard);
-        drop(g);
-        ticket::Held::<ticket::CacheNoShard>::of()
+        drop(g); // unlock, THEN decrement the held count (guard field order)
+        _t.release_cache_shard()
     }
 
     #[inline]
     fn release_cache_shard_w(
-        g: crate::sync::RwLockWriteGuard<'_, CacheShard<K, V>>,
+        g: CacheShardWrite<'_, K, V>,
         _t: ticket::Held<ticket::CacheShardHeld>,
     ) -> ticket::Held<ticket::CacheNoShard> {
-        sync_order::held_dec(sync_order::Fam::CacheShard);
-        drop(g);
-        ticket::Held::<ticket::CacheNoShard>::of()
+        drop(g); // unlock, THEN decrement the held count (guard field order)
+        _t.release_cache_shard()
     }
 }
 
@@ -1499,12 +2396,14 @@ where
         DefaultCache::with_capacity(capacity)
     }
 
-    fn probe(
+    fn probe_with_epoch(
         &self,
         key: &K,
         alloc: impl FnOnce(&mut ticket::Held<ticket::CacheNoShard>) -> dep_graph::DepNodeIndex,
-    ) -> (dep_graph::DepNodeIndex, Option<V>, bool) {
-        // (3.3) ONE hash pass: the shard index here, the sketch bump on
+        capture: &mut impl FnMut(dep_graph::DepNodeIndex) -> u64,
+        green: &mut impl FnMut(dep_graph::DepNodeIndex) -> bool,
+    ) -> (dep_graph::DepNodeIndex, Option<V>, bool, u64) {
+        // ONE hash pass: the shard index here, the sketch bump on
         // the hit below.
         let h = Self::hash_key(key);
         let s = Self::shard_of_hash(h);
@@ -1516,18 +2415,47 @@ where
         // Mechanism B: inside the critical section only the CacheShardHeld
         // ticket is present; dep shard/grow physically cannot get in (the
         // compile face of contract 3 + the tripwire's cross-family row).
+        //
+        // C1: the epoch is captured INSIDE this critical section, BEFORE
+        // the value is cloned — see the trait method's doc for why the
+        // caller-side capture was unsound.
         let hit = {
             let (shard, t1) = self.take_cache_shard_r(s, ticket::Held::fresh());
-            let out = shard.map.get(key).map(|entry| {
-                if let Some(v) = &entry.value {
-                    entry.referenced.store(true, Ordering::Relaxed);
-                    (entry.node, Some(v.clone()), false)
-                } else {
-                    // Registered node, no staged value: fresh registration,
-                    // unstaged, or evicted.
-                    (entry.node, None, false)
+            let out = match shard.map.get(key).copied() {
+                Some(idx) => {
+                    let slot = &shard.slots[idx as usize];
+                    if let Some(v) = &slot.value {
+                        // C1: capture BEFORE the value clone (see the trait
+                        // method's doc).  Only captured on a value-returning
+                        // path — a `None`-valued entry is never served, so
+                        // the caller's serve re-check never consults the
+                        // epoch; returning 0 there saves one TLS probe +
+                        // atomic load per miss (the consumers of this tuple
+                        // only read the epoch when `cached.is_some()`).
+                        let epoch = capture(slot.node);
+                        // #4: `capture` is paid even on a red hit, and this
+                        // order is load-bearing: a mark bumps the epoch
+                        // (AcqRel) *then* sets the dirty bit (Release), so
+                        // capturing before `green` is what makes a later
+                        // green observation imply a higher epoch.  Do not
+                        // reorder these two lines.
+                        let keep = green(slot.node);
+                        // R-W reference-bit idiom: only a *green* hit grants a
+                        // CLOCK second chance.  A red entry is about to be
+                        // re-staged, so marking it referenced only delays its
+                        // eviction and wastes admission budget.
+                        if keep && !slot.referenced.load(Ordering::Relaxed) {
+                            slot.referenced.store(true, Ordering::Relaxed);
+                        }
+                        Some((slot.node, keep.then(|| v.clone()), false, epoch))
+                    } else {
+                        // Registered node, no staged value: fresh registration,
+                        // unstaged, or evicted.
+                        Some((slot.node, None, false, 0))
+                    }
                 }
-            });
+                None => None,
+            };
             let _ = Self::release_cache_shard_r(shard, t1);
             out
         };
@@ -1548,7 +2476,7 @@ where
             alloc(&mut no_shard)
         };
         let (mut shard, t2) = self.take_cache_shard_w(s, ticket::Held::fresh());
-        if let Some(entry) = shard.map.get(key) {
+        if let Some(&idx) = shard.map.get(key) {
             // Race loser: the winner registered first.  Discard our
             // allocated index (an orphan node — the same harmless class
             // as the pre-merge two-phase loser) and return the winner's
@@ -1557,115 +2485,111 @@ where
             // fingerprints, stamps, finishing) and may have grown the
             // dirty/epoch tables, so each lost race burns those bits too.
             // Bounded by registration contention; `clear_all` releases
-            // them.
-            let out = if let Some(v) = &entry.value {
-                entry.referenced.store(true, Ordering::Relaxed);
-                (entry.node, Some(v.clone()), false)
-            } else {
-                (entry.node, None, false)
+            // them.  Observable rather than silent: every
+            // raced cold key mints N-1 orphan nodes whose per-slot dep-graph
+            // storage lives until `clear_all`.  The counter is the gauge; the
+            // tri-state reserve protocol is deferred until a profile can show
+            // the herd is real (see the field doc).
+            let orphans = self.orphan_nodes.fetch_add(1, Ordering::Relaxed) + 1;
+            #[cfg(debug_assertions)]
+            if orphans % ORPHAN_NODE_WARN_EVERY == 0 {
+                eprintln!(
+                    "NOTE: cache race losers minted {orphans} orphan dep nodes \
+                     (cold-key contention); they are released by clear_all"
+                );
+            }
+            let out = {
+                let slot = &shard.slots[idx as usize];
+                if let Some(v) = &slot.value {
+                    let epoch = capture(slot.node);
+                    let keep = green(slot.node);
+                    if !slot.referenced.load(Ordering::Relaxed) {
+                        slot.referenced.store(true, Ordering::Relaxed);
+                    }
+                    (slot.node, keep.then(|| v.clone()), false, epoch)
+                } else {
+                    // No value ⇒ never served ⇒ the epoch is not consulted
+                    // (same contract as the phase-1 arm above).
+                    (slot.node, None, false, 0)
+                }
             };
             let _ = Self::release_cache_shard_w(shard, t2);
+            // Contended first-touch: when the loser observes a STAGED
+            // value (`out.1.is_some()`), it feeds the TinyLFU sketch like
+            // the phase-1 hit — a key that RACES on first touch was
+            // systematically under-ranked here and admission rejected it
+            // in favour of colder residents.  When the loser observes a
+            // fresh registration (value still `None`), it deliberately
+            // does NOT bump: the winner's subsequent `stage` bump covers
+            // the key exactly once, and a loser bump would double-count
+            // the first touch.
+            if out.1.is_some() {
+                self.note_access_hash(h);
+            }
             return out;
         }
-        shard.map.insert(
-            key.clone(),
-            MergedEntry {
-                node: fresh_node,
-                value: None,
-                referenced: AtomicBool::new(false),
-                prev: None,
-                next: None,
-            },
-        );
+        let idx = shard.slots.len() as u32;
+        shard.slots.push(Slot {
+            key: key.clone(),
+            node: fresh_node,
+            value: None,
+            referenced: AtomicBool::new(false),
+            prev: NONE,
+            next: NONE,
+            hash: h,
+        });
+        shard.map.insert(key.clone(), idx);
         let _ = Self::release_cache_shard_w(shard, t2);
-        (fresh_node, None, true)
+        // Fresh registration: the caller's `cached` is `None`, so the C1
+        // serve re-check is never consulted — return a zero epoch instead of
+        // paying the capture.  (Capture AFTER the lock would also be fine
+        // here: `fresh_node` is not yet reachable through any dep edge, so
+        // no publisher can race a mark against it.)
+        (fresh_node, None, true, 0)
     }
 
     fn stage(&self, key: K, node: dep_graph::DepNodeIndex, v: V) {
-        // (3.3) ONE hash pass — see `insert`.
-        let h = Self::hash_key(&key);
-        let s = Self::shard_of_hash(h);
-        self.note_access_hash(h);
-        self.admit_tick();
-        let mut dropped: Vec<V> = Vec::new();
-        // #8: the eviction loop's `stat_bump` may take the stat registry
-        // UNDER this shard write lock — see `insert`.
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "cache.stage");
-        {
-            let mut shard = self.shards[s].write();
-            let valued_before = shard.valued;
-            if let Some(entry) = shard.map.get_mut(&key) {
-                debug_assert_eq!(
-                    entry.node, node,
-                    "stage: node must match the probe-registered entry"
-                );
-                let old = entry.value.replace(v);
-                let was_staged = old.is_some();
-                if let Some(old) = old {
-                    // The replaced payload drops post-lock (trait
-                    // contract 4).
-                    dropped.push(old);
-                }
-                if was_staged {
-                    // Re-stage over a staged value (a red node's suspect
-                    // entry replaced by the recompute): already chained —
-                    // just promote.
-                    Self::move_to_head(&mut shard, &key);
-                } else {
-                    // Fresh registration, unstaged, or evicted entry:
-                    // (re-)join the chain with its second chance already
-                    // granted (see `link_head_fresh`).
-                    Self::link_head_fresh(&mut shard, &key);
-                    shard.valued += 1;
-                    self.staged_global.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                // Defensive totality: `stage` without a prior probe
-                // registration.  Upstream never does this (probe
-                // precedes staging in `get_shared`), but the entry
-                // carries the caller's node so the map stays consistent.
-                shard.map.insert(
-                    key.clone(),
-                    MergedEntry {
-                        node,
-                        value: Some(v),
-                        referenced: AtomicBool::new(false),
-                        prev: None,
-                        next: None,
-                    },
-                );
-                Self::link_head_fresh(&mut shard, &key);
-                shard.valued += 1;
-                self.staged_global.fetch_add(1, Ordering::Relaxed);
-            }
-            // Eviction + TinyLFU admission — see `evict_with_admission`.
-            let fresh = shard.valued > valued_before;
-            self.evict_with_admission(&mut shard, &key, h, fresh, &mut dropped);
-        } // shard lock released — payload Drops run from here on
-        drop(dropped);
+        // The tracked-cache face: the caller's node must match the
+        // probe-registered entry (see `stage_inner`'s `assert_node`).
+        self.stage_inner(&key, node, v, true, "cache.stage");
     }
 
     fn unstage(&self, key: &K) -> Option<dep_graph::DepNodeIndex> {
         let s = Self::shard_of_key(key);
         let mut dropped: Option<V> = None;
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "cache.unstage");
         let node = {
+            // Drop-order discipline: the
+            // tripwire `_tw` must be released BEFORE the payload's `Drop`
+            // runs, so a fat value's recursive drop can never re-enter the
+            // cache-shard family.  `dropped` is declared FIRST so unwind
+            // order is shard → `_tw` → payload.
+            let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "cache.unstage");
             let mut shard = self.shards[s].write();
-            let entry = shard.map.get_mut(key)?;
-            let node = entry.node;
-            if let Some(old) = entry.value.take() {
+            let idx = *shard.map.get(key)?;
+            let (node, old, prev, next) = {
+                let slot = &mut shard.slots[idx as usize];
+                let node = slot.node;
+                let old = slot.value.take();
+                let prev = slot.prev;
+                let next = slot.next;
+                slot.prev = NONE;
+                slot.next = NONE;
+                (node, old, prev, next)
+            };
+            if let Some(old) = old {
                 dropped = Some(old);
-                let (prev, next) = (entry.prev.take(), entry.next.take());
-                Self::unlink_entry(&mut shard, key, prev, next);
+                Self::unlink_entry(&mut shard, idx, prev, next);
                 // saturating_sub: hardening for the hypothetical window
-                // where a panic landed between `entry.value.replace(v)`
+                // where a panic landed between `value.replace(v)`
                 // and the `valued`/`staged_global` increments in `stage`
                 // (today every panic source in stage/evict_one sits
                 // either before any mutation or after both increments).
                 // A debug overflow here would abort DURING unwind.
                 shard.valued = shard.valued.saturating_sub(1);
-                self.staged_global.fetch_sub(1, Ordering::Relaxed);
+                self.staged_add(s, -1);
             }
+            drop(shard);
+            drop(_tw);
             node
         };
         // Post-lock drop of the withdrawn payload (trait contract 4).
@@ -1676,7 +2600,8 @@ where
     fn node_of(&self, key: &K) -> Option<dep_graph::DepNodeIndex> {
         let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "cache.node_of");
         let shard = self.shards[Self::shard_of_key(key)].read();
-        shard.map.get(key).map(|e| e.node)
+        let idx = shard.map.get(key).copied()?;
+        Some(shard.slots[idx as usize].node)
     }
 
     fn clear(&self) {
@@ -1686,26 +2611,46 @@ where
         // (DepGraph::reset discipline); payloads drop after ALL locks
         // release.
         let mut dropped: Vec<V> = Vec::new();
-        for shard_lock in &self.shards {
+        for (s, shard_lock) in self.shards.iter().enumerate() {
             // One shard lock at a time (DepGraph::reset discipline).
             let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "cache.clear");
             let mut shard = shard_lock.write();
-            for entry in shard.map.values_mut() {
-                if let Some(old) = entry.value.take() {
+            for slot in shard.slots.iter_mut() {
+                if let Some(old) = slot.value.take() {
                     dropped.push(old);
                 }
-                entry.prev = None;
-                entry.next = None;
+                slot.prev = NONE;
+                slot.next = NONE;
             }
-            shard.head = None;
-            shard.tail = None;
+            shard.head = NONE;
+            shard.tail = NONE;
+            // The CLOCK hand must not survive the clear either: every
+            // staged entry just went valueless, so a persisted hand would
+            // point at a detached key.  The sweep-start `filter(value
+            // is_some)` fallback would save it, but that is a recovery
+            // path, not a license — reset the hand here.
+            shard.hand = NONE;
             // Snapshot under THIS shard's lock (no concurrent stage can
             // interleave here); a single `store(0)` would swallow
             // concurrent increments on the other shards.
             let cleared = shard.valued;
             shard.valued = 0;
-            self.staged_global.fetch_sub(cleared, Ordering::Relaxed);
+            self.staged_add(s, -(cleared as isize));
         }
+        // The TinyLFU sketch must not survive the clear either: its counts
+        // are the PREVIOUS world's heat, and a cache reused via `clear::<Q>`
+        // for a fresh session would let stale-hot keys keep vetoing
+        // newcomers until aging decayed them away.  Pure lock-free atomics
+        // (no shard lock — the sketch is shared and only ever used as an
+        // admission heuristic; a concurrent stage's bump racing this reset
+        // at worst loses one count).  Also reset the aging cursor so the
+        // new world starts its decay schedule from zero.
+        for cell in &self.admit {
+            cell.store(0, Ordering::Relaxed);
+        }
+        self.admit_clock.0.store(0, Ordering::Relaxed);
+        self.admit_aging_left.store(0, Ordering::Relaxed);
+        self.admit_aging_cursor.store(0, Ordering::Relaxed);
         drop(dropped);
     }
 
@@ -1715,9 +2660,10 @@ where
         // 0) under that shard's own write lock. Relaxed is sufficient:
         // transient skew only over/under-evicts, and over-eviction is
         // pure perf loss (node half is never evicted). This drops 64
-        // read locks (and the CacheShard edge in `stats()`) to one
-        // atomic load.
-        self.staged_global.load(Ordering::Relaxed)
+        // read locks (and the CacheShard edge in `stats()`) to a handful
+        // of atomic loads (one per padded counter shard, 5 of the perf
+        // pass).
+        self.staged_total()
     }
 
     fn for_each(&self, mut f: impl FnMut(&K, &V)) {
@@ -1725,12 +2671,12 @@ where
             // One shard lock at a time.
             let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "cache.for_each");
             let shard = shard_lock.read();
-            let mut cur = shard.head.clone();
-            while let Some(k) = cur {
-                let entry = shard.map.get(&k).expect("chain entry must exist");
-                let next = entry.next.clone();
-                if let Some(v) = &entry.value {
-                    f(&k, v);
+            let mut cur = shard.head;
+            while cur != NONE {
+                let slot = &shard.slots[cur as usize];
+                let next = slot.next;
+                if let Some(v) = &slot.value {
+                    f(&slot.key, v);
                 }
                 cur = next;
             }
@@ -1739,14 +2685,18 @@ where
 
     fn stats(&self) -> CacheStats {
         // `len()` is the embedded `staged_global` load (a Relaxed atomic
-        // read), so `entries` is the lock-free half of the function.  What
-        // still matters is the lock-ORDER rule on `stat_bump_cold`: never
-        // take a shard lock while holding the stat-registry lock.  The
-        // registry section below registers `StatRegistry` under that
-        // family, which makes #9 genuinely enforced: a future `stats()`
-        // that took shard locks AFTER the registry would trip
-        // ORD[StatRegistry][CacheShard].  ("Entries FIRST" is not a scheduling
-        // statement — nothing blocks on it today.)
+        // read), so `entries` carries no shard lock and the "entries
+        // before registry" ordering is academic HERE.  It is NOT academic
+        // for `SingleCache`/`DefIdCache`, whose `len()` takes a
+        // `CacheShard` lock — so keep taking `len()` first on every impl:
+        // the ordering contract is shared, and only this impl's
+        // implementation makes it currently vacuous.  Do not "restore" a
+        // shard lock here for symmetry.  What still matters is the
+        // lock-ORDER rule on `stat_bump_cold`: never take a shard lock
+        // while holding the stat-registry lock.  The registry section
+        // below registers `StatRegistry` under that family, which makes
+        // #9 genuinely enforced: a future `stats()` that took shard locks
+        // AFTER the registry would trip ORD[StatRegistry][CacheShard].
         let entries = self.len();
         let _tw = sync_order::Acquired::acquire(sync_order::Fam::StatRegistry, "cache.stats");
         let registry = self.stat_shards.lock();
@@ -1818,22 +2768,34 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<(), V> for SingleCache<V> {
     fn from_capacity(_capacity: usize) -> Self {
         Self::new()
     }
-    fn probe(
+    fn probe_with_epoch(
         &self,
         _key: &(),
         alloc: impl FnOnce(&mut ticket::Held<ticket::CacheNoShard>) -> dep_graph::DepNodeIndex,
-    ) -> (dep_graph::DepNodeIndex, Option<V>, bool) {
+        capture: &mut impl FnMut(dep_graph::DepNodeIndex) -> u64,
+        green: &mut impl FnMut(dep_graph::DepNodeIndex) -> bool,
+    ) -> (dep_graph::DepNodeIndex, Option<V>, bool, u64) {
         // Single-lock cache: registered under Fam::CacheShard so the whole
         // cache family is visible to the tripwire.  One lock at a time:
         // each critical section registers separately and the guard is
         // dropped BEFORE the fresh-node alloc — holding CacheShard across
         // `alloc` trips the tripwire (CacheShard → DepShard is Forbid,
         // contract 3; see DefaultCache::probe's two-phase shape).
+        // C1: the epoch is captured inside the critical section, before
+        // the value clone (see the trait method's doc).
         {
             let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "single.probe");
             let entry = self.entry.read();
             if let Some(e) = entry.as_ref() {
-                return (e.node, e.value.clone(), false);
+                // Epoch only consumed on a value-returning path (see the
+                // trait doc / DefaultCache's phase-1 arm).
+                let epoch = if e.value.is_some() { capture(e.node) } else { 0 };
+                let cached = if e.value.is_some() && green(e.node) {
+                    e.value.clone()
+                } else {
+                    None
+                };
+                return (e.node, cached, false, epoch);
             }
         }
         // Fresh registration two-phase: allocate the node OUTSIDE the
@@ -1848,22 +2810,41 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<(), V> for SingleCache<V> {
         let mut entry = self.entry.write();
         if let Some(e) = entry.as_ref() {
             // Race loser: discard our allocated index, return the
-            // winner's slot.
-            return (e.node, e.value.clone(), false);
+            // winner's slot.  Same None-value epoch rule as phase 1.
+            let epoch = if e.value.is_some() { capture(e.node) } else { 0 };
+            let cached = if e.value.is_some() && green(e.node) {
+                e.value.clone()
+            } else {
+                None
+            };
+            return (e.node, cached, false, epoch);
         }
         *entry = Some(SingleEntry {
             node: fresh_node,
             value: None,
         });
-        (fresh_node, None, true)
+        // Fresh registration: the caller's `cached` is `None`, so the C1
+        // serve re-check is never consulted — return 0 (also fine because
+        // `fresh_node` is not yet reachable through any dep edge).
+        (fresh_node, None, true, 0)
     }
     fn stage(&self, _key: (), node: dep_graph::DepNodeIndex, v: V) {
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "single.stage");
         let old = {
+            // Drop-order discipline: the
+            // tripwire releases before the payload's `Drop` runs.  `old`
+            // is declared inside so unwind order is entry → `_tw` → payload.
+            let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "single.stage");
             let mut entry = self.entry.write();
             match entry.as_mut() {
                 Some(e) => {
-                    debug_assert_eq!(
+                    // Unconditional (not debug-only), matching
+                    // `stage_inner`'s justification: the stored node is the
+                    // entry's permanent identity (trait contract 1), and in
+                    // release a silent mismatch would corrupt `node_of`
+                    // lookups and feed the dep graph a node whose value was
+                    // never published under it.  `stage` is a cold path —
+                    // one call per fresh compute.
+                    assert_eq!(
                         e.node, node,
                         "stage: node must match the probe-registered slot"
                     );
@@ -1883,13 +2864,17 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<(), V> for SingleCache<V> {
         drop(old);
     }
     fn unstage(&self, _key: &()) -> Option<dep_graph::DepNodeIndex> {
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "single.unstage");
         let mut old: Option<V> = None;
         let node = {
+            // Drop-order discipline: the
+            // tripwire releases before the payload's `Drop` runs.
+            let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "single.unstage");
             let mut entry = self.entry.write();
             let e = entry.as_mut()?;
             let node = e.node;
             old = e.value.take();
+            drop(entry);
+            drop(_tw);
             node
         };
         drop(old);
@@ -1902,8 +2887,10 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<(), V> for SingleCache<V> {
     fn clear(&self) {
         // Value goes, node STAYS (trait contract 1): the next get
         // recomputes against the surviving node instead of re-allocating.
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "single.clear");
+        // Drop-order discipline: tripwire released before the
+        // payload's `Drop` runs.
         let old = {
+            let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "single.clear");
             let mut entry = self.entry.write();
             match entry.as_mut() {
                 Some(e) => e.value.take(),
@@ -1976,6 +2963,13 @@ pub struct DefIdCache<V> {
     overflow: RwLock<FxHashMap<usize, DefIdEntry<V>>>,
     stats_hits: AtomicU64,
     stats_misses: AtomicU64,
+    /// Mirror of "entries with a staged value" — the None→Some (stage) and
+    /// Some→None (unstage) transitions maintain it, so `len()` is one
+    /// atomic load instead of a walk over up to `DEFID_DENSE_LIMIT` slots
+    /// (a sparse index at 65534 previously made every `stats()` call pay
+    /// O(65536) regardless of population).  Relaxed: the same transient-
+    /// skew contract as `DefaultCache`'s `staged_global`.
+    staged: AtomicUsize,
 }
 
 /// One merged slot: node half (registration-once) + value half.
@@ -1985,18 +2979,57 @@ struct DefIdEntry<V> {
     value: Option<V>,
 }
 
-/// Largest `DefIndex` served by the dense `Vec` path (≈8 MB of slots in
-/// the worst case; well above real crate def counts).  Higher indices
-/// go to the overflow map.
-const DEFID_DENSE_LIMIT: usize = 1 << 20;
+/// Initial dense slab and growth granularity.  The cache starts with one
+/// chunk and grows by WHOLE CHUNKS on first touch of a higher index, so a
+/// first touch near `DEFID_DENSE_LIMIT` under the write lock allocates and
+/// zeroes at most `DEFID_DENSE_CHUNK` slots (≈64 KiB for typical 16-byte
+/// entries, a few µs) instead of the up-to-1 MiB `resize_with(idx + 1)`
+/// geometric growth used to perform.  Geometric doubling was
+/// the wrong shape here: its worst single resize is bounded only by the
+/// limit, and it fires inside the lock every concurrent `probe`/`stage`
+/// serializes on.
+const DEFID_DENSE_INIT: usize = DEFID_DENSE_CHUNK;
+const DEFID_DENSE_CHUNK: usize = 4096;
+
+fn ensure_dense_len<V>(entries: &mut Vec<Option<DefIdEntry<V>>>, idx: usize) {
+    if idx < entries.len() {
+        return;
+    }
+    // Round up to the next whole chunk, capped at the dense limit.  `idx`
+    // is already `< DEFID_DENSE_LIMIT` at every call site, so the addition
+    // cannot overflow.
+    let target = ((idx / DEFID_DENSE_CHUNK) + 1) * DEFID_DENSE_CHUNK;
+    let target = target.min(DEFID_DENSE_LIMIT);
+    entries.resize_with(target, || None);
+}
+
+/// Largest `DefIndex` served by the dense `Vec` path.  Worst-case table
+/// size is `LIMIT × size_of::<DefIdEntry<V>>` — the node half is a u32
+/// and the value half is `Option<V>` (nicely compressed for `Arc`-like
+/// `V`s, so 16-byte entries are typical): at 1 << 16 that is ≈1 MiB.
+/// Growth happens in `DEFID_DENSE_CHUNK`-sized steps, so no
+/// single resize under the write lock can exceed one chunk (~64 KiB).
+/// Real crate def counts that outgrow 64K simply take the overflow map — a
+/// hash probe instead of a dense index, not an OOM.
+const DEFID_DENSE_LIMIT: usize = 1 << 16;
 
 impl<V: Clone + std::fmt::Debug> DefIdCache<V> {
     pub fn new() -> Self {
+        // Start with a modest slab and grow geometrically.
+        // A full pre-size cost ~1 MiB per instance even for a system that
+        // touches a handful of DefIds; geometric growth keeps a first
+        // high-index touch O(idx) once and amortized O(1) per later slot,
+        // while never zeroing more than the touched prefix.
+        // `Option<DefIdEntry<V>>` has no `Clone` to spare (V may not be
+        // Clone), so grow via `resize_with`.
+        let mut entries = Vec::new();
+        entries.resize_with(DEFID_DENSE_INIT, || None);
         DefIdCache {
-            entries: RwLock::new(Vec::new()),
+            entries: RwLock::new(entries),
             overflow: RwLock::new(FxHashMap::default()),
             stats_hits: AtomicU64::new(0),
             stats_misses: AtomicU64::new(0),
+            staged: AtomicUsize::new(0),
         }
     }
 }
@@ -2005,16 +3038,20 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
     fn from_capacity(_capacity: usize) -> Self {
         Self::new()
     }
-    fn probe(
+    fn probe_with_epoch(
         &self,
         key: &crate::hir::types::DefId,
         alloc: impl FnOnce(&mut ticket::Held<ticket::CacheNoShard>) -> dep_graph::DepNodeIndex,
-    ) -> (dep_graph::DepNodeIndex, Option<V>, bool) {
+        capture: &mut impl FnMut(dep_graph::DepNodeIndex) -> u64,
+        green: &mut impl FnMut(dep_graph::DepNodeIndex) -> bool,
+    ) -> (dep_graph::DepNodeIndex, Option<V>, bool, u64) {
         // Registered under Fam::CacheShard (single-lock cache discipline;
         // dense/overflow are sequential, never co-held).  Each critical
         // section registers separately: the guard MUST NOT span the
         // fresh-node alloc — CacheShard → DepShard is Forbid (contract 3;
         // see DefaultCache::probe's two-phase shape).
+        // C1: the epoch is captured inside the critical section, before
+        // the value clone (see the trait method's doc).
         let idx = key.0;
         if idx < DEFID_DENSE_LIMIT {
             // Phase 1: read lock.
@@ -2022,7 +3059,15 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
                 let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.probe");
                 let entries = self.entries.read();
                 if let Some(entry) = entries.get(idx).and_then(|e| e.as_ref()) {
-                    return (entry.node, entry.value.clone(), false);
+                    // Epoch only consumed on a value-returning path (see the
+                    // trait doc / DefaultCache's phase-1 arm).
+                    let epoch = if entry.value.is_some() { capture(entry.node) } else { 0 };
+                    let cached = if entry.value.is_some() && green(entry.node) {
+                        entry.value.clone()
+                    } else {
+                        None
+                    };
+                    return (entry.node, cached, false, epoch);
                 }
             }
             // Phase 2: allocate OUTSIDE the lock (trait contract 3), then
@@ -2036,18 +3081,27 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
             let mut entries = self.entries.write();
             if let Some(entry) = entries.get(idx).and_then(|e| e.as_ref()) {
                 // Race loser: discard our index, return the winner's slot.
-                return (entry.node, entry.value.clone(), false);
+                // Same None-value epoch rule as phase 1.
+                let epoch = if entry.value.is_some() { capture(entry.node) } else { 0 };
+                let cached = if entry.value.is_some() && green(entry.node) {
+                    entry.value.clone()
+                } else {
+                    None
+                };
+                return (entry.node, cached, false, epoch);
             }
-            if idx >= entries.len() {
-                // Holes stay outer-`None`: a never-probed DefId has no
-                // node, and probing it later allocates one.
-                entries.resize_with(idx + 1, || None);
-            }
+            // Holes stay outer-`None`: a never-probed DefId has no node, and
+            // probing it later allocates one.  Geometric growth, not a
+            // one-shot `idx + 1` memset.
+            ensure_dense_len(&mut entries, idx);
             entries[idx] = Some(DefIdEntry {
                 node: fresh_node,
                 value: None,
             });
-            return (fresh_node, None, true);
+            // Fresh registration: `cached` is `None`, so the C1 serve
+            // re-check is never consulted — return 0 (also fine because
+            // `fresh_node` is not yet reachable through any dep edge).
+            return (fresh_node, None, true, 0);
         }
         // Sentinel/sparse index: a dense resize would try to allocate up
         // to `idx + 1` slots (multi-exabyte for sentinels like
@@ -2056,7 +3110,14 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
             let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.probe");
             let overflow = self.overflow.read();
             if let Some(entry) = overflow.get(&idx) {
-                return (entry.node, entry.value.clone(), false);
+                // Same None-value epoch rule as the dense arm.
+                let epoch = if entry.value.is_some() { capture(entry.node) } else { 0 };
+                let cached = if entry.value.is_some() && green(entry.node) {
+                    entry.value.clone()
+                } else {
+                    None
+                };
+                return (entry.node, cached, false, epoch);
             }
         }
         let fresh_node = {
@@ -2067,7 +3128,13 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
         let mut overflow = self.overflow.write();
         if let Some(entry) = overflow.get(&idx) {
             // Race loser.
-            return (entry.node, entry.value.clone(), false);
+            let epoch = if entry.value.is_some() { capture(entry.node) } else { 0 };
+            let cached = if entry.value.is_some() && green(entry.node) {
+                entry.value.clone()
+            } else {
+                None
+            };
+            return (entry.node, cached, false, epoch);
         }
         overflow.insert(
             idx,
@@ -2076,26 +3143,42 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
                 value: None,
             },
         );
-        (fresh_node, None, true)
+        // Fresh registration: same zero-epoch rule as the dense arm.
+        (fresh_node, None, true, 0)
     }
 
     fn stage(&self, key: crate::hir::types::DefId, node: dep_graph::DepNodeIndex, v: V) {
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.stage");
-        let idx = key.0;
+        // Drop-order discipline: the
+        // tripwire must release BEFORE the replaced payload's `Drop` runs,
+        // so a fat value's recursive drop can never re-enter the
+        // cache-shard family.  `old` is returned from the critical section
+        // and dropped below, after `_tw` is gone.
+        let old = {
+            let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.stage");
+            let idx = key.0;
         let old = if idx < DEFID_DENSE_LIMIT {
             // One write lock, not two: the resize and the store happen in
             // the same critical section (Perf Book §13.1).
             let mut entries = self.entries.write();
-            if idx >= entries.len() {
-                entries.resize_with(idx + 1, || None);
-            }
+            ensure_dense_len(&mut entries, idx);
             match &mut entries[idx] {
                 Some(entry) => {
-                    debug_assert_eq!(
+                    // Unconditional (not debug-only), matching
+                    // `stage_inner`'s justification (see there): a silent
+                    // node mismatch in release would corrupt `node_of`
+                    // lookups and feed the dep graph a node whose value was
+                    // never published under it.  Cold path — one call per
+                    // fresh compute.
+                    assert_eq!(
                         entry.node, node,
                         "stage: node must match the probe-registered slot"
                     );
-                    std::mem::replace(&mut entry.value, Some(v))
+                    let old = std::mem::replace(&mut entry.value, Some(v));
+                    // None→Some transition: one more staged value.
+                    if old.is_none() {
+                        self.staged.fetch_add(1, Ordering::Relaxed);
+                    }
+                    old
                 }
                 // Defensive totality: stage without a prior probe.
                 slot @ None => {
@@ -2103,6 +3186,7 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
                         node,
                         value: Some(v),
                     });
+                    self.staged.fetch_add(1, Ordering::Relaxed);
                     None
                 }
             }
@@ -2110,11 +3194,18 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
             let mut overflow = self.overflow.write();
             match overflow.get_mut(&idx) {
                 Some(entry) => {
-                    debug_assert_eq!(
+                    // Unconditional (not debug-only) — same justification
+                    // as the dense branch above.
+                    assert_eq!(
                         entry.node, node,
                         "stage: node must match the probe-registered slot"
                     );
-                    std::mem::replace(&mut entry.value, Some(v))
+                    let old = std::mem::replace(&mut entry.value, Some(v));
+                    // None→Some transition: one more staged value.
+                    if old.is_none() {
+                        self.staged.fetch_add(1, Ordering::Relaxed);
+                    }
+                    old
                 }
                 // Defensive totality: stage without a prior probe.
                 None => {
@@ -2125,28 +3216,46 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
                             value: Some(v),
                         },
                     );
+                    self.staged.fetch_add(1, Ordering::Relaxed);
                     None
                 }
             }
         };
-        // Post-lock drop of the replaced payload (trait contract 4).
+        old
+        };
+        // Post-lock drop of the replaced payload (trait contract 4): the
+        // tripwire `_tw` was scoped inside the block above, so it is already
+        // released here.
         drop(old);
     }
 
     fn unstage(&self, key: &crate::hir::types::DefId) -> Option<dep_graph::DepNodeIndex> {
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.unstage");
         let idx = key.0;
-        let (old, node) = if idx < DEFID_DENSE_LIMIT {
-            let mut entries = self.entries.write();
-            let entry = entries.get_mut(idx).and_then(|e| e.as_mut())?;
-            (entry.value.take(), entry.node)
-        } else {
-            // The overflow ENTRY stays (node preserved — trait contract
-            // 1); only its value leaves.
-            let mut overflow = self.overflow.write();
-            let entry = overflow.get_mut(&idx)?;
-            (entry.value.take(), entry.node)
+        let (old, node) = {
+            // Drop-order discipline: the
+            // tripwire releases before the payload's `Drop` runs.
+            let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.unstage");
+            if idx < DEFID_DENSE_LIMIT {
+                let mut entries = self.entries.write();
+                let entry = entries.get_mut(idx).and_then(|e| e.as_mut())?;
+                (entry.value.take(), entry.node)
+            } else {
+                // The overflow ENTRY stays (node preserved — trait contract
+                // 1); only its value leaves.
+                let mut overflow = self.overflow.write();
+                let entry = overflow.get_mut(&idx)?;
+                (entry.value.take(), entry.node)
+            }
         };
+        // Some→None transition: one fewer staged value (checked_sub via
+        // fetch_update so a hypothetical accounting skew can never wrap).
+        if old.is_some() {
+            let _ = self.staged.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            );
+        }
         // Post-lock drop (trait contract 4).
         drop(old);
         Some(node)
@@ -2168,41 +3277,43 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
 
     fn clear(&self) {
         // Values go, nodes stay (trait contract 1).  One lock at a time;
-        // payloads drop after their lock releases.
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.clear");
+        // payloads drop after the tripwire releases.
         let dense_dropped: Vec<V> = {
+            let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.clear");
             let mut entries = self.entries.write();
             entries
                 .iter_mut()
                 .filter_map(|slot| slot.as_mut().and_then(|e| e.value.take()))
                 .collect()
         };
-        drop(dense_dropped);
         let over_dropped: Vec<V> = {
+            let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.clear");
             let mut overflow = self.overflow.write();
             overflow
                 .values_mut()
                 .filter_map(|e| e.value.take())
                 .collect()
         };
+        drop(dense_dropped);
         drop(over_dropped);
+        // Set the mirror AFTER both maps are empty: a direct
+        // caller outside quiescence could otherwise stage between the store
+        // and the clears, leaving a non-zero counter over an empty cache.
+        self.staged.store(0, Ordering::Relaxed);
     }
 
     fn len(&self) -> usize {
-        let _tw = sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "defid.len");
-        let dense = self
-            .entries
-            .read()
-            .iter()
-            .filter(|e| matches!(e, Some(s) if s.value.is_some()))
-            .count();
-        dense
-            + self
-                .overflow
-                .read()
-                .values()
-                .filter(|e| e.value.is_some())
-                .count()
+        // O(1): the `staged` counter mirrors every None→Some / Some→None
+        // transition under that cache's own write lock (see the field doc).
+        // The previous shape walked all `DEFID_DENSE_LIMIT` slots on every
+        // `stats()` call.
+        // No `Fam::CacheShard` registration here: this reads
+        // ONE atomic and takes no lock, so registering the family would be
+        // a phantom hold that could false-positive the re-held assert if a
+        // caller legitimately held a CacheShard across `len()`.  The
+        // `stats()` ordering contract (`len()` before the registry) is
+        // still honored by every impl that DOES take a lock.
+        self.staged.load(Ordering::Relaxed)
     }
 
     fn for_each(&self, mut f: impl FnMut(&crate::hir::types::DefId, &V)) {
@@ -2222,8 +3333,8 @@ impl<V: Clone + std::fmt::Debug> QueryCacheType<crate::hir::types::DefId, V> for
     }
 
     fn stats(&self) -> CacheStats {
-        // No CacheShard registration here: `len()` below registers — a
-        // second would trip the same-family re-held assert.
+        // No CacheShard registration here: `len()` below takes no lock at all
+        // (one atomic load), so no registration is needed.
         CacheStats {
             hits: self.stats_hits.load(Ordering::Relaxed),
             misses: self.stats_misses.load(Ordering::Relaxed),
@@ -2306,7 +3417,11 @@ pub trait Query<'q, 'src: 'q>: Sized + 'static {
     type Storage: Erasable<'q, Self::Value>;
     /// The cache implementation for this query's key type.  It stores
     /// the *erased* form ([`Stored`]), never the provided value.
-    type Cache: QueryCacheType<Self::Key, Stored<'q, 'src, Self>> + Default + Send + Sync;
+    /// Constructed exclusively via [`QueryCacheType::from_capacity`] —
+    /// no `Default` bound: the framework never calls `default()`, and
+    /// requiring it would force cache authors to implement a constructor
+    /// the framework does not invoke.
+    type Cache: QueryCacheType<Self::Key, Stored<'q, 'src, Self>> + Send + Sync;
 
     fn descriptor() -> QueryDescriptor;
     /// Compute the value for `key`.  Nested gets that only READ a
@@ -2594,6 +3709,13 @@ trait QueryVTableDyn<'q, 'src, S: Scheduler>: Send + Sync {
     /// re-request (and its cache/poison side effects) into a foreign
     /// session whose dep graph was walked. Redirecting into a foreign
     /// session would leak cache/poison side effects across query systems.
+    ///
+    /// Residual hazard (do not read total immunity into this fix site):
+    /// the pin covers the RE-REQUEST entry only.  Once the recompute
+    /// runs, nested `query_get`s inside `compute` still route through
+    /// `provider.query_system()` — a mismatched provider trips the
+    /// `InFlightGuard` cross-system tripwire THERE (a hard panic, not a
+    /// silent redirect).  Keep provider and executing system paired.
     fn get_shared_erased(
         &self,
         system: &QuerySystem<'q, 'src, S>,
@@ -2632,9 +3754,24 @@ fn downcast_vtable<'a, 'src, 'q, Q: Query<'q, 'src>, S: Scheduler>(
 /// part that actually matters under `par_get` — it removes a *global*
 /// lock: two threads resolving nodes for different query types no longer
 /// contend on a single shared `RwLock`.
+/// Debug-build warning cadence for the eval_always node-leak gauge (see
+/// `QueryVTable::eval_always_nodes`): every Nth fresh allocation prints a
+/// warning naming the query and the leak's only release path
+/// (`clear_all`).
+const EVAL_ALWAYS_NODE_WARN_EVERY: u64 = 10_000;
+
+/// Debug-build warning cadence for the race-loser orphan-node gauge (see
+/// `DefaultCache::orphan_nodes`): every Nth discarded index prints one note,
+/// so a genuine cold-key herd is visible without spamming a debug test run.
+const ORPHAN_NODE_WARN_EVERY: u64 = 100_000;
+
 #[derive(Debug)]
 pub(crate) struct QueryVTable<'q, 'src, Q: Query<'q, 'src>> {
     pub descriptor: QueryDescriptor,
+    /// FxHash digest of `TypeId::of::<Q>()`, computed ONCE here so the
+    /// active-key miss path does not re-hash the 128-bit TypeId on every
+    /// call.  `ActiveKey::of` mixes this with the key hash.
+    pub type_hash: u64,
     /// `None` for `descriptor.untracked` queries: the cache trait is
     /// node-ful (`stage`, `node_of`) and an untracked key must never own
     /// a node index, so constructing the (64-shard) cache for a memo-only
@@ -2656,13 +3793,50 @@ pub(crate) struct QueryVTable<'q, 'src, Q: Query<'q, 'src>> {
     /// slot IS the thread's state.  Each entry is partitioned by
     /// `QuerySystem` id (see [`ActivePartitions`]).
     active: thread_local::ThreadLocal<std::cell::RefCell<ActivePartitions<'q, 'src, Q>>>,
-    /// Memo-only store for `descriptor.untracked` queries: `Key → Stored`.
-    /// Kept OUTSIDE `Q::Cache` deliberately — the cache trait is node-ful
-    /// (`stage(node)`, `node_of`) and an untracked key must never own a
-    /// node index.  Dies with the vtable on `clear_all` (registry replace),
-    /// so no generation stamp is needed: vtable lifetime == world epoch.
-    /// Leaf lock: acquire under `Fam::CacheShard` like the cache shards.
-    untracked: crate::sync::RwLock<FxHashMap<Q::Key, Stored<'q, 'src, Q>>>,
+    /// Memo-only store for `descriptor.untracked` queries: `(memo_gen,
+    /// Key → (entry_gen, program_epoch, value))`.  Kept OUTSIDE `Q::Cache`
+    /// deliberately — the cache trait is node-ful (`stage(node)`,
+    /// `node_of`) and an untracked key must never own a node index.  Dies
+    /// with the vtable on `clear_all` (registry replace).  Leaf lock:
+    /// acquire under `Fam::CacheShard` like the cache shards.
+    ///
+    /// The OUTER `u64` is the current memo generation, bumped on every
+    /// per-query `clear`/`invalidate` under the write lock; each ENTRY
+    /// carries the generation it was inserted at.  `get_untracked` takes
+    /// NO quiesce read pin ("nothing to quiesce" holds for the compute's
+    /// INPUTS — but the memo is served-world state, and `clear` runs
+    /// under the write side), so an in-flight compute that started before
+    /// `clear::<Q>` could otherwise insert its pre-clear value into the
+    /// freshly wiped map — the next get would HIT it, violating clear's
+    /// "next get recomputes" contract (d19's letter, untracked edition).
+    /// The insert-time generation check discards such a result; only the
+    /// rare race wastes the compute.
+    ///
+    /// The THIRD element is the FIFO insertion queue backing overflow
+    /// eviction: `get_untracked` evicts `pop_front()`'s first LIVE entry
+    /// instead of the old bucket-arbitrary `map.keys().next()`.  FIFO by
+    /// FIRST insertion (a replaced entry keeps its queue slot) — not
+    /// recency — but it is deterministic, which is what lets a test name
+    /// the survivor; a stale queue entry (removed by `invalidate` without
+    /// its queue slot) is skipped lazily at pop time.
+    untracked:
+        crate::sync::RwLock<(
+            u64,
+            FxHashMap<Q::Key, (u64, usize, Stored<'q, 'src, Q>)>,
+            std::collections::VecDeque<Q::Key>,
+        )>,
+    /// Leak gauge (see the descriptor's BUG-MAGNET note): an eval_always
+    /// query mints a monotone dep node per DISTINCT KEY (post cache-merge —
+    /// NOT per request; repeat requests hit the memo) and nothing releases
+    /// them except `clear_all` — unbounded keys grow RSS monotonically.
+    /// The
+    /// counter is INCREMENTED only in debug builds (release keeps the
+    /// field zero and branch-free); every
+    /// [`EVAL_ALWAYS_NODE_WARN_EVERY`] fresh allocations print a warning,
+    /// so a test run with an unbounded eval_always key shows the leak
+    /// instead of production RSS charts doing it.  Present unconditionally
+    /// because struct-literal fields cannot carry `#[cfg]`.
+    eval_always_nodes: std::sync::atomic::AtomicU64,
 }
 
 impl<'src, 'q, Q: Query<'q, 'src>, S: Scheduler> QueryVTableDyn<'q, 'src, S>
@@ -2743,6 +3917,22 @@ impl<'src, 'q, Q: Query<'q, 'src>> QueryVTable<'q, 'src, Q> {
             "query '{}': untracked memoizes unconditionally, eval_always recomputes every get — contradictory",
             d.name,
         );
+        // Arena storage × cycle handler is the silent trap: the handlers
+        // are bare `fn(&Key, &[Key]) -> Value` pointers with NO provider,
+        // so an arena query's handler has no channel to the session arena
+        // it would need to mint a `&'q V` (the only routes are a leak or
+        // a static).  Registration-time reject — no production query
+        // defines a handler today, so this fires the day someone adds
+        // one, instead of at the first raced cycle.
+        assert!(
+            <Q::Storage as Erasable<'q, Q::Value>>::RECOVERY_SUPPORTED
+                || !(Q::cycle_recovery().is_some() || Q::cycle_processor().is_some()),
+            "query '{}': cycle handlers are unsupported on Arena storage — \
+             a bare fn pointer has no channel to the session arena needed \
+             to mint a &'q V recovery value; use Owned storage or drop the \
+             handler",
+            d.name,
+        );
         let cache = if d.untracked {
             None
         } else {
@@ -2750,11 +3940,17 @@ impl<'src, 'q, Q: Query<'q, 'src>> QueryVTable<'q, 'src, Q> {
         };
         QueryVTable {
             descriptor: d,
+            type_hash: type_id_hash::<Q>(),
             cache,
             cycle_recovery: Q::cycle_recovery(),
             cycle_processor: Q::cycle_processor(),
             active: thread_local::ThreadLocal::new(),
-            untracked: crate::sync::RwLock::new(FxHashMap::default()),
+            untracked: crate::sync::RwLock::new((
+                0,
+                FxHashMap::default(),
+                std::collections::VecDeque::new(),
+            )),
+            eval_always_nodes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2864,8 +4060,14 @@ impl<'src, 'q, Q: Query<'q, 'src>> QueryVTable<'q, 'src, Q> {
             .get_or(|| std::cell::RefCell::new(ActivePartitions::default()));
         let mut guard = tls.borrow_mut();
         let state = active_partition(&mut guard, system_id, epoch);
-        state.stack.push(key.clone());
-        state.set.insert(key.clone());
+        // Clone BEFORE mutating: if either clone panics (allocation), the
+        // active stack is still untouched, so the caller's panic-cleanup may
+        // safely assume `entered == false` rather than popping the caller's
+        // own frame.
+        let for_stack = key.clone();
+        let for_set = key.clone();
+        state.stack.push(for_stack);
+        state.set.insert(for_set);
     }
 
     /// Pop the current thread's key off its active stack.  When the stack
@@ -2890,6 +4092,15 @@ impl<'src, 'q, Q: Query<'q, 'src>> QueryVTable<'q, 'src, Q> {
             }
             if let Some(key) = slot.2.stack.pop() {
                 slot.2.set.remove(&key);
+            } else {
+                // Stack underflow with a live partition: a leaked set entry
+                // would later surface as a false cycle report, so make the
+                // mismatch loud in debug builds instead of silently popping
+                // nothing.
+                debug_assert!(
+                    slot.2.set.is_empty(),
+                    "active stack underflow: set has entries the stack does not"
+                );
             }
             if slot.2.stack.is_empty() {
                 parts.parts.swap_remove(idx);
@@ -2965,15 +4176,24 @@ impl IntoQueryKey<crate::hir::types::DefId> for usize {
 /// Hit/miss stats count under the same gate (a red node's probe touches
 /// no counters — trait contract 5); both bumps are lock-free atomic adds.
 ///
-/// Returns `(node, cached_value, fresh)`: `fresh` is true only when THIS
+/// Returns `(node, cached_value, fresh, capture_epoch)`: `fresh` is true only when THIS
 /// call registered the node — the caller registers the `node_to_key`
 /// mapping exactly once on that path, keeping the global write lock and
-/// the `Box`ed key allocation off the hit path.
+/// the `Box`ed key allocation off the hit path.  `capture_epoch` is the
+/// C1 epoch captured UNDER the cache shard lock that also read the value
+/// (see `QueryCacheType::probe_with_epoch`) — callers serve it straight
+/// to `serve_cached_verified`; the old caller-side capture + double-read
+/// seal is gone (it left the (value-read .. first-load) window open).
 fn probe<'src, 'q, Q: Query<'q, 'src>, S: Scheduler>(
     vtable: &QueryVTable<'q, 'src, Q>,
     dep_graph: &dep_graph::DepGraph<S>,
     key: &Q::Key,
-) -> (dep_graph::DepNodeIndex, Option<Stored<'q, 'src, Q>>, bool) {
+) -> (
+    dep_graph::DepNodeIndex,
+    Option<Stored<'q, 'src, Q>>,
+    bool,
+    u64,
+) {
     // Tracked-only entry point: an untracked query branches to the memo
     // map before any cache access (see `get_shared`), so the cache is
     // always constructed here.
@@ -2981,7 +4201,12 @@ fn probe<'src, 'q, Q: Query<'q, 'src>, S: Scheduler>(
         .cache
         .as_ref()
         .expect("untracked query reached the tracked probe path");
-    let (node, cached, fresh) = cache.probe(key, |_no_cache_shard| {
+    // Reuse the cache's green verdict when it consulted one (a red value
+    // is then already suppressed), so the check is not repeated here.
+    let mut probed_green: Option<bool> = None;
+    let (node, cached, fresh, capture_epoch) = cache.probe_with_epoch(
+        key,
+        |_no_cache_shard| {
         // The node's DECLARED durability is stamped HERE — inside the
         // allocation closure, BEFORE the node becomes reachable through
         // the cache registration.  `set_node_durability` OVERWRITES the
@@ -2996,20 +4221,61 @@ fn probe<'src, 'q, Q: Query<'q, 'src>, S: Scheduler>(
         // index, which nothing ever references.
         let node = dep_graph.allocate_node_index(vtable.descriptor.content_class);
         dep_graph.set_node_durability(node, vtable.descriptor.durability);
-        node
-    });
-    if !vtable.descriptor.eval_always && dep_graph.is_green(node) {
-        match cached {
-            // NO `record_hit` HERE — see below.
-            Some(value) => {
-                return (node, Some(value), false);
+        // Leak gauge (see `QueryVTable::eval_always_nodes`): debug builds
+        // count eval_always node mints and warn periodically, surfacing
+        // the monotonic-growth contract violation in tests.
+        if vtable.descriptor.eval_always && cfg!(debug_assertions) {
+            let n = vtable
+                .eval_always_nodes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % EVAL_ALWAYS_NODE_WARN_EVERY == 0 && n > 0 {
+                eprintln!(
+                    "WARNING: eval_always query '{}' has allocated {n} dep nodes; \
+                     eval_always nodes are released only by clear_all — an \
+                     UNBOUNDED key here grows RSS monotonically",
+                    vtable.descriptor.name
+                );
             }
-            None => cache.record_miss(),
         }
+        node
+        },
+        // C1 capture: reads the epoch table OUTSIDE any cache shard lock
+        // (the callback is invoked from inside `probe_with_epoch`'s
+        // critical section, but `epoch_of` only takes the dep-side TLS
+        // snapshot — never a cache shard lock — so no cross-family lock is
+        // acquired; contract 3 holds).
+        &mut |node| dep_graph.epoch_of(node),
+        // Green check inside the cache's critical section, BEFORE the
+        // value clone: a red node's value is never served, so the clone is
+        // skipped.  The verdict is cached for the caller.
+        &mut |node| {
+            let g = dep_graph.is_green(node);
+            probed_green = Some(g);
+            g
+        },
+    );
+    if vtable.descriptor.eval_always {
+        // eval_always never reaches a serve verdict (the gate above is its
+        // only cache interaction — the value is always recomputed).  Its
+        // miss is NOT recorded here: every miss-less path of `probe`
+        // (eval_always, green+None, red±staged, fresh) is counted at the
+        // SINGLE fall-through in `get_shared_inner`, so a red-node
+        // recompute — the invalidation-storm traffic — is counted exactly
+        // once instead of being invisible.
+        return (node, None, fresh, capture_epoch);
+    }
+    if probed_green.unwrap_or_else(|| dep_graph.is_green(node)) {
+        // Green with a staged value: return it — the serve verdict
+        // (`serve_cached_verified`) records the hit or miss exactly once.
+        if let Some(value) = cached {
+            return (node, Some(value), false, capture_epoch);
+        }
+        // Green with NO staged value: fall through — counted at the
+        // unified fall-through (see the eval_always note above).
     }
     // Red node, eval_always, or a fresh registration (which cannot have
     // a cached value) — `None` is exact here.
-    (node, None, fresh)
+    (node, None, fresh, capture_epoch)
     //
     // Hit accounting is the SERVE VERDICT's job, not this probe's.  A green
     // node with a staged value is only a CANDIDATE: `serve_cached_verified`
@@ -3144,25 +4410,252 @@ impl std::error::Error for QueryError {}
 /// cache, and active-key state together.  Also owns a `DepGraph` for
 /// tracking dependencies between query executions, enabling incremental
 /// re-evaluation when inputs change.
-/// RAII handle for one in-flight query computation.  Holds the system's
-/// `quiesce` RwLock for READ from before the thread can become a job
-/// owner until its value is in the cache — so an invalidator holding the
-/// WRITE lock can never observe a half-published compute.  Released on
-/// drop, so the panic unwind path needs no dedicated code.
+// ── Quiesce gate: distributed reader-writer (brlock) ────────────────
+
+/// Shard count for the quiesce gate's reader-count table (matches the
+/// other contention domains; each shard is a `CachePadded` counter on its
+/// own cache line).
+const QUIESCE_SHARDS: usize = 64;
+
+/// Bounded spin for a reader waiting out a short mutation before parking
+/// on the condvar.  Mirrors the latch's hot-then-park discipline.
+const QUIESCE_SPIN_LIMIT: u32 = 32;
+
+/// Thread-shard for the quiesce pin count: hashed thread id, the same
+/// striping discipline as `wait_shard_of`.  A reader touches exactly one
+/// shard counter, so the outermost-entry path is an uncontended RMW on a
+/// line private to the entering thread — the shared-line serialization
+/// the old single `RwLock<()>` read word imposed (Perf Book §13.1) is
+/// gone.
+#[inline]
+fn quiesce_shard_of() -> usize {
+    // Thread id is stable for a thread's lifetime, so re-hashing it on
+    // every outermost `get_shared` was pure waste — cache the shard index
+    // per OS thread (TLS).  Under shuttle this becomes per-OS-thread
+    // rather than per-task; still correct, since `QuiescePin` stores its
+    // shard and the Dekker protocol doesn't depend on WHICH shard a
+    // reader uses, only on striping granularity (which coarsens).
+    thread_local! {
+        static QUIESCE_SHARD_CACHE: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(usize::MAX) };
+    }
+    QUIESCE_SHARD_CACHE.with(|c| {
+        let v = c.get();
+        if v != usize::MAX {
+            return v;
+        }
+        let mut h = rustc_hash::FxHasher::default();
+        std::thread::current().id().hash(&mut h);
+        let s = h.finish() as usize & (QUIESCE_SHARDS - 1);
+        c.set(s);
+        s
+    })
+}
+
+/// The quiesce gate: a distributed reader-writer lock replacing the old
+/// `RwLock<()>` quiesce word.  Same contract — every outermost query
+/// compute holds a READ pin from before it can become a job owner until
+/// its value is published; world mutations hold the WRITE side — but the
+/// read path is thread-private instead of one shared lock word.
 ///
-/// Nested gets do NOT take the read lock (parking_lot RwLocks are not
-/// reentrant and a nested frame cannot outlive its outer frame's
-/// publish); the frame that is outermost FOR A GIVEN SYSTEM holds that
-/// system's read guard, tracked via the per-system thread-local depths
-/// below.  A frame nested on a DIFFERENT system therefore holds that
-/// foreign system's guard too — its depth there is 1 — which is what
+/// Protocol (all four atomics SeqCst — the Dekker pair is load-bearing):
+///
+///  * reader: `shard_count++` (SeqCst), then `mutating.load` (SeqCst).
+///    False ⇒ proceed.  True ⇒ undo, wait, retry.
+///  * writer: `mutating.store(true)` (SeqCst), then drain-scan every
+///    shard until all counts read zero.
+///
+/// Correctness of the pair: a reader whose flag load returned `false`
+/// has `increment <_sc flag-load <_sc flag-store <_sc writer-scan` in the
+/// SC total order, so the writer's scan observes its count and waits it
+/// out; a reader that observes the flag steps aside and waits.  No
+/// reader can slip past the writer's scan unseen — the property the old
+/// RwLock's write-preferring arbitration gave for free.
+///
+/// The reader fast path is an uncontended RMW on the thread's own line;
+/// the writer (already extremely cold) pays one scan of 64 lines.  The
+/// `park_wait`/`unpark` release/re-take dance maps 1:1 (release = pin
+/// decrement + writer wakeup; re-take = the same read() path, which
+/// blocks while a mutation drains — exactly what queuing behind the old
+/// write lock did).  Writer↔writer exclusivity is a plain cold `Mutex`.
+///
+/// The three-way-ring argument of `park_wait` carries over unchanged: a
+/// parked waiter's pin is RELEASED (count decremented, writer notified),
+/// so the invalidator's drain never queues behind blocked waiters.
+struct QuiesceGate {
+    /// Writer↔writer exclusivity (mutations are rare).
+    writer: crate::sync::Mutex<()>,
+    /// Mutation-in-flight flag.  SeqCst on every access (Dekker).
+    mutating: AtomicBool,
+    /// Waiters' sleep/wake channel: readers waiting out a mutation, and
+    /// the writer waiting for pins to drain.
+    state: crate::sync::Mutex<()>,
+    cv: crate::sync::Condvar,
+    /// Per-shard reader pin counts (see `quiesce_shard_of`).  These are
+    /// the ONLY reader-side state: there is deliberately no global
+    /// "anyone pinned?" counter — a single shared word
+    /// incremented on every outermost get is an N-way coherence storm on
+    /// the hottest entry point, and it only ever saved the (rare) writer
+    /// a 64-line scan that is already its correctness oracle.
+    shards: Vec<CachePadded<AtomicU64>>,
+}
+
+impl QuiesceGate {
+    fn new() -> Self {
+        QuiesceGate {
+            writer: crate::sync::Mutex::new(()),
+            mutating: AtomicBool::new(false),
+            state: crate::sync::Mutex::new(()),
+            cv: crate::sync::Condvar::new(),
+            shards: (0..QUIESCE_SHARDS)
+                .map(|_| CachePadded(AtomicU64::new(0)))
+                .collect(),
+        }
+    }
+
+    /// Acquire a read pin (see the struct doc for the protocol).
+    fn read(&self) -> QuiescePin<'_> {
+        let shard = quiesce_shard_of();
+        loop {
+            self.shards[shard].0.fetch_add(1, Ordering::SeqCst);
+            if !self.mutating.load(Ordering::SeqCst) {
+                return QuiescePin {
+                    gate: self,
+                    shard,
+                    held: true,
+                };
+            }
+            // A mutation is in flight: step aside and wait it out.  Spin
+            // briefly before parking so a short drain avoids the futex
+            // round-trip, then re-check.
+            self.release_shard(shard);
+            let mut ready = false;
+            for _ in 0..QUIESCE_SPIN_LIMIT {
+                if !self.mutating.load(Ordering::SeqCst) {
+                    ready = true;
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            if ready {
+                continue;
+            }
+            let mut _state = self.state.lock();
+            while self.mutating.load(Ordering::SeqCst) {
+                self.cv.wait(&mut _state);
+            }
+        }
+    }
+
+    /// Acquire the write side: exclusive with other writers, and no
+    /// reader pin survives the return (they drained or stepped aside).
+    fn write(&self) -> QuiesceWriteBarrier<'_> {
+        let _writer = self.writer.lock();
+        self.mutating.store(true, Ordering::SeqCst);
+        // Drain: wait for every pin that pre-dates the flag store (the
+        // Dekker pair guarantees the scan sees each of them).
+        loop {
+            // The 64-line scan IS the oracle.
+            if self
+                .shards
+                .iter()
+                .all(|s| s.0.load(Ordering::SeqCst) == 0)
+            {
+                break;
+            }
+            // Hold the state mutex across re-check and wait: a reader's
+            // final decrement notifies UNDER this mutex, so a wakeup
+            // cannot slip into the re-check → wait window (the standard
+            // missed-wakeup hole).
+            let mut _state = self.state.lock();
+            if self
+                .shards
+                .iter()
+                .all(|s| s.0.load(Ordering::SeqCst) == 0)
+            {
+                break;
+            }
+            self.cv.wait(&mut _state);
+        }
+        QuiesceWriteBarrier {
+            _writer,
+            gate: self,
+        }
+    }
+
+    /// Decrement one shard's pin count; wake a draining writer when the
+    /// count reaches zero.  The notify takes the state mutex so it can
+    /// never interleave into the writer's re-check → wait window (see
+    /// `write`).
+    fn release_shard(&self, shard: usize) {
+        let prev = self.shards[shard].0.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 && self.mutating.load(Ordering::SeqCst) {
+            let _state = self.state.lock();
+            self.cv.notify_all();
+        }
+    }
+}
+
+/// A held read pin (see [`QuiesceGate`]).  Release is `Drop` (or
+/// `release` for the `park_wait` dance — the pin may be re-taken).
+struct QuiescePin<'a> {
+    gate: &'a QuiesceGate,
+    shard: usize,
+    held: bool,
+}
+
+impl QuiescePin<'_> {
+    /// Voluntarily release the pin (the `park_wait` downgrade): a thread
+    /// about to block on another thread's job latch must not hold it —
+    /// otherwise the invalidator's drain queues behind waiters blocked
+    /// on jobs owned by threads queuing behind the invalidator (the
+    /// three-way cycle; full argument on `InFlightGuard::park_wait`).
+    fn release(&mut self) {
+        if self.held {
+            self.held = false;
+            self.gate.release_shard(self.shard);
+        }
+    }
+}
+
+impl Drop for QuiescePin<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// The held write side of a [`QuiesceGate`] (RAII mirror of the old
+/// `RwLockWriteGuard<'_, ()>`).
+struct QuiesceWriteBarrier<'a> {
+    _writer: crate::sync::MutexGuard<'a, ()>,
+    gate: &'a QuiesceGate,
+}
+
+impl Drop for QuiesceWriteBarrier<'_> {
+    fn drop(&mut self) {
+        let mut _state = self.gate.state.lock();
+        self.gate.mutating.store(false, Ordering::SeqCst);
+        self.gate.cv.notify_all();
+    }
+}
+
+/// RAII handle for one in-flight query computation.  Holds the system's
+/// quiesce READ pin (see [`QuiesceGate`]) from before the thread can
+/// become a job owner until its value is in the cache — so an invalidator
+/// holding the WRITE side can never observe a half-published compute.
+/// Released on drop, so the panic unwind path needs no dedicated code.
+///
+/// Nested gets do NOT take the read pin (only the frame that is outermost
+/// FOR A GIVEN SYSTEM holds it, tracked via the per-system thread-local
+/// depths below).  A frame nested on a DIFFERENT system therefore holds
+/// that foreign system's guard too — its depth there is 1 — which is what
 /// closes the d10 erase window for provider/system mispairings.
 struct InFlightGuard<'q, 'a, 'src, S: Scheduler> {
-    _read: Option<crate::sync::RwLockReadGuard<'a, ()>>,
-    /// True while the read lock was voluntarily released for a latch
-    /// wait (`park_wait`) and must be re-taken by `unpark`.
+    _pin: Option<QuiescePin<'a>>,
+    /// True while the pin was voluntarily released for a latch wait
+    /// (`park_wait`) and must be re-taken by `unpark`.
     parked: bool,
-    /// The owning system — needed by `unpark` (re-take the read lock)
+    /// The owning system — needed by `unpark` (re-take the read pin)
     /// and by the outermost drop (drain deferred mutations, d11).
     system: &'a QuerySystem<'q, 'src, S>,
     /// This frame's session total just after its bump — the firing depth
@@ -3228,7 +4721,21 @@ impl<'a, 'src, 'q, S: Scheduler> QuiescedSystem<'a, 'q, 'src, S> {
             // Mirror `QuerySystem::clear`: untracked memos live in
             // `untracked`, not the cache.
             if vt.descriptor.untracked {
-                vt.untracked.write().clear();
+                // Bump the memo generation too (see `untracked`'s field
+                // doc): an in-flight `get_untracked` compute must not
+                // resurrect the cleared map on its way out — d19's letter,
+                // untracked edition.
+                // Leaf-lock discipline: acquire under `Fam::CacheShard` like
+                // the cache shards (see `untracked`'s field doc) — the
+                // tripwire must see every acquisition of this lock.
+                let _tw = sync_order::Acquired::acquire(
+                    sync_order::Fam::CacheShard,
+                    "clear.untracked",
+                );
+                let mut lock = vt.untracked.write();
+                lock.0 = lock.0.wrapping_add(1);
+                lock.1.clear();
+                lock.2.clear();
             } else {
                 vt.cache
                     .as_ref()
@@ -3367,16 +4874,32 @@ thread_local! {
     ///
     /// A marker may outlive the entries it announces: `Drop for
     /// QuerySystem` sweeps the system's queue without this thread's
-    /// participation.  The stale marker then costs one lock acquisition
-    /// that finds nothing and clears itself.  Never a missed or a
+    /// participation.  A marker for a LIVE system implies a non-empty
+    /// queue (only a drain that finds nothing leaves the set populated),
+    /// so it costs one lock acquisition that finds nothing.  Never a
+    /// missed or a duplicated execution — membership in the QUEUE, not in
+    /// this set, is what makes a closure runnable, and only one drain
+    /// removes it.
+    /// Per (system, thread) the residue is one `usize`.  Because
+    /// `NEXT_SYSTEM_ID` is a monotonic `fetch_add(1)`, a dropped system's
+    /// id is NEVER handed out again — a stale marker naming a dropped
+    /// system is never cleared by id reuse.  It stays until this thread
+    /// next drains THAT id (which never happens for a dropped id), so the
+    /// residue is bounded by (systems-ever-dropped × threads) one-`usize`
+    /// entries and accepted as such: reclamation would need a global
+    /// live-id registry consulted on every drain, which costs more than
+    /// the leak is worth.  Note a stale marker is still never a missed or
     /// duplicated execution — membership in the QUEUE, not in this set,
     /// is what makes a closure runnable, and only one drain removes it.
-    /// Per (system, thread) the residue is one `usize`, which also means
-    /// a dropped system's id can be handed out again while this marker
-    /// still names it: the later flush probes the new system's empty
-    /// queue, finds nothing, and clears itself, so reuse is harmless.
     static DEFERRED_PENDING: std::cell::RefCell<FxHashSet<usize>> =
         std::cell::RefCell::new(FxHashSet::default());
+    /// Fast-path gate for [`DEFERRED_PENDING`]: the number of
+    /// systems with a non-empty parked queue ON THIS THREAD.  One `Cell`
+    /// load replaces a TLS borrow + hash-set probe on every outermost query
+    /// completion — the overwhelmingly common case never parks anything.
+    /// The SET stays the source of truth; a stale non-zero count (a system
+    /// dropped without a drain) only costs an extra set probe.
+    static DEFERRED_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// System ids whose deferred queue is being drained on this thread,
     /// inside that drain's quiesce write lock.  Keyed by system id like
     /// the presence marker: a reentrant `mutate_world` on the DRAINING
@@ -3454,7 +4977,15 @@ impl<'q, 'src: 'q, 'a, S: Scheduler> InFlightGuard<'q, 'a, 'src, S> {
                      rejects this shape, and leaving it through here deadlocks — the \
                      nested frame parks holding the outer system's read guard, and the \
                      owner blocks on that system's read lock behind a queued \
-                     invalidator.  Route the nested query through the paired provider.",
+                     invalidator.  Route the nested query through the paired provider.\n\
+                     NOTE: `SESSION` is per-OS-thread state.  Under `--features shuttle` \
+                     the scheduler multiplexes tasks onto one OS thread, so this arm can \
+                     ALSO fire for two CONCURRENT (non-nested) tasks that use different \
+                     systems in one shuttle execution — that is a limitation of the \
+                     per-OS-thread state (see `ExecId`'s doc), not a provider/system \
+                     mispairing.  A shuttle test must therefore use ONE system per \
+                     execution (or run each system's queries under `#[cfg(not(feature = \
+                     \"shuttle\"))]`).",
                     system.id, live,
                 );
             }
@@ -3512,10 +5043,16 @@ impl<'q, 'src: 'q, 'a, S: Scheduler> InFlightGuard<'q, 'a, 'src, S> {
         // `Drop for QuerySystem`, so its assert (use-after-free tripwire)
         // can never read a stale non-zero count and fire on a legal
         // teardown.
-        system.frames.fetch_add(1, Ordering::AcqRel);
+        // Only the OUTERMOST frame per system is counted:
+        // nested frames can only exist under it, so `frames == 0` still
+        // implies no live guard, while a deep chain no longer pays one
+        // locked RMW per level on a single shared line.
+        if prev == 0 {
+            system.frames.fetch_add(1, Ordering::AcqRel);
+        }
         if prev > 0 {
             return InFlightGuard {
-                _read: None,
+                _pin: None,
                 parked: false,
                 system,
                 total,
@@ -3531,7 +5068,7 @@ impl<'q, 'src: 'q, 'a, S: Scheduler> InFlightGuard<'q, 'a, 'src, S> {
         // compute stream; strict fairness (and thus formal
         // starvation-freedom for readers) is not guaranteed.
         InFlightGuard {
-            _read: Some(system.quiesce.read()),
+            _pin: Some(system.quiesce.read()),
             parked: false,
             system,
             total,
@@ -3585,15 +5122,20 @@ impl<'q, 'src: 'q, 'a, S: Scheduler> InFlightGuard<'q, 'a, 'src, S> {
         if !self.is_outer() {
             return;
         }
-        self._read = None;
+        if let Some(pin) = self._pin.as_mut() {
+            pin.release();
+        }
         self.parked = true;
     }
 
-    /// Re-take the read lock after a wait (see `park_wait`).
+    /// Re-take the read pin after a wait (see `park_wait`).  The re-take
+    /// goes through the same `QuiesceGate::read` path, which blocks while
+    /// a mutation drains — exactly what queuing behind the old write lock
+    /// did.
     fn unpark(&mut self) {
         if self.parked {
             self.parked = false;
-            self._read = Some(self.system.quiesce.read());
+            self._pin = Some(self.system.quiesce.read());
         }
     }
 
@@ -3648,8 +5190,20 @@ impl<'q, 'src: 'q, 'a, S: Scheduler> Drop for InFlightGuard<'q, 'a, '_, S> {
             s.total = s.total.saturating_sub(1);
             (prev, s.total)
         });
-        self._read = None; // release the read lock (if outermost for this system)
-        self.system.frames.fetch_sub(1, Ordering::AcqRel);
+        self._pin = None; // release the read pin (if outermost for this system)
+        // ORDERING IS LOAD-BEARING: `frames` is decremented BEFORE the
+        // drain below.  `Drop for QuerySystem` asserts `frames == 0` and
+        // then drains — that assert is only sound because an outermost
+        // guard has already dropped its count by the time any `&mut self`
+        // can exist.  If the drain panics (a deferred closure that escapes
+        // `run_deferred_batch`'s per-closure catch re-raises after the
+        // batch), the count is already gone — which is correct: this
+        // frame IS dead, the panic must not resurrect it.
+        // Paired with the outermost-only increment in `acquire`: `prev == 1`
+        // is this system's last live frame on this thread.
+        if prev == 1 {
+            self.system.frames.fetch_sub(1, Ordering::AcqRel);
+        }
         // Drain ONLY at full thread quiescence: `prev == 1` is outermost
         // for THIS system, but a foreign system's frame may still be live
         // above us (cross-system nesting) holding ITS read guard —
@@ -3795,6 +5349,54 @@ mod node_to_key {
             guard.get(&node).cloned()
         }
 
+        /// Batched [`Self::clone_out`]: visit the nodes
+        /// SHARD-GROUPED, so each touched shard's read lock is taken ONCE
+        /// for the whole group instead of once per node.  The caller's
+        /// tripwire registration is likewise paid once for the batch.
+        ///
+        /// Order is shard-grouped, not input order.  Every consumer
+        /// (`try_serve_verified_inner`'s re-request loop) treats the deps as
+        /// an unordered set — each re-request is independent — so this is
+        /// not observable.
+        ///
+        /// `f` returns `false` to abort (the caller turns that into its
+        /// conservative "recompute" verdict).  Returns `false` as soon as a
+        /// node has no mapping.  `f` runs while the shard lock is held, so it
+        /// must not take another lock in this family (it only moves the
+        /// cloned tag out).
+        pub(super) fn clone_out_grouped(
+            &self,
+            nodes: &[dep_graph::DepNodeIndex],
+            mut f: impl FnMut(TaggedQueryKey) -> bool,
+        ) -> bool {
+            // One sort replaces the old shard-major scan (SHARDS × N probes,
+            // each `shard_of` recomputed): group the nodes by shard once, then
+            // take each shard's read lock exactly once.  Stable sort, so the
+            // per-shard order (and therefore the callback order) is the
+            // caller's order.
+            let mut ordered: smallvec::SmallVec<[dep_graph::DepNodeIndex; 8]> =
+                nodes.iter().copied().collect();
+            ordered.sort_by_key(|n| shard_of(*n));
+            let mut i = 0;
+            while i < ordered.len() {
+                let shard = shard_of(ordered[i]);
+                let start = i;
+                while i < ordered.len() && shard_of(ordered[i]) == shard {
+                    i += 1;
+                }
+                let guard = self.0[shard].read();
+                for &node in &ordered[start..i] {
+                    let Some(entry) = guard.get(&node) else {
+                        return false; // unresolvable dep: recompute (conservative)
+                    };
+                    if !f(entry.clone()) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+
         /// `clear_all` sweep: every shard, one at a time (never two shard
         /// locks coexisting — the §0 multi-shard discipline).
         pub(super) fn clear(&self) {
@@ -3818,6 +5420,21 @@ where
     fn clone_box(&self) -> Box<dyn CloneAny + Send + Sync> {
         Box::new(self.clone())
     }
+}
+
+/// One pooled body-check worker (see `QuerySystem::body_worker_pool`).
+/// Owns the pieces of per-function worker construction that are pure
+/// repeated allocation: the sharing `TypeContext` and the worker `TraitEnv`.
+/// `None` halves mean the previous compute on this thread panicked inside
+/// its worker and the state was dropped — the next compute simply rebuilds.
+pub(crate) struct BodyWorkerSlot<'input> {
+    /// Pool stamp: `(origin ctx session_id, program epoch)`.  A mismatch
+    /// discards the slot — a stale worker context must never see a session
+    /// or program it was not built for (same discipline as the
+    /// `resolve_cache` epoch check).
+    pub stamp: (usize, usize),
+    pub ctx: Option<crate::hir::types::TypeContext<'input>>,
+    pub env: Option<crate::hir::traits::TraitEnv<'input>>,
 }
 
 pub struct QuerySystem<'q, 'src: 'q, S: Scheduler> {
@@ -3893,7 +5510,18 @@ pub struct QuerySystem<'q, 'src: 'q, S: Scheduler> {
     /// `clear_all_impl` before the registry is emptied); a stale entry is
     /// replaced, never served, so a waiter re-resolving after a
     /// `clear_all` (d18) cannot observe an orphaned vtable through here.
-    resolve_cache: thread_local::ThreadLocal<std::cell::RefCell<Vec<ResolveEntry<'src, 'q, S>>>>,
+    resolve_cache:
+        thread_local::ThreadLocal<std::cell::RefCell<ResolveCache<'src, 'q, S>>>,
+    /// Per-thread pool of body-check worker state (2b of the perf pass):
+    /// `(TypeContext, TraitEnv)` pairs left behind by the previous
+    /// `CheckFnBody::compute` on this thread, reset in place instead of
+    /// rebuilt per function.  Slots are stamped `(ctx session_id, program
+    /// identity)`; a stamp miss (new session, rebuilt program, provider
+    /// swap) discards the pool — the same discipline `resolve_cache` uses
+    /// for vtable resolution.  Per-thread `RefCell`s: no slot is ever
+    /// touched by two threads, so no cross-thread sharing of the worker
+    /// state (which is `&mut`-borrowed for the whole compute).
+    body_worker_pool: thread_local::ThreadLocal<std::cell::RefCell<Option<BodyWorkerSlot<'q>>>>,
     /// Schedule-point sink shared with the dep graph (both hold an `Arc`
     /// pointing at one instance).  For `NoOpScheduler` every `suspend`
     /// call monomorphizes to an empty inlined body — the field costs one
@@ -3931,7 +5559,20 @@ pub struct QuerySystem<'q, 'src: 'q, S: Scheduler> {
     /// pointing at itself.  Registered just before `wait_on` and removed
     /// right after it returns (both Ok and Err), so it always reflects
     /// in-flight waits.
-    wait_graph: RwLock<FxHashMap<job::ExecId, WaitEdge>>,
+    ///
+    /// SHARDED by waiter `ExecId` (same striping discipline as
+    /// `active_keys`/`node_to_key`): the old single global write lock was
+    /// a serialization point touched on every cross-thread wait AND every
+    /// job completion.  Sharding costs the walk-and-insert atomicity the
+    /// global lock used to provide — closed by `register_wait`'s
+    /// install-then-revalidate protocol (see there).
+    wait_graph: Vec<CachePadded<RwLock<FxHashMap<job::ExecId, WaitEdge>>>>,
+    /// Count of live wait edges, mirrored by every shard mutation.  Lets
+    /// `clear_waiters_of_me` (which runs on job completion) skip the
+    /// 64-shard scan entirely on the common no-waiters path.  Relaxed: a
+    /// stale count only over- or under-scans — a missing decrement can
+    /// cost one empty scan, never a missed edge.
+    wait_count: AtomicUsize,
     /// Quiescence gate for world mutation: `RwLock<()>` — every
     /// outermost query compute holds it for READ from before it can
     /// become a job owner until its value is in the cache (panic
@@ -3967,7 +5608,13 @@ pub struct QuerySystem<'q, 'src: 'q, S: Scheduler> {
     /// `acquire_key_slot` — and a thread blocked on a job latch is
     /// covered by the job owner's own read lock, whose chain terminates
     /// at a compute that publishes and releases.  No cycle.
-    quiesce: RwLock<()>,
+    /// Quiescence gate for world mutation — a distributed reader-writer
+    /// gate (see [`QuiesceGate`]): every outermost query compute holds a
+    /// READ pin on a thread-private shard counter; world mutations take
+    /// the WRITE side (exclusive, all pins drained).  Same contract as
+    /// the old `RwLock<()>`, without the shared lock word on the reader
+    /// path.
+    quiesce: QuiesceGate,
     /// Reverse mapping from `DepNodeIndex` to `(TypeId, key)` for
     /// transitive green verification.  Allows re-requesting dirty
     /// dependencies of any query type when a cached value's dependencies
@@ -3999,11 +5646,24 @@ pub struct QuerySystem<'q, 'src: 'q, S: Scheduler> {
 /// compiler then forces every `for_each_query!` consumer (today: only
 /// `list_queries`) to cover it.
 ///
+/// CAVEAT: macro coverage is compile-time only for the consumers above.
+/// `TaggedQueryKey`, `rerequest_dirty_dependency`, and the
+/// `into_tagged`/`from_tagged` overrides are HAND-synced with this
+/// manifest — a new query type compiles fine without them (the `Opaque`
+/// fallback keeps the system working) but takes the slow erased path and
+/// cannot be re-requested as a dirty dependency.  Add the typed variants
+/// in the same change as the manifest line.
+///
 /// Deliberately NOT used for registration: test-only queries (the
 /// `tests` module's `TestQuery`, `storm_query`, …) are outside the
 /// manifest and keep registering lazily, so unit tests need no manifest
 /// edits.
 macro_rules! for_each_query {
+    // Hand-written literal: `macro_rules!` cannot count the expansion
+    // below, so adding/removing a query type must bump this by hand.
+    (count) => {
+        4
+    };
     ($mac:ident) => {
         $mac!(queries::TypeDefShape);
         $mac!(queries::CheckFnSignature);
@@ -4021,6 +5681,86 @@ struct ResolveEntry<'src, 'q, S: Scheduler> {
     vtable: Arc<dyn QueryVTableDyn<'q, 'src, S> + 'q>,
 }
 
+/// Per-thread resolved-vtable cache.  A linear `Vec` is fastest while the
+/// manifest is tiny (4 entries today: one `TypeId` compare per resolve),
+/// but every slow-path resolve pays O(entries) — a cliff once a system
+/// resolves many query types.  Promotion to an `FxHashMap` past
+/// [`RESOLVE_LINEAR_MAX`] keeps the resolve O(1) without giving up the
+/// small-manifest fast path.
+enum ResolveCache<'src, 'q, S: Scheduler> {
+    Linear(Vec<ResolveEntry<'src, 'q, S>>),
+    Mapped(FxHashMap<TypeId, ResolveEntry<'src, 'q, S>>),
+}
+
+/// Linear scan is unbeatable for a handful of entries; past this, hash.
+const RESOLVE_LINEAR_MAX: usize = 8;
+
+impl<'src, 'q, S: Scheduler> ResolveCache<'src, 'q, S> {
+    #[inline]
+    fn get(
+        &self,
+        ty: TypeId,
+        epoch: u64,
+    ) -> Option<&Arc<dyn QueryVTableDyn<'q, 'src, S> + 'q>> {
+        match self {
+            ResolveCache::Linear(entries) => entries
+                .iter()
+                .find(|e| e.ty == ty && e.epoch == epoch)
+                .map(|e| &e.vtable),
+            ResolveCache::Mapped(map) => map
+                .get(&ty)
+                .filter(|e| e.epoch == epoch)
+                .map(|e| &e.vtable),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        ty: TypeId,
+        epoch: u64,
+        vtable: Arc<dyn QueryVTableDyn<'q, 'src, S> + 'q>,
+    ) {
+        // Promote BEFORE the push that would cross the threshold: the map
+        // then never grows from a linear scan it has to redo.
+        if let ResolveCache::Linear(entries) = self {
+            if entries.len() >= RESOLVE_LINEAR_MAX && !entries.iter().any(|e| e.ty == ty) {
+                let mapped: FxHashMap<TypeId, ResolveEntry<'src, 'q, S>> =
+                    entries.drain(..).map(|e| (e.ty, e)).collect();
+                *self = ResolveCache::Mapped(mapped);
+            }
+        }
+        match self {
+            ResolveCache::Linear(entries) => match entries.iter_mut().find(|e| e.ty == ty) {
+                Some(e) => {
+                    e.epoch = epoch;
+                    e.vtable = vtable;
+                }
+                None => entries.push(ResolveEntry {
+                    ty,
+                    epoch,
+                    vtable,
+                }),
+            },
+            ResolveCache::Mapped(map) => match map.get_mut(&ty) {
+                Some(e) => {
+                    e.epoch = epoch;
+                    e.vtable = vtable;
+                }
+                None => {
+                    map.insert(
+                        ty,
+                        ResolveEntry {
+                            ty,
+                            epoch,
+                            vtable,
+                        },
+                    );
+                }
+            },
+        }
+    }
+}
+
 /// A resolved vtable whose lifetime is fenced by a borrow, not a refcount.
 ///
 /// - `Cached` keeps the `RefCell` shared borrow open for the guard's
@@ -4036,6 +5776,23 @@ struct ResolveEntry<'src, 'q, S: Scheduler> {
 enum VtableResolve<'q, 'a, 'src, Q: Query<'q, 'src>> {
     Cached(std::cell::Ref<'a, QueryVTable<'q, 'src, Q>>),
     Owned(Arc<QueryVTable<'q, 'src, Q>>),
+    /// Transient placeholder written by [`Self::release_borrow`] and
+    /// immediately replaced by the next `resolve_vtable`.
+    /// It is never dereferenced: the wake path only needs the old `Cached`
+    /// `Ref` dropped before `resolve_vtable` may `try_borrow_mut`, and the
+    /// previous shape dropped it by assigning a freshly cloned `Owned`
+    /// `Arc` that was overwritten on the very next line.  `Deref` panics
+    /// on this arm so any future use outside that two-statement window is
+    /// loud rather than silent.
+    Vacant,
+}
+
+impl<'src, 'a, 'q, Q: Query<'q, 'src>> VtableResolve<'q, 'a, 'src, Q> {
+    /// Drop a held `Cached` borrow in place, without cloning an `Arc`.
+    #[inline]
+    fn release_borrow(&mut self) {
+        *self = VtableResolve::Vacant;
+    }
 }
 
 impl<'src, 'a, 'q, Q: Query<'q, 'src>> std::ops::Deref for VtableResolve<'q, 'a, 'src, Q> {
@@ -4044,6 +5801,9 @@ impl<'src, 'a, 'q, Q: Query<'q, 'src>> std::ops::Deref for VtableResolve<'q, 'a,
         match self {
             VtableResolve::Cached(r) => r,
             VtableResolve::Owned(a) => a,
+            VtableResolve::Vacant => {
+                unreachable!("VtableResolve::Vacant dereferenced outside its release window")
+            }
         }
     }
 }
@@ -4153,12 +5913,16 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             vtables: ArcSwap::from_pointee(FxHashMap::default()),
             init_lock: Mutex::new(()),
             resolve_cache: thread_local::ThreadLocal::new(),
+            body_worker_pool: thread_local::ThreadLocal::new(),
             dep_graph: dep_graph::DepGraph::with_owner(id, shared),
             active_keys: (0..ACTIVE_SHARDS)
                 .map(|_| CachePadded(RwLock::new(FxHashMap::default())))
                 .collect(),
-            wait_graph: RwLock::new(FxHashMap::default()),
-            quiesce: RwLock::new(()),
+            wait_graph: (0..WAIT_SHARDS)
+                .map(|_| CachePadded(RwLock::new(FxHashMap::default())))
+                .collect(),
+            wait_count: AtomicUsize::new(0),
+            quiesce: QuiesceGate::new(),
             node_to_key: node_to_key::ShardedMap::default(),
         }
     }
@@ -4166,8 +5930,9 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     /// Stable per-instance id.  Keys this thread's `DEFERRED_PENDING`
     /// marker and the `IN_DRAIN` set — never an address: addresses are
     /// recycled after drop, which once let one system's deferred closure
-    /// run against another.
-    fn system_id(&self) -> usize {
+    /// run against another.  `pub(crate)`: the compute-log tags (see
+    /// `FN_BODY_COMPUTE_LOG`) key on it for the same reason.
+    pub(crate) fn system_id(&self) -> usize {
         self.id
     }
 
@@ -4234,6 +5999,11 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     ///   from `Drop` while unwinding aborts the process; logging is the
     ///   best we can do there).
     fn drain_deferred(&self) {
+        // One `Cell` load on the common path: the set probe
+        // below is paid only by threads that actually parked something.
+        if DEFERRED_COUNT.with(|c| c.get()) == 0 {
+            return;
+        }
         if !DEFERRED_PENDING.with(|p| p.borrow().contains(&self.id)) {
             return;
         }
@@ -4256,7 +6026,16 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
              outermost is not quiescence (cross-system nesting holds a \
              foreign read guard; write here is the ABBA half)"
         );
+        // Soundness note for BOTH asserts: `InFlightGuard::drop` computed
+        // `(prev, total)` under one SESSION borrow and then called this
+        // method AFTER dropping that borrow, so the re-read here is not the
+        // same linearization as the caller's — the two reads are only
+        // sound TOGETHER because a same-thread `InFlightGuard::acquire`
+        // cannot interleave between them (a destructor that called
+        // `get_shared` mid-drop would be re-entrant drop, which is already
+        // forbidden).  Do not weaken that ban thinking the assert re-checks.
         DEFERRED_PENDING.with(|p| p.borrow_mut().remove(&self.id));
+        DEFERRED_COUNT.with(|c| c.set(c.get().saturating_sub(1)));
         let pending: Vec<DeferredMutation<S>> = self
             .deferred
             .lock()
@@ -4324,8 +6103,17 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                  two-system ABBA"
             );
         }
-        let _drain_guard = DrainGuard::new(self.id);
+        // Take the write lock FIRST.  The `IN_DRAIN` marker is only
+        // meaningful once the lock is actually held — `mutate_world`'s
+        // inline branch relies on the invariant "IN_DRAIN has id ⇒ this
+        // thread holds the write lock".  The old order left a window
+        // where IN_DRAIN contained the id but the lock wasn't yet
+        // acquired; a `mutate_world` running in that window would run
+        // inline without the lock.  (Traced unreachable through the
+        // current call graph, but the ordering restores the invariant
+        // unconditionally.)
         let _write = self.quiesce.write();
+        let _drain_guard = DrainGuard::new(self.id);
         // Note: Fam::Deferred is not registered here — that family refers to
         // the `deferred` partition mutex itself (leaf, §0 #5/#17), not the
         // drain scope; during the drain, closures legally acquire
@@ -4434,7 +6222,9 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 .entry(std::thread::current().id())
                 .or_default()
                 .push(Box::new(f));
-            DEFERRED_PENDING.with(|p| p.borrow_mut().insert(id));
+            if DEFERRED_PENDING.with(|p| p.borrow_mut().insert(id)) {
+                DEFERRED_COUNT.with(|c| c.set(c.get() + 1));
+            }
             // NOTE: no re-check of the session total here — the read is
             // thread-local and nothing between it and the defer can drop
             // a frame (no suspension point), so a second `== 0` check is
@@ -4470,6 +6260,15 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         }
         self.drain_deferred();
         let _write = self.quiesce.write();
+        // Compact any dep-graph shard whose reverse-edge log crossed the
+        // threshold (log rework #10). This is the ONLY scheduled
+        // compaction site; it runs under the quiesce WRITE lock, so it
+        // cannot race a reader mid-scan (readers hold the read pin or
+        // `&Quiesced`, both excluded here). Between compactions the log is
+        // bounded by the threshold — except during a query-heavy phase
+        // with no mutation, whose growth-and-tail-scan bound is documented
+        // on `DepGraph::rev_logs`.
+        self.dep_graph.compact_rev_edges(&dep_graph::Quiesced::mint());
         // Register the drain marker on the inline path too (same set
         // `run_deferred_batch` uses).  Without it a query or a foreign
         // mutation reached from inside `f` via a captured alias saw an
@@ -4492,7 +6291,12 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             .load()
             .get(&TypeId::of::<Q>())
             .map(|arc| {
-                downcast_vtable::<Q, S>(arc.as_ref())?;
+                // No `downcast_vtable` re-check here: the map is keyed by
+                // `TypeId::of::<Q>()` and entries never move across keys, so
+                // the cast below is already justified by the lookup (the
+                // virtual re-check belonged to `find_vtable_dyn` /
+                // `get_shared_erased`, where the TypeId comes from an
+                // untrusted tag).
                 let arc_clone = arc.clone();
                 // SAFETY: the TypeId lookup guarantees the concrete type
                 // is exactly QueryVTable<'q, 'src, Q>, so the raw pointer cast is valid.
@@ -4525,14 +6329,18 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         let epoch = self.epoch();
         let slot = self
             .resolve_cache
-            .get_or(|| std::cell::RefCell::new(Vec::new()));
+            .get_or(|| std::cell::RefCell::new(ResolveCache::Linear(Vec::new())));
         // Fast path: shared borrow only.  `filter_map` hands the borrow
         // back on miss so the slow path starts unborrowed.
-        match std::cell::Ref::filter_map(slot.borrow(), |entries| {
-            entries
-                .iter()
-                .find(|e| e.ty == ty && e.epoch == epoch)
-                .and_then(|e| downcast_vtable::<Q, S>(e.vtable.as_ref()))
+        match std::cell::Ref::filter_map(slot.borrow(), |cache| {
+            // Linear while the manifest is small, hashed past
+            // `RESOLVE_LINEAR_MAX`: the per-thread cache is
+            // otherwise O(registered query types) on every slow-path
+            // resolve.  A thread legitimately touching many query types
+            // (function-local test queries) is NOT an error — no assert.
+            cache
+                .get(ty, epoch)
+                .and_then(|e| downcast_vtable::<Q, S>(e.as_ref()))
         }) {
             Ok(hit) => return VtableResolve::Cached(hit),
             Err(_borrow) => {}
@@ -4547,19 +6355,8 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // a stale-epoch entry is safe: only this thread ever touches its
         // slot, and a live outer guard would fail the `try` above instead
         // of letting us swap under it.
-        if let Ok(mut entries) = slot.try_borrow_mut() {
-            let erased: Arc<dyn QueryVTableDyn<'q, 'src, S> + 'q> = owned.clone();
-            match entries.iter_mut().find(|e| e.ty == ty) {
-                Some(e) => {
-                    e.epoch = epoch;
-                    e.vtable = erased;
-                }
-                None => entries.push(ResolveEntry {
-                    ty,
-                    epoch,
-                    vtable: erased,
-                }),
-            }
+        if let Ok(mut cache) = slot.try_borrow_mut() {
+            cache.insert(ty, epoch, owned.clone());
         }
         VtableResolve::Owned(owned)
     }
@@ -4575,22 +6372,38 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     /// Re-probe + serve step for the cross-thread waiter path (the latch
     /// wake), mirroring the cached-hit branch of `get_shared`.
     ///
-    /// NOTE: stats double-count on this path.  The pre-wait probe already
-    /// recorded a hit/miss for this logical request and the re-probe
-    /// inside `try_serve_verified` records a second one, so hit ratios
-    /// read optimistic whenever a thread actually waited.  Kept simple
-    /// deliberately — the wake path cannot always attribute a phantom
-    /// wait to its logical request, and the alternative (threading a
-    /// "already counted" flag through the waiter) buys accuracy in a
+    /// NOTE: stats double-count on the wake path.  The pre-wait probe
+    /// already recorded a hit/miss for this logical request and the
+    /// re-probe inside `try_serve_verified` records a second one, so hit
+    /// ratios read optimistic whenever a thread actually parked.  Kept
+    /// simple deliberately — the wake path cannot always attribute a
+    /// phantom wait to its logical request, and the alternative (threading
+    /// a "already counted" flag through the waiter) buys accuracy in a
     /// diagnostic counter at the price of bookkeeping on the latency
     /// path.
+    ///
+    /// Current shape: the two PHANTOM paths call
+    /// `try_serve_verified_inner`, which records NO stats — those threads
+    /// never parked, and the pre-probe decision point in
+    /// `get_shared_inner` already recorded their logical request exactly
+    /// once.  The wake path calls `serve_cached_verified`, which records a
+    /// second hit/miss for the same logical request (the documented
+    /// double-count), because its pre-wait count may genuinely have been
+    /// invalidated by a `clear_all` during the park.
     fn serve_reprobed<Q: Query<'q, 'src>>(
         &self,
         vtable: &QueryVTable<'q, 'src, Q>,
         key: &Q::Key,
         provider: &dyn QueryProvider<'q, 'src, S>,
     ) -> Option<Stored<'q, 'src, Q>> {
-        let (node, cached, fresh) = probe(vtable, &self.dep_graph, key);
+        let (node, cached, fresh, capture_epoch) = probe(vtable, &self.dep_graph, key);
+        // C1: `capture_epoch` was captured UNDER the cache shard lock that
+        // also read the value (see `QueryCacheType::probe_with_epoch`) —
+        // there is no (value-read .. capture) window for a publish's
+        // [stage → bump] to hide in, so the old caller-side capture +
+        // double-read seal is gone.  Any bump after the capture makes
+        // `captured < live` at the finish-side re-check: suspect, the safe
+        // direction.
         if fresh {
             // Third node_to_key registration site (get_shared.register /
             // get_shared.wake_register are the other two): register for
@@ -4603,28 +6416,28 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             self.node_to_key.insert(node, Q::into_tagged(key));
         }
         let value = cached?;
-        self.try_serve_verified::<Q>(
-            vtable
-                .cache
-                .as_ref()
-                .expect("untracked query reached the tracked serve path"),
-            node,
-            value,
-            provider,
-        )
+        // No stats parameter: both call sites (the two post-wait re-probes)
+        // record stats once at the pre-probe decision point and serve
+        // silently — the wake path uses `serve_cached_verified` directly,
+        // so a "count stats" variant here was dead code.
+        self.try_serve_verified_inner::<Q>(node, value, provider, capture_epoch)
     }
 
     /// The cached-hit serve step shared by the initial probe and the
     /// post-wake re-probe.  `None` cached → `None` (fall through to compute).
+    /// `capture_epoch` is the CALLER-CAPTURED probe-time epoch (C1): the
+    /// read edge recorded on success must start from an epoch taken at or
+    /// before the value was obtained, never from a record-time capture.
     fn serve_cached_verified<Q: Query<'q, 'src>>(
         &self,
         cache: &Q::Cache,
         node_index: dep_graph::DepNodeIndex,
         cached: Option<Stored<'q, 'src, Q>>,
         provider: &dyn QueryProvider<'q, 'src, S>,
+        capture_epoch: u64,
     ) -> Option<Stored<'q, 'src, Q>> {
         let value = cached?;
-        self.try_serve_verified::<Q>(cache, node_index, value, provider)
+        self.try_serve_verified::<Q>(cache, node_index, value, provider, capture_epoch)
     }
 
     /// Re-request a dirty dependency during transitive green verification.
@@ -4696,8 +6509,9 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         node_index: dep_graph::DepNodeIndex,
         value: Stored<'q, 'src, Q>,
         provider: &dyn QueryProvider<'q, 'src, S>,
+        capture_epoch: u64,
     ) -> Option<Stored<'q, 'src, Q>> {
-        let out = self.try_serve_verified_inner::<Q>(node_index, value, provider);
+        let out = self.try_serve_verified_inner::<Q>(node_index, value, provider, capture_epoch);
         match out {
             Some(_) => cache.record_hit(),
             None => cache.record_miss(),
@@ -4708,59 +6522,99 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     /// The verification body: transitive green check, dirty-dependency
     /// re-request, and the read-edge record.  Returns `Some(value)` only
     /// when the value may actually be served.
+    ///
+    /// The read edge is recorded via [`DepGraph::read_with_epoch`] with the
+    /// caller-captured probe epoch (C1): capturing at record time instead
+    /// would swallow any mark landing between "value received" and the
+    /// record — a thread preempted in that window compared equal epochs and
+    /// published green over a pre-mark value.
+    ///
+    /// The SECOND walk does not repeat the first walk's explicit
+    /// `dirty.contains(&node_index)` check — that is not an omission.  The
+    /// second walk is a full re-verification of the SAME root: if a
+    /// re-requested dependency's changed fingerprint re-dirtied this node,
+    /// the walk puts `node_index` in `dirty` and returns `false`, falling
+    /// through to `return None`.  Repeating the check would be redundant;
+    /// the invariant is that `verify_green_collect_dirty` reports the root
+    /// itself exactly like any other dirty closure member.
     fn try_serve_verified_inner<Q: Query<'q, 'src>>(
         &self,
         node_index: dep_graph::DepNodeIndex,
         value: Stored<'q, 'src, Q>,
         provider: &dyn QueryProvider<'q, 'src, S>,
+        capture_epoch: u64,
     ) -> Option<Stored<'q, 'src, Q>> {
-        if let Some(dirty_dep) = self
+        // Collect ALL dirty deps in one walk, batch re-request them, then
+        // run ONE final re-verify — instead of the old first-dirty loop of
+        // (re-request → full-closure re-walk) per dirty dep, which paid
+        // O(d) walks after an invalidation storm.
+        let mut dirty: SmallVec<[dep_graph::DepNodeIndex; 8]> = SmallVec::new();
+        if !self
             .dep_graph
-            .verify_green_transitive_with_dirty(node_index)
+            .verify_green_collect_dirty(node_index, &mut dirty)
         {
             // The node ITSELF was marked red between capture and here (a
             // concurrent invalidate, a dependency's changed-fingerprint
             // fan-out, or — waiter case — the owner's own d16 epoch
             // restore): serving the captured value would disagree with
             // the graph — recompute instead (d17).
-            if dirty_dep == node_index {
+            //
+            // The walk pushes the ROOT first on BOTH root-fail arms — the
+            // red-bit arm AND the d24 `finishing` arm — and the visited set
+            // prevents any later re-push, so `first()` is exactly "was the
+            // root dirty?" in O(1).  This still carries the
+            // finishing semantics the old O(d) `contains` scan did; do not
+            // substitute `is_green`, which cannot see `finishing`.
+            if dirty.first() == Some(&node_index) {
                 return None;
             }
-            // Clone (TypeId, key) out and DROP the shard lock before
-            // re-requesting: the re-request's nested `get_shared` takes
-            // a `node_to_key` shard write lock — a same-thread read→write
-            // upgrade self-deadlocks parking_lot RwLocks (this hung
-            // g1c/stress before the fix).
-            let dep_info: Option<TaggedQueryKey> = {
+            // Clone every (TypeId, key) out FIRST — SHARD-GROUPED, one read
+            // lock per touched shard, and DROP the shard
+            // locks before re-requesting: the re-request's nested
+            // `get_shared` takes a `node_to_key` shard write lock — a
+            // same-thread read→write upgrade self-deadlocks parking_lot
+            // RwLocks (this hung g1c/stress before the fix).  The
+            // registration is paid once for the batch instead of once per
+            // dep.
+            let mut tags: SmallVec<[TaggedQueryKey; 8]> = SmallVec::new();
+            let all_found = {
                 let _tw = sync_order::Acquired::acquire(
                     sync_order::Fam::NodeToKey,
                     "try_serve_verified.read",
                 );
-                self.node_to_key.clone_out(dirty_dep)
+                self.node_to_key.clone_out_grouped(&dirty, |tag| {
+                    tags.push(tag);
+                    true
+                })
             };
-            let Some(tag) = dep_info else {
+            if !all_found {
                 return None; // unresolvable dep: recompute (conservative)
-            };
-            self.rerequest_dirty_dependency(&tag, provider);
-            // If the dependency's fingerprint changed, its publish marked
-            // THIS node red — the re-verify below returns the node itself.
-            if self
-                .dep_graph
-                .verify_green_transitive_with_dirty(node_index)
-                .is_none()
-            {
+            }
+            for tag in &tags {
+                self.rerequest_dirty_dependency(tag, provider);
+            }
+            // Recomputing one re-requested dep may change the colour of the
+            // OTHER deps (a fingerprint change fans out back to this node),
+            // so this final FULL re-verify is load-bearing and must not be
+            // reduced to a "stamps were refreshed" shortcut.  If it passes,
+            // the whole closure is green under one linearized window.
+            // The second walk only needs the verdict; no caller inspects the
+            // dirty list after a full re-request, so skip collection
+            //.
+            if self.dep_graph.verify_green_only(node_index) {
                 // All green now — serve the cached value.  Record that the
                 // current task read this node (no-op without an active
                 // task): without this edge, a later invalidation of the
                 // node never dirties the outer query, causing silent
                 // staleness — the waiter's dep edge was not recorded.
-                self.dep_graph.read(node_index);
+                // The PROBE-captured epoch (C1), not a record-time capture.
+                self.dep_graph.read_with_epoch(node_index, capture_epoch);
                 return Some(value);
             }
             return None;
         }
         // All transitive dependencies green — serve.
-        self.dep_graph.read(node_index);
+        self.dep_graph.read_with_epoch(node_index, capture_epoch);
         Some(value)
     }
 
@@ -4795,7 +6649,12 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // collision is introduced, which is the only time it can still be
         // fixed cheaply.  (`TypeId` would be the better identity for the
         // schedule points — see scheduler.rs's `SchedulePoint`.)
-        debug_assert!(
+        // Unconditional, not `debug_assert!`: the `--release --features shuttle`
+        // suite is exactly where the d17/d15/d21/d24 scheduler choreography
+        // keys on these names, and a release build compiles `debug_assert!`
+        // out.  The scan is O(registered queries) on a first-touch-only path,
+        // so the cost is a rounding error.
+        assert!(
             !self
                 .vtables
                 .load()
@@ -4863,21 +6722,21 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // expression.  (The cycle state committed below is TLS and takes
         // no lock, so unlike the old sharded-map design there is no nested
         // acquisition inside this guard.)
+        // LAZY allocation: `QueryJob::new()` is an `Arc` alloc
+        // PLUS a global `NEXT_JOB_ID` RMW on a shared cache line.  The old
+        // pre-lock allocation made every WAITER pay both and drop the job —
+        // and in a dedup storm waiters outnumber owners, so the "one wasted
+        // alloc" was really one wasted shared-line RMW per parked request,
+        // the exact workload the Wait path exists to optimize.  Owners
+        // allocate inside the (brief) shard write section instead.
         let _tw = sync_order::Acquired::acquire(sync_order::Fam::ActiveShard, "acquire_key_slot");
         let mut active = self.active_keys[active_shard(akey)].write();
 
-        // NOTE: the `Arc` in `QueryJob::new()` is ALLOCATED INSIDE the
-        // write-lock below (the `Vacant` arm only).  Hoisting it out
-        // would need a read-lock pre-check that could race — a
-        // write-lock protocol change for a one-off allocation on a
-        // cold-miss path, which is exactly the path about to pay for
-        // the compute it precedes.  Not worth it; the wait paths and
-        // `Started` hit paths allocate nothing.
-
         // `entry` hashes the key ONCE for the get-or-insert below (a `get`
         // followed by `insert` would hash twice per miss acquisition).  The
-        // `akey.clone()` is an `Arc` bump only; the Wait arms borrow it and
-        // drop it, same as before.
+        // `akey.clone()` is an inline `SmallBox` copy for identity-shaped
+        // keys (a heap allocation only for keys larger than 32 bytes); the
+        // Wait arms borrow it and drop it, same as before.
         use std::collections::hash_map::Entry;
         match active.entry(akey.clone()) {
             Entry::Occupied(o) => match o.get() {
@@ -4919,10 +6778,48 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 // We become the owner — commit the active-stack entry.
                 // The key was cloned once for the entry lookup above; the
                 // Wait paths borrow it and drop it.
-                vtable.commit_enter(self.system_id(), epoch, key);
-                let job = job::QueryJob::new();
-                v.insert(ActiveKeyStatus::Started(job));
-                Ok(KeySlot::Compute)
+                //
+                // Panic safety: `commit_enter` (TLS push) and `v.insert`
+                // (allocation) are wrapped so a panic between them cannot
+                // strand a half-acquired slot.  There is no
+                // `catch_unwind`-to-`abort_with_poison` staging guard AFTER
+                // this point that could clean the `Started` entry (the
+                // entry is only inserted at the end of this arm), so the
+                // cleanup happens here: undo the commit via `leave` and
+                // resume.  If the map insert panicked, the entry is still
+                // vacant — no `Started` row exists to strand waiters on.
+                // The job is allocated here (inside the lock) — see the
+                // LAZY ALLOCATION note above for why the owner, not every
+                // waiter, pays it.
+                // Allocate the job OUTSIDE the guard.
+                // `QueryJob::new` can only unwind before anything is
+                // committed; if it does, this arm unwinds with no TLS
+                // frame pushed and no `Started` row, so the unconditional
+                // `leave` in the Err arm below must not run.  Keeping it
+                // inside the guard made that arm pop the CALLER's frame.
+                let pre_job = job::QueryJob::new();
+                let mut entered = false;
+                let committed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    vtable.commit_enter(self.system_id(), epoch, key);
+                    // `commit_enter` clones before mutating, so reaching here
+                    // means exactly one frame was pushed.
+                    entered = true;
+                    v.insert(ActiveKeyStatus::Started(pre_job));
+                }));
+                match committed {
+                    Ok(()) => Ok(KeySlot::Compute),
+                    Err(payload) => {
+                        // Only pop if a frame was actually pushed.  The old
+                        // unconditional `leave` would pop the CALLER's frame
+                        // if `commit_enter` panicked before pushing; with the
+                        // clone-before-mutate contract above, `entered ==
+                        // false` now means the stack is untouched.
+                        if entered {
+                            vtable.leave(self.system_id(), epoch);
+                        }
+                        std::panic::resume_unwind(payload);
+                    }
+                }
             }
         }
     }
@@ -5013,15 +6910,141 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             );
         }
         let key = key.into_query_key();
-        let vtable = self.vtable_or_init::<Q>();
-        // Fast path: memo hit — one leaf shard read.
-        {
-            let _tw =
-                sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "get_untracked.read");
-            if let Some(value) = vtable.untracked.read().get(&key) {
-                return Ok(value.clone());
+        // Mirror the tracked path's per-thread resolve cache: the untracked
+        // path is also hot (every memo hit), and `vtable_or_init` pays an
+        // `ArcSwap::load` + `Arc::clone` on every call.  `resolve_vtable`
+        // serves a borrow out of the cached `Arc` — one TLS slot fetch +
+        // epoch compare, no atomic, no refcount bump.
+        // WORLD-EPOCH GUARD: capture the world epoch BEFORE
+        // resolving the vtable and re-resolve while they disagree.  The
+        // original order resolved FIRST and loaded the epoch after, so a
+        // `clear_all` landing between the two returned the OLD vtable with
+        // the NEW epoch: the read-section check below then compared
+        // new == new and served a pre-clear memo hit.
+        // Bounded retry: each iteration re-runs
+        // `resolve_vtable`, which on a moved epoch rebuilds the whole vtable
+        // (64-shard cache + memo map).  A pathological `clear_all` storm
+        // interleaving with this loop must not live-lock the caller, so
+        // give up after a small budget and compute WITHOUT touching the
+        // memo: the value we hold may belong to the pre-clear registry, and
+        // serving/inserting into it would be lost work at best, staleness
+        // at worst.  Untracked values are pure, so the non-memoized compute
+        // is always correct.
+        const UNTRACKED_RESOLVE_RETRIES: usize = 8;
+        // #7: a `clear_all` storm can flip the epoch between the two loads
+        // below on every pass.  Waiting for a stable snapshot before calling
+        // `resolve_vtable` means at most one vtable rebuild per attempt
+        // instead of up to eight full ~4 KiB vtable allocations.
+        const STABILIZE_SPINS: usize = 64;
+        let mut attempts = 0usize;
+        let (vtable, world_epoch, orphaned) = loop {
+            let before = self.epoch.load(Ordering::Acquire);
+            let mut stable = false;
+            for _ in 0..STABILIZE_SPINS {
+                if self.epoch.load(Ordering::Acquire) == before {
+                    stable = true;
+                    break;
+                }
+                std::hint::spin_loop();
             }
+            if !stable {
+                attempts += 1;
+                if attempts >= UNTRACKED_RESOLVE_RETRIES {
+                    let vt = self.resolve_vtable::<Q>();
+                    let after = self.epoch.load(Ordering::Acquire);
+                    break (vt, after, true);
+                }
+                continue;
+            }
+            let vt = self.resolve_vtable::<Q>();
+            let after = self.epoch.load(Ordering::Acquire);
+            if after == before {
+                break (vt, before, false);
+            }
+            attempts += 1;
+            if attempts >= UNTRACKED_RESOLVE_RETRIES {
+                break (vt, after, true);
+            }
+        };
+        if orphaned {
+            UNTRACKED_DEPTH.with(|d| d.set(d.get() + 1));
+            let _depth = UntrackedDepthGuard;
+            return Ok(erase_value::<'q, 'src, Q>(Q::compute(&key, provider)));
         }
+        // WORLD-EPOCH GUARD: `clear_all` replaces the vtable
+        // registry WITHOUT bumping the old vtable's memo generation — only
+        // `clear::<Q>`/`invalidate` do.  A get whose `resolve_vtable` lands
+        // on the OLD vtable just before a concurrent `clear_all` completes
+        // would otherwise memo-HIT the orphaned vtable and serve pre-clear
+        // data: the entry's gen/epoch checks never see the wipe.  `self.epoch`
+        // IS bumped by `clear_all_impl`, so snapshotting it here and
+        // re-checking it inside the read section (and at insert time below)
+        // turns that race into a clean miss.  Relaxed suffices: a missed
+        // bump at worst serves one more recompute — the failure direction
+        // is recomputation, never staleness.  (The epoch itself is the one
+        // captured before `resolve_vtable` above.)
+        // DELIBERATELY OUTSIDE `stats()`' hit/miss accounting: the untracked
+        // memo is exempt from the red-green machinery (its only failure
+        // mode is a recompute, never staleness — see the memo doc below),
+        // so its hit ratio has a different meaning than the tracked
+        // queries'.  Folding it into `stats()` would skew the ratio every
+        // consumer reads; if observability is ever needed here, it gets a
+        // SEPARATE counter, not this one.
+        // Fast path: memo hit — one leaf shard read.  Entries are stamped
+        // with the provider's `program_epoch`: a hit from a DIFFERENT
+        // epoch (the driver rebuilt the program without a clear_all — the
+        // exact "one system reused across two Programs" embedding) is
+        // treated as a miss, and in debug builds it fires loudly: an
+        // untracked memo serving the OLD program's facts for the NEW
+        // program's `FnId` index is a soundness failure for
+        // borrow-signature facts, not a perf loss.  Entries also carry
+        // the memo generation (see `untracked`'s field doc): a hit from a
+        // stale generation — a `clear`/`invalidate` that raced this
+        // read — is a miss, and the captured generation is validated
+        // again at insert time below.
+        let program_epoch = provider
+            .session()
+            .map_or(0, |v| v.program_epoch());
+        let captured_gen = {
+            let _tw = sync_order::Acquired::acquire(
+                sync_order::Fam::CacheShard,
+                "get_untracked.read",
+            );
+            let lock = vtable.untracked.read();
+            let (current_gen, map, _) = &*lock;
+            let cur_gen = *current_gen;
+            if self.epoch.load(Ordering::Relaxed) == world_epoch {
+                if let Some(&(entry_gen, entry_epoch, ref value)) = map.get(&key) {
+                    if entry_gen == cur_gen && entry_epoch == program_epoch {
+                        return Ok(value.clone());
+                    }
+                    // No assert here, deliberately.  Two distinct
+                    // mismatch shapes, and the epoch tag already handles
+                    // both soundly:
+                    // - `entry_epoch != program_epoch` with a LIVE memo
+                    //   (`entry_gen == cur_gen`): the driver bumped the
+                    //   epoch per the documented contract — the SANCTIONED
+                    //   graceful-degradation mechanism.  The stale entry is
+                    //   a clean miss and recomputes.  (An assert here would
+                    //   make the documented path crash in debug builds on
+                    //   every stale-key first touch.)
+                    // - the genuinely dangerous shape — the Program was
+                    //   rebuilt with NEITHER clear_all NOR an epoch bump —
+                    //   is structurally INVISIBLE here: the new program has
+                    //   the same epoch as the old entry, so the first branch
+                    //   serves it as a hit.  No assertion inside this
+                    //   function can see that; the contract is the driver's
+                    //   (see `program_epoch`'s doc).  Do not add an assert
+                    //   back for shape 1 — it fires on sanctioned behavior
+                    //   and stays silent on the actual hazard.
+                }
+                // World-epoch guard miss path: when the guard
+                // above is FALSE, no memo entry of this orphaned vtable is
+                // consulted at all — the read falls through as a miss and
+                // recomputes against the new world.
+            }
+            cur_gen
+        };
         // Miss: compute with nesting forbidden.  The guard restores the
         // depth on unwind so a panicking compute cannot fence the thread.
         UNTRACKED_DEPTH.with(|d| d.set(d.get() + 1));
@@ -5038,20 +7061,11 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // types, so "evict one arbitrary entry" is plenty for a pure
         // memo.
         //
-        // The old comment here claimed "insertion-order
-        // eviction (pseudo-LRU)", which the code does NOT provide:
-        // `FxHashMap::keys().next()` is BUCKET order (hash plus capacity
-        // dependent), not insertion or recency order.  A hot key can be
-        // evicted while cold keys persist, and a working set just over
-        // capacity can thrash arbitrarily.  The consequence is
-        // RECOMPUTE-ONLY (untracked queries are pure, so a recomputed
-        // value is identical), but claiming a property the code lacks is
-        // how a future maintainer ends up trusting an ordering that was
-        // never there.  If recency ever matters for a caller, the fix is
-        // a `VecDeque<K>` insertion queue beside the map, NOT a comment.
-        // FxHashMap order is arbitrary and the recompute is
-        // deterministic, so this costs only a recomputation, never a
-        // wrong answer.
+        // Eviction is FIFO by FIRST insertion: the `VecDeque` queue beside the
+        // map supplies the victim, so `FxHashMap`'s bucket order is never
+        // consulted.  A replaced entry keeps its original queue slot.  The
+        // consequence of any eviction is RECOMPUTE-ONLY (untracked queries
+        // are pure, so a recomputed value is identical).
         //
         // Note: the memo map is a single global RwLock — one write per
         // miss insert.  Acceptable at current scale; shard it the same way
@@ -5059,15 +7073,55 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         {
             let _tw =
                 sync_order::Acquired::acquire(sync_order::Fam::CacheShard, "get_untracked.insert");
-            let mut map = vtable.untracked.write();
-            let cap = vtable.descriptor.cache_capacity;
-            if cap != 0
-                && map.len() >= cap
-                && let Some(k) = map.keys().next().cloned()
+            let mut lock = vtable.untracked.write();
+            let (ref mut current_gen, ref mut map, ref mut queue) = *lock;
+            if *current_gen != captured_gen
+                || self.epoch.load(Ordering::Relaxed) != world_epoch
             {
-                map.remove(&k);
+                // A `clear`/`invalidate` raced this compute (the untracked
+                // twin of d19: get_untracked holds no quiesce pin, so the
+                // wipe could interleave between the compute's start and
+                // its insert) — or a `clear_all` did.
+                // Discard the result — the next get recomputes.
+                // Over-invalidating a sibling key is harmless because
+                // untracked values are pure.
+                return Ok(value);
             }
-            map.insert(key, value.clone());
+            let cap = vtable.descriptor.cache_capacity;
+            // Replace-first: a key already in the map does not
+            // grow it, so evicting BEFORE checking would drop a live entry
+            // the map never needed room for (over-eviction ⇒ a later
+            // recompute).  `contains_key` costs the same O(1) probe the
+            // `insert().is_some()` below pays either way.
+            let already_present = map.contains_key(&key);
+            if cap != 0 && !already_present && map.len() >= cap {
+                // FIFO eviction by FIRST insertion (see `untracked`'s
+                // field doc): pop until a LIVE key surfaces — a stale
+                // queue entry (removed by `invalidate`, which prunes its
+                // slot, or replaced in place) is skipped, not tolerated
+                // as a wasted eviction.
+                while let Some(k) = queue.pop_front() {
+                    if map.remove(&k).is_some() {
+                        break;
+                    }
+                }
+            }
+            // First insertion pushes the queue slot; a REPLACE (a stale
+            // gen/epoch entry re-computed under the same key) keeps its
+            // original position — FIFO by first insertion, the property
+            // the doc names.
+            let replaced = map
+                .insert(key.clone(), (captured_gen, program_epoch, value.clone()))
+                .is_some();
+            if !replaced {
+                queue.push_back(key);
+            }
+            // Queue-length doc note: `queue` retains one slot
+            // per DISTINCT key ever inserted until `invalidate` prunes it or
+            // eviction pops it, so under a workload touching N distinct keys
+            // with a small cap the queue holds O(N) slots against a map of
+            // `cap` entries.  Stale slots are skipped lazily at pop time;
+            // memory is bounded by distinct-keys-touched, not by capacity.
         }
         Ok(value)
     }
@@ -5133,7 +7187,20 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // `clear_all` invalidates the pre-wait snapshot (see the Wait
         // branch, d18).
         let mut vtable = self.resolve_vtable::<Q>();
-        let (mut node_index, cached, fresh) = probe(&vtable, &self.dep_graph, &key);
+        let (mut node_index, cached, fresh, probe_epoch) = probe(&vtable, &self.dep_graph, &key);
+        // C1: `probe_epoch` was captured UNDER the cache shard lock that
+        // also read the value (see `QueryCacheType::probe_with_epoch`) —
+        // the capture happens-before any publisher's `stage` in lock
+        // order, so the old caller-side capture + double-read "seal" is
+        // gone.  The seal only ever detected bumps between its own two
+        // loads; a publish whose [stage → bump] landed inside
+        // (value-read .. first-load) compared equal epochs at the
+        // finish-side re-check and served the PRE-change value green —
+        // permanently stale.  With the in-lock capture, any bump after it
+        // makes `captured < live` at finish (suspect ✓, the safe
+        // direction), and a bump before the value read is either reflected
+        // in the served value or caught by the red bit.  Cost: ONE epoch
+        // capture per probe (down from two loads + a capture on hits).
 
         // Register the key for this node EXACTLY ONCE, on the fresh path
         // only: the mapping is immutable for the node's lifetime, so re-
@@ -5171,16 +7238,30 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                     .cache
                     .as_ref()
                     .expect("untracked query reached the tracked serve path");
-                self.serve_cached_verified::<Q>(cache, node_index, Some(value), provider)
+                self.serve_cached_verified::<Q>(cache, node_index, Some(value), provider, probe_epoch)
             } {
                 return Ok(value);
             }
             // The node itself was red, a dirty dependency could not be
             // resolved, or a re-requested dependency's changed fingerprint
-            // re-dirtied this node — fall through to the compute path.
+            // re-dirtied this node — fall through to the compute path.  The
+            // verdict above already recorded this request's miss exactly once.
+        } else {
+            // No candidate existed (fresh, red±staged, green+None, or
+            // eval_always): exactly one miss, recorded at this single
+            // decision point.  `probe` deliberately records nothing — a red
+            // node's recomputes are the invalidation-storm traffic, and the
+            // old probe-local accounting left them (and fresh registrations)
+            // invisible, skewing the hit ratio most optimistic exactly where
+            // lazy invalidation matters.
+            vtable
+                .cache
+                .as_ref()
+                .expect("untracked query reached the tracked path")
+                .record_miss();
         }
 
-        let akey = ActiveKey::of::<Q>(&key);
+        let akey = ActiveKey::of::<Q>(&key, vtable.type_hash);
 
         // (The quiesce read lock is already held — `InFlightGuard` is
         // acquired at the TOP of this function, before the preflight, so
@@ -5454,6 +7535,22 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 // entry: the same failure mode the finalize-panic arm
                 // guards against (d14 step 5).  The node STAYS
                 // registered (trait contract 1).
+                // Withdraw FIRST: the finalize below clears `finishing`,
+                // and `abort_with_poison`'s unstage-before-clear_finishing
+                // ordering must hold across the whole cleanup sequence, not
+                // just within the helper.  A concurrent getter that reaches
+                // the node in the [clear_finishing .. unstage] window would
+                // see a FRESH node (GREEN by default) with a staged value
+                // and serve the aborted compute's result, bypassing the
+                // sticky-poison contract.  `abort_with_poison`'s own
+                // unstage then no-ops (it's idempotent).
+                if !vtable.descriptor.eval_always {
+                    let _ = vtable
+                        .cache
+                        .as_ref()
+                        .expect("tracked query has a cache")
+                        .unstage(&key);
+                }
                 let r = panic::catch_unwind(AssertUnwindSafe(|| {
                     let _ = self.dep_graph.finish_task_and_publish(node_index, None);
                 }));
@@ -5548,15 +7645,15 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 // BEFORE the entry leaves the map (see the ORDER comment
                 // above).
                 use std::collections::hash_map::Entry;
+                let mut completed_job_id: Option<job::QueryJobId> = None;
                 match active.entry(akey.clone()) {
                     Entry::Occupied(mut o) => {
                         if let ActiveKeyStatus::Started(job) = o.get() {
                             job.latch.set();
                         }
                         if let ActiveKeyStatus::Started(job) = o.remove() {
-                            // Edges for the completed job are now walker-invisible
-                            // (latch resolved); this sweep just reclaims them.
-                            self.clear_waiters_of_me(job.id);
+                            // The sweep is DEFERRED below the lock drop.
+                            completed_job_id = Some(job.id);
                         }
                     }
                     // eval_always queries never insert — tolerate absence,
@@ -5564,6 +7661,17 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                     Entry::Vacant(_) => {}
                 }
                 drop(active);
+                // Edges for the completed job are now walker-invisible
+                // (latch resolved before the entry left the map); this
+                // sweep just reclaims them.  It runs OUTSIDE the
+                // active-shard write lock: the sweep takes up to 64
+                // wait_graph shard locks, and holding the active lock
+                // across them widens the §0 #2/#3 critical section for
+                // pure reclamation — waiters also self-clean via
+                // `remove_wait`, so a deferred sweep loses nothing.
+                if let Some(id) = completed_job_id {
+                    self.clear_waiters_of_me(id);
+                }
                 value
             }
             Err(payload) => {
@@ -5656,6 +7764,8 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             }
             // Phantom — the owner already finished; loop back
             // (the cache now holds the value, or we recompute).
+            // Stats were already recorded once at the pre-probe decision
+            // point — do not double-count (see `serve_reprobed`'s doc).
             if let Some(value) = self.serve_reprobed::<Q>(vtable, key, provider) {
                 return WaitOutcome::Done(Ok(value));
             }
@@ -5672,6 +7782,8 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             // serve it rather than recompute. Same validity discipline as the
             // wake path (a non-quiesced fan-out may already have marked the
             // node red between the owner's publish and this probe).
+            // Stats were already recorded once at the pre-probe decision
+            // point — do not double-count (see `serve_reprobed`'s doc).
             if let Some(value) = self.serve_reprobed::<Q>(vtable, key, provider) {
                 return WaitOutcome::Done(Ok(value));
             }
@@ -5686,7 +7798,7 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         self.remove_wait();
         in_flight.unpark();
         // The owner poisoned the job: the exact error the inline `?` produced.
-        if let Err(()) = wait_result {
+        if wait_result.is_err() {
             return WaitOutcome::Done(Err(QueryError::Poisoned {
                 query_name: Q::descriptor().name,
                 key: format!("{:?}", key),
@@ -5712,9 +7824,22 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // refreshed values are written back through the out-params: the
         // attempt loop re-enters `acquire_key_slot` against the current world
         // (and publishes when computing).
+        // Drop the old `Cached` borrow BEFORE resolving:
+        // assigning the fresh resolve while the old guard is still alive
+        // made its `try_borrow_mut` fail and forced the slow `Owned` path
+        // for every woken waiter (d18).  `release_borrow` drops the guard
+        // in place — the previous shape woke through
+        // `VtableResolve::Owned(vtable_or_init())`, paying an `ArcSwap`
+        // load + `Arc` clone that the very next assignment discarded
+        //.
+        vtable.release_borrow();
         *vtable = self.resolve_vtable::<Q>();
-        let (node2, cached2, fresh2) = probe(vtable, &self.dep_graph, key);
+        let (node2, cached2, fresh2, capture_epoch) = probe(vtable, &self.dep_graph, key);
         *node_index = node2;
+        // C1: `capture_epoch` was captured UNDER the cache shard lock that
+        // also read the value (see `QueryCacheType::probe_with_epoch`) —
+        // same shape as `get_shared_inner`, the old caller-side capture +
+        // double-read seal is gone.
         if fresh2 {
             let _tw = sync_order::Acquired::acquire(
                 sync_order::Fam::NodeToKey,
@@ -5733,9 +7858,13 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 .cache
                 .as_ref()
                 .expect("untracked query reached the tracked serve path");
-            if let Some(value) =
-                self.serve_cached_verified::<Q>(cache, *node_index, Some(value), provider)
-            {
+            if let Some(value) = self.serve_cached_verified::<Q>(
+                cache,
+                *node_index,
+                Some(value),
+                provider,
+                capture_epoch,
+            ) {
                 return WaitOutcome::Done(Ok(value));
             }
         }
@@ -5808,15 +7937,16 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     /// d14-class bugs happened.
     ///
     /// ORDER IS LOAD-BEARING (mirror of the success path):
-    ///  1. `clear_finishing` (d24) — a leaked flag would make the node
-    ///     permanently unverifiable;
-    ///  2. un-stage the staged value BEFORE the active shard lock —
-    ///     unstage takes a cache shard write lock, and cache-under-active
-    ///     would be a new §0 edge (same order as `invalidate_quiesced`).
-    ///     A fresh node is GREEN by default, so a staged value left over
-    ///     it would be served by the next getter's `probe` without ever
-    ///     consulting the poisoned active entry (d14 step 5).  The NODE
+    /// ORDER IS LOAD-BEARING (mirror of the success path):
+    ///  1. un-stage the staged value (a fresh node is GREEN by default;
+    ///     a staged value left over it would be served by the next
+    ///     getter's `probe` without ever consulting the poisoned active
+    ///     entry — d14 step 5).  Unstage takes a cache shard write lock
+    ///     BEFORE the active shard lock — cache-under-active would be a
+    ///     new §0 edge (same order as `invalidate_quiesced`).  The NODE
     ///     STAYS registered (trait contract 1);
+    ///  2. `clear_finishing` (d24) — a leaked flag makes the node
+    ///     permanently unverifiable;
     ///  3. `vtable.leave` pops the compute frame — only when the caller
     ///     has not already done it (`leave_pending`): the finalize path
     ///     deactivates BEFORE the finalize match, the staging path
@@ -5835,7 +7965,21 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         leave_pending: bool,
         payload: Box<dyn std::any::Any + Send>,
     ) -> ! {
-        self.dep_graph.clear_finishing(node_index);
+        // ORDER IS LOAD-BEARING: withdraw the staged value BEFORE clearing
+        // `finishing`.  `finishing` is d24's serve-blocking flag — a
+        // verifier reaching this node while it is set takes the
+        // compute/wait path instead of serving.  Clearing it first would
+        // open a serve window: a concurrent verifier could probe green +
+        // staged-value (the aborted compute DID stage on the
+        // panic-after-`stage` shape) and serve it, while `unstage` races
+        // behind — and if the panic landed inside
+        // `finish_task_and_publish`, the closure's rev-edges are
+        // incomplete, so later invalidations never propagate: permanent
+        // staleness for that verifier's caller.  With the value withdrawn
+        // first, the window closes: a verifier sees either
+        // `finishing == true` (wait path → poison error) or
+        // `finishing == false` with no staged value (falls through to
+        // compute → poison error).  Either way, no serve.
         if !vtable.descriptor.eval_always {
             let _ = vtable
                 .cache
@@ -5843,14 +7987,33 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 .expect("tracked query has a cache")
                 .unstage(key);
         }
+        // Keep the aborted node RED.  A panic after the
+        // publish section (or in any later cleanup) can leave the node
+        // green with no staged value; a transitive reader would then
+        // verify a green closure and serve its own stale value.  Mark
+        // BEFORE clearing `finishing` so there is no green-without-value
+        // window.
+        if !vtable.descriptor.eval_always {
+            self.dep_graph.mark_dirty_for_abort(node_index);
+        }
+        self.dep_graph.clear_finishing(node_index);
         if leave_pending {
             vtable.leave(self.system_id(), self.epoch());
         }
         let _tw =
             sync_order::Acquired::acquire(sync_order::Fam::ActiveShard, "get_shared.poison_path");
         let mut active = self.active_keys[active_shard(akey)].write();
-        self.poison_active(vtable, akey, &mut active);
+        let completed = self.poison_active(vtable, akey, &mut active);
         drop(active);
+        drop(_tw);
+        // The waiter sweep runs AFTER the active-shard guard releases —
+        // same rationale as the success path: the latch is already
+        // poisoned, so every edge naming this job is walker-invisible and
+        // the sweep is pure reclamation that must not hold the active
+        // lock across up to 64 wait_graph shard locks.
+        if let Some(id) = completed {
+            self.clear_waiters_of_me(id);
+        }
         // Resume the panic — the compiler will abort or catch it higher up.
         panic::resume_unwind(payload)
     }
@@ -5882,54 +8045,341 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     /// owned by `job.owner`, and detect cross-thread wait cycles before
     /// blocking.  The edge is registered only when no cycle is found.
     /// On a cycle, returns the wait chain (me → owner → …) for diagnostics.
+    ///
+    /// SHARDED two-phase protocol.  The global-lock version was atomic
+    /// between the cycle walk and the edge insert; sharding costs that,
+    /// and the loss is NOT benign: two threads installing complementary
+    /// edges (A waits on B, B waits on A) can both phase-1-miss the other's
+    /// not-yet-inserted edge and install a cycle NOBODY detected — a real,
+    /// permanent deadlock.  The protocol closes it:
+    ///
+    ///   1. WALK from `owner` over live edges (one shard read lock per
+    ///      hop).  Reaching `me` → cycle → Err.
+    ///   2. INSTALL `me → owner` into my shard (write lock).
+    ///   3. RE-VALIDATE: walk again from `owner`.  My own edge is now
+    ///      present, so ANY cycle that closes through me is visible —
+    ///      including the mutual-miss cycle two concurrent installs just
+    ///      formed.  Reaching `me` → remove my edge, Err.
+    ///
+    /// At least one party of a raced cycle always re-validates after BOTH
+    /// edges are present, so a raced cycle is always detected.  The
+    /// retraction is ASYMMETRIC (install-seq tiebreak): exactly the
+    /// earliest-installed waiter of a raced 2-cycle retracts and retries
+    /// (its phase-1 probe then sees the keeper's live edge and takes the
+    /// recovery path — the same asymmetric outcome the old global-lock
+    /// walk serialized into), while the other keeps its edge and blocks;
+    /// the retractor's recovered value publishes and resolves its latch.
+    /// A transient cycle among OTHER threads' stale edges still
+    /// terminates via revisit → stop.
     fn register_wait(&self, job: &job::QueryJob) -> Result<(), Vec<job::ExecId>> {
         let me = job::current_exec_id();
         let owner = job.owner;
         let _tw = sync_order::Acquired::acquire(sync_order::Fam::WaitGraph, "register_wait");
-        let mut wg = self.wait_graph.write();
-        let mut chain = vec![me];
-        let mut cur = owner;
-        // Threads already visited on this walk.  The check-and-insert
-        // below is atomic under `wg`, so a cycle of LIVE edges involving
-        // `me` can never be present here (the thread that would close it
-        // detects `cur == me` and declines to insert).  A cycle among
-        // OTHER threads' edges can only be transient (a dead edge whose
-        // registrant has not yet retracted it), but this walk must still
-        // terminate: revisit → stop following, do NOT loop (an unbounded
-        // walk could spin forever under the mutex and hang every other
-        // wait-graph caller).
-        let mut visited: FxHashSet<job::ExecId> = FxHashSet::default();
-        loop {
-            if cur == me {
-                return Err(chain);
-            }
-            // Transient cycle not involving us: not our deadlock — stop
-            // following and register.  `me`'s own liveness is still
-            // guarded by the latch + `job_still_active` pair that follows.
-            if !visited.insert(cur) {
-                break;
-            }
-            match wg.get(&cur) {
-                // A live edge only: the waited-on job's latch must still be
-                // unresolved.  A completed/poisoned job's edge is history,
-                // not a wait — skipping it makes a phantom edge invisible
-                // to this walk even before its registrant retracts it.
-                Some(edge) if !edge.latch.is_complete() => {
-                    chain.push(cur);
-                    cur = edge.owner;
+
+        // One hop of the cycle walk: follow `cur`'s live wait edge (the
+        // waited-on job's latch must still be unresolved — a completed
+        // job's edge is history, not a wait).  Inlined into `probe` below
+        // so the walk can also capture the edge's install seq per hop.
+        // When `witness_out` is `Some`, the traversal is recorded as a
+        // witness fingerprint for the phase-3 topology check
+        // ): every followed hop is pushed as `(cur, seq)`, and a stop
+        // (genuine terminal or revisit) is pushed as `(cur, 0)`.
+
+        let mut probe = |start: job::ExecId,
+                         mut witness_out: Option<&mut WitnessFingerprint>|
+         -> Option<Option<(job::ExecId, u64)>> {
+            // `Some(Some((pred, pred_seq)))` = the walk reached `me` (cycle
+            // through me); `pred` is the node whose live edge pointed at me
+            // and `pred_seq` is the install seq of THAT edge as the walk
+            // saw it.  `None` = no cycle through me.
+            let mut visited: SmallVec<[job::ExecId; 8]> = SmallVec::new();
+            let mut cur = start;
+            let mut pred: Option<(job::ExecId, u64)> = None;
+            loop {
+                if cur == me {
+                    return Some(pred);
                 }
-                _ => break,
+                // Transient cycle not involving us: not our deadlock —
+                // stop following.  (An unbounded walk could spin forever
+                // under contention and hang every other wait-graph
+                // caller.)  A linear scan over a `SmallVec`: wait chains
+                // are short (each hop is a thread actually blocked on
+                // another), so probing a few inline slots beats hashing
+                // on every hop.
+                if visited.contains(&cur) {
+                    // Revisit stop: the witness records the revisited node
+                    // with the 0 sentinel; `witness_unchanged` distinguishes
+                    // this from a genuine terminal by the node appearing
+                    // earlier in the witness.
+                    if let Some(w) = witness_out.as_deref_mut() {
+                        w.push((cur, 0));
+                    }
+                    return None;
+                }
+                visited.push(cur);
+                let next = {
+                    let wg = self.wait_graph[wait_shard_of(cur)].read();
+                    match wg.get(&cur) {
+                        Some(edge) if !edge.latch.is_complete() => {
+                            Some((edge.owner, edge.seq))
+                        }
+                        _ => None,
+                    }
+                };
+                let Some((n, seq)) = next else {
+                    // Genuine terminal: no live edge. Record the sentinel.
+                    if let Some(w) = witness_out.as_deref_mut() {
+                        w.push((cur, 0));
+                    }
+                    return None;
+                };
+                if let Some(w) = witness_out.as_deref_mut() {
+                    w.push((cur, seq));
+                }
+                pred = Some((cur, seq));
+                cur = n;
+            }
+        };
+
+        // Phase 1: pre-install cycle walk, recording the witness
+        // fingerprint.  The error carries the FULL chain, rebuilt by
+        // `rebuild_wait_chain` below: at this point no wait-graph lock is
+        // held (the probe took per-shard read locks and dropped them
+        // between hops), so the rebuild is safe here.  (The old "[me,
+        // owner] only" truncation was an artifact of the pre-fix
+        // global-lock rebuild self-deadlocking — the diagnostic fidelity
+        // then depended on whether the race window sent the caller down
+        // phase 1 or phase 3, exactly the schedule nondeterminism the
+        // scheduler abstraction exists to eliminate.  Both phases now
+        // report the same chain for the same cycle.)
+        let mut witness: WitnessFingerprint = SmallVec::new();
+        if probe(owner, Some(&mut witness)).is_some() {
+            return Err(self.rebuild_wait_chain(me, owner));
+        }
+        // Phase 2: install.  Every edge is keyed by its WAITER, so this
+        // touches exactly one shard — no other waiter's lock.  The
+        // install order stamps the tiebreak (see `WaitEdge::seq`).
+        let my_seq = WAIT_INSTALL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let my_shard = wait_shard_of(me);
+        {
+            let mut wg = self.wait_graph[my_shard].write();
+            // The slot is provably vacant here (the caller's edge was
+            // removed by `remove_wait`, or never existed).  A replaced
+            // edge would silently lose its latch/seq and skew
+            // `wait_count` — an accounting corruption that degrades cycle
+            // detection — so that failure mode is a pointed assert, not a
+            // silent overwrite.
+            let old = wg.insert(
+                me,
+                WaitEdge {
+                    owner,
+                    job_id: job.id,
+                    latch: job.latch.clone(),
+                    seq: my_seq,
+                },
+            );
+            debug_assert!(
+                old.is_none(),
+                "stale wait edge for the current ExecId — remove_wait was \
+                 skipped (unwind path or refactor bug)"
+            );
+            if old.is_none() {
+                self.wait_count.fetch_add(1, Ordering::Relaxed);
             }
         }
-        wg.insert(
-            me,
-            WaitEdge {
-                owner,
-                job_id: job.id,
-                latch: job.latch.clone(),
-            },
-        );
+        // Phase 3: re-validate (see the protocol note above).
+        // WITNESS PROTOCOL FIRST: if the topology along the
+        // phase-1 path is unchanged, the walk from `owner` follows exactly
+        // the same path and terminates at the same node — so, since phase 1
+        // proved `me` is not on that path, no new cycle can have closed
+        // through `me`. Skip the full walk; in the overwhelmingly common
+        // no-race case the second traversal was pure overhead.
+        if self.witness_unchanged(&witness) {
+            return Ok(());
+        }
+        // Topology changed: fall back to a fresh full probe. The change
+        // may have been the raced install closing a cycle through `me`
+        // (this phase exists for that case), so the fresh walk is
+        // authoritative.
+        if let Some(pred) = probe(owner, None) {
+            // Raced cycle.  The retraction MUST be asymmetric: the old
+            // global lock serialized the pair, so exactly one side
+            // detected and retracted while the other installed and
+            // blocked — guaranteed progress.  Sharding lets BOTH sides
+            // re-validate after BOTH edges are present; if both retract,
+            // both retry, and the recovery handshake can livelock until
+            // the wedge timeout.  Tiebreak on INSTALL SEQ: the
+            // earliest-installed edge of the cycle retracts.  In the
+            // raced 2-cycle the two comparisons are complementary
+            // (my_seq < pred_seq vs pred_seq < my_seq), so exactly one
+            // side retracts and retries (its phase-1 probe then sees the
+            // keeper's live edge, detects the cycle, and takes the
+            // recovery path — the old asymmetric outcome).  The keeper
+            // keeps its edge and blocks; the retractor's recovered value
+            // publishes and resolves its latch.  Longer raced cycles
+            // (≥3 threads) break at every descent of the seq sequence —
+            // at least one per directed cycle, which is all breaking
+            // one requires.
+            let retract = match pred {
+                Some((p, walk_seq)) => {
+                    let wg = self.wait_graph[wait_shard_of(p)].read();
+                    match wg.get(&p) {
+                        // Compare only against the edge the walk SAW: one
+                        // that still points at `me`, is still unresolved,
+                        // AND carries the same install seq it carried at
+                        // walk time.  Two stale cases fall to the arm
+                        // below rather than the seq comparison:
+                        //  * a re-installed edge (`e.seq != walk_seq`) —
+                        //    `p` removed and re-added its edge between the
+                        //    walk and this read, so the cycle-closing edge
+                        //    the walk saw is gone; comparing `my_seq` to
+                        //    the FRESH seq could retract even though the
+                        //    cycle is gone, and both sides of a 2-cycle
+                        //    could then retract and retry (the livelock
+                        //    the tiebreak exists to prevent).
+                        //  * a completed latch — history, not a wait (the
+                        //    same rule `follow` applies in the walk);
+                        //    retracting against it would only add spurious
+                        //    retries.
+                        // Block normally in both cases: the cycle already
+                        // broke (both outcomes are safe either way —
+                        // retract would just retry, keep is a normal wait
+                        // — but only the exact-edge match preserves the
+                        // "exactly one side retracts" precision).
+                        Some(e)
+                            if e.owner == me
+                                && e.seq == walk_seq
+                                && !e.latch.is_complete() =>
+                        {
+                            my_seq < walk_seq
+                        }
+                        // Edge removed, replaced, or completed: the
+                        // detected cycle is stale — keep my edge and block.
+                        _ => false,
+                    }
+                }
+                // `pred` is None only when `start == me` (self-wait) —
+                // unreachable past phase 1; retract conservatively.
+                None => true,
+            };
+            if retract {
+                // Retract my edge and report.  Inline the removal (not
+                // `remove_wait`): this IS the current thread's only edge,
+                // and the Fam::WaitGraph acquisition is already held.
+                //
+                // The write guard is scoped to the removal ONLY: the
+                // diagnostic rebuild below takes per-shard READ locks, and
+                // holding the write across them would be a bare
+                // wait_graph→wait_graph nesting — §0 #5 leaf violation.  A
+                // chain node hashing to `my_shard` would self-deadlock the
+                // non-reentrant parking_lot RwLock outright, and two
+                // concurrent retractors rebuilding chains in opposite
+                // shard order would ABBA.  The tripwire cannot see it:
+                // bare locks skip `Acquired::acquire`, so the re-held
+                // assert never fires.
+                {
+                    let mut wg = self.wait_graph[my_shard].write();
+                    if wg.remove(&me).is_some() {
+                        self.wait_count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                } // write lock released before the rebuild walks
+                // Rebuild the diagnostic chain: me → owner → … back to me.
+                let chain = self.rebuild_wait_chain(me, owner);
+                return Err(chain);
+            }
+            // Keeper path: my edge stays and I block normally.  The
+            // retractor's cycle-recovery recompute publishes a value that
+            // resolves my latch, so progress is preserved.
+        }
         Ok(())
+    }
+
+    /// Phase-3 topology check for the witness fingerprint protocol (see
+    /// [`QuerySystem::register_wait`] for the protocol and its soundness
+    /// argument.
+    ///
+    /// Returns `true` iff the wait-graph topology along `witness`'s path is
+    /// unchanged since phase 1: every non-terminal entry `(node, seq)`
+    /// still has a live edge carrying the same (globally-unique) install
+    /// seq, and the terminal entry `(node, 0)` is still a stop — either
+    /// genuinely terminal (no live edge) or a revisit stop (the same node
+    /// appears earlier in the witness).
+    ///
+    /// Checking only the seq is sufficient: `WAIT_INSTALL_SEQ` is globally
+    /// monotonic and unique, so an edge's `(owner, target)` is determined
+    /// by its seq. `edge(node).seq == seq` therefore proves the edge is
+    /// the one phase 1 followed — same owner, same target. A seq mismatch
+    /// means the edge was removed and re-installed, or replaced by a
+    /// different edge; either way the walk's next node may differ, so the
+    /// caller falls back to a fresh full probe.
+    ///
+    /// Lock discipline: one per-shard READ lock at a time, dropped between
+    /// entries — same shape as the walk itself, under the `Fam::WaitGraph`
+    /// tripwire `register_wait` already holds for the whole call.
+    fn witness_unchanged(&self, witness: &[(job::ExecId, u64)]) -> bool {
+        for (i, &(node, seq)) in witness.iter().enumerate() {
+            let current = {
+                let wg = self.wait_graph[wait_shard_of(node)].read();
+                match wg.get(&node) {
+                    Some(edge) if !edge.latch.is_complete() => Some((edge.owner, edge.seq)),
+                    _ => None,
+                }
+            };
+            if seq == 0 {
+                // Terminal sentinel. `node` must still be a stop: either no
+                // live edge (genuine terminal), or the node is part of a
+                // transient cycle among OTHER waiters — which it was in
+                // phase 1 too, witnessed by its earlier entry — so the
+                // walk from `owner` stops here again either way.
+                return match current {
+                    None => true,
+                    Some(_) => witness[..i].iter().any(|&(prev, _)| prev == node),
+                };
+            }
+            match current {
+                Some((_, s)) if s == seq => {}
+                _ => return false,
+            }
+        }
+        // Reached the end without a terminal sentinel: witness malformed
+        // (phase 1 always pushes a terminal). Treat as changed — a full
+        // walk is always sound.
+        false
+    }
+
+    /// Rebuild the full diagnostic wait chain `me → owner → … → me` by
+    /// walking live wait edges, one per-shard READ lock at a time (dropped
+    /// between hops — the non-reentrant RwLock self-deadlocked the pre-fix
+    /// rebuild that walked under a held lock).  Both `register_wait`'s
+    /// phase-1 and phase-3 cycle paths report through this helper, so the
+    /// chain a `cycle_processor` sees no longer depends on which phase
+    /// caught the race.  Termination mirrors the probe's revisit guard: a
+    /// transient cycle not through `me` stops the walk.
+    fn rebuild_wait_chain(
+        &self,
+        me: job::ExecId,
+        owner: job::ExecId,
+    ) -> Vec<job::ExecId> {
+        let mut chain = vec![me, owner];
+        let mut cur = owner;
+        let mut visited: SmallVec<[job::ExecId; 8]> = SmallVec::new();
+        while cur != me {
+            if visited.contains(&cur) {
+                break;
+            }
+            visited.push(cur);
+            let next = {
+                let wg = self.wait_graph[wait_shard_of(cur)].read();
+                match wg.get(&cur) {
+                    Some(edge) if !edge.latch.is_complete() => Some(edge.owner),
+                    _ => None,
+                }
+            };
+            let Some(n) = next else { break };
+            chain.push(n);
+            cur = n;
+        }
+        chain
     }
 
     /// Re-check, under the owning shard's lock, that `active[akey]` still
@@ -5953,7 +8403,18 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     fn remove_wait(&self) {
         let me = job::current_exec_id();
         let _tw = sync_order::Acquired::acquire(sync_order::Fam::WaitGraph, "remove_wait");
-        self.wait_graph.write().remove(&me);
+        // One shard: every edge is keyed by its waiter.
+        let mut wg = self.wait_graph[wait_shard_of(me)].write();
+        if wg.remove(&me).is_some() {
+            self.wait_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Test-only peek: are all wait-graph shards empty?  (Replaces the
+    /// single-map `read().is_empty()` the sharded graph no longer offers.)
+    #[cfg(test)]
+    fn wait_graph_is_empty(&self) -> bool {
+        self.wait_graph.iter().all(|s| s.read().is_empty())
     }
 
     /// Remove the wait edges pointing at the CURRENT thread for the one
@@ -5968,9 +8429,30 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     fn clear_waiters_of_me(&self, completed_job_id: job::QueryJobId) {
         let me = job::current_exec_id();
         let _tw = sync_order::Acquired::acquire(sync_order::Fam::WaitGraph, "clear_waiters_of_me");
-        self.wait_graph
-            .write()
-            .retain(|_, edge| !(edge.owner == me && edge.job_id == completed_job_id));
+        // No waiters at all — the common case on job completion: skip the
+        // 64-shard scan entirely (see `wait_count`).
+        if self.wait_count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        // The edges are keyed by WAITER, and we scan by OWNER: the scan
+        // must visit every shard (one write lock at a time — no nesting).
+        // The count is decremented PER SHARD, inside the loop: the
+        // early-exit probe below compares against `wait_count`, so the
+        // decrement must land before the probe for the exit to fire when
+        // THIS loop removed the last surviving edge (a post-loop decrement
+        // would make the probe depend entirely on concurrent drains).
+        for shard in &self.wait_graph {
+            let mut wg = shard.write();
+            let before = wg.len();
+            wg.retain(|_, edge| !(edge.owner == me && edge.job_id == completed_job_id));
+            let removed_here = before - wg.len();
+            if removed_here > 0 {
+                self.wait_count.fetch_sub(removed_here, Ordering::Relaxed);
+            }
+            if self.wait_count.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+        }
     }
 
     /// Tear down a key's `Started` entry after a failed finalize: drop
@@ -5985,7 +8467,7 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         vtable: &QueryVTable<'q, 'src, Q>,
         akey: &ActiveKey,
         active: &mut FxHashMap<ActiveKey, ActiveKeyStatus>,
-    ) {
+    ) -> Option<job::QueryJobId> {
         // ORDER IS LOAD-BEARING (mirror of the success path): resolve
         // the latch while the entry is still present, so the window in
         // which the job is finished but its wait edges still look live
@@ -5995,14 +8477,29 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         if let Some(ActiveKeyStatus::Started(job)) = active.get(akey) {
             job.latch.poison();
         }
-        if let Some(entry) = active.remove(akey)
-            && let ActiveKeyStatus::Started(job) = entry
-        {
-            self.clear_waiters_of_me(job.id);
-        }
+        // The sweep is DEFERRED to the caller (returned job id): the
+        // edges are already walker-invisible, so running it INSIDE the
+        // caller's ActiveShard write guard would hold that lock across
+        // up to 64 wait_graph shard locks for pure reclamation — the
+        // exact widening the success path deliberately avoids.
+        let completed = if let Some(entry) = active.remove(akey) {
+            match entry {
+                ActiveKeyStatus::Started(job) => Some(job.id),
+                other => {
+                    // Not a started job (e.g. an already-Poisoned
+                    // marker): restore nothing — the caller re-inserts
+                    // the marker below.
+                    active.insert(akey.clone(), other);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if !vtable.descriptor.eval_always {
             active.insert(akey.clone(), ActiveKeyStatus::Poisoned);
         }
+        completed
     }
 
     /// Invalidate a specific node in the dependency graph.
@@ -6069,26 +8566,76 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         key: &Q::Key,
         input_digest: u64,
     ) -> bool {
+        assert_not_in_untracked("invalidate_if_changed");
         let key = key.clone();
-        let vt = self.find_vtable::<Q>();
-        // NOT a `debug_assert!`: the violation is cheap to check (the vtable is
-        // already in hand) and unrecoverable either way, so an untracked query
-        // must be rejected in EVERY build.  As a debug assert it silently
-        // stopped firing in release and the gate returned a confident `false`
-        // — the "miswritten condition never triggers" failure mode u5 exists to
-        // pin down.  See `defense_tests::untracked::u5`.
+        // Descriptor check FIRST: it fires on the very first call — before
+        // the vtable is registered — where `find_vtable` would return
+        // `None` and the old registry-based assert silently PASSED, then
+        // returned a confident `false` ("unchanged, nothing invalidated")
+        // for a query whose gate has nothing to look at (the exact
+        // miswritten-condition failure mode u5 exists to pin).  `Q::descriptor()`
+        // is a `const fn` and monomorphizes, so the check is total, free,
+        // and needs no vtable lookup; the `find_vtable` below now serves
+        // only the tracked branch.
         assert!(
-            !vt.as_ref().is_some_and(|vt| vt.descriptor.untracked),
+            !Q::descriptor().untracked,
             "invalidate_if_changed on untracked query '{}': untracked keys never own \
              dep nodes — the gate would report 'unchanged' without doing anything. \
              Use clear::<Q>() to drop the memo.",
             Q::descriptor().name,
         );
-        let changed = vt
-            .and_then(|vt| vt.lookup_node(&key))
-            .is_some_and(|node| self.dep_graph.digest_gate(node, input_digest));
+        let system_id = self.system_id();
+        if IN_DRAIN.with(|d| d.borrow().contains(&system_id)) {
+            panic!(
+                "invalidate_if_changed called while this thread drains a \
+                 world-mutation batch for system {system_id}: the quiesce \
+                 read pin cannot be taken under the held write lock"
+            );
+        }
+        // A live frame for this system already implies its outermost
+        // `InFlightGuard` holds the quiesce read pin.  Taking a SECOND pin
+        // here can deadlock: a queued writer waits for the outer pin to
+        // drain, while this inner `read` waits for the writer's `mutating`
+        // flag — neither moves.  Reuse the outer pin.
+        let already_pinned =
+            SESSION.with(|s| s.borrow().systems.iter().any(|(sid, _)| *sid == system_id));
+        // The node lookup and the digest gate MUST be pinned under one
+        // quiesce READ pin: `clear_all_impl` → `dep_graph.reset` clears
+        // `sh.digests` (and restarts `next_index`) under the quiesce WRITE
+        // side, so an unpinned gate can land between `reset` taking a
+        // shard's digests and the rest of the reset — writing a PRE-reset
+        // node's digest into a freshly-cleared slot.  After `reset` the
+        // next allocation inherits that stale digest (`ensure_shard_len`
+        // extends with `None` but never resets an existing slot), and a
+        // colliding gate would then report "unchanged" for content that
+        // never fed the cached value — a stale-serve hole.  The pin is not
+        // a query frame; it only blocks the reset's write side for the
+        // duration of the (synchronous) gate, so the deferral-path exactness
+        // is preserved.
+        //
+        // Re-entrancy note: `QuiescedSystem` does not expose
+        // `invalidate_if_changed`, so the gate can never be reached from
+        // inside a deferred closure (which would self-deadlock on the
+        // read-under-write).  Keep it that way.
+        let changed = {
+            let _pin = (!already_pinned).then(|| self.quiesce.read());
+            // Resolve UNDER the pin: a `clear_all` between
+            // the lookup and the pin would orphan `vt` and let the gate
+            // write a digest into a reset shard.
+            self.find_vtable::<Q>()
+                .and_then(|vt| vt.lookup_node(&key))
+                .is_some_and(|node| self.dep_graph.digest_would_change(node, input_digest))
+        };
         if changed {
-            self.mutate_world(move |system| system.invalidate::<Q>(&key));
+            // Record the digest INSIDE the mutation closure, atomically
+            // with the invalidation.  `mutate_world` DEFERS
+            // when called from inside a query; writing the digest up front
+            // made a concurrent caller see "unchanged" while the
+            // invalidation was still queued.
+            self.mutate_world(move |system| {
+                system.invalidate::<Q>(&key);
+                system.note_input_digest::<Q>(&key, input_digest);
+            });
         }
         changed
     }
@@ -6108,20 +8655,14 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     ///
     /// QUIESCED via `mutate_world`, like every red-green-world mutation.
     pub fn note_input_digest<Q: Query<'q, 'src>>(&self, key: &Q::Key, input_digest: u64) {
-        // Hard assert for the same reason as `invalidate_if_changed`'s: the
-        // check is free (the vtable is already in hand) and unrecoverable, so a
-        // debug-only assertion would silently stop firing in release.  See
-        // `defense_tests::untracked::u6`.
-        //
-        // (One assert only — an identical `debug_assert!` DIRECTLY above this
-        // one would be pure dead weight: `assert!` always runs, so the
-        // `debug_assert!` could never observe anything the assert had not
-        // already rejected.)
+        assert_not_in_untracked("note_input_digest");
+        // Descriptor check first — see `invalidate_if_changed`: the old
+        // registry-based assert never fired for a never-driven query
+        // (`find_vtable` → `None`), silently accepting a digest that has
+        // nothing to record against.
         let key = key.clone();
         assert!(
-            !self
-                .find_vtable::<Q>()
-                .is_some_and(|vt| vt.descriptor.untracked),
+            !Q::descriptor().untracked,
             "note_input_digest on untracked query '{}': untracked keys never own \
              dep nodes — there is nothing to record against.",
             Q::descriptor().name,
@@ -6172,7 +8713,30 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                     sync_order::Fam::CacheShard,
                     "invalidate_quiesced.untracked",
                 );
-                vtable.untracked.write().remove(key);
+                let mut lock = vtable.untracked.write();
+                // Bump BEFORE remove: an in-flight `get_untracked` compute
+                // captured the pre-bump generation, so its insert-time
+                // validation (see `get_untracked`) discards the stale
+                // result — d19's letter, untracked edition.
+                // Destructure so `queue.retain` can read `map` (disjoint
+                // fields) without a second lock.
+                let (ref mut current_gen, ref mut map, ref mut queue) = *lock;
+                *current_gen = current_gen.wrapping_add(1);
+                map.remove(key);
+                // Do NOT scan/remove the queue slot: an
+                // `iter().position()` + `VecDeque::remove` per invalidate is
+                // O(n) and makes bulk invalidation O(n²).  Stale slots are
+                // skipped lazily at pop time; compact only when the queue
+                // outgrows both the capacity and the live map, so memory
+                // stays O(live keys).
+                let cap = vtable.descriptor.cache_capacity;
+                let trigger = cap
+                    .saturating_mul(2)
+                    .max(map.len().saturating_mul(2))
+                    .saturating_add(64);
+                if queue.len() > trigger {
+                    queue.retain(|k| map.contains_key(k));
+                }
                 return;
             }
             // Fused (a merge win): ONE cache shard write lock both
@@ -6195,7 +8759,7 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             // `Poisoned` is removed — `Started` belongs to an
             // in-flight compute, which quiescence guarantees is
             // absent here.
-            let akey = ActiveKey::of::<Q>(key);
+            let akey = ActiveKey::of::<Q>(key, vtable.type_hash);
             let _tw =
                 sync_order::Acquired::acquire(sync_order::Fam::ActiveShard, "invalidate_quiesced");
             let mut active = self.active_keys[active_shard(&akey)].write();
@@ -6235,8 +8799,11 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         };
         // `poison_active` installs the marker only for non-eval-always
         // queries (they have no cache entry to serve green), so there is
-        // nothing to lift there.
-        if vtable.descriptor.eval_always {
+        // nothing to lift there.  Untracked queries never install
+        // `Poisoned` markers either (they never call `poison_active` —
+        // there is no active-key slot).  Skipping the 64-shard sweep here
+        // saves a full lock pass per `clear::<Q>` call.
+        if vtable.descriptor.eval_always || vtable.descriptor.untracked {
             return;
         }
         for shard in &self.active_keys {
@@ -6273,6 +8840,7 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     /// later `get` with "that query panicked once" would contradict it —
     /// `clear` would empty the cache and still serve `Poisoned` forever.
     pub fn clear<Q: Query<'q, 'src>>(&self) {
+        assert_not_in_untracked("clear");
         // The closure captures nothing (no key, no data), so
         // `FnOnce(&Self) + Send + 'static` holds for any `Q: Query`.
         self.mutate_world(move |system| {
@@ -6283,7 +8851,21 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 // forever (the d19 "next get recomputes" contract must
                 // hold for the memo-only store too).
                 if vtable.descriptor.untracked {
-                    vtable.untracked.write().clear();
+                    // Bump the memo generation too (see `untracked`'s
+                    // field doc): an in-flight `get_untracked` compute
+                    // must not resurrect the cleared map — d19's letter,
+                    // untracked edition.
+                    // Leaf-lock discipline: acquire under `Fam::CacheShard`
+                    // like the cache shards (see `untracked`'s field doc) —
+                    // the tripwire must see every acquisition of this lock.
+                    let _tw = sync_order::Acquired::acquire(
+                        sync_order::Fam::CacheShard,
+                        "clear_quiesced.untracked",
+                    );
+                    let mut lock = vtable.untracked.write();
+                    lock.0 = lock.0.wrapping_add(1);
+                    lock.1.clear();
+                    lock.2.clear();
                 } else {
                     vtable
                         .cache
@@ -6300,6 +8882,7 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     }
 
     pub fn clear_all(&self) {
+        assert_not_in_untracked("clear_all");
         // Quiesced via `mutate_world` (d10/d11): the write lock lives in
         // the gate now.  An in-flight owner whose active_keys entry we
         // are about to wipe would find nothing on its completion path
@@ -6326,14 +8909,36 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // stale vtable by storing a map cloned from the pre-clear
         // registry.
         let _init = self.init_lock.lock();
-        // Rotate the world generation FIRST: any per-thread cycle
-        // partition stamped with an older generation is panic-leak
-        // residue (all live frames are excluded by the quiesce write
-        // lock this function holds) and resets itself on next touch.
-        self.epoch.fetch_add(1, Ordering::Relaxed);
-        // Replacing the registry drops every per-query node map with
-        // it (except for `Arc`s already held by in-flight queries).
+        // Replace the registry BEFORE rotating the world generation
+        //: a resolver that observes the NEW epoch must also
+        // observe the emptied registry, otherwise `vtable_or_init` can
+        // return (and cache) a pre-clear vtable under the new epoch — a
+        // stale memo hit.  With this order the worst case is a resolver
+        // that sees the old epoch and the new (empty) registry: it builds
+        // a fresh vtable that the following bump invalidates, i.e. one
+        // wasted registration, never a stale serve.  Per-thread cycle
+        // partitions stamped with an older generation are panic-leak
+        // residue (all live frames are excluded by the quiesce write lock
+        // this function holds) and reset themselves on next touch.
         self.vtables.store(Arc::new(FxHashMap::default()));
+        // Rotate the world generation AFTER the registry swap.  AcqRel
+        // pairs with the Acquire epoch loads on the untracked resolve
+        // path; the generation still predates every live frame's removal.
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        // KNOWN RETENTION (bounded, deliberate): each thread's
+        // `resolve_cache` keeps its `ResolveEntry` — a full
+        // `Arc<dyn QueryVTableDyn>` (64-shard `DefaultCache` ≈ 4 KiB of
+        // shard state, plus the untracked memo) — alive until that
+        // (thread, query) pair is RE-TOUCHED.  Stale entries are never
+        // SERVED (their `epoch` predates the bump above; the resolve path
+        // replaces them), so this is memory retention only.  A best-effort
+        // purge of reachable slots would need `&mut self` — or a lock on
+        // every resolve, i.e. on the hot path — neither of which exists
+        // here; the sweep below runs under quiescence (no live `Cached`
+        // guards anywhere), so a future purge hook belongs in
+        // `ThreadLocal::iter_mut` territory at THAT same quiescence point.
+        // Write the constraint down so nobody "fixes" the retention with
+        // a lock on the resolve fast path.
         // Poison every started job BEFORE dropping its active entry:
         // with quiescence held there are normally no entries — this
         // is a belt-and-braces sweep for any straggler (e.g. a
@@ -6382,7 +8987,10 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 sync_order::Fam::WaitGraph,
                 "clear_all_impl.wait_graph",
             );
-            self.wait_graph.write().clear();
+            for shard in &self.wait_graph {
+                shard.write().clear();
+            }
+            self.wait_count.store(0, Ordering::Relaxed);
         }
         self.dep_graph.reset(_q);
     }
@@ -6394,7 +9002,10 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     /// even before any query has run, and takes no locks (no tripwire
     /// registration needed).
     pub fn list_queries(&self) -> Vec<&'static str> {
-        let mut names = Vec::new();
+        // Manifest-derived: adding a query type without
+        // touching this line no longer silently reallocates on the last
+        // push.
+        let mut names = Vec::with_capacity(for_each_query!(count));
         macro_rules! push_name {
             ($q:ty) => {
                 names.push(<$q as Query>::descriptor().name);
@@ -6440,6 +9051,20 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         Q::Key: Sync,
         Q::Value: Send,
     {
+        // Purity fence, same shape as `get_untracked`'s: `UNTRACKED_DEPTH`
+        // is a TLS counter, and rayon work-stealing would run the spawned
+        // computes on OTHER threads where the depth is 0 — so without this
+        // entry check, a `par_get` issued from inside an untracked compute
+        // silently escapes the "untracked compute must not call any query"
+        // fence instead of panicking.  The sequential nested path below is
+        // safe (edges record on the calling thread), but the untracked
+        // contract is about the CALLER's purity, not about edge recording.
+        if UNTRACKED_DEPTH.with(|d| d.get()) != 0 {
+            panic!(
+                "query '{}' fan-out issued from inside an untracked computation — untracked queries must be pure functions of (key, immutable data)",
+                Q::descriptor().name,
+            );
+        }
         // ── Nested call: degrade to sequential ─────────────────────
         // A query task is already active on THIS thread.  Rayon
         // work-stealing would steal items onto pool workers whose
@@ -6462,6 +9087,22 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 .collect();
         }
         use rayon::prelude::*;
+        if Q::descriptor().eval_always {
+            // d5: every requester computes its own value, so there is no
+            // dedup to do.  Drive rayon directly on `keys` instead of
+            // cloning them into `unique` just to identity-map every slot
+            //.
+            let computed: Vec<Result<Q::Value, QueryError>> = if keys.len() <= 4 {
+                keys.iter()
+                    .map(|k| self.get::<Q>(k.clone(), provider))
+                    .collect()
+            } else {
+                keys.par_iter()
+                    .map(|k| self.get::<Q>(k.clone(), provider))
+                    .collect()
+            };
+            return computed;
+        }
         // Keyed dedup: each distinct key is computed exactly once and the
         // result fanned out to every input position by index.  Without this
         // a cold duplicate key parks a second rayon task on the first task's
@@ -6474,16 +9115,26 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // new bounds.  Order of `results` still matches `keys`.
         // `eval_always` opts out: its contract is one compute per request
         // (d5), so duplicates stay separate — see the branch below.
-        let mut unique: Vec<Q::Key> = Vec::new();
-        let mut slots: Vec<usize> = Vec::with_capacity(keys.len());
-        if Q::descriptor().eval_always {
-            // d5's contract — every requester computes its OWN value —
-            // applies inside one batch too.  Dedup would collapse
-            // duplicate keys into a single compute and clone that value
-            // into every slot, which is exactly what d5 pins against for
-            // sequential gets.  Stay parallel, but identity-map slots.
-            unique.extend(keys.iter().cloned());
-            slots.extend(0..keys.len());
+        // `SmallVec` for both: the common fan-out is a handful of
+        // keys, and the small path never touches the rayon pool — two heap
+        // `Vec`s per call there is pure allocator churn.  Only a >8-key
+        // batch spills (and the >16 branch already allocates a map anyway).
+        let mut unique: SmallVec<[Q::Key; 8]> = SmallVec::new();
+        let mut slots: SmallVec<[usize; 16]> = SmallVec::new();
+        // Dedup threshold, shared with `par_get_shared`: a
+        // linear scan beats an `FxHashMap` up to 16 keys; past that the one
+        // map allocation amortizes.
+        if keys.len() <= 16 {
+            for key in keys {
+                let slot = unique
+                    .iter()
+                    .position(|u| u == key)
+                    .unwrap_or_else(|| {
+                        unique.push(key.clone());
+                        unique.len() - 1
+                    });
+                slots.push(slot);
+            }
         } else {
             let mut slot_of: FxHashMap<&Q::Key, usize> = FxHashMap::default();
             for key in keys {
@@ -6494,24 +9145,61 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 slots.push(slot);
             }
         }
-        let computed: Vec<Result<Q::Value, QueryError>> = unique
-            .par_iter()
-            .map(|key| self.get::<Q>(key.clone(), provider))
-            .collect();
-        let results: Vec<Result<Q::Value, QueryError>> =
-            slots.into_iter().map(|s| computed[s].clone()).collect();
-        // Record the parent task's dependency on every node HERE, on the
-        // calling thread, after the join — independent of which worker
-        // computed what.  A no-op with no active task (the normal
-        // top-level case, where `read` finds an empty stack); the exact
-        // edge set the outer query needs if this system ever runs
-        // par_get under a manually-driven task stack.
-        let vtable = self.vtable_or_init::<Q>();
-        for key in keys {
-            if let Some(node) = vtable.lookup_node(key) {
-                self.dep_graph.read(node);
-            }
+        // Small fan-outs do not benefit from rayon task overhead
+        //: a warm spawn-join is ~1–5 µs per task, so a 5–7-key
+        // batch pays more in fan-out than it saves.  4 was below any plausible
+        // break-even; 8 matches `par_get_shared` and the measured crossover.
+        let computed: Vec<Result<Q::Value, QueryError>> = if unique.len() <= 8 {
+            unique
+                .into_iter()
+                .map(|key| self.get::<Q>(key, provider))
+                .collect()
+        } else {
+            unique
+                .into_vec()
+                .into_par_iter()
+                .map(|key| self.get::<Q>(key, provider))
+                .collect()
+        };
+        // Fan-out without a deep clone per slot: each unique
+        // value is cloned into every slot EXCEPT its last use, which takes
+        // ownership in place.  `last_use[s]` is the final slot consuming
+        // unique value `s`; earlier slots clone, the last one moves — so a
+        // batch of distinct keys (the common case) pays zero clones.
+        let mut computed: Vec<Option<Result<Q::Value, QueryError>>> =
+            computed.into_iter().map(Some).collect();
+        let mut last_use: Vec<usize> = vec![usize::MAX; computed.len()];
+        for (i, &s) in slots.iter().enumerate() {
+            last_use[s] = i;
         }
+        let results: Vec<Result<Q::Value, QueryError>> = slots
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                if last_use[s] == i {
+                    computed[s]
+                        .take()
+                        .expect("last-use slot must still hold its computed value")
+                } else {
+                    computed[s]
+                        .as_ref()
+                        .expect("earlier-use slot must still hold its computed value")
+                        .clone()
+                }
+            })
+            .collect();
+        // NO post-join dependency recording — deliberately.  The only way
+        // to reach this code is with `current_node().is_none()` (the nested
+        // case returned to the sequential path above), and nothing on the
+        // calling thread pushes a task frame during the rayon join — so a
+        // `dep_graph.read(node)` here was a PROVABLE no-op that still paid
+        // `vtable_or_init` (an ArcSwap load + Arc clone) and N TLS probes
+        // on every top-level fan-out.
+        // A no-op path with a "might matter one day" comment invites future
+        // code to depend on it and re-introduce the ABBA-with-quiesce shape
+        // the sequential-on-nested branch exists to prevent; if fan-out
+        // recording under a manually driven task stack is ever needed, it
+        // must be designed against that lock cycle explicitly.
         results
     }
 
@@ -6545,6 +9233,15 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         Q::Key: Sync,
         Q::Value: Send + Sync,
     {
+        // Purity fence, same as `par_get` — see its comment there for why
+        // the entry check is needed on a fan-out that would otherwise run
+        // on rayon workers with a fresh TLS depth.
+        if UNTRACKED_DEPTH.with(|d| d.get()) != 0 {
+            panic!(
+                "query '{}' fan-out issued from inside an untracked computation — untracked queries must be pure functions of (key, immutable data)",
+                Q::descriptor().name,
+            );
+        }
         // Nested: sequential on the calling thread, same argument as
         // `par_get` (work-stealing loses the current task's edges and can
         // close a quiesce/join cycle).
@@ -6555,13 +9252,27 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 .collect();
         }
         use rayon::prelude::*;
-        let mut unique: Vec<Q::Key> = Vec::new();
-        let mut slots: Vec<usize> = Vec::with_capacity(keys.len());
+        let mut unique: SmallVec<[Q::Key; 8]> = SmallVec::new();
+        let mut slots: SmallVec<[usize; 16]> = SmallVec::new();
         if Q::descriptor().eval_always {
             // Same d5 carve-out as `par_get`: no dedup, every slot is its
             // own compute.
             unique.extend(keys.iter().cloned());
             slots.extend(0..keys.len());
+        } else if keys.len() <= 16 {
+            // Linear-dedup threshold mirrors `par_get`;
+            // `SmallVec` keeps the common small fan-out heap-free
+            //.
+            for key in keys {
+                let slot = unique
+                    .iter()
+                    .position(|u| u == key)
+                    .unwrap_or_else(|| {
+                        unique.push(key.clone());
+                        unique.len() - 1
+                    });
+                slots.push(slot);
+            }
         } else {
             let mut slot_of: FxHashMap<&Q::Key, usize> = FxHashMap::default();
             for key in keys {
@@ -6572,18 +9283,46 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 slots.push(slot);
             }
         }
-        let computed: Vec<Result<Stored<'q, 'src, Q>, QueryError>> = unique
-            .par_iter()
-            .map(|key| self.get_shared::<Q>(key.clone(), provider))
-            .collect();
-        let results: Vec<Result<Stored<'q, 'src, Q>, QueryError>> =
-            slots.into_iter().map(|s| computed[s].clone()).collect();
-        let vtable = self.vtable_or_init::<Q>();
-        for key in keys {
-            if let Some(node) = vtable.lookup_node(key) {
-                self.dep_graph.read(node);
-            }
+        // Sequential-compute threshold unified with `par_get`: a `Stored` fan-out
+        // is an `Arc` bump per slot, so driving rayon for a handful of keys
+        // costs more than it saves; the crossover is higher than 4.
+        let computed: Vec<Result<Stored<'q, 'src, Q>, QueryError>> = if unique.len() <= 8 {
+            unique
+                .into_iter()
+                .map(|key| self.get_shared::<Q>(key, provider))
+                .collect()
+        } else {
+            unique
+                .into_vec()
+                .into_par_iter()
+                .map(|key| self.get_shared::<Q>(key, provider))
+                .collect()
+        };
+        // Last-use move fan-out — see `par_get`'s tail.
+        let mut computed: Vec<Option<Result<Stored<'q, 'src, Q>, QueryError>>> =
+            computed.into_iter().map(Some).collect();
+        let mut last_use: Vec<usize> = vec![usize::MAX; computed.len()];
+        for (i, &s) in slots.iter().enumerate() {
+            last_use[s] = i;
         }
+        let results: Vec<Result<Stored<'q, 'src, Q>, QueryError>> = slots
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                if last_use[s] == i {
+                    computed[s]
+                        .take()
+                        .expect("last-use slot must still hold its computed value")
+                } else {
+                    computed[s]
+                        .as_ref()
+                        .expect("earlier-use slot must still hold its computed value")
+                        .clone()
+                }
+            })
+            .collect();
+        // No post-join dependency recording — see `par_get`'s tail comment
+        // (the loop was a provable no-op on every reachable path).
         results
     }
 }
@@ -6625,8 +9364,43 @@ pub trait CompilerSessionView<'input, 'src>: Sync {
     fn symbols(&self) -> &crate::hir::symbol::SymbolTable<'input>;
     fn trait_env(&self) -> &crate::hir::traits::TraitEnv<'input>;
     fn resolution_map(&self) -> &crate::hir::resolver::ResolutionMap<'input>;
+    /// Shared (`Arc`) handle to the resolution map, for body-check workers
+    /// that consume it by value (2a of the perf pass): the checker stores
+    /// `Arc<ResolutionMap>`, so an `Arc` here replaces a full map clone per
+    /// function compute.  `None` (the default) makes the caller fall back
+    /// to [`Self::resolution_map`] + clone.
+    fn resolution_map_arc(
+        &self,
+    ) -> Option<std::sync::Arc<crate::hir::resolver::ResolutionMap<'input>>> {
+        let _ = self;
+        None
+    }
     /// The parsed program, so a query can reach the item it is keyed by.
     fn program(&self) -> &crate::ast::Program<'input, 'src>;
+    /// Monotonic identity of the Program this view serves, minted by the
+    /// DRIVER (bump per rebuilt program).  Untracked memos
+    /// (`QueryVTable::untracked`) stamp entries with it, and BOTH escape
+    /// hatches for a reused query system are sanctioned, with different
+    /// strengths:
+    ///
+    /// - `clear_all` (or `clear::<Q>`) is the STRONG mechanism: the memo
+    ///   generation bumps, so a stale entry is discarded outright and an
+    ///   in-flight compute racing the clear is invalidated at insert time.
+    /// - Bumping the epoch per rebuilt program is the GRACEFUL
+    ///   mechanism: a stale entry is treated as a miss and recomputed
+    ///   (never served), so cross-program aliasing is impossible — the
+    ///   cost is only the wasted memo entry until re-staged.
+    ///
+    /// The failure mode NEITHER mechanism covers is a rebuilt Program
+    /// with neither: the new program shares the old epoch, so a memo hit
+    /// for a reinterpreted `FnId` index is indistinguishable from a hit
+    /// for the current program — that aliasing hazard is the driver's
+    /// contract to uphold, not something the lookup can detect.  Default
+    /// 0: providers that never rebuild a program (the tests, one program
+    /// per system) are all in epoch 0 and identical.
+    fn program_epoch(&self) -> usize {
+        0
+    }
     /// Read-only handle for `TypeContext::new_sharing` (opt-in; `None`
     /// unless the provider was built with
     /// `SessionQueryProvider::with_body_check`).  The returned context must
@@ -6779,6 +9553,17 @@ impl<'q, 'src: 'q, 'a, S: Scheduler> QueryHandle<'q, 'a, 'src, S> {
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    /// Pins the `staged_global` striping: the counter index is derived from
+    /// the SHARD index (`shard_idx & 7`), so all 64 shards must cover every
+    /// one of the 8 padded counters.  The address-derived predecessor of
+    /// this mapping collapsed to 2 counters (see `STAGED_GLOBAL_SHARDS`).
+    #[test]
+    fn staged_global_striping_covers_all_cells() {
+        let covered: std::collections::HashSet<usize> =
+            (0..DEFAULT_CACHE_SHARDS).map(|i| i & (STAGED_GLOBAL_SHARDS - 1)).collect();
+        assert_eq!(covered.len(), STAGED_GLOBAL_SHARDS);
+    }
 
     struct TestQuery;
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -7209,6 +9994,144 @@ mod tests {
         // Second call: must ALSO compute (not cached), counter = 1.
         let r2 = system.get::<EvalAlwaysQ>(TestKey(1), &provider).unwrap();
         assert_eq!(r2, TestValue("eval_1_1".into()));
+    }
+
+    /// Pins the eval_always × stats contract (P2-5): an eval_always query
+    /// never reaches a serve verdict, so its every request IS a miss —
+    /// the probe records exactly that, making eval_always visible in
+    /// `stats()` instead of silently absent.  Hit must stay 0 (nothing is
+    /// ever served from cache).
+    #[test]
+    fn eval_always_records_misses_in_stats() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static EVAL_STATS_COUNTER: AtomicU64 = AtomicU64::new(0);
+        EVAL_STATS_COUNTER.store(0, Ordering::SeqCst);
+
+        let system = QuerySystem::new();
+
+        struct EvalStatsQ;
+        impl<'q, 'src: 'q> Query<'q, 'src> for EvalStatsQ {
+            type Storage = Owned;
+            type Key = TestKey;
+            type Value = TestValue;
+            type Cache = DefaultCache<TestKey, Stored<'q, 'src, Self>>;
+            fn descriptor() -> QueryDescriptor {
+                QueryDescriptor::new("eval_stats", "always re-computed (stats)")
+                    .with_eval_always(true)
+            }
+            fn compute<S: Scheduler>(
+                key: &TestKey,
+                _: &dyn QueryProvider<'q, 'src, S>,
+            ) -> TestValue {
+                TestValue(format!(
+                    "eval_stats_{}_{}",
+                    key.0,
+                    EVAL_STATS_COUNTER.fetch_add(1, Ordering::SeqCst)
+                ))
+            }
+        }
+        let provider = TestProvider;
+
+        for _ in 0..3 {
+            let _ = system.get::<EvalStatsQ>(TestKey(1), &provider).unwrap();
+        }
+        let stats = system
+            .vtable_or_init::<EvalStatsQ>()
+            .lookup_stats()
+            .expect("tracked query has a cache");
+        assert_eq!(stats.misses, 3, "every eval_always request is a recompute");
+        assert_eq!(stats.hits, 0, "eval_always never serves from cache");
+    }
+
+    /// P2-1 regression: `clear` must reset the CLOCK hand, and the FIRST
+    /// eviction sweep after a clear must be correct (the hand pointed at
+    /// a shard whose entries just went valueless — the sweep-start
+    /// `filter(value.is_some())` fallback masked it, so this pins the
+    /// reset explicitly rather than trusting the fallback).
+    #[test]
+    fn clear_resets_the_clock_hand_and_sweep_stays_correct() {
+        let cache = DefaultCache::with_capacity(2);
+        let shard_i = DefaultCache::<TestKey, TestValue>::shard_of_key(&TestKey(0));
+        let mut keys: Vec<TestKey> = Vec::new();
+        let mut i = 0usize;
+        while keys.len() < 7 {
+            let k = TestKey(i);
+            if DefaultCache::<TestKey, TestValue>::shard_of_key(&k) == shard_i {
+                keys.push(k);
+            }
+            i += 1;
+        }
+        // Fill past the global budget (one sweep runs pre-clear), then
+        // clear everything.
+        for (n, k) in keys.iter().take(4).enumerate() {
+            cache.stage(k.clone(), dep_graph::DepNodeIndex(n as u32 + 1), TestValue(format!("v{n}")));
+        }
+        cache.clear();
+        assert!(
+            cache.shards[shard_i].read().hand == NONE,
+            "clear must reset the CLOCK hand"
+        );
+        // Immediate eviction sweep post-clear: the sweep starts from a
+        // fresh (None) hand and must terminate with correct accounting.
+        // FRESH keys — clear keeps the node half registered (contract 1),
+        // so re-staging a cleared key must reuse ITS node, not a new one.
+        for (n, k) in keys.iter().skip(4).enumerate() {
+            cache.stage(k.clone(), dep_graph::DepNodeIndex(n as u32 + 10), TestValue(format!("w{n}")));
+        }
+        assert!(cache.len() <= 2, "global budget holds across the post-clear sweep");
+    }
+
+    ///  regression harness: the raced 2-cycle retraction under REAL
+    /// OS threads (the race is not deterministically reproducible under
+    /// shuttle — its task muxing plus the deterministic scheduler cannot
+    /// produce the install/install overlap on demand).  Each round arms
+    /// two threads that wait on each other's jobs simultaneously; the
+    /// two-phase register_wait protocol must resolve every interleaving
+    /// WITHOUT deadlock (the pre-fix retract branch held the wait_graph
+    /// write lock across the diagnostic rebuild — a chain node colliding
+    /// with my own shard self-deadlocked the non-reentrant RwLock) and
+    /// WITHOUT both sides retracting (the install-seq tiebreak: exactly
+    /// one side of a raced cycle retracts; the other keeps its edge).
+    /// Both-Ok is a legal serialization (the "cycle" never coexisted —
+    /// one side's edge was removed before the other's probe ran), so the
+    /// pinned invariant is: NOT both Err, and both threads always join.
+    #[test]
+    fn register_wait_raced_two_cycle_never_deadlocks_never_double_retracts() {
+        let system: &'static QuerySystem<'static, 'static, NoOpScheduler> =
+            Box::leak(Box::new(QuerySystem::new()));
+        for _ in 0..50 {
+            let (id_tx_a, id_rx_a) = crossbeam_channel::unbounded();
+            let (id_tx_b, id_rx_b) = crossbeam_channel::unbounded();
+            std::thread::scope(|s| {
+                let ha = s.spawn(|| {
+                    let me = job::current_exec_id();
+                    id_tx_b.send(me).unwrap();
+                    let other = id_rx_a.recv().unwrap();
+                    let mut job = job::QueryJob::new();
+                    job.owner = other;
+                    let r = system.register_wait(&job);
+                    system.remove_wait();
+                    r
+                });
+                let hb = s.spawn(|| {
+                    let me = job::current_exec_id();
+                    id_tx_a.send(me).unwrap();
+                    let other = id_rx_b.recv().unwrap();
+                    let mut job = job::QueryJob::new();
+                    job.owner = other;
+                    let r = system.register_wait(&job);
+                    system.remove_wait();
+                    r
+                });
+                let (ra, rb) = (ha.join().unwrap(), hb.join().unwrap());
+                assert!(
+                    !(ra.is_err() && rb.is_err()),
+                    "both sides of a raced 2-cycle retracted — the install-seq \
+                     tiebreak broke (livelock risk)"
+                );
+            });
+        }
     }
 
     /// Verifies that `depth_limit` queries return an error when the
@@ -7663,7 +10586,7 @@ mod tests {
         // B must be parked on A's latch BEFORE A is released — that is
         // the exact race this test covers.
         let blocked = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while system.wait_graph.read().is_empty() {
+        while system.wait_graph.iter().all(|s| s.read().is_empty()) {
             assert!(
                 std::time::Instant::now() < blocked,
                 "waiter never reached the wait path"
@@ -7817,10 +10740,16 @@ mod tests {
             1,
             "budget back at capacity after reject + restore"
         );
-        assert!(
-            cache.stats().evictions >= 2,
-            "both sweep victims (the filler and the restored hot entry) \
-             must have been counted"
+        assert_eq!(
+            cache.stats().evictions,
+            0,
+            "evictions counts RESIDENTS that actually left the cache, net of \
+             admission-gate restores: here BOTH sweep victims (the first \
+             stage's hot resident and the second stage's filler) were \
+             restored by the gate, so nothing ever left — the old \
+             sweep-iteration count (>= 2) overstated eviction pressure. \
+             The rejected NEWCOMER's dropped staged value is an admission \
+             rejection, not a resident eviction, and is not counted either"
         );
     }
 

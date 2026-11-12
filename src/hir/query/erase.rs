@@ -40,6 +40,17 @@ pub trait Erasable<'q, Provided>: Sized {
     /// the arena path (a `Copy` handle — no refcount, no allocation).
     type Erased: Clone + Debug + Send + Sync + 'q;
 
+    /// Whether this storage path can source a CYCLE-RECOVERY value.
+    /// Cycle handlers (`cycle_recovery` / `cycle_processor`) are
+    /// stateless `fn(&Key, &[Key]) -> Value` pointers: they receive no
+    /// provider, so an [`Arena`] query's handler has NO channel to the
+    /// session arena it would need to mint a `&'q V` — the only routes
+    /// are a leak or a static, neither acceptable.  `Owned` is fine (the
+    /// handler returns an owned value like any compute).  [`QueryVTable`]
+    /// asserts this at registration, converting the silent trap into a
+    /// registration-time panic.
+    const RECOVERY_SUPPORTED: bool;
+
     /// Provider side → cache side.  Runs once per fresh compute, inside
     /// the staging critical section.
     fn provided_to_erased(provided: Provided) -> Self::Erased;
@@ -65,6 +76,8 @@ where
     V: QueryValue<'q>,
 {
     type Erased = Arc<V>;
+    // Owned values: a handler returns the value like any compute would.
+    const RECOVERY_SUPPORTED: bool = true;
 
     #[inline]
     fn provided_to_erased(provided: V) -> Self::Erased {
@@ -91,13 +104,30 @@ where
 /// `compute` hands back some `&'a V` with `'a: 'q`; the shortening
 /// coercion at the call boundary makes it `&'q V`, so both directions
 /// below are exact-`'q` identities (a copy out, a copy back).
+///
+/// RSS NOTE: each recomputation allocates a FRESH `&'q V` in the arena;
+/// an invalidation orphans the old value (unreachable but not freed) and
+/// nothing is reclaimed until the arena itself is destroyed.  Inherent to
+/// the borrow-path design — a frequently-invalidating driver on a hot key
+/// grows RSS by (recompute count × value size) for the session's
+/// lifetime.  Such drivers should weight this against [`Owned`]'s
+/// per-value `Arc` (freed on drop) before choosing the storage class.
 pub struct Arena;
 
 impl<'q, V> Erasable<'q, &'q V> for Arena
 where
-    V: Debug + Send + Sync + 'q + StableHash,
+    // `V: Sync` (not `Send`): `Erased = &'q V` needs `V: Sync` for its
+    // `Send + Sync` bounds, and nothing here moves a `V` across threads by
+    // value.  Requiring `Send` too would reject valid value types for no
+    // benefit.
+    V: Debug + Sync + 'q + StableHash,
 {
     type Erased = &'q V;
+    // The landmine: a cycle handler is a bare `fn(&Key, &[Key]) -> Value`
+    // with no provider — an arena query's handler cannot mint a `&'q V`
+    // without leaking or a static (see `RECOVERY_SUPPORTED`'s doc).
+    // `QueryVTable::new` asserts this at registration.
+    const RECOVERY_SUPPORTED: bool = false;
 
     #[inline]
     fn provided_to_erased(provided: &'q V) -> Self::Erased {

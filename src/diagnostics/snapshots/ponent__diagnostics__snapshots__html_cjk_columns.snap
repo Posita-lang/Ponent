@@ -7,8 +7,8 @@ expression: out
 <div><span class='code'>E030</span> <span class='message'>wide char</span></div>
 <div class='span'>at &lt;input&gt;:1:10</div>
 <pre class='source-line'><span class='line-num' data-location='&lt;input&gt;:1:10' aria-label='Line 1'>1 │ </span>set a = &quot;<span class='highlight'>中</span>&quot; + b;
-<span class='line-num'>   │ </span><span class='underline'>         ^^    ~</span>
-<span class='line-num'>   │ </span><span class='label'>               | after CJK</span>
+<span class='line-num'>  │ </span><span class='underline'>         ^^    ~</span>
+<span class='line-num'>  │ </span><span class='label'>               | after CJK</span>
 </pre>
 <details class='explain'>
 <summary>Explain E030</summary>

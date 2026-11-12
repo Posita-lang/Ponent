@@ -1,6 +1,18 @@
 # Russian messages. Slugs match en.ftl exactly; never translate a slug.
 
 comptime-error = ошибка comptime: { $e }
+comptime-step-limit = превышен лимит шагов comptime (возможен бесконечный цикл)
+comptime-division-by-zero = деление на ноль в выражении comptime
+comptime-overflow = целочисленное переполнение в выражении comptime
+comptime-type-error = ошибка типа comptime: { $e }
+comptime-assertion-failed = не выполнено утверждение comptime: { $e }
+comptime-unknown-identifier = неизвестный идентификатор в comptime: { $e }
+comptime-not-allowed = недопустимо в comptime: { $e }
+comptime-deferred = выражение не может быть вычислено на этапе компиляции
+comptime-sandbox-violation = нарушение песочницы comptime: { $e }
+comptime-memory-limit = превышен лимит памяти comptime: { $e }
+comptime-internal = внутренняя ошибка comptime: { $e }
+comptime-call-stack-header = стек вызовов comptime (сначала последний):
 trait-solver-error = ошибка решателя трейтов: { $msg }
 type-mismatch = несоответствие типов: ожидался `{ $expected }`, найден `{ $found }`
 argument-type-mismatch = несоответствие типов аргумента в вызове `{ $callee }`: параметр `{ $param }` ожидал `{ $expected }`, найден `{ $found }`
@@ -8,6 +20,7 @@ contract-non-bool = условие `{ $clause }` должно быть логи�
 impl-missing-method = в impl `{ $trait }` отсутствует метод `{ $method }`
 duplicate-definition = повторное определение `{ $name }`
 field-not-found = поле `{ $field }` не найдено в типе `{ $type }`
+name-not-found = имя не найдено: `{ $name }`
 main-not-found = функция `main` не найдена в крейте
 set-no-destructuring = `set` не поддерживает деструктуризацию; используйте `let`
 let-requires-initializer = `let` требует явного инициализатора
@@ -103,3 +116,20 @@ run-explain-hint-detail = запустите `ponent explain <CODE>` с допу
 run-explain-hint-example = запустите `ponent explain <CODE>` с допустимым кодом (например `ponent explain E030`)
 run-explain-detail = Запустите `ponent explain <CODE>` для подробностей о конкретном коде ошибки.
 unknown-error = неизвестная ошибка
+
+# Batch trailers / fold marker / call-chain header (renderers)
+suppressed-note =
+    { $count ->
+        [one]   { $count } дополнительная ошибка скрыта
+        [few]   { $count } дополнительные ошибки скрыты
+        [many]  { $count } дополнительных ошибок скрыто
+       *[other] { $count } дополнительной ошибки скрыто
+    }
+fold-marker-lines =
+    { $gap ->
+        [one]   { $gap } строка опущена
+        [few]   { $gap } строки опущены
+        [many]  { $gap } строк опущено
+       *[other] { $gap } строки опущено
+    }
+chain-header = ссылки из:

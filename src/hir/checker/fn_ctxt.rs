@@ -3,6 +3,7 @@ use super::{
     did_you_mean_suggestion, typing_context_to_type_ctx,
 };
 use crate::ast::FileId;
+use as_variant::as_variant;
 use crate::ast::ast_type_display;
 use crate::ast::visit::replace_ident_in_expr;
 use crate::ast::{Attribute, BinOp, Expr, GenericArg, Literal, Pattern, Span, Stmt, Type, UnaryOp};
@@ -222,10 +223,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
     /// such as `Int<32>`.
     fn infer_origin(&self, ty: TypeId) -> Option<(usize, crate::ast::Span)> {
         let var_id = self.checker.ctx.get_infer_var_id(ty)?;
-        match self.checker.infer.var_origins().get(var_id)? {
-            VarOrigin::Expression(Some(span)) => Some((var_id, *span)),
-            _ => None,
-        }
+        as_variant!(self.checker.infer.var_origins().get(var_id)?, VarOrigin::Expression(Some(span)) => (var_id, *span))
     }
 
     /// Generate a human-readable reason for a type mismatch between two
@@ -1860,10 +1858,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             // assumes Set semantics for μ/ν (initial/final algebras) — see
             // the semantic-model note in the same module.
             let char = self.checker.ctx.characteristic(resolved_scrut_ty);
-            let total_count_from_char = match char {
-                Characteristic::FiniteExhaustible(n) => Some(n),
-                _ => None,
-            };
+            let total_count_from_char = as_variant!(char, Characteristic::FiniteExhaustible(n) => n);
             let inferred_count: Option<usize> = match self.checker.ctx.get(resolved_scrut_ty) {
                 TypeData::InferVar { id, .. } => match self.checker.infer.get_var_kind(*id) {
                     Some(TypeVariableKind::Bool) => Some(2),
@@ -2358,10 +2353,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 // suspended-constraint discipline for why speculative
                 // inference must be transactional.
                 let base_ty = match &hir {
-                    HirExpr::Call { callee, .. } => match callee.as_ref() {
-                        HirExpr::FieldAccess { base, .. } => Some(base.ty()),
-                        _ => None,
-                    },
+                    HirExpr::Call { callee, .. } => as_variant!(callee.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty()),
                     _ => None,
                 };
                 match base_ty {
@@ -2590,10 +2582,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 // (OutsideIn(X) constraint-generation/solving separation;
                 // OmniML suspended-constraint discipline).
                 let base_ty = match &expr_hir {
-                    HirExpr::Call { callee, .. } => match callee.as_ref() {
-                        HirExpr::FieldAccess { base, .. } => Some(base.ty()),
-                        _ => None,
-                    },
+                    HirExpr::Call { callee, .. } => as_variant!(callee.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty()),
                     _ => None,
                 };
                 match base_ty {
@@ -4225,10 +4214,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             span,
         } = expr
         {
-            let expected_ty = match expected {
-                Expectation::HasType(ty) => Some(ty),
-                _ => None,
-            };
+            let expected_ty = as_variant!(expected, Expectation::HasType(ty) => ty);
             let (callee_hir, callee_ty) = self.infer_expr(callee, None)?;
             // Try type argument synthesis with the expected return type hint.
             // Propagate the Err variant (a synthesis failure such as an
@@ -4258,10 +4244,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         // Propagate the expected type into inference: context-sensitive
         // expressions (EnumLit / Call / StructLit) need it to recover type
         // arguments (e.g. `Expr<T>` in `return Expr::Lit(42)`).
-        let expected_ty = match expected {
-            Expectation::HasType(ty) => Some(ty),
-            _ => None,
-        };
+        let expected_ty = as_variant!(expected, Expectation::HasType(ty) => ty);
         let (hir, ty) = self.infer_expr(expr, expected_ty)?;
         if let Expectation::HasType(expected_ty) = expected {
             // Check kind compatibility before unification:
@@ -4309,10 +4292,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         // id's meta.  Using `get_raw` keeps the binder consistent with the
         // invariant it belongs to (the alpha-rename below must rewrite the
         // invariant's OWN binder name).
-        let Some(binder) = (match self.checker.ctx.get_raw(expected_ty) {
-            TypeData::Exists { name, .. } => Some(*name),
-            _ => None,
-        }) else {
+        let Some(binder) = as_variant!(self.checker.ctx.get_raw(expected_ty), TypeData::Exists { name, .. } => *name) else {
             return;
         };
         let Some(base_ty) = self.checker.ctx.base_of_exists(expected_ty) else {
@@ -4321,10 +4301,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         // Fast path: the value's own type carries an alpha-equivalent
         // invariant — `set y: NonZeroInt = x` where `x: NonZeroInt`.
         if let Some(v_inv) = self.checker.ctx.get_invariant(value.ty())
-            && let Some(v_binder) = (match self.checker.ctx.get_raw(value.ty()) {
-                TypeData::Exists { name, .. } => Some(*name),
-                _ => None,
-            })
+            && let Some(v_binder) = as_variant!(self.checker.ctx.get_raw(value.ty()), TypeData::Exists { name, .. } => *name)
             && let Some(arena) = self.checker.ctx.arena
         {
             let renamed = crate::ast::visit::replace_ident_in_expr(arena, &v_inv, v_binder, binder);

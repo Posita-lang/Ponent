@@ -5,6 +5,7 @@
 //! checker from reaching back into the resolver (layering), giving the
 //! comparison family a single authoritative home.
 
+use as_variant::as_variant;
 use crate::ast::FileId;
 use crate::hir::octagon::Dbm;
 use crate::hir::symbol::*;
@@ -371,17 +372,11 @@ fn generic_args_eq_ignoring_spans_renamed<'input>(
     }
     let a_named: Vec<(&Symbol, &crate::ast::Type)> = a
         .iter()
-        .filter_map(|x| match x {
-            crate::ast::GenericArg::Named(n, t) => Some((n, t)),
-            _ => None,
-        })
+        .filter_map(as_variant!(crate::ast::GenericArg::Named(n, t) => (n, t)))
         .collect();
     let b_named: Vec<(&Symbol, &crate::ast::Type)> = b
         .iter()
-        .filter_map(|x| match x {
-            crate::ast::GenericArg::Named(n, t) => Some((n, t)),
-            _ => None,
-        })
+        .filter_map(as_variant!(crate::ast::GenericArg::Named(n, t) => (n, t)))
         .collect();
     a_named.len() == b_named.len()
         && a_named.iter().all(|(n1, t1)| {
@@ -542,10 +537,7 @@ struct Affine<'a, 'b> {
 }
 
 fn affine_of<'a, 'b>(e: &'a crate::ast::Expr<'b>) -> Option<Affine<'a, 'b>> {
-    let lit = |x: &crate::ast::Expr<'b>| match x {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(*v),
-        _ => None,
-    };
+    let lit = |x: &crate::ast::Expr<'b>| as_variant!(x, crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => *v);
     match e {
         crate::ast::Expr::Ident(..) => Some(Affine {
             core: e,
@@ -686,10 +678,7 @@ impl Linear {
 }
 
 pub(crate) fn linear_of<'a, 'b>(e: &'a crate::ast::Expr<'b>) -> Option<Linear> {
-    let lit = |x: &crate::ast::Expr<'b>| match x {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(*v),
-        _ => None,
-    };
+    let lit = |x: &crate::ast::Expr<'b>| as_variant!(x, crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => *v);
     match e {
         crate::ast::Expr::Ident(s, _) => Some(Linear {
             coeffs: smallvec::smallvec![(*s, 1)],
@@ -738,10 +727,7 @@ fn linear_cmp<'a, 'b>(
     if !is_int {
         return None;
     }
-    let lit = |x: &crate::ast::Expr<'b>| match x {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(*v),
-        _ => None,
-    };
+    let lit = |x: &crate::ast::Expr<'b>| as_variant!(x, crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => *v);
     // Mirror the constant to the right (`c < X` ⟺ `X > c`).
     let (op, left, right) = match (op, lit(left), lit(right)) {
         (crate::ast::BinOp::Lt, Some(_), None) => (crate::ast::BinOp::Gt, right, left),
@@ -1194,10 +1180,7 @@ pub(crate) fn norm_cmp<'a, 'b: 'a>(
         } => (op, left, right),
         _ => return None,
     };
-    let lit = |x: &crate::ast::Expr<'b>| match x {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => Some(*v),
-        _ => None,
-    };
+    let lit = |x: &crate::ast::Expr<'b>| as_variant!(x, crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => *v);
     // L3.5: multi-variable linear — both sides affine (e.g. `X > Y`,
     // `X - Y + 1 > 1`), merged onto the canonical form `Σ aᵢXᵢ + c op 0`.
     // Single-variable shapes return `None` and fall through to L2/L3 below.

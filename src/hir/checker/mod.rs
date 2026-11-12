@@ -1,3 +1,4 @@
+use as_variant::as_variant;
 use crate::ast::FileId;
 use crate::ast::{
     Attribute, BinOp, Contract, Expr, GenericArg, Item, Literal, Pattern, Program, Span, Stmt,
@@ -28,6 +29,7 @@ use crate::hir::types::{
 };
 use crate::symbol::Symbol;
 use arrayvec::ArrayVec;
+use std::sync::Arc;
 use num_bigint::BigInt;
 use num_traits::Zero;
 use small_map::FxSmallMap;
@@ -35,6 +37,7 @@ use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::mem;
@@ -484,7 +487,10 @@ pub struct TypeChecker<'a, 'src, 'input> {
     /// statements): passed to `borrow_check_function` so the finally
     /// statements participate in the borrow check (SYNTAX.md §finally —
     /// the block runs on every function-exit edge).
-    function_finally: HashMap<Symbol, Vec<HirStmt<'input>>>,
+    /// `BTreeMap` (not `HashMap`): the map flows verbatim into
+    /// `FnBodyCheck::function_finally`, whose `stable_hash` needs
+    /// deterministic iteration without a per-call sort.
+    function_finally: BTreeMap<Symbol, Vec<HirStmt<'input>>>,
     /// GADT constructions deferred to the post-solve validation phase
     /// (solve → default → validate).
     pub(crate) pending_gadt_constructs: Vec<PendingGadtConstruct>,
@@ -529,7 +535,13 @@ pub struct TypeChecker<'a, 'src, 'input> {
     /// Scoped alongside `local_variable_types` via `VarScopeGuard`.
     local_variable_spans: Rc<RefCell<Vec<HashMap<Symbol, Span>>>>,
     /// Pre-resolved by NameResolver: variable name → TypeId
-    resolution_map: ResolutionMap<'input>,
+    ///
+    /// `Arc` (2a of the query-layer perf pass): the checker only ever READS
+    /// the map (NameResolver populates it; every access site here is a
+    /// `.get`), so the body-check query path shares one `Arc` instead of
+    /// cloning a full map of `FxHashMap`s per function.  Constructors take
+    /// `impl Into<Arc<_>>`, so by-value callers are unchanged.
+    resolution_map: Arc<ResolutionMap<'input>>,
     /// Local cache of generic type parameter types (e.g. `T` in `def foo<T>(x: T)`).
     /// Populated when processing function definitions with type_params.
     /// Also used by `set auto<T> = expr` to bind captured type names.
@@ -673,7 +685,7 @@ pub struct TypeChecker<'a, 'src, 'input> {
     /// When false, items marked @experimental cause a compile error.
     enable_experimental: bool,
     /// Conditional compilation features from `--feature xxx`.
-    pub(crate) features: Vec<String>,
+    pub(crate) features: std::sync::Arc<[String]>,
     /// Whether debug mode is enabled (`@cfg(debug)` = true).
     pub(crate) debug: bool,
 }
@@ -894,10 +906,10 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         ctx: &'a mut TypeContext<'input>,
         symbols: &'a SymbolTable<'input>,
         trait_env: &'a mut TraitEnv<'input>,
-        resolution_map: ResolutionMap<'input>,
+        resolution_map: impl Into<Arc<ResolutionMap<'input>>>,
         strict_mode: bool,
         enable_experimental: bool,
-        features: Vec<String>,
+        features: impl Into<std::sync::Arc<[String]>>,
         debug: bool,
     ) -> Self {
         Self::new_with_source(
@@ -917,10 +929,10 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         ctx: &'a mut TypeContext<'input>,
         symbols: &'a SymbolTable<'input>,
         trait_env: &'a mut TraitEnv<'input>,
-        resolution_map: ResolutionMap<'input>,
+        resolution_map: impl Into<Arc<ResolutionMap<'input>>>,
         strict_mode: bool,
         enable_experimental: bool,
-        features: Vec<String>,
+        features: impl Into<std::sync::Arc<[String]>>,
         debug: bool,
         source: Option<&'src str>,
     ) -> Self {
@@ -935,7 +947,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             shared: std::sync::Arc::new(SharedCheckState::default()),
             query_system: crate::hir::query::QuerySystem::new(),
             pending_runtime_checks: Vec::new(),
-            function_finally: HashMap::new(),
+            function_finally: BTreeMap::new(),
             pending_gadt_constructs: Vec::new(),
             method_cache: HashMap::new(),
             source,
@@ -949,7 +961,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             local_variable_types: ScopedVarMap::new(),
             local_variable_spans: Rc::new(RefCell::new(vec![HashMap::new()])),
             local_type_param_cache: FxSmallMap::new(),
-            resolution_map,
+            resolution_map: resolution_map.into(),
             guarantee_chain: GuaranteeChain::new(),
             ghost_var_scopes: Rc::new(RefCell::new(Vec::new())),
             runtime_var_scopes: Rc::new(RefCell::new(Vec::new())),
@@ -971,7 +983,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             residual_trait_obligations: Vec::new(),
             strict_mode,
             enable_experimental,
-            features,
+            features: features.into(),
             debug,
         };
 
@@ -1287,10 +1299,15 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // run below (barrier items register methods into the main env).
         let body_harness = crate::session::BodyCheckHarness {
             shared: self.shared.clone(),
-            session_stamp: &*self.ctx as *const _ as usize,
+            // Monotonic session identity (NOT the ctx address — addresses
+            // are reused after drop, so a stale harness from a dead
+            // session could pass the address tripwire silently): the id
+            // minted by this checker's context; `new_sharing` propagates
+            // it, so every per-compute worker context pairs with it.
+            session_stamp: self.ctx.session_id,
             strict_mode: self.strict_mode,
             enable_experimental: self.enable_experimental,
-            features: self.features.clone(),
+            features: std::sync::Arc::clone(&self.features),
             debug: self.debug,
             source: self.source,
         };
@@ -1375,6 +1392,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     .expect("check_program requires a session arena on the TypeContext"),
             )
             .with_body_check(&*self.ctx, body_harness.clone());
+            // OWNED fan-out, deliberately: the serial
+            // merge below MOVES each fact struct's fields (runtime checks,
+            // gadt obligations, diagnostics, `hir`) out of the value, so a
+            // `Stored` handle would have to be `Arc::unwrap_or_clone`d —
+            // exactly the clone `par_get` already performs, and worse on a
+            // multi-reader hit.  Every production caller of `par_get` is
+            // this shape; read-only fan-outs belong on `par_get_shared`.
             let outcomes = self.query_system.par_get::<CheckFnBody>(&keys, &provider);
             // Record the digests AFTER the fan-out: on the first iteration
             // the gate ran before the nodes existed (a cold system's
@@ -3222,10 +3246,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         let enclosing_closure =
                             self.region_tree
                                 .iter_frames_rev()
-                                .find_map(|f| match f.kind {
-                                    CtxKind::Closure | CtxKind::AsyncBlock => Some(f.span),
-                                    _ => None,
-                                });
+                                .find_map(|f| as_variant!(f.kind, CtxKind::Closure | CtxKind::AsyncBlock => f.span));
                         if enclosing_closure.is_some() {
                             self.diagnostics.push(
                                 Diagnostic::error("cannot `leave` out of a closure or async block")
@@ -3267,10 +3288,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         let enclosing_closure =
                             self.region_tree
                                 .iter_frames_rev()
-                                .find_map(|f| match f.kind {
-                                    CtxKind::Closure | CtxKind::AsyncBlock => Some(f.span),
-                                    _ => None,
-                                });
+                                .find_map(|f| as_variant!(f.kind, CtxKind::Closure | CtxKind::AsyncBlock => f.span));
                         if enclosing_closure.is_some() {
                             self.diagnostics.push(
                                 Diagnostic::error(
@@ -3379,10 +3397,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
             Stmt::GhostVariableDef { inner, span } => {
                 // Extract the variable name from the inner `set mut? name = ...`.
-                let var_name = match inner {
-                    crate::ast::Stmt::VariableDef { name: Some(n), .. } => Some(*n),
-                    _ => None,
-                };
+                let var_name = as_variant!(inner, crate::ast::Stmt::VariableDef { name: Some(n), .. } => *n);
                 if let Some(name) = var_name {
                     // Push to the current (topmost) scope, or create one.
                     // The fallback is unreachable in practice: `VarScopeGuard`
@@ -3779,10 +3794,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 // so that `def f() -> Int<32> { comptime { 42 } }` type-checks.
                 let ty = hir
                     .last()
-                    .and_then(|s| match s {
-                        HirStmt::Expression(e) => Some(e.ty()),
-                        _ => None,
-                    })
+                    .and_then(as_variant!(HirStmt::Expression(e) => e.ty()))
                     .unwrap_or_else(|| self.ctx.unit());
                 if self.comptime_fn_pass {
                     // During Pass 2 (comptime function body checking), defer
@@ -4449,10 +4461,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     // the receiver type's impl blocks (mirror of the
                     // `Expr::Try` path).
                     let base_ty = value_hir.as_ref().and_then(|vh| match vh {
-                        HirExpr::Call { callee: c, .. } => match c.as_ref() {
-                            HirExpr::FieldAccess { base, .. } => Some(base.ty()),
-                            _ => None,
-                        },
+                        HirExpr::Call { callee: c, .. } => as_variant!(c.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty()),
                         _ => None,
                     });
                     base_ty.map_or(false, |base_ty| {
@@ -8883,10 +8892,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // Try direct lookup first
         {
             let data = self.ctx.get(ty);
-            let def_id = match data {
-                TypeData::Adt { def_id, .. } => Some(*def_id),
-                _ => None,
-            };
+            let def_id = as_variant!(data, TypeData::Adt { def_id, .. } => *def_id);
             if let Some(def_id) = def_id {
                 let args: &[TypeId] = match data {
                     TypeData::Adt { args, .. } => args.as_slice(),
@@ -9110,10 +9116,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         span: Span,
     ) -> Result<Option<Expr<'input>>, Diagnostic<'src>> {
         let resolved = self.ctx.resolve_binding(ty_id);
-        let def_id = match self.ctx.get(resolved) {
-            TypeData::Adt { def_id, .. } => Some(*def_id),
-            _ => None,
-        };
+        let def_id = as_variant!(self.ctx.get(resolved), TypeData::Adt { def_id, .. } => *def_id);
         if let Some(def_id) = def_id
             && let Some(binding) = self.symbols.lookup_type_by_def_id(def_id)
         {

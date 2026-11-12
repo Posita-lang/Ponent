@@ -35,50 +35,27 @@ impl Default for JsonRenderer {
 }
 
 impl Renderer for JsonRenderer {
-    fn begin(&self, out: &mut impl DiagnosticSink) -> io::Result<()> {
+    fn begin(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
         out.write_str(if self.pretty { "[\n" } else { "[" })
     }
 
     fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
-        self.write_diagnostic(diag, cx, 1, out);
+        // Batch output is a JSON array; indent the object one level under `[`
+        // (fields one level deeper still), which is what every pretty-printer
+        // and `jq` produce.
+        self.write_diagnostic(diag, cx, 2, out);
     }
 
     fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String {
-        let hint = diag.message.len()
-            + 128
-            + diag.code.as_ref().map_or(0, |c| c.code().len() + 64)
-            + diag.file_name().len()
-            + 16
-            + diag.spans.first().map_or(0, |_| 64)
-            + diag
-                .labels
-                .iter()
-                .map(|l| l.message.len() + 80)
-                .sum::<usize>()
-            + diag
-                .related_errors
-                .iter()
-                .map(|r| {
-                    r.message.len()
-                        + r.code.as_ref().map_or(0, |c| c.code().len())
-                        + if r.span.is_some() { 40 } else { 0 }
-                        + 32
-                })
-                .sum::<usize>()
-            + diag
-                .suggestions
-                .iter()
-                .map(|s| s.message.len() + 64)
-                .sum::<usize>()
-            + diag.help.as_ref().map_or(0, |h| h.len() + 16)
-            + diag.call_chain.as_ref().map_or(0, |c| {
-                c.entries()
-                    .iter()
-                    .map(|e| e.message.len() + 50)
-                    .sum::<usize>()
-            });
-        let mut out = String::with_capacity(hint);
-        self.render_into(diag, cx, &mut out);
+        // A conservative capacity floor only: the exact hint lives in
+        // `write_diagnostic`, computed *after* humanization from the
+        // accessor views (the pre-humanize fields of a kind-built
+        // diagnostic are empty, so the old up-front sum undercounted by
+        // kilobytes on exactly the diagnostics that need it most).
+        let mut out = String::with_capacity(diag.message().len() + 128);
+        // Single-object output is not inside an array, so keep the brace at
+        // column 0 (fields still one level in).
+        self.write_diagnostic(diag, cx, 1, &mut out);
         out
     }
 
@@ -94,7 +71,7 @@ impl Renderer for JsonRenderer {
         String::new()
     }
 
-    fn end(&self, out: &mut impl DiagnosticSink) -> io::Result<()> {
+    fn end(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
         out.write_str(if self.pretty { "\n]\n" } else { "]\n" })
     }
 }
@@ -109,37 +86,14 @@ impl JsonRenderer {
     /// values that exceed the 24-byte `CompactString` inline limit touch the
     /// heap exactly once instead of twice.
     fn push_json_str(out: &mut impl Write, s: &str) {
-        // A single SWAR scan decides whether escaping is needed: the only
-        // characters JSON must escape are the control bytes (`U+0000`–
-        // `U+001F`, i.e. any byte `< 0x20`), `"` and `\`. UTF-8 continuation
-        // bytes are all `>= 0x80`, so no multi-byte character can be
-        // mistaken for one of them — and the scan catches `\n`, `\r`, `\t`
-        // at any position, not only byte 0.  See [`needs_json_escape`] for
-        // the chunk-wise SWAR identities.
-        let needs_escape = needs_json_escape(s);
-        let _ = out.write_char('"');
-        if needs_escape {
-            let bytes = s.as_bytes();
-            let mut start = 0;
-            let mut i = 0;
-            while i < bytes.len() {
-                let b = bytes[i];
-                if b < 0x20 || b == b'"' || b == b'\\' {
-                    if i > start {
-                        let _ = out.write_str(&s[start..i]);
-                    }
-                    push_json_escaped(out, b as char);
-                    start = i + 1;
-                }
-                i += 1;
-            }
-            if start < bytes.len() {
-                let _ = out.write_str(&s[start..]);
-            }
-        } else {
-            let _ = out.write_str(s);
-        }
-        let _ = out.write_char('"');
+        // Escaping is decided and applied by [`push_json_escaped_str`]: a
+        // single SWAR scan per 8-byte chunk finds each escape site, and the
+        // runs between them are bulk-copied with `write_str`.  The clean case
+        // (no control byte, `"`, or `\`) is one scan that finds nothing plus
+        // one `write_str(s)`.
+        let _ = out.write_str("\"");
+        push_json_escaped_str(out, s);
+        let _ = out.write_str("\"");
     }
 
     /// Indentation for `level` nesting steps.
@@ -171,7 +125,37 @@ impl JsonRenderer {
     ) {
         let ind = Self::indent(indent_lvl);
         let ind1 = Self::indent(indent_lvl + 1);
-        let mut obj = JsonContainer::object(out, &ind, self.pretty);
+        // `{` sits at the *outer* indentation, so `}` aligns with it; the
+        // fields sit one level deeper.
+        let ind0 = Self::indent(indent_lvl.saturating_sub(1));
+        // Length-bounded capacity estimate: sizing from collection *lengths*
+        // avoids a full O(labels + suggestions + related) traversal whose only
+        // purpose was to feed `reserve`, while still getting the common case
+        // down to one allocation (`String` growth stays amortized for the
+        // pathological escape-dense inputs).
+        // Heuristic, not a guarantee: `* 2` covers quote/backslash escapes,
+        // while control bytes expand to 6 bytes (`\u00XX`) and the per-item
+        // multipliers are averages.  Under-reserving only causes normal
+        // amortized growth; the point is to avoid it on the common case.
+        let cap = 192
+            + diag.message().len()
+            + diag.file_name().len() * 2
+            + 64
+            + diag.labels().len() * 128
+            + diag.suggestions().len() * 96
+            + diag.related_errors.len() * 96
+            + diag.call_chain.as_ref().map_or(0, |c| c.entries().len() * 80);
+        out.reserve(cap);
+        let mut obj = JsonContainer::object(out, &ind0, &ind, self.pretty);
+
+        // Resolve the anchor source's line index once per diagnostic: the
+        // span, additional-span, related-error and call-chain paths all need
+        // it, and each `cx.line_index` call is an LRU probe (or, past the
+        // cache capacity, a full rescan).  `anchor_file` is the file those
+        // line/column values are resolved against — a span from any *other*
+        // file must not be mapped through this index.
+        let anchor_file = diag.spans.first().map(|s| s.file);
+        let idx = diag.source().map(|s| cx.line_index(s));
 
         // Stable identifier: computed from `(code, primary span, message)`
         // via FNV-1a so tools can dedupe/suppress across runs. Emitted
@@ -184,7 +168,13 @@ impl JsonRenderer {
         obj.string(diag.level.as_str());
 
         obj.key("message");
-        obj.string(&diag.message);
+        // Accessors, not field access: `message()`/`labels()`/… carry
+        // `debug_assert!(kind.is_none() || humanized)` — a caller that
+        // renders a kind-built diagnostic without humanizing it must fail
+        // loudly in debug builds (with `""` message in release), not
+        // silently emit a JSON document missing its data.  `spans` has no
+        // assert and keeps direct access.
+        obj.string(diag.message());
 
         if let Some(code) = &diag.code {
             obj.key("code");
@@ -193,7 +183,7 @@ impl JsonRenderer {
                 obj.key("title");
                 obj.string(entry.title);
                 obj.key("category");
-                obj.string(entry.category.as_str());
+                obj.string(entry.category.key());
             } else {
                 obj.key("title");
                 obj.raw("null");
@@ -215,8 +205,11 @@ impl JsonRenderer {
                 sp.u64(span.start as u64);
                 sp.key("end");
                 sp.u64(span.end as u64);
-                if let Some(source) = diag.source() {
-                    let (line, col) = cx.line_index(source).linecol_display(span.start_as_usize());
+                if let Some(source) = diag.source()
+                    && let Some(idx) = idx.as_ref()
+                {
+                    let (line, col) =
+                        idx.linecol_display(span.start_as_usize().min(source.len()));
                     sp.key("line");
                     sp.u64((line + 1) as u64);
                     sp.key("column");
@@ -226,24 +219,91 @@ impl JsonRenderer {
             }
         }
 
+        // Additional primary spans beyond the first are currently dropped by
+        // the singular `span` above; surface them so multi-location
+        // diagnostics are not silently truncated in the machine format.
+        // Borrowed view — one pointer, no per-diagnostic `Vec` clone (mirrors
+        // the HTML renderer).
+        let all_spans = diag.spans.primary_ref();
+        if all_spans.len() > 1 {
+            obj.key("additionalSpans");
+            let mut arr = JsonContainer::array(&mut *obj.out, &ind1, &ind, self.pretty);
+            for sp in all_spans.iter().skip(1) {
+                arr.element();
+                let o = &mut *arr.out;
+                o.push('{');
+                // every additional span carries its owning file,
+                // mirroring `labels`/`relatedErrors`; a bare {start,end}
+                // cannot be placed by a machine consumer.
+                match diag.file_name_for(sp.file) {
+                    Some(name) => {
+                        flat_key0(o, "file");
+                        Self::push_json_str(o, name);
+                    }
+                    None => {
+                        flat_key0(o, "fileId");
+                        super::fmt::push_uint(o, sp.file.as_u32() as u64);
+                    }
+                }
+                flat_key(o, "start");
+                super::fmt::push_uint(o, sp.start as u64);
+                flat_key(o, "end");
+                super::fmt::push_uint(o, sp.end as u64);
+                if let Some(idx) = idx.as_ref()
+                    && let Some(source) = diag.source()
+                    // The line index is the *anchor* file's: resolving a
+                    // foreign span's offsets through it would emit
+                    // coordinates in the wrong file.
+                    && anchor_file == Some(sp.file)
+                {
+                    // [1]17: clamp rather than omit for an EOF-crossing span;
+                    // the primary path does the same.
+                    let (line, col) =
+                        idx.linecol_display(sp.start_as_usize().min(source.len()));
+                    flat_key(o, "line");
+                    super::fmt::push_uint(o, (line + 1) as u64);
+                    flat_key(o, "column");
+                    super::fmt::push_uint(o, (col + 1) as u64);
+                }
+                o.push('}');
+            }
+            arr.close();
+        }
+
         // labels
-        if !diag.labels.is_empty() {
+        if !diag.labels().is_empty() {
             obj.key("labels");
             let mut arr = JsonContainer::array(&mut *obj.out, &ind1, &ind, self.pretty);
-            for lbl in &diag.labels {
+            for lbl in diag.labels() {
                 arr.element();
-                let mut it = JsonContainer::compact_object(&mut *arr.out);
-                it.key("start");
-                it.u64(lbl.span.start as u64);
-                it.key("end");
-                it.u64(lbl.span.end as u64);
-                it.key("file");
-                it.u64(lbl.span.file.as_u32() as u64);
-                it.key("message");
-                it.string(&lbl.message);
-                it.key("kind");
-                it.string(crate::diagnostics::annotation_kind_name(lbl.kind));
-                it.close();
+                // Flat `{"k": v, …}` element: bytes pushed directly, no
+                // per-element `JsonContainer` frame (see `flat_open`).
+                let o = &mut *arr.out;
+                o.push('{');
+                flat_key0(o, "start");
+                super::fmt::push_uint(o, lbl.span.start as u64);
+                flat_key(o, "end");
+                super::fmt::push_uint(o, lbl.span.end as u64);
+                // Resolve the label's `FileId` to the same file-name string the
+                // top-level `file` field uses; the numeric `FileId` is
+                // process-local and must not leak into stable output.  Only an
+                // unresolvable foreign file falls back to the id, under a
+                // distinctly-named key.
+                match diag.file_name_for(lbl.span.file) {
+                    Some(name) => {
+                        flat_key(o, "file");
+                        Self::push_json_str(o, name);
+                    }
+                    None => {
+                        flat_key(o, "fileId");
+                        super::fmt::push_uint(o, lbl.span.file.as_u32() as u64);
+                    }
+                }
+                flat_key(o, "message");
+                Self::push_json_str(o, &lbl.message);
+                flat_key(o, "kind");
+                Self::push_json_str(o, crate::diagnostics::annotation_kind_name(lbl.kind));
+                o.push('}');
             }
             arr.close();
         }
@@ -254,51 +314,113 @@ impl JsonRenderer {
             let mut arr = JsonContainer::array(&mut *obj.out, &ind1, &ind, self.pretty);
             for rel in &diag.related_errors {
                 arr.element();
-                let mut it = JsonContainer::compact_object(&mut *arr.out);
-                it.key("code");
-                match &rel.code {
-                    Some(c) => it.string(c.code()),
-                    None => it.raw("null"),
+                let o = &mut *arr.out;
+                o.push('{');
+                // Whether the two sibling arrays are concerned, a related
+                // error can point into a *different* file; name it (matching
+                // `labels`/`callChain`) instead of emitting a bare span the
+                // consumer cannot place.
+                if let Some(sp) = rel.span.as_ref() {
+                    match diag.file_name_for(sp.file) {
+                        Some(name) => {
+                            flat_key0(o, "file");
+                            Self::push_json_str(o, name);
+                        }
+                        None => {
+                            flat_key0(o, "fileId");
+                            super::fmt::push_uint(o, sp.file.as_u32() as u64);
+                        }
+                    }
+                    flat_key(o, "code");
+                } else {
+                    flat_key0(o, "code");
                 }
-                it.key("message");
-                it.string(&rel.message);
-                it.key("span");
+                match &rel.code {
+                    Some(c) => Self::push_json_str(o, c.code()),
+                    None => o.push_str("null"),
+                }
+                flat_key(o, "message");
+                Self::push_json_str(o, &rel.message);
+                flat_key(o, "span");
                 match rel.span.as_ref() {
                     Some(sp) => {
-                        let mut o = JsonContainer::compact_object(&mut *it.out);
-                        o.key("start");
-                        o.u64(sp.start as u64);
-                        o.key("end");
-                        o.u64(sp.end as u64);
-                        o.close();
+                        o.push('{');
+                        flat_key0(o, "start");
+                        super::fmt::push_uint(o, sp.start as u64);
+                        flat_key(o, "end");
+                        super::fmt::push_uint(o, sp.end as u64);
+                        // Free when the anchor's source is attached *and*
+                        // the span belongs to that same file (the common
+                        // same-file case); a foreign span's offsets would
+                        // otherwise be mapped through the wrong buffer.
+                        if let Some(idx) = idx.as_ref()
+                            && let Some(source) = diag.source()
+                            && anchor_file == Some(sp.file)
+                            && sp.end_as_usize() <= source.len()
+                        {
+                            let (line, col) = idx.linecol_display(sp.start_as_usize());
+                            flat_key(o, "line");
+                            super::fmt::push_uint(o, (line + 1) as u64);
+                            flat_key(o, "column");
+                            super::fmt::push_uint(o, (col + 1) as u64);
+                        }
+                        o.push('}');
                     }
-                    None => it.raw("null"),
+                    None => o.push_str("null"),
                 }
-                it.close();
+                o.push('}');
             }
             arr.close();
         }
 
         // help
-        if let Some(help) = &diag.help {
+        if let Some(help) = diag.help() {
             obj.key("help");
             obj.string(help);
         }
 
         // suggestions
-        if !diag.suggestions.is_empty() {
+        if !diag.suggestions().is_empty() {
             obj.key("suggestions");
             let mut arr = JsonContainer::array(&mut *obj.out, &ind1, &ind, self.pretty);
-            for sug in &diag.suggestions {
+            for sug in diag.suggestions() {
                 arr.element();
-                let mut it = JsonContainer::compact_object(&mut *arr.out);
-                it.key("message");
-                it.string(&sug.message);
-                it.key("applicability");
-                it.string(crate::diagnostics::applicability_name(sug.applicability));
-                it.key("style");
-                it.string(crate::diagnostics::suggestion_style_name(sug.style));
-                it.close();
+                let o = &mut *arr.out;
+                o.push('{');
+                flat_key0(o, "message");
+                Self::push_json_str(o, &sug.message);
+                flat_key(o, "applicability");
+                Self::push_json_str(o, crate::diagnostics::applicability_name(sug.applicability));
+                flat_key(o, "style");
+                Self::push_json_str(o, crate::diagnostics::suggestion_style_name(sug.style));
+                // A machine consumer that wants to apply the fix needs the
+                // edit itself, which the model already carries.  Emit the span
+                // (using the same file/fileId convention as labels) and the
+                // replacement text; both are optional by design.
+                if let Some(sp) = sug.span {
+                    flat_key(o, "span");
+                    o.push('{');
+                    flat_key0(o, "start");
+                    super::fmt::push_uint(o, sp.start as u64);
+                    flat_key(o, "end");
+                    super::fmt::push_uint(o, sp.end as u64);
+                    match diag.file_name_for(sp.file) {
+                        Some(name) => {
+                            flat_key(o, "file");
+                            Self::push_json_str(o, name);
+                        }
+                        None => {
+                            flat_key(o, "fileId");
+                            super::fmt::push_uint(o, sp.file.as_u32() as u64);
+                        }
+                    }
+                    o.push('}');
+                }
+                if let Some(replacement) = &sug.replacement {
+                    flat_key(o, "replacement");
+                    Self::push_json_str(o, replacement);
+                }
+                o.push('}');
             }
             arr.close();
         }
@@ -310,34 +432,87 @@ impl JsonRenderer {
             && !chain.is_empty()
         {
             obj.key("callChain");
-            // Reuse the per-batch LRU line index (like the span path above and
-            // every other renderer) instead of rebuilding a fresh `LineIndex`
-            // per diagnostic — a batch of M diagnostics with a call chain over
-            // one n-byte source would otherwise pay O(M·n) instead of O(n).
-            let idx = diag.source.as_ref().map(|s| cx.line_index(s));
+            // The hoisted anchor index (resolved once above) serves every
+            // entry: a batch of M diagnostics with a call chain over one
+            // n-byte source would otherwise pay O(M·n).
             let file_name = diag.file_name();
             let mut arr = JsonContainer::array(&mut *obj.out, &ind1, &ind, self.pretty);
             for entry in chain.entries() {
                 arr.element();
                 // At most three parts (label, kind, location), streamed
                 // straight into the output buffer.
-                let mut it = JsonContainer::compact_object(&mut *arr.out);
-                it.key("label");
-                it.string(&entry.message);
-                it.key("kind");
-                it.string(crate::diagnostics::chain_entry_kind_name(entry.kind));
-                if let (Some(idx), Some(span)) = (idx.as_ref(), entry.span) {
-                    let (line, col) = idx.linecol_display(span.start_as_usize());
-                    it.key("location");
-                    it.location(file_name, (line + 1) as u64, (col + 1) as u64);
+                let o = &mut *arr.out;
+                o.push('{');
+                flat_key0(o, "label");
+                Self::push_json_str(o, &entry.message);
+                flat_key(o, "kind");
+                Self::push_json_str(o, crate::diagnostics::chain_entry_kind_name(entry.kind));
+                // a chain entry pointing into a foreign file must carry
+                // that file's identity; otherwise its location is silently
+                // dropped and a JSON consumer cannot place it.
+                if let Some(span) = entry.span {
+                    match diag.file_name_for(span.file) {
+                        Some(name) => {
+                            flat_key(o, "file");
+                            Self::push_json_str(o, name);
+                        }
+                        None => {
+                            flat_key(o, "fileId");
+                            super::fmt::push_uint(o, span.file.as_u32() as u64);
+                        }
+                    }
                 }
-                it.close();
+                if let (Some(idx), Some(span)) = (idx.as_ref(), entry.span)
+                    // Only an entry in the anchor file can be located with
+                    // the anchor's line index; a foreign entry's file/line
+                    // pair would be silently wrong.
+                    && anchor_file == Some(span.file)
+                {
+                    let (line, col) = idx.linecol_display(span.start_as_usize());
+                    flat_key(o, "location");
+                    flat_location(o, file_name, (line + 1) as u64, (col + 1) as u64);
+                }
+                o.push('}');
             }
             arr.close();
         }
 
         obj.close();
     }
+}
+
+/// Inline flat-object emission for compact array elements.
+///
+/// The `labels` / `relatedErrors` / `suggestions` / `callChain` elements are
+/// flat `{"k": v, …}` objects; pushing their bytes directly into the output
+/// buffer (instead of constructing a [`JsonContainer::compact_object`] frame
+/// per element) drops the per-element `sep`/`first`/`pretty` bookkeeping from
+/// exactly the loops that scale with label/related/suggestion count.  The
+/// byte shapes are pinned identical to `compact_object` (`"` + key +
+/// `": "`, `", "` separators) — the JSON snapshots hold this.
+fn flat_key(out: &mut String, key: &str) {
+    out.push_str(", ");
+    flat_key0(out, key);
+}
+
+/// First field of a flat object: no separator (the `{` was just pushed).
+fn flat_key0(out: &mut String, key: &str) {
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\": ");
+}
+
+/// `push_json_str`-shaped helper for the inline flat-object path.
+fn flat_location(out: &mut String, file: &str, line: u64, col: u64) {
+    out.push('"');
+    if !file.is_empty() {
+        push_json_escaped_str(out, file);
+        out.push(':');
+    }
+    super::fmt::push_uint(out, line);
+    out.push(':');
+    super::fmt::push_uint(out, col);
+    out.push('"');
 }
 
 /// Streams one JSON container (object or array) into a single buffer.
@@ -358,20 +533,35 @@ struct JsonContainer<'a> {
     pretty: bool,
     first: bool,
     close: char,
+    /// Set by [`Self::close`]; the `Drop` tripwire fires if a container is
+    /// dropped without closing, so an early `return` cannot silently emit
+    /// invalid JSON (the "bracket always closed" invariant, mirroring the
+    /// separator-before-field invariant that is structural).
+    closed: bool,
 }
 
 impl<'a> JsonContainer<'a> {
-    /// `{` … `}` whose fields sit at `ind` — the diagnostic body.
-    fn object(out: &'a mut String, ind: &'a str, pretty: bool) -> Self {
+    /// `{` … `}` whose fields sit at `field_ind` and whose `}` aligns with
+    /// the `{` at `open_ind` — standard pretty-printer layout (`{` at column
+    /// 0, fields at column 2, `}` at column 0), instead of the old shape
+    /// where `}` sat at the fields' indentation, two columns right of `{`.
+    /// Valid JSON either way; this matches every other pretty-printer.
+    fn object(out: &'a mut String, open_ind: &'a str, field_ind: &'a str, pretty: bool) -> Self {
+        // The brace sits at `open_ind` so a diagnostic inside an array is
+        // indented (standard pretty layout); compact mode writes no indent.
+        if pretty {
+            out.push_str(open_ind);
+        }
         out.push('{');
         Self {
             out,
             sep: ",",
-            elem_ind: ind,
-            close_ind: ind,
+            elem_ind: field_ind,
+            close_ind: open_ind,
             pretty,
             first: true,
             close: '}',
+            closed: false,
         }
     }
 
@@ -387,6 +577,7 @@ impl<'a> JsonContainer<'a> {
             pretty,
             first: true,
             close: ']',
+            closed: false,
         }
     }
 
@@ -403,6 +594,7 @@ impl<'a> JsonContainer<'a> {
             pretty: false,
             first: true,
             close: '}',
+            closed: false,
         }
     }
 
@@ -450,73 +642,130 @@ impl<'a> JsonContainer<'a> {
         self.out.push('"');
     }
 
-    /// Value: a JSON string `"file:line:col"` (or `"line:col"` when file is
-    /// empty) — the file portion may need escaping, line/col are ASCII digits.
-    fn location(&mut self, file: &str, line: u64, col: u64) {
-        self.out.push('"');
-        if !file.is_empty() {
-            if needs_json_escape(file) {
-                for c in file.chars() {
-                    push_json_escaped(self.out, c);
-                }
-            } else {
-                self.out.push_str(file);
-            }
-            self.out.push(':');
-        }
-        super::fmt::push_uint(self.out, line);
-        self.out.push(':');
-        super::fmt::push_uint(self.out, col);
-        self.out.push('"');
-    }
-
     /// Close the container, indenting the bracket in pretty mode.
-    fn close(self) {
+    fn close(mut self) {
         if self.pretty && !self.first {
             self.out.push('\n');
             self.out.push_str(self.close_ind);
         }
         self.out.push(self.close);
+        self.closed = true;
+        // `Drop` runs at the end of this scope; `closed` is already true, so
+        // the tripwire stays silent.
     }
 }
 
-/// Does `s` contain a byte that JSON must escape — a control byte (`< 0x20`),
-/// `"` or `\`?  One SWAR pass per 8-byte chunk instead of a scalar per-byte
-/// scan, so the common clean-string check (the hot path of
-/// [`JsonRenderer::push_json_str`]) costs a few ALU ops per chunk rather than
-/// ~8 branch-taken per byte.
+impl Drop for JsonContainer<'_> {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.closed,
+            "JsonContainer dropped without close() — invalid JSON would be emitted"
+        );
+    }
+}
+
+/// Index of the first byte JSON must escape — a control byte (`< 0x20`),
+/// `"` or `\` — or `None` if none qualifies.  One SWAR pass per 8-byte chunk
+/// instead of a scalar per-byte scan, so the common clean-string check (the
+/// hot path of [`JsonRenderer::push_json_str`]) costs a few ALU ops per chunk
+/// rather than ~8 branch-taken per byte, and the dirty path jumps straight to
+/// each escape site for a bulk `write_str` between them.
 ///
 /// `b < 0x20` uses Mycroft's `hasless` trick `((x - SP) & ~x & HI)`; `b == '"'`
 /// and `b == '\\'` use the `has_zero` trick `((q - LO) & ~q & HI)` on
 /// `q = x ^ V_broadcast`.  Each is correct for the "any byte" predicate: a
 /// cross-byte borrow can only produce a false positive at a byte equal to the
 /// threshold, which requires a preceding byte to have already triggered a true
-/// positive, so the overall `!= 0` answer stays sound.  UTF-8 continuation
-/// bytes are all `≥ 0x80`, so no multi-byte character is mistaken for an
-/// escape candidate.
+/// positive, so the lowest set lane in the combined mask is a true match.
+/// UTF-8 continuation bytes are all `≥ 0x80`, so no multi-byte character is
+/// mistaken for an escape candidate.
 #[inline]
-fn needs_json_escape(s: &str) -> bool {
-    const HI: u64 = 0x8080_8080_8080_8080;
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const SP: u64 = 0x2020_2020_2020_2020;
-    const QU: u64 = 0x2222_2222_2222_2222;
-    const BS: u64 = 0x5C5C_5C5C_5C5C_5C5C;
+fn next_json_escape_byte(b: &[u8]) -> Option<usize> {
+    // The two structural bytes (`"`, `\`) are found with a SIMD `memchr2`
+    // (wider than SWAR).  Control bytes are then scanned only up to the first
+    // structural hit, so a string with a quote early never pays the full
+    // control pass; a clean string pays one SIMD pass plus one SWAR pass,
+    // both cache-resident for the short diagnostic strings this sees.
+    let structural = memchr::memchr2(b'"', b'\\', b);
+    let limit = structural.unwrap_or(b.len());
+    let ctrl = next_ctrl_byte(&b[..limit]);
+    match (structural, ctrl) {
+        (Some(s), Some(c)) => Some(s.min(c)),
+        (s, c) => s.or(c),
+    }
+}
 
-    let b = s.as_bytes();
+/// First byte `< 0x20` in `b` (JSON control range), or `None`.
+///
+/// Mycroft's `hasless` trick (`(x - 0x20) & ~x & 0x80`) skips clean 8-byte
+/// chunks; the lowest flagged lane is always a true match (a cross-byte borrow
+/// can only flag a byte that is itself `≥ 0x20` *after* a true `< 0x20` lane).
+#[inline]
+fn next_ctrl_byte(b: &[u8]) -> Option<usize> {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const SP: u64 = 0x2020_2020_2020_2020;
     let mut i = 0;
     while i + 8 <= b.len() {
         let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        let ctrl = (x.wrapping_sub(SP) & !x & HI) != 0;
-        let q = x ^ QU;
-        let quote = (q.wrapping_sub(LO) & !q & HI) != 0;
-        let r = x ^ BS;
-        let backslash = (r.wrapping_sub(LO) & !r & HI) != 0;
-        if ctrl || quote || backslash {
-            return true;
+        let ctrl = x.wrapping_sub(SP) & !x & HI;
+        if ctrl != 0 {
+            return Some(i + (ctrl.trailing_zeros() / 8) as usize);
         }
         i += 8;
     }
-    b[i..].iter().any(|&c| c < 0x20 || c == b'"' || c == b'\\')
+    b[i..].iter().position(|&c| c < 0x20).map(|j| i + j)
+}
+
+/// Does `s` contain a byte that JSON must escape?  Test-only scalar-shaped
+/// view of [`next_json_escape_byte`] so the positional and predicate SWAR
+/// scans cannot drift apart.
+#[cfg(test)]
+#[inline]
+fn needs_json_escape(s: &str) -> bool {
+    next_json_escape_byte(s.as_bytes()).is_some()
+}
+
+/// Append `s` to `out` with JSON string escaping (no surrounding quotes).
+/// Bulk-copies the runs between escape sites instead of a per-byte branch
+/// loop; the clean case (no escapes) is a single `write_str`.
+fn push_json_escaped_str<W: std::fmt::Write>(out: &mut W, s: &str) {
+    let bytes = s.as_bytes();
+    // Stateful merged scan: the structural iterator (`"` / `\`) advances only
+    // when its byte is actually escaped, and the control scan runs only up to
+    // the next structural position.  Re-deriving the structural hit from
+    // `bytes[start..]` on every iteration made control-heavy strings with no
+    // quotes/backslashes O(n²) (one full `memchr2` miss per escaped control);
+    // this makes the total scan linear.
+    let mut structural = memchr::memchr2_iter(b'"', b'\\', bytes);
+    let mut next_structural = structural.next();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let limit = next_structural.unwrap_or(bytes.len());
+        let ctrl = if start < limit {
+            next_ctrl_byte(&bytes[start..limit]).map(|off| start + off)
+        } else {
+            None
+        };
+        let i = match (ctrl, next_structural) {
+            (Some(c), _) => c,
+            (None, Some(st)) => st,
+            (None, None) => break,
+        };
+        if i > start {
+            let _ = out.write_str(&s[start..i]);
+        }
+        // The escape candidates (`< 0x20`, `"`, `\`) are all ASCII, so
+        // `bytes[i]` is a char boundary and `bytes[i] as char` is the
+        // codepoint to escape.
+        push_json_escaped(out, bytes[i] as char);
+        start = i + 1;
+        if Some(i) == next_structural {
+            next_structural = structural.next();
+        }
+    }
+    if start < bytes.len() {
+        let _ = out.write_str(&s[start..]);
+    }
 }
 
 /// Append one character to `out`, JSON-escaped. Used by
@@ -525,7 +774,19 @@ fn needs_json_escape(s: &str) -> bool {
 ///
 /// Generic over the output so escaping can go straight into whatever buffer
 /// the caller is building — `String` or `CompactString` alike.
+/// Write the escaped form of one byte/char that
+/// [`next_json_escape_byte`] selected.
+///
+/// Contract: `c` comes from that scanner, i.e. it is one of `"`, `\`, or a
+/// byte `< 0x20`.  A caller passing an arbitrary `char` would produce valid
+/// but unexpected output (`0x7F` becomes `\u007f`, and U+2028/2029 are left
+/// raw); the debug assert pins the contract rather than silently accepting
+/// it.
 fn push_json_escaped<W: std::fmt::Write>(out: &mut W, c: char) {
+    debug_assert!(
+        matches!(c, '"' | '\\' | '\n' | '\r' | '\t' | '\u{0}'..='\u{1f}'),
+        "push_json_escaped called with a char the scanner would not select: {c:?}"
+    );
     let _ = match c {
         '"' => out.write_str("\\\""),
         '\\' => out.write_str("\\\\"),
@@ -710,6 +971,30 @@ mod tests {
         }
     }
 
+    /// A diagnostic whose message and file name carry every JSON escape
+    /// candidate (`"`, `\`, control bytes) must still serialise to valid JSON
+    /// that round-trips through `serde_json`.  Exercises the bulk-copy dirty
+    /// path of `push_json_escaped_str` end-to-end through the renderer.
+    #[test]
+    fn json_dirty_message_round_trips() {
+        let msg = "a\"b\\c\nd\re\tf\x07g\x1fh";
+        let diag = crate::diagnostics::Diagnostic::error(msg)
+            .with_span(crate::ast::Span::new(crate::ast::FileId::DUMMY, 0, 1))
+            .with_source("x")
+            .with_file_name("weird\"\\file\n.rs");
+        for pretty in [false, true] {
+            let out = json_of(&diag, pretty);
+            let v: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("invalid JSON ({pretty}): {e}\n{out}"));
+            let obj = v.as_object().expect("diagnostic is an object");
+            assert_eq!(
+                obj.get("message").and_then(|m| m.as_str()),
+                Some(msg),
+                "message round-trip ({pretty})"
+            );
+        }
+    }
+
     /// The SWAR `needs_json_escape` must agree with the scalar predicate it
     /// replaces for every byte value and at every 8-byte chunk boundary — the
     /// `hasless`/`has_zero` tricks carry cross-byte borrows that are only
@@ -719,12 +1004,28 @@ mod tests {
         fn scalar(s: &str) -> bool {
             s.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\')
         }
+        // `needs_json_escape` and `next_json_escape_byte` are two views of the
+        // same SWAR predicate — pin both against the scalar reference and, when
+        // a candidate exists, confirm the position actually names one.
+        fn check(s: &str, ctx: &str) {
+            let want = scalar(s);
+            assert_eq!(needs_json_escape(s), want, "{ctx}: needs_json_escape");
+            let pos = next_json_escape_byte(s.as_bytes());
+            assert_eq!(pos.is_some(), want, "{ctx}: next_json_escape_byte");
+            if let Some(i) = pos {
+                let b = s.as_bytes()[i];
+                assert!(
+                    b < 0x20 || b == b'"' || b == b'\\',
+                    "{ctx}: pos {i} = {b:#04x} is not an escape byte"
+                );
+            }
+        }
         // Every ASCII single byte (0x00..=0x7F) as a 1-byte string — all are
         // valid UTF-8.  Multi-byte continuations can't be a single-byte `&str`.
         for byte in 0u8..0x80 {
             let buf = [byte];
             let s = std::str::from_utf8(&buf).unwrap();
-            assert_eq!(needs_json_escape(s), scalar(s), "single byte {byte:#04x}");
+            check(s, &format!("single byte {byte:#04x}"));
         }
         // Escape candidate at each position 0..=16, padded clean on both sides
         // — hits every offset within and across 8-byte chunks.
@@ -734,22 +1035,18 @@ mod tests {
                 let mut bytes = clean.as_bytes().to_vec();
                 bytes[pos] = cand;
                 let s = String::from_utf8(bytes).unwrap();
-                assert_eq!(
-                    needs_json_escape(&s),
-                    scalar(&s),
-                    "cand {cand:#04x} at pos {pos}"
-                );
+                check(&s, &format!("cand {cand:#04x} at pos {pos}"));
             }
         }
         // Lengths straddling the 8-byte chunk boundary with clean content.
         for len in 0..=17 {
             let s = &"abcdefghijklmnopqrstuvwxyz"[..len];
-            assert_eq!(needs_json_escape(s), scalar(s), "clean len {len}");
+            check(s, &format!("clean len {len}"));
         }
         // A long clean string (multiple full chunks) and one dirty at the end.
         let long_clean = &"a".repeat(200);
-        assert_eq!(needs_json_escape(long_clean), scalar(long_clean));
+        check(long_clean, "long clean");
         let long_dirty = format!("{}{}", "a".repeat(200), "\\");
-        assert_eq!(needs_json_escape(&long_dirty), scalar(&long_dirty));
+        check(&long_dirty, "long dirty");
     }
 }

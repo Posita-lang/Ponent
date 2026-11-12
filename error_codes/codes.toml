@@ -125,16 +125,19 @@ explain = "E023.md"
 title = "type mismatch"
 category = "type"
 explain = "E030.md"
+related = ["E031", "E032"]
 
 [codes.E031]
 title = "kind mismatch"
 category = "type"
 explain = "E031.md"
+related = ["E030"]
 
 [codes.E032]
 title = "operator type error"
 category = "type"
 explain = "E032.md"
+related = ["E030"]
 
 [codes.E033]
 title = "cannot infer type"

@@ -10,12 +10,12 @@
 ///   2. `LANG` environment variable (system locale, e.g. `en_US.UTF-8`)
 ///   3. English (default)
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt::Display;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use fluent_bundle::FluentValue;
-use fluent_templates::{LanguageIdentifier, Loader, langid, static_loader};
+use fluent_bundle::{FluentArgs, FluentBundle, FluentResource, FluentValue};
+use fluent_templates::{LanguageIdentifier, langid};
 
 use crate::smallvec::SmallVec;
 
@@ -115,16 +115,119 @@ impl<'a> LiftCow<'a> for Cow<'static, str> {
     }
 }
 
-// Compile-time locale embedding: the macro walks `locales/` at expansion
-// and `include_str!`s every file, so no runtime file access is needed
-// (the offline explain server relies on that).  Isolating marks must be
-// off: our renderer and byte-exact tests expect plain substituted text.
-static_loader! {
-    static LOCALES = {
-        locales: "./locales",
-        fallback_language: "en",
-        customise: |bundle| bundle.set_use_isolating(false),
+// Compile-time locale embedding: `include_str!` every file, so no runtime
+// file access is needed (the offline explain server relies on that).
+// We build the `FluentBundle`s ourselves instead of going through
+// `fluent_templates`' `Loader`: its `try_lookup_with_args` takes a
+// `HashMap` of args and re-copies every key/value into a `FluentArgs`
+// internally, and it formats before we can even probe whether the slug
+// exists.  Holding the bundles directly lets us probe with `get_message`
+// (O(1), no formatting), then build `FluentArgs` straight from `pairs`
+// (Vec-backed, linear search — the right shape for ≤4 args).  Isolating
+// marks must be off: our renderer and byte-exact tests expect plain
+// substituted text.  Order is [en, ru, zh] — index 0 is the fallback.
+type Bundle = fluent_bundle::concurrent::FluentBundle<&'static FluentResource>;
+
+static BUNDLES: OnceLock<[Bundle; N_LANGS]> = OnceLock::new();
+
+fn bundles() -> &'static [Bundle; N_LANGS] {
+    BUNDLES.get_or_init(|| {
+        const EN_FTL: &str = include_str!("../../locales/en.ftl");
+        const RU_FTL: &str = include_str!("../../locales/ru.ftl");
+        const ZH_FTL: &str = include_str!("../../locales/zh.ftl");
+        [
+            make_bundle(langid!("en"), EN_FTL),
+            make_bundle(langid!("ru"), RU_FTL),
+            make_bundle(langid!("zh"), ZH_FTL),
+        ]
+    })
+}
+
+fn make_bundle(lang: LanguageIdentifier, src: &'static str) -> Bundle {
+    // Locales are validated by `validate_locales` at build time, so parse
+    // errors should not occur; keep the (recoverable) resource if they do.
+    let res: &'static FluentResource = Box::leak(Box::new(match FluentResource::try_new(src.to_owned()) {
+        Ok(r) => r,
+        Err((r, _)) => r,
+    }));
+    let mut bundle = fluent_bundle::concurrent::FluentBundle::new_concurrent(vec![lang]);
+    bundle.set_use_isolating(false);
+    bundle.add_resource(res).expect("conflicting Fluent message ids");
+    bundle
+}
+
+fn bundle_for(lang: &LanguageIdentifier) -> &'static Bundle {
+    let bundles = bundles();
+    // Matches the `language` subtag only: a `zh-Hant` identifier resolves to
+    // the `zh` (Simplified) bundle, and `en-GB` to `en`.  That is correct for
+    // the `Lang` enum path (only `Zh` exists) but would silently serve the
+    // wrong script for an arbitrary `format_slug(langid!("zh-Hant"), …)`; add
+    // a `ZhHant` locale + a script-aware match before exposing that.
+    bundles
+        .iter()
+        .find(|b| b.locales[0].language == lang.language)
+        .unwrap_or(&bundles[0])
+}
+
+/// Resolve + format `slug` in `lang`'s bundle, falling back to the `en`
+/// bundle — the same chain the loader used: unknown slug or a format
+/// error (e.g. a missing referenced argument) moves on to `en`, and `None`
+/// only when `en` fails too, so the caller returns `msg` verbatim.
+///
+/// Not test-only: the generated `fluent_gen.rs` calls `super::format_slug`
+/// for the typed zero/one-arg accessors.
+fn format_slug(
+    lang: &LanguageIdentifier,
+    slug: &str,
+    args: Option<&FluentArgs>,
+) -> Option<String> {
+    let mut out = String::new();
+    format_slug_into(lang, slug, args, &mut out).then_some(out)
+}
+
+/// [`format_slug`] writing the formatted pattern straight into `out` —
+/// `format_pattern` yields a `Cow<str>` that is `Borrowed` for every
+/// substitution-free pattern, so routing it through an intermediate
+/// `String` copied one more `into_owned()` + `push_str()` per render.
+/// Returns `false` when the slug is unknown even after the `en` fallback
+/// (or a format error occurred); `out` is then left untouched.
+fn format_slug_into(
+    lang: &LanguageIdentifier,
+    slug: &str,
+    args: Option<&FluentArgs>,
+    out: &mut String,
+) -> bool {
+    let bundles = bundles();
+    let primary = bundle_for(lang);
+    let en = &bundles[0];
+
+    // Hoisted out of `try_bundle`: a fresh `Vec::new()` per attempt is free
+    // on the success path (lazy allocation) but pays a fresh `Drop` per
+    // bundle attempt on the fallback path; one buffer reused across the
+    // chain removes both.
+    let mut errors = Vec::new();
+    let mut try_bundle = |b: &Bundle, out: &mut String| -> bool {
+        errors.clear();
+        let Some(pattern) = b.get_message(slug).and_then(|m| m.value()) else {
+            return false;
+        };
+        let value = b.format_pattern(pattern, args, &mut errors);
+        if errors.is_empty() {
+            out.push_str(&value);
+            true
+        } else {
+            false
+        }
     };
+
+    let chain = std::iter::once(primary)
+        .chain((!std::ptr::eq(primary, en)).then_some(en));
+    for b in chain {
+        if try_bundle(b, out) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `LANG` sentinel meaning "not yet detected".
@@ -132,6 +235,11 @@ const LANG_UNSET: u8 = 0;
 const LANG_EN: u8 = 1;
 const LANG_RU: u8 = 2;
 const LANG_ZH: u8 = 3;
+
+/// Number of supported languages. Single source of truth for the bundle
+/// table, the language-id cache and the `cached_label!` arrays (A5) — adding
+/// a `Lang` variant previously meant hunting three separate literals.
+pub(crate) const N_LANGS: usize = 3;
 
 static LANG: AtomicU8 = AtomicU8::new(LANG_UNSET);
 
@@ -180,6 +288,20 @@ impl Lang {
         }
     }
 
+    /// Zero-based index of this language, for generated caches.
+    ///
+    /// The generated `ZERO_ARG_TABLE` indexes by this, not by
+    /// `as usize - 1`: `En` may take the default discriminant 0, and the old
+    /// subtraction underflowed.
+    #[inline]
+    pub fn index(self) -> usize {
+        match self {
+            Lang::En => 0,
+            Lang::Ru => 1,
+            Lang::Zh => 2,
+        }
+    }
+
     pub fn set(lang: Lang) {
         LANG.store(lang as u8, Ordering::Relaxed);
     }
@@ -200,14 +322,21 @@ impl Lang {
 fn detect_from_env() -> Lang {
     let env = std::env::var("PONENT_LANG")
         .or_else(|_| std::env::var("LANG"))
-        .unwrap_or_default()
-        .to_lowercase();
-    if env.starts_with("ru") {
-        Lang::Ru
-    } else if env.starts_with("zh") {
-        Lang::Zh
-    } else {
-        Lang::En
+        .unwrap_or_default();
+    detect_from_str(&env)
+}
+
+/// Pure BCP-47 primary-subtag classification, split out so it is testable
+/// without mutating the process environment.
+fn detect_from_str(env: &str) -> Lang {
+    let env = env.to_lowercase();
+    // Compare the BCP-47 *primary* subtag exactly: a prefix test would let
+    // `zha` (Zhuang, ISO 639-3) match `zh`, and `ru*` collides similarly.
+    let primary = env.split(['-', '_']).next().unwrap_or("");
+    match primary {
+        "ru" => Lang::Ru,
+        "zh" => Lang::Zh,
+        _ => Lang::En,
     }
 }
 
@@ -225,30 +354,37 @@ pub fn render<'msg, 'src>(
     msg: &'msg str,
     pairs: &[(&'static str, Cow<'src, str>)],
 ) -> Cow<'msg, str> {
-    if is_ftl_slug(msg)
-        && let Some(s) = try_fluent(msg, pairs)
-    {
-        return Cow::Owned(s);
+    if is_ftl_slug(msg) {
+        // Zero-arg slug: build-time cached, returns borrowed — no formatting
+        // and no allocation after the first call per (slug, lang).
+        if pairs.is_empty()
+            && let Some(c) = fluent::zero_arg_slug(msg)
+        {
+            return c;
+        }
+        if let Some(s) = try_fluent(msg, pairs) {
+            return Cow::Owned(s);
+        }
     }
     Cow::Borrowed(msg)
 }
 
 /// [`render`] into an existing buffer.
-///
-/// The fallback (unknown slug / legacy key) is written straight through
-/// instead of being wrapped in a `Cow` first; a Fluent hit still has to
-/// allocate its `String` internally, so this saves the wrapper, not the
-/// formatting allocation.
 pub fn render_into<'msg, 'src>(
     msg: &'msg str,
     pairs: &[(&'static str, Cow<'src, str>)],
     out: &mut String,
 ) {
-    if is_ftl_slug(msg)
-        && let Some(s) = try_fluent(msg, pairs)
-    {
-        out.push_str(&s);
-        return;
+    if is_ftl_slug(msg) {
+        if pairs.is_empty()
+            && let Some(c) = fluent::zero_arg_slug(msg)
+        {
+            out.push_str(&c);
+            return;
+        }
+        if try_fluent_into(msg, pairs, out) {
+            return;
+        }
     }
     out.push_str(msg);
 }
@@ -267,10 +403,28 @@ fn is_ftl_slug(msg: &str) -> bool {
         })
 }
 
-fn lang_id() -> &'static LanguageIdentifier {
-    static IDS: std::sync::OnceLock<[LanguageIdentifier; 3]> = std::sync::OnceLock::new();
+/// `LanguageIdentifier` for the `i`-th supported language (0 = en fallback).
+pub(crate) fn lang_id_at(i: usize) -> &'static LanguageIdentifier {
+    // Same loud-failure stance as `cached_label!`: a bad index is a programmer
+    // error in the established `discriminant - 1` mapping, so flag it by name
+    // in debug and let the slice bounds check panic in release rather than
+    // silently serving a different locale.
+    debug_assert!(i < N_LANGS, "language index {i} out of range 0..{N_LANGS}");
+    static IDS: std::sync::OnceLock<[LanguageIdentifier; N_LANGS]> = std::sync::OnceLock::new();
     let ids = IDS.get_or_init(|| [langid!("en"), langid!("ru"), langid!("zh")]);
-    &ids[Lang::current() as usize - 1]
+    &ids[i]
+}
+
+fn lang_id() -> &'static LanguageIdentifier {
+    // `Lang` discriminants start at 1 (`LANG_EN`), so the table index is
+    // `discriminant - 1`.  A future 0-discriminant variant underflows and must
+    // fail loudly instead of aliasing another language.
+    let discriminant = Lang::current() as usize;
+    debug_assert!(
+        (1..=N_LANGS).contains(&discriminant),
+        "Lang discriminant {discriminant} outside 1..={N_LANGS}"
+    );
+    lang_id_at(discriminant - 1)
 }
 
 /// `None` when the slug is unknown even after the loader's fallback chain
@@ -281,36 +435,95 @@ fn lang_id() -> &'static LanguageIdentifier {
 /// CLDR categories.  Everything else is substituted as plain text —
 /// `try_number` silently coerced numeric-looking strings like `"00123"`
 /// or `"1.0"` into numbers, corrupting values that are names, not counts.
-const NUMERIC_ARG_KEYS: &[&str] = &["count", "n", "num"];
+///
+/// Generated (not hardcoded): the set is every `$var` used as a select /
+/// plural selector in `en.ftl` plus the legacy count names, so a future
+/// locale message introducing a differently-named plural key cannot
+/// silently fall to the `other` CLDR branch — the build regenerates the
+/// list from the source of truth on every compile.
+use fluent::is_numeric_arg_key;
 
 fn try_fluent<'msg, 'src>(
     msg: &'msg str,
     pairs: &[(&'static str, Cow<'src, str>)],
 ) -> Option<String> {
-    // Zero-argument fast path: the common static-message lookup never
-    // allocates an argument map.
+    let mut out = String::new();
+    try_fluent_into(msg, pairs, &mut out).then_some(out)
+}
+
+/// [`try_fluent`] writing the formatted pattern straight into `out` —
+/// one copy total instead of `into_owned()` + a second `push_str()`.
+/// Returns `false` when no bundle produced a clean rendering; `out` is
+/// then left untouched.
+fn try_fluent_into<'msg, 'src>(
+    msg: &'msg str,
+    pairs: &[(&'static str, Cow<'src, str>)],
+    out: &mut String,
+) -> bool {
+    let lang = lang_id();
     if pairs.is_empty() {
-        return LOCALES.try_lookup(lang_id(), msg);
+        // Zero-argument fast path: one lookup per bundle attempt, no
+        // argument map.
+        return format_slug_into(lang, msg, None, out);
     }
-    let mut args = HashMap::with_capacity(pairs.len());
-    pairs.iter().for_each(|(k, v)| {
-        // `v.clone()` — not `FluentValue::String(v)` by value. `pairs`
-        // arrives as `&[...]` borrowed from `DiagMessage::render_into(&self)`,
-        // so `v` is behind a shared reference and cannot be moved (E0507).
-        // Taking `pairs` by value would force `render_into` to own its
-        // message, breaking the `&self` API (a diagnostic may render more
-        // than once) and rippling through every caller. Under `&self`,
-        // `clone` is the cheapest legal option: `Cow::Borrowed` copies a
-        // pointer (zero heap, the common `&str`-arg path); only `Cow::Owned`
-        // deep-copies — unavoidable without ownership.
-        let value = if NUMERIC_ARG_KEYS.contains(k) {
-            FluentValue::try_number(v.as_ref())
-        } else {
-            FluentValue::String(v.clone())
+    // Single-pass resolve+format: walk the bundle chain once, and build the
+    // argument map lazily — only when a bundle actually has the message.
+    // The old `slug_exists` probe + `format_slug` paid two `get_message`
+    // hash lookups per bundle for the same answer.
+    let bundles = bundles();
+    let primary = bundle_for(lang);
+    let en = &bundles[0];
+    let build_args = || {
+        let mut args = FluentArgs::new();
+        pairs.iter().for_each(|(k, v)| {
+            // `v.clone()` — not `FluentValue::String(v)` by value. `pairs`
+            // arrives as `&[...]` borrowed from `DiagMessage::render_into(&self)`,
+            // so `v` is behind a shared reference and cannot be moved (E0507).
+            // Taking `pairs` by value would force `render_into` to own its
+            // message, breaking the `&self` API (a diagnostic may render more
+            // than once) and rippling through every caller. Under `&self`,
+            // `clone` is the cheapest legal option: `Cow::Borrowed` copies a
+            // pointer (zero heap, the common `&str`-arg path); only `Cow::Owned`
+            // deep-copies — unavoidable without ownership.
+            let value = if is_numeric_arg_key(k) {
+                FluentValue::try_number(v.as_ref())
+            } else {
+                FluentValue::String(v.clone())
+            };
+            args.set(*k, value);
+        });
+        args
+    };
+    // P2: resolve each bundle in turn and *retry formatting* on the next one
+    // when a bundle has the message but fails to format it (a broken
+    // translation, a missing argument in a translation, or a malformed
+    // pattern).  The old `find_map` stopped at the first bundle with the
+    // message, so one bad localized translation fell all the way back to the
+    // raw slug even when `en` would have formatted cleanly.  The argument map
+    // is still built at most once.
+    let mut args: Option<FluentArgs> = None;
+    let mut errors = Vec::new();
+    let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
+    for b in chain {
+        let Some(pattern) = b.get_message(msg).and_then(|m| m.value()) else {
+            continue;
         };
-        args.insert(Cow::Borrowed(*k), value);
-    });
-    LOCALES.try_lookup_with_args(lang_id(), msg, &args)
+        let args = args.get_or_insert_with(|| build_args());
+        errors.clear();
+        let val = b.format_pattern(pattern, Some(args), &mut errors);
+        if errors.is_empty() {
+            out.push_str(&val);
+            return true;
+        }
+    }
+    // Cold path only: a slug that exists in `en` yet fails to format there is
+    // a caller/translation bug (bad argument key), not an unknown slug.
+    debug_assert!(
+        bundles[0].get_message(msg).is_none(),
+        "slug {msg:?} exists but formatting failed on every bundle — \
+         missing or misspelled argument? errors: {errors:?}"
+    );
+    false
 }
 
 /// Consuming variant of [`render_into`]: moves `pairs` by value so
@@ -324,34 +537,87 @@ pub fn render_into_owned<'msg, 'src>(
     pairs: SmallVec<[(&'static str, Cow<'src, str>); 4]>,
     out: &mut String,
 ) {
-    if is_ftl_slug(msg)
-        && let Some(s) = try_fluent_owned(msg, pairs)
-    {
-        out.push_str(&s);
-        return;
+    if is_ftl_slug(msg) {
+        if pairs.is_empty()
+            && let Some(c) = fluent::zero_arg_slug(msg)
+        {
+            out.push_str(&c);
+            return;
+        }
+        if try_fluent_owned_into(msg, pairs, out) {
+            return;
+        }
     }
     out.push_str(msg);
 }
 
-fn try_fluent_owned<'msg, 'src>(
+fn try_fluent_owned_into<'msg, 'src>(
     msg: &'msg str,
     pairs: SmallVec<[(&'static str, Cow<'src, str>); 4]>,
-) -> Option<String> {
+    out: &mut String,
+) -> bool {
+    let lang = lang_id();
     if pairs.is_empty() {
-        return LOCALES.try_lookup(lang_id(), msg);
+        return format_slug_into(lang, msg, None, out);
     }
-    let mut args = HashMap::with_capacity(pairs.len());
-    pairs.into_iter().for_each(|(k, v)| {
-        let value = if NUMERIC_ARG_KEYS.contains(&k)
-            && let Ok(n) = v.as_ref().parse::<fluent_bundle::types::FluentNumber>()
-        {
-            n.into()
-        } else {
-            FluentValue::String(v)
+    // Single-pass resolve (see `try_fluent`): one `get_message` hash lookup
+    // per bundle.  The argument map is built once, only after a bundle with
+    // the message is found — `pairs` is consumed, so the build cannot sit
+    // inside the loop.
+    let bundles = bundles();
+    let primary = bundle_for(lang);
+    let en = &bundles[0];
+    let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
+    // Retry formatting on the next bundle when this one has the message but
+    // fails to format it (see `try_fluent_into`).  `pairs` is consumed to
+    // build the map, so build it lazily once and reuse it for the fallback
+    // attempt instead of trying to reconstruct it.
+    let mut pending_pairs = Some(pairs);
+    let mut built_args: Option<FluentArgs> = None;
+    let mut errors = Vec::new();
+    for b in chain {
+        let Some(pattern) = b.get_message(msg).and_then(|m| m.value()) else {
+            continue;
         };
-        args.insert(Cow::Borrowed(k), value);
-    });
-    LOCALES.try_lookup_with_args(lang_id(), msg, &args)
+        let args = built_args.get_or_insert_with(|| {
+            let mut args = FluentArgs::new();
+            pending_pairs
+                .take()
+                .expect("pairs are taken only when the map is first built")
+                .into_iter()
+                .for_each(|(k, v)| {
+                    // Owned path: `FluentValue::try_number` borrows the input,
+                    // but `v` is consumed here, so parse into an owned
+                    // `FluentNumber` instead.  The policy is the same as the
+                    // borrowed path (`try_number` is `parse::<FluentNumber>` with
+                    // a `String` fallback).
+                    let value = if is_numeric_arg_key(&k) {
+                        match v.as_ref().parse::<fluent_bundle::types::FluentNumber>() {
+                            Ok(n) => n.into(),
+                            Err(_) => FluentValue::String(v),
+                        }
+                    } else {
+                        FluentValue::String(v)
+                    };
+                    args.set(k, value);
+                });
+            args
+        });
+        errors.clear();
+        let val = b.format_pattern(pattern, Some(args), &mut errors);
+        if errors.is_empty() {
+            out.push_str(&val);
+            return true;
+        }
+    }
+    // Same cold-path probe as `try_fluent_into`: a slug that exists in `en`
+    // yet fails to format there is a caller/translation bug.
+    debug_assert!(
+        bundles[0].get_message(msg).is_none(),
+        "slug {msg:?} exists but formatting failed — missing or \
+         misspelled argument? errors: {errors:?}"
+    );
+    false
 }
 
 /// Direct-indexed per-`Lang` cache for a fixed table of zero-argument
@@ -367,17 +633,60 @@ macro_rules! cached_label {
         variant = $variant:expr,
         init = [$($init:expr),+ $(,)?],
     ) => {{
-        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; 3] = [
+        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] = [
             ::std::sync::OnceLock::new(),
             ::std::sync::OnceLock::new(),
             ::std::sync::OnceLock::new(),
         ];
         let lang_idx = ($crate::diagnostics::i18n::Lang::current() as usize) - 1;
+        // `Lang` starts at discriminant 1 (`LANG_EN = 1`), so the index is
+        // `discriminant - 1` and must stay in `0..3`.  A new variant with
+        // discriminant 0 would wrap to `usize::MAX`; the debug assert names
+        // that, and in release the bounds check below panics loudly rather
+        // than silently serving the wrong language (the old `.min(2)` coerced
+        // a bad index to Chinese — strictly worse than a panic).
+        debug_assert!(
+            lang_idx < $crate::diagnostics::i18n::N_LANGS,
+            "Lang discriminant out of the cached range"
+        );
         let table = CACHES[lang_idx].get_or_init(|| [$($init),+]);
         ::std::borrow::Cow::Borrowed(&table[$variant])
     }};
 }
 pub(crate) use cached_label;
+
+/// Zero-wrapper variant of [`cached_label!`]: returns `&'static str` directly.
+///
+/// `cached_label!` always produces `Cow::Borrowed` (the `init` expressions are
+/// `into_owned()` `String`s stored in a `OnceLock<[String; N]>`, so the borrow
+/// is `'static`), making the `Owned` branch dead and the `Cow` a 32-byte shell
+/// around a `&'static str`.  This macro skips the `Cow` entirely, returning
+/// `table[variant].as_str()` with the `'static` lifetime of the cached table.
+macro_rules! cached_label_static {
+    (
+        n = $n:literal,
+        variant = $variant:expr,
+        init = [$($init:expr),+ $(,)?],
+    ) => {{
+        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] = [
+            ::std::sync::OnceLock::new(),
+            ::std::sync::OnceLock::new(),
+            ::std::sync::OnceLock::new(),
+        ];
+        let lang_idx = ($crate::diagnostics::i18n::Lang::current() as usize) - 1;
+        // Same invariant as `cached_label!`: `LANG_EN = 1` anchors the
+        // `discriminant - 1` index in `0..3`; a 0-discriminant variant would
+        // wrap and must fail the debug assertion, not index garbage in
+        // release (the bounds check panics; no `.min` coercion).
+        debug_assert!(
+            lang_idx < $crate::diagnostics::i18n::N_LANGS,
+            "Lang discriminant out of the cached range"
+        );
+        let table = CACHES[lang_idx].get_or_init(|| [$($init),+]);
+        table[$variant].as_str()
+    }};
+}
+pub(crate) use cached_label_static;
 
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
@@ -397,6 +706,74 @@ mod tests {
             );
         }
         assert_eq!(Lang::from_u8(LANG_UNSET), None);
+    }
+
+    /// A slug that is known but whose arguments are missing (or an unknown
+/// slug) must report failure and leave `out` untouched — the caller then
+/// falls back to the verbatim message instead of rendering a bare slug or
+/// partial text.
+#[test]
+fn format_slug_into_degrades_without_touching_out() {
+    let en = lang_id_at(0);
+    let mut out = String::from("prefix");
+    assert!(!format_slug_into(en, "no-such-slug", None, &mut out));
+    assert_eq!(out, "prefix");
+    // `type-mismatch` needs two args; formatting without them fails.
+    assert!(!format_slug_into(en, "type-mismatch", None, &mut out));
+    assert_eq!(out, "prefix");
+}
+
+#[test]
+    fn detect_from_str_uses_primary_subtag_exactly() {
+        // Documented inputs resolve identically.
+        assert_eq!(detect_from_str("en"), Lang::En);
+        assert_eq!(detect_from_str("ru_RU"), Lang::Ru);
+        assert_eq!(detect_from_str("ru-RU"), Lang::Ru);
+        assert_eq!(detect_from_str("zh_TW"), Lang::Zh);
+        assert_eq!(detect_from_str("zh-Hant"), Lang::Zh);
+        // `zha` is Zhuang, not Chinese: a prefix test would misclassify it.
+        assert_eq!(detect_from_str("zha_CN"), Lang::En);
+        assert_eq!(detect_from_str("rux"), Lang::En);
+        // Unset / POSIX locale sentinels.
+        assert_eq!(detect_from_str(""), Lang::En);
+        assert_eq!(detect_from_str("C"), Lang::En);
+    }
+
+    /// The zero-arg slug cache must be language-aware: fetching under `En`,
+    /// switching to `Zh`, and fetching again must change the output.  If the
+    /// generated table ever latched a single language, this fails.
+    #[test]
+    fn zero_arg_slug_is_language_aware() {
+        let _lang_guard = acquire_test_lang_lock();
+        Lang::set(Lang::En);
+        let en = fluent::zero_arg_slug("main-not-found").expect("main-not-found exists");
+        Lang::set(Lang::Zh);
+        let zh = fluent::zero_arg_slug("main-not-found").expect("main-not-found exists");
+        assert_ne!(en, zh, "zero-arg slug cache did not follow Lang::set");
+        Lang::set(Lang::En);
+    }
+
+    /// `render` under a non-EN latch must produce localised, parameterised
+    /// output — the end-to-end path the RU/ZH direct-bundle test bypasses.
+    #[test]
+    fn render_localises_under_explicit_lang() {
+        let _lang_guard = acquire_test_lang_lock();
+        Lang::set(Lang::Ru);
+        assert_eq!(
+            render("main-not-found", &[]),
+            "функция `main` не найдена в крейте"
+        );
+        Lang::set(Lang::En);
+    }
+
+    /// `render_into` must leave `out` untouched when the slug is unknown.
+    #[test]
+    fn render_into_unknown_slug_leaves_buffer_untouched() {
+        let _lang_guard = acquire_test_lang_lock();
+        Lang::set(Lang::En);
+        let mut out = String::from("prefix:");
+        render_into("definitely-unknown-slug", &[], &mut out);
+        assert_eq!(out, "prefix:definitely-unknown-slug");
     }
 
     /// The stored discriminants must stay aligned with the `LANG_*` sentinels.
@@ -483,24 +860,23 @@ mod tests {
     /// avoid racing the global `Lang` against parallel tests.
     #[test]
     fn ru_and_zh_bundles_parse_and_render() {
-        use fluent_templates::Loader;
-        let no_args: HashMap<Cow<'static, str>, FluentValue> = HashMap::new();
+        let no_args = FluentArgs::new();
         assert_eq!(
-            LOCALES.try_lookup_with_args(&langid!("ru"), "main-not-found", &no_args),
+            format_slug(&langid!("ru"), "main-not-found", Some(&no_args)),
             Some("функция `main` не найдена в крейте".to_string())
         );
         assert_eq!(
-            LOCALES.try_lookup_with_args(&langid!("zh"), "main-not-found", &no_args),
+            format_slug(&langid!("zh"), "main-not-found", Some(&no_args)),
             Some("crate 中没有找到 `main` 函数".to_string())
         );
-        let mut count: HashMap<Cow<'static, str>, FluentValue> = HashMap::new();
-        count.insert(Cow::Borrowed("count"), FluentValue::try_number("2"));
+        let mut count = FluentArgs::new();
+        count.set("count", FluentValue::try_number("2"));
         assert_eq!(
-            LOCALES.try_lookup_with_args(&langid!("ru"), "summary-errors", &count),
+            format_slug(&langid!("ru"), "summary-errors", Some(&count)),
             Some("прерывание из-за 2 предыдущих ошибок".to_string())
         );
         assert_eq!(
-            LOCALES.try_lookup_with_args(&langid!("zh"), "summary-errors", &count),
+            format_slug(&langid!("zh"), "summary-errors", Some(&count)),
             Some("因之前的 2 个错误中止".to_string())
         );
     }
@@ -512,7 +888,7 @@ mod tests {
     fn render_parameterised_messages_substitute_arguments() {
         let _lang_guard = acquire_test_lang_lock();
         Lang::set(Lang::En);
-        let cases: [(&str, &[(&str, &str)], &str); 3] = [
+        let cases: [(&str, &[(&str, &str)], &str); 6] = [
             (
                 "missing-method",
                 &[("method", "to_bits"), ("trait", "BitCast")],
@@ -527,6 +903,21 @@ mod tests {
                 "let-requires-initializer",
                 &[],
                 "`let` requires an explicit initializer; it cannot rely on a type's default value",
+            ),
+            (
+                "comptime-step-limit",
+                &[],
+                "comptime step limit exceeded (possible infinite loop)",
+            ),
+            (
+                "comptime-type-error",
+                &[("e", "boom")],
+                "comptime type error: boom",
+            ),
+            (
+                "name-not-found",
+                &[("name", "foo")],
+                "name not found: `foo`",
             ),
         ];
         for (slug, kvs, want) in cases {

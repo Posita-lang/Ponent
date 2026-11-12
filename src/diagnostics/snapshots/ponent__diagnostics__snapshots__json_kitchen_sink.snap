@@ -3,27 +3,30 @@ source: src/diagnostics/snapshots.rs
 expression: out
 ---
 {
-  "id": "0x2d4bdb8fd810f164",
+  "id": "0x07fe47ea46a79e5d",
   "level": "error",
   "message": "return type mismatch",
   "code": "E030",
   "title": "type mismatch",
-  "category": "Type Error",
+  "category": "type",
   "file": "example.ps",
   "span": {"start": 43, "end": 68, "line": 3, "column": 2},
+  "additionalSpans": [
+    {"file": "example.ps", "start": 73, "end": 74, "line": 4, "column": 9}
+  ],
   "labels": [
-    {"start": 43, "end": 68, "file": 4294967295, "message": "this is Bool", "kind": "Primary"},
-    {"start": 0, "end": 8, "file": 4294967295, "message": "declared to return Int<32>", "kind": "Secondary"},
-    {"start": 9, "end": 69, "file": 4294967295, "message": "spans four lines", "kind": "Primary"}
+    {"start": 43, "end": 68, "file": "example.ps", "message": "this is Bool", "kind": "Primary"},
+    {"start": 0, "end": 8, "file": "example.ps", "message": "declared to return Int<32>", "kind": "Secondary"},
+    {"start": 9, "end": 69, "file": "example.ps", "message": "spans four lines", "kind": "Primary"}
   ],
   "relatedErrors": [
-    {"code": "E019", "message": "duplicate definition of `i`", "span": {"start": 43, "end": 56}}
+    {"file": "example.ps", "code": "E019", "message": "duplicate definition of `i`", "span": {"start": 43, "end": 56, "line": 3, "column": 2}}
   ],
   "help": "change the return type",
   "suggestions": [
     {"message": "cast with `as`", "applicability": "Unspecified", "style": "ShowAlways"}
   ],
   "callChain": [
-    {"label": "main", "kind": "Call", "location": "example.ps:1:1"}
+    {"label": "main", "kind": "Call", "file": "example.ps", "location": "example.ps:1:1"}
   ]
-  }
+}

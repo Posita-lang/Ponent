@@ -169,9 +169,21 @@ impl ComptimeReason {
     /// through Fluent so it follows the active
     /// [`Lang`](super::i18n::Lang).
     pub fn as_str(&self) -> Cow<'static, str> {
+        // Explicit variant → slot mapping, like every other label site
+        // (`level.rs`, `error_code.rs`, `chain.rs`): reordering the enum
+        // below must be a compile error here, not a silent label swap.
+        let variant = match self {
+            ComptimeReason::ComptimeBlock => 0,
+            ComptimeReason::ComptimeFnDef => 1,
+            ComptimeReason::ComptimeFnCall => 2,
+            ComptimeReason::ComptimeTest => 3,
+            ComptimeReason::Assertion => 4,
+            ComptimeReason::TypeInfo => 5,
+            ComptimeReason::LayoutOf => 6,
+        };
         crate::diagnostics::i18n::cached_label! {
             n = 7,
-            variant = *self as usize,
+            variant = variant,
             init = [
                 crate::diagnostics::i18n::fluent::comptime_reason_block().into_owned(),
                 crate::diagnostics::i18n::fluent::comptime_reason_fndef().into_owned(),
@@ -213,9 +225,15 @@ pub enum ComptimeErrorKind {
 }
 
 /// Map a frame span to the traceback's `Option<Span>`: the abandoned
-/// `(0,0)` sentinel becomes `None` (a frame with no source position),
-/// while a real zero-length span at offset 0 stays `Some` — same
-/// conversion `ChainEntry` made when it moved off the sentinel.
+/// `(0,0)` sentinel becomes `None` (a frame with no source position).
+///
+/// The conversion is ambiguous by construction: a *real* zero-length span at
+/// file offset 0 is exactly `(0,0)` and is also mapped to `None`, silently
+/// losing its position.  The sentinel lives in the traceback source
+/// representation (`Vec<(reason, Option<Span>)>` upstream stores the real
+/// `Option`), so this helper only bridges legacy `(reason, Span)` lists; a
+/// caller that needs start-of-file zero-length frames must store
+/// `Option<Span>` at construction instead of recovering it here.
 pub fn maybe_span(span: Span) -> Option<Span> {
     (span.start != 0 || span.end != 0).then_some(span)
 }
@@ -253,6 +271,61 @@ pub trait Humanizer<'src> {
     }
 }
 
+/// Localized message for a comptime failure (C4).
+///
+/// Shared by the borrowing [`Humanizer::message`] path and the consuming
+/// `humanize_into` path so the two cannot drift, and routed through Fluent so
+/// the most user-visible error family follows the active language instead of
+/// emitting English unconditionally.
+fn comptime_message<'a>(kind: &ComptimeErrorKind) -> DiagMessage<'a> {
+    match kind {
+        ComptimeErrorKind::StepLimitExceeded => DiagMessage::Slug {
+            slug: "comptime-step-limit",
+            pairs: smallvec![],
+        },
+        ComptimeErrorKind::DivisionByZero => DiagMessage::Slug {
+            slug: "comptime-division-by-zero",
+            pairs: smallvec![],
+        },
+        ComptimeErrorKind::Overflow => DiagMessage::Slug {
+            slug: "comptime-overflow",
+            pairs: smallvec![],
+        },
+        ComptimeErrorKind::TypeError(e) => DiagMessage::Slug {
+            slug: "comptime-type-error",
+            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+        },
+        ComptimeErrorKind::AssertionFailed(e) => DiagMessage::Slug {
+            slug: "comptime-assertion-failed",
+            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+        },
+        ComptimeErrorKind::UnknownIdentifier(e) => DiagMessage::Slug {
+            slug: "comptime-unknown-identifier",
+            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+        },
+        ComptimeErrorKind::NotComptimeAllowed(e) => DiagMessage::Slug {
+            slug: "comptime-not-allowed",
+            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+        },
+        ComptimeErrorKind::Deferred => DiagMessage::Slug {
+            slug: "comptime-deferred",
+            pairs: smallvec![],
+        },
+        ComptimeErrorKind::SandboxViolation(e) => DiagMessage::Slug {
+            slug: "comptime-sandbox-violation",
+            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+        },
+        ComptimeErrorKind::MemoryLimitExceeded(e) => DiagMessage::Slug {
+            slug: "comptime-memory-limit",
+            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+        },
+        ComptimeErrorKind::Internal(e) => DiagMessage::Slug {
+            slug: "comptime-internal",
+            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+        },
+    }
+}
+
 impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
     fn message(&self) -> DiagMessage<'src> {
         match self {
@@ -273,7 +346,16 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 let has_suffix =
                     reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
                 if has_suffix {
-                    let mut msg = String::new();
+                    // Pre-size: base sentence ≈ "type mismatch: expected `…`,
+                    // found `…`" plus the fixed `" ("`/`" — "` connectors, so
+                    // a TypeMismatch with context/reason never reallocates.
+                    let mut msg = String::with_capacity(
+                        expected.as_ref().len()
+                            + found.as_ref().len()
+                            + 48
+                            + context.map_or(0, |_| 24)
+                            + reason.as_ref().map_or(0, |r| r.len() + 8),
+                    );
                     crate::diagnostics::i18n::render_into(
                         "type-mismatch",
                         &[("expected", expected.clone()), ("found", found.clone())],
@@ -301,7 +383,13 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 field_name,
                 type_name,
                 ..
-            } => format!("no field `{field_name}` on type `{type_name}`").into(),
+            } => DiagMessage::Slug {
+                slug: "field-not-found",
+                pairs: smallvec![
+                    ("field", field_name.clone()),
+                    ("type", type_name.clone()),
+                ],
+            },
             DiagnosticKind::ArgumentTypeMismatch {
                 callee,
                 param_name,
@@ -317,7 +405,10 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                     ("found", found.clone()),
                 ],
             },
-            DiagnosticKind::NameNotFound { name, .. } => format!("name not found: `{name}`").into(),
+            DiagnosticKind::NameNotFound { name, .. } => DiagMessage::Slug {
+                slug: "name-not-found",
+                pairs: smallvec![("name", name.clone())],
+            },
             DiagnosticKind::DuplicateDefinition { name, .. } => DiagMessage::Slug {
                 slug: "duplicate-definition",
                 pairs: smallvec![("name", name.clone())],
@@ -340,45 +431,16 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
             DiagnosticKind::Comptime {
                 kind, traceback, ..
             } => {
-                let msg = match kind {
-                    ComptimeErrorKind::StepLimitExceeded => DiagMessage::static_str(
-                        "comptime step limit exceeded (possible infinite loop)",
-                    ),
-                    ComptimeErrorKind::DivisionByZero => {
-                        DiagMessage::static_str("division by zero in comptime expression")
-                    }
-                    ComptimeErrorKind::Overflow => {
-                        DiagMessage::static_str("integer overflow in comptime expression")
-                    }
-                    ComptimeErrorKind::TypeError(s) => format!("comptime type error: {s}").into(),
-                    ComptimeErrorKind::AssertionFailed(s) => {
-                        format!("comptime assertion failed: {s}").into()
-                    }
-                    ComptimeErrorKind::UnknownIdentifier(s) => {
-                        format!("unknown identifier in comptime: {s}").into()
-                    }
-                    ComptimeErrorKind::NotComptimeAllowed(s) => {
-                        format!("not allowed in comptime: {s}").into()
-                    }
-                    ComptimeErrorKind::Deferred => {
-                        DiagMessage::static_str("expression cannot be evaluated at compile time")
-                    }
-                    ComptimeErrorKind::SandboxViolation(s) => {
-                        format!("comptime sandbox violation: {s}").into()
-                    }
-                    ComptimeErrorKind::MemoryLimitExceeded(s) => {
-                        format!("comptime memory limit exceeded: {s}").into()
-                    }
-                    ComptimeErrorKind::Internal(s) => {
-                        format!("internal comptime error: {s}").into()
-                    }
-                };
+                let msg = comptime_message(kind);
                 if traceback.is_empty() {
                     msg
                 } else {
                     let mut s = String::with_capacity(64 + traceback.len() * 32);
                     msg.render_into(&mut s);
-                    s.push_str("\n\ncomptime call stack (most recent first):\n");
+                    s.push('\n');
+                    s.push('\n');
+                    s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
+                    s.push('\n');
                     for (i, (reason, span)) in traceback.iter().enumerate() {
                         if i > 0 {
                             s.push('\n');
@@ -585,7 +647,15 @@ impl<'src> DiagnosticKind<'src> {
                 let has_suffix =
                     reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
                 let message = if has_suffix {
-                    let mut msg = String::new();
+                    // Pre-size (see `message()`): avoids 1–2 reallocations on
+                    // the common with-context/with-reason path.
+                    let mut msg = String::with_capacity(
+                        expected.as_ref().len()
+                            + found.as_ref().len()
+                            + 48
+                            + context.map_or(0, |_| 24)
+                            + reason.as_ref().map_or(0, |r| r.len() + 8),
+                    );
                     crate::diagnostics::i18n::render_into(
                         "type-mismatch",
                         &[("expected", expected.clone()), ("found", found.clone())],
@@ -625,8 +695,10 @@ impl<'src> DiagnosticKind<'src> {
                 type_name,
                 span,
             } => {
-                let message: DiagMessage =
-                    format!("no field `{field_name}` on type `{type_name}`").into();
+                let message: DiagMessage = DiagMessage::Slug {
+                    slug: "field-not-found",
+                    pairs: smallvec![("field", field_name), ("type", type_name)],
+                };
                 let mut labels = CovariantVec::new();
                 labels.push(Label::new(span, fluent::label_field_not_found().lift()));
                 (message, labels, None, vec![])
@@ -666,7 +738,10 @@ impl<'src> DiagnosticKind<'src> {
                 span,
                 suggestions,
             } => {
-                let message: DiagMessage = format!("name not found: `{name}`").into();
+                let message: DiagMessage = DiagMessage::Slug {
+                    slug: "name-not-found",
+                    pairs: smallvec![("name", name)],
+                };
                 let mut labels = CovariantVec::new();
                 labels.push(Label::new(span, fluent::label_not_in_scope().lift()));
                 let help = if suggestions.is_empty() {
@@ -733,47 +808,16 @@ impl<'src> DiagnosticKind<'src> {
                 traceback,
             } => {
                 let message: DiagMessage = {
-                    let msg = match kind {
-                        ComptimeErrorKind::StepLimitExceeded => DiagMessage::static_str(
-                            "comptime step limit exceeded (possible infinite loop)",
-                        ),
-                        ComptimeErrorKind::DivisionByZero => {
-                            DiagMessage::static_str("division by zero in comptime expression")
-                        }
-                        ComptimeErrorKind::Overflow => {
-                            DiagMessage::static_str("integer overflow in comptime expression")
-                        }
-                        ComptimeErrorKind::TypeError(s) => {
-                            format!("comptime type error: {s}").into()
-                        }
-                        ComptimeErrorKind::AssertionFailed(s) => {
-                            format!("comptime assertion failed: {s}").into()
-                        }
-                        ComptimeErrorKind::UnknownIdentifier(s) => {
-                            format!("unknown identifier in comptime: {s}").into()
-                        }
-                        ComptimeErrorKind::NotComptimeAllowed(s) => {
-                            format!("not allowed in comptime: {s}").into()
-                        }
-                        ComptimeErrorKind::Deferred => DiagMessage::static_str(
-                            "expression cannot be evaluated at compile time",
-                        ),
-                        ComptimeErrorKind::SandboxViolation(s) => {
-                            format!("comptime sandbox violation: {s}").into()
-                        }
-                        ComptimeErrorKind::MemoryLimitExceeded(s) => {
-                            format!("comptime memory limit exceeded: {s}").into()
-                        }
-                        ComptimeErrorKind::Internal(s) => {
-                            format!("internal comptime error: {s}").into()
-                        }
-                    };
+                    let msg = comptime_message(&kind);
                     if traceback.is_empty() {
                         msg
                     } else {
                         let mut s = String::with_capacity(64 + traceback.len() * 32);
                         msg.render_into(&mut s);
-                        s.push_str("\n\ncomptime call stack (most recent first):\n");
+                        s.push('\n');
+                        s.push('\n');
+                        s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
+                        s.push('\n');
                         for (i, (reason, sp)) in traceback.iter().enumerate() {
                             if i > 0 {
                                 s.push('\n');
@@ -802,6 +846,119 @@ impl<'src> DiagnosticKind<'src> {
                 }
                 (message, labels, None, vec![])
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod humanizer_differential_tests {
+    use super::*;
+    use crate::ast::{FileId, Span};
+
+    fn span(a: usize, b: usize) -> Span {
+        Span::new(FileId::DUMMY, a as u32, b as u32)
+    }
+
+    fn corpus() -> Vec<DiagnosticKind<'static>> {
+        vec![
+            DiagnosticKind::TypeMismatch {
+                expected: Cow::Borrowed("Int<32>"),
+                found: Cow::Borrowed("Bool"),
+                span: span(0, 3),
+                found_span: Some(span(4, 8)),
+                reason: Some(Cow::Borrowed("nope")),
+                context: None,
+            },
+            DiagnosticKind::TypeMismatch {
+                expected: Cow::Borrowed("A"),
+                found: Cow::Borrowed("B"),
+                span: span(0, 1),
+                found_span: None,
+                reason: None,
+                context: None,
+            },
+            DiagnosticKind::NoSuchField {
+                field_name: Cow::Borrowed("x"),
+                type_name: Cow::Borrowed("T"),
+                span: span(2, 3),
+            },
+            DiagnosticKind::ArgumentTypeMismatch {
+                callee: Cow::Borrowed("f"),
+                param_name: Cow::Borrowed("a"),
+                expected: Cow::Borrowed("Int"),
+                found: Cow::Borrowed("Bool"),
+                span: span(5, 6),
+                param_span: Some(span(7, 8)),
+            },
+            DiagnosticKind::NameNotFound {
+                name: Cow::Borrowed("n"),
+                span: span(0, 1),
+                suggestions: vec!["m".to_string()],
+            },
+            DiagnosticKind::NameNotFound {
+                name: Cow::Borrowed("n"),
+                span: span(0, 1),
+                suggestions: Vec::new(),
+            },
+            DiagnosticKind::DuplicateDefinition {
+                name: Cow::Borrowed("d"),
+                this_span: span(0, 1),
+                original_span: span(2, 3),
+            },
+            DiagnosticKind::ContractNonBool {
+                clause: Cow::Borrowed("requires"),
+                found: Cow::Borrowed("Int"),
+                span: span(4, 5),
+            },
+            DiagnosticKind::ImplMissingMethod {
+                trait_name: Cow::Borrowed("Tr"),
+                method_name: Cow::Borrowed("m"),
+                impl_span: span(0, 1),
+                trait_span: span(2, 3),
+            },
+            DiagnosticKind::Comptime {
+                kind: ComptimeErrorKind::AssertionFailed("boom".into()),
+                span: span(0, 1),
+                traceback: vec![
+                    (ComptimeReason::Assertion, Some(span(0, 1))),
+                    (ComptimeReason::ComptimeBlock, None),
+                ],
+            },
+        ]
+    }
+
+    fn render(m: DiagMessage<'_>) -> String {
+        let mut out = String::new();
+        m.render_into_owned(&mut out);
+        out
+    }
+
+    fn label_key(l: &Label<'_>) -> (usize, usize, String) {
+        (l.span.start_as_usize(), l.span.end_as_usize(), l.message.to_string())
+    }
+
+    /// The borrowing `Humanizer` impl and the consuming `humanize_into`
+    /// duplicate every variant's formatting with no oracle. Pin them equal for
+    /// a corpus covering every variant and the main option combinations.
+    #[test]
+    fn humanizer_and_humanize_into_agree() {
+        for (i, k) in corpus().into_iter().enumerate() {
+            let lazy_msg = render(k.message());
+            let lazy_labels: Vec<_> = k.labels().iter().map(label_key).collect();
+            let lazy_help = k.help().map(|c| c.into_owned());
+            let lazy_sug: Vec<String> = k.suggestions().iter().map(|c| c.to_string()).collect();
+
+            let (m, labels, help, sug) = k.clone().humanize_into();
+            assert_eq!(lazy_msg, render(m), "message drift, corpus #{i}");
+            let got: Vec<_> = labels.iter().map(label_key).collect();
+            assert_eq!(lazy_labels, got, "labels drift, corpus #{i}");
+            assert_eq!(
+                lazy_help,
+                help.map(|c| c.into_owned()),
+                "help drift, corpus #{i}"
+            );
+            let got_sug: Vec<String> = sug.iter().map(|c| c.to_string()).collect();
+            assert_eq!(lazy_sug, got_sug, "suggestions drift, corpus #{i}");
         }
     }
 }

@@ -211,14 +211,14 @@ pub struct InferRegionTree {
     /// Uses Vec indexed by var_id (dense sequential integers) for direct
     /// O(1) indexing without hashing overhead.
     var_to_region: Vec<Option<InferRegionId>>,
-    /// Memoized per-region subtree var lists (review 3.5): `check_determinacy`
+    /// Memoized per-region subtree var lists: `check_determinacy`
     /// rebuilt region membership by scanning all nodes × `is_ancestor` on
     /// every call.  Membership of region r lives in r and every ancestor, so
     /// an invalidation clears exactly the mutated region's ancestor chain
     /// (`invalidate_subtree_cache_upwards`).  Pure cache — rollback clears it
     /// wholesale (pool state is restored there).
     subtree_vars_cache: HashMap<InferRegionId, Vec<usize>>,
-    /// Exhaustive NCA cross-check switch for `is_ancestor` (review 3.6):
+    /// Exhaustive NCA cross-check switch for `is_ancestor`:
     /// region regression tests that historically relied on per-call
     /// verification opt in via `set_verify_all`; production runs sample
     /// every 64th call in debug builds.
@@ -267,7 +267,7 @@ pub enum PoolUndoEntry {
 
 impl InferRegionTree {
     /// Opt in to exhaustive per-call NCA cross-checks of `is_ancestor`
-    /// (review 3.6). Tests that historically relied on exhaustiveness
+    /// Tests that historically relied on exhaustiveness
     /// (the ancestor-interval regression suite) call this once at setup.
     #[cfg(test)]
     pub fn set_verify_all(&self, on: bool) {
@@ -486,7 +486,7 @@ impl InferRegionTree {
         };
         let result = self.tin[ancestor.0] <= self.tin[node.0] && t_node <= t_anc;
         // Debug anchor: NCA is correct for open AND closed regions; the O(1)
-        // interval fast path must agree with it.  Sampling (review 3.6):
+        // interval fast path must agree with it.  Sampling:
         // is_ancestor sits inside exit_level's assert and the determinacy
         // region scans, so debug profiling pays for the O(log n) NCA on
         // EVERY call if we verify exhaustively — verify every 64th call in
@@ -642,7 +642,7 @@ impl InferRegionTree {
         // re-examined before its next exit.
         self.mark_dirty(region_id);
     }
-    /// Exact invalidation for `subtree_vars_cache` (review 3.5): region r's
+    /// Exact invalidation for `subtree_vars_cache`: region r's
     /// membership lives in r and every ancestor, so a mutation clears exactly
     /// the mutated region's ancestor chain.
     fn invalidate_subtree_cache_upwards(&mut self, mut region: InferRegionId) {
@@ -1668,7 +1668,7 @@ impl InferenceContext {
 /// Binary Lifting max levels: 2^20 ≈ 10^6, far beyond any real nesting depth.
 const MAX_LOG: usize = 20;
 
-/// Observability counter (review 4.5): number of times `lift` clamped a
+    /// Observability counter: number of times `lift` clamped a
 /// depth >= 2^20 query to the root.  A non-zero count in CI is a bug signal
 /// (region nesting should stay far below the table capacity).
 static REGION_LIFT_CLAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2265,7 +2265,7 @@ pub struct InferenceContext {
     /// entry to `None`.
     var_promotions: HashMap<usize, usize>,
     /// Memo cache for `check_rigid_escape` keyed by (type, region level)
-    /// (review 3.3: each candidate variable per sweep/transition walked the
+    /// (each candidate variable per sweep/transition walked the
     /// full resolved type). Keyed on `binding_epoch` — types are
     /// arena-immutable between allocations, so a stale hit is impossible
     /// across binding changes.
@@ -2275,7 +2275,7 @@ pub struct InferenceContext {
     /// keyed by type alone (level-free). Same epoch discipline.
     closed_type_cache: HashMap<TypeId, bool>,
     closed_cache_epoch: u64,
-    /// SMT-unicity memo (review 3.2): keyed by (fingerprint, target type).
+    /// SMT-unicity memo: keyed by (fingerprint, target type).
     /// The fingerprint covers every semantic input of the Z3 query (all
     /// resolved bindings, all active var-var Eq pairs, the skolem env), so
     /// a hit is a PROOF, not a heuristic reuse; a collision is impossible
@@ -3912,7 +3912,7 @@ impl InferenceContext {
             if in_env(i) {
                 continue;
             }
-            // Promotion-aware (review 3.2): a promoted var's binding lives
+            // Promotion-aware: a promoted var's binding lives
             // only in the solver-local maps, and a ctx-only resolve here
             // would feed Z3 a stale InferVar — making unicity HARDER, i.e.
             // conservative but prone to needless SMT calls.
@@ -3945,7 +3945,7 @@ impl InferenceContext {
             }
         }
 
-        // ── 3. Check unicity via Z3 (memoized, review 3.2) ───────
+        // ── 3. Check unicity via Z3 (memoized) ─────────────────
         // Fingerprint the ACTUAL inputs, order-independently.
         use std::hash::{Hash, Hasher};
         let mut h = rustc_hash::FxHasher::default();
@@ -4456,7 +4456,7 @@ impl InferenceContext {
         roots
     }
 
-    /// Memoized `check_rigid_escape` (review 3.3): the predicate is invoked
+    /// Memoized `check_rigid_escape`: the predicate is invoked
     /// per candidate variable per sweep/transition, and each call walked the
     /// full resolved type. Keyed by `(type, level)` and gated on the ctx
     /// binding epoch — types are arena-immutable between allocations, so a
@@ -4484,7 +4484,7 @@ impl InferenceContext {
         v
     }
 
-    /// Memoized closedness predicate (review 3.3): `!ty_mentions_infer_var`
+    /// Memoized closedness predicate: `!ty_mentions_infer_var`
     /// walked the full resolved type at every deferred-copy retry and
     /// Instance-handler check. Same epoch discipline as
     /// `check_rigid_escape_cached`.
@@ -5380,7 +5380,7 @@ impl InferenceContext {
             }
         }
         let var_region = self.type_vars.get(effective_id).map(|v| v.region_id);
-        // Memoized subtree membership (review 3.5): this rebuild ran an
+        // Memoized subtree membership: this rebuild ran an
         // all-nodes × is_ancestor scan per call; callers invoke
         // check_determinacy per PG variable.
         let mut region_vars: FxHashSet<usize> = var_region
@@ -6980,7 +6980,7 @@ impl InferenceContext {
             {
                 let mut match_ctx_changed = true;
                 // Cached (active Eqs, eq_index) carried across passes of the
-                // fixed-point loop (review 3.4): a discharge is the only
+                // fixed-point loop: a discharge is the only
                 // event that can push new Eqs, so the cache is invalidated
                 // exactly there; passes that discharge nothing reuse it.
                 let mut eq_cache: Option<(
@@ -7042,7 +7042,7 @@ impl InferenceContext {
                             continue;
                         }
                         // O(1) eq-index lookup instead of a per-match
-                        // linear scan (review 3.4).
+                        // linear scan.
                         if let Some(unicity_shape) = Self::unicity_check_with_index(
                             self,
                             ctx,

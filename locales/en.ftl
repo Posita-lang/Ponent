@@ -1,6 +1,18 @@
 # English source messages (rustc-style Fluent). Slugs are stable identifiers: never translated, renamed only with a codebase-wide codemod.
 
 comptime-error = comptime error: { $e }
+comptime-step-limit = comptime step limit exceeded (possible infinite loop)
+comptime-division-by-zero = division by zero in comptime expression
+comptime-overflow = integer overflow in comptime expression
+comptime-type-error = comptime type error: { $e }
+comptime-assertion-failed = comptime assertion failed: { $e }
+comptime-unknown-identifier = unknown identifier in comptime: { $e }
+comptime-not-allowed = not allowed in comptime: { $e }
+comptime-deferred = expression cannot be evaluated at compile time
+comptime-sandbox-violation = comptime sandbox violation: { $e }
+comptime-memory-limit = comptime memory limit exceeded: { $e }
+comptime-internal = internal comptime error: { $e }
+comptime-call-stack-header = comptime call stack (most recent first):
 trait-solver-error = trait solver error: { $msg }
 type-mismatch = type mismatch: expected `{ $expected }`, found `{ $found }`
 argument-type-mismatch = argument type mismatch in call to `{ $callee }`: parameter `{ $param }` expected `{ $expected }`, found `{ $found }`
@@ -8,6 +20,7 @@ contract-non-bool = `{ $clause }` clause must be boolean, found `{ $found }`
 impl-missing-method = impl of `{ $trait }` is missing method `{ $method }`
 duplicate-definition = duplicate definition of `{ $name }`
 field-not-found = no field `{ $field }` found on type `{ $type }`
+name-not-found = name not found: `{ $name }`
 main-not-found = `main` function not found in crate
 set-no-destructuring = `set` does not support pattern destructuring; use `let` instead
 let-requires-initializer = `let` requires an explicit initializer; it cannot rely on a type's default value
@@ -99,3 +112,16 @@ run-explain-hint-detail = run `ponent explain <CODE>` with a valid error code
 run-explain-hint-example = run `ponent explain <CODE>` with a valid code (e.g. `ponent explain E030`)
 run-explain-detail = Run `ponent explain <CODE>` for details on a specific error code.
 unknown-error = unknown error
+
+# Batch trailers / fold marker / call-chain header (renderers)
+suppressed-note =
+    { $count ->
+        [one]   { $count } additional error suppressed
+       *[other] { $count } additional errors suppressed
+    }
+fold-marker-lines =
+    { $gap ->
+        [one]   { $gap } line omitted
+       *[other] { $gap } lines omitted
+    }
+chain-header = referenced by:

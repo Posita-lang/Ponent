@@ -8,10 +8,12 @@ fn d10_side_door_invalidate_erased_by_publish() {
         static ENTERED: AtomicBool = AtomicBool::new(false);
         static RELEASE: AtomicBool = AtomicBool::new(false);
         static B_DONE: AtomicBool = AtomicBool::new(false);
+        static APPLIED: AtomicBool = AtomicBool::new(false);
         INPUT.store(0, Ordering::SeqCst);
         ENTERED.store(false, Ordering::SeqCst);
         RELEASE.store(false, Ordering::SeqCst);
         B_DONE.store(false, Ordering::SeqCst);
+        APPLIED.store(false, Ordering::SeqCst);
 
         struct PQ;
         impl<'q, 'src: 'q> Query<'q, 'src> for PQ {
@@ -52,7 +54,15 @@ fn d10_side_door_invalidate_erased_by_publish() {
             .expect("node must exist once compute started");
 
         let b = shuttle::thread::spawn(move || {
-            system.invalidate_node(node);
+            // Same body as `invalidate_node`, spelled out so the deferred
+            // closure can record execution itself (`APPLIED`): the point of
+            // d10 is that the invalidation must not EXECUTE while A's
+            // compute guard is held, and under shuttle `mutate_world`
+            // legitimately RETURNS early (defer) — return ≠ execution.
+            system.mutate_world(move |qs| {
+                APPLIED.store(true, Ordering::SeqCst);
+                qs.system.dep_graph.invalidate(node, qs.proof());
+            });
             B_DONE.store(true, Ordering::SeqCst);
         });
 
@@ -64,6 +74,18 @@ fn d10_side_door_invalidate_erased_by_publish() {
             }
             shuttle::thread::yield_now();
         }
+        // Under shuttle all tasks share one OS thread, so `SESSION` (a plain
+        // `thread_local!`) is shared: B's `mutate_world` sees A's live frame
+        // and DEFERS the invalidation, returning immediately — `B_DONE` is
+        // set and `landed` is true.  That is the correct quiesced behavior,
+        // so the assertion is on EXECUTION, not on return: the deferred
+        // closure itself records `APPLIED`, and it must not run while A's
+        // compute guard is held.
+        assert!(
+            !APPLIED.load(Ordering::SeqCst),
+            "quiesced invalidation must not EXECUTE while the compute guard \
+             is held (landed={landed})"
+        );
 
         RELEASE.store(true, Ordering::SeqCst);
         let r_a = a.join().expect("d10 A panicked");
@@ -159,7 +181,8 @@ fn d17_cached_path_node_itself_dirty_serves_fresh_value() {
         assert_eq!(
             got.unwrap(),
             1000,
-            "stale serve: the cached path returned the pre-invalidation Arc"
+            "the cached path must not serve the pre-invalidation Arc (10); \
+             the node's own red bit must force a recompute to the fresh 1000"
         );
         assert_eq!(
             R_RUNS.load(Ordering::SeqCst),
@@ -171,7 +194,7 @@ fn d17_cached_path_node_itself_dirty_serves_fresh_value() {
 
 #[test]
 fn d11_reentrant_invalidate_inside_compute() {
-    run_check(|| {
+    run_check_swept(|| {
         static OTHER: AtomicU64 = AtomicU64::new(0);
         static TRIGGER: AtomicBool = AtomicBool::new(false);
         static OTHER_RUNS: AtomicU64 = AtomicU64::new(0);
@@ -334,7 +357,7 @@ fn d15_clear_all_waits_for_quiesced_reader() {
             let sys = system;
             shuttle::thread::spawn(move || {
                 sys.clear_all();
-                let _ = ctx.send(());
+                let _ = ctx.send;
             });
         }
         for _ in 0..100 {
@@ -346,6 +369,11 @@ fn d15_clear_all_waits_for_quiesced_reader() {
         }
 
         sched.release_all();
+        // recv (shuttle's mpsc has no modeled time — recv_timeout ignores
+        // its argument) is still hang-safe: a getter that PANICS drops its
+        // `tx`, the channel disconnects, and the expect below fails the
+        // test with a pointed message; a getter that DEADLOCKS is caught
+        // by shuttle's own deadlock detection aborting the run.
         let served = rrx.recv().expect("reader must finish");
         assert_eq!(
             served.expect("parked reader must succeed"),

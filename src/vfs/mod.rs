@@ -67,6 +67,26 @@ pub trait VfsBackend: fmt::Debug {
     ) -> Result<(String, Option<std::time::SystemTime>), VfsError<'static>> {
         self.read_file(path).map(|s| (s, None))
     }
+
+    /// Read a file as raw bytes.
+    ///
+    /// Default: UTF-8-validated [`read_file`](Self::read_file) (backends that
+    /// store `String`s need no change).  Real filesystems override this with a
+    /// byte read so a source that is not valid UTF-8 is *diagnosed* by the
+    /// loader instead of being silently decoded through U+FFFD (which would
+    /// also break every byte-offset span).
+    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError<'static>> {
+        self.read_file(path).map(String::into_bytes)
+    }
+
+    /// Byte-exact variant of [`read_file_with_mtime`](Self::read_file_with_mtime).
+    fn read_file_bytes_with_mtime(
+        &self,
+        path: &str,
+    ) -> Result<(Vec<u8>, Option<std::time::SystemTime>), VfsError<'static>> {
+        self.read_file_with_mtime(path)
+            .map(|(s, m)| (s.into_bytes(), m))
+    }
 }
 
 /// Collapse `.` / `..` segments and duplicate separators lexically.
@@ -148,6 +168,20 @@ impl VfsBackend for FsBackend {
         path: &str,
     ) -> Result<(String, Option<std::time::SystemTime>), VfsError<'static>> {
         let content = self.read_file(path)?;
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        Ok((content, mtime))
+    }
+
+    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError<'static>> {
+        std::fs::read(path)
+            .map_err(|e| VfsError::Io(format!("failed to read '{}': {}", path, e)))
+    }
+
+    fn read_file_bytes_with_mtime(
+        &self,
+        path: &str,
+    ) -> Result<(Vec<u8>, Option<std::time::SystemTime>), VfsError<'static>> {
+        let content = self.read_file_bytes(path)?;
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         Ok((content, mtime))
     }
@@ -473,7 +507,7 @@ where
         for result in lexer {
             match result {
                 Ok(token) => tokens.push(token),
-                Err(()) => return Err(VfsError::Lex(format!("invalid token in '{}'", self.name))),
+                Err(_) => return Err(VfsError::Lex(format!("invalid token in '{}'", self.name))),
             }
         }
         self.tokens = Some(tokens);
@@ -504,11 +538,11 @@ where
             .src
             .as_deref()
             .ok_or(VfsError::Io("source not loaded".to_string()))?;
+        let src: &'input str = arena.alloc_str(raw);
         let mut source_map = crate::sourcemap::SourceMap::new();
         let file_id = source_map
-            .add_file(self.name.clone(), raw)
+            .add_file(self.name.clone(), src)
             .map_err(|e| VfsError::Io(e.to_string()))?;
-        let src: &'input str = arena.alloc_str(raw);
         let mut parser = Parser::new(src, file_id, arena);
         match parser.parse_program() {
             Ok(program) => {

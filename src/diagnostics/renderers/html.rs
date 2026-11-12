@@ -5,9 +5,10 @@ use crate::ast::Span;
 use crate::diagnostics::emitter::stylesheet::dark_css_cached;
 
 use crate::diagnostics::Diagnostic;
+use crate::diagnostics::DiagnosticLevel;
 use crate::diagnostics::LineIndex;
 use crate::diagnostics::glyph::{
-    DEFAULT_TAB_WIDTH, LabelWindow, UnderlineLanes, compute_line_annotation_ranges,
+    LabelWindow, SectionScratch, byte_offset_to_display, compute_line_annotation_ranges,
     render_line_merged_with,
 };
 use crate::diagnostics::label::Label;
@@ -15,30 +16,52 @@ use crate::diagnostics::render::{RenderCtx, Renderer};
 use crate::diagnostics::renderers::fmt;
 use crate::diagnostics::sink::DiagnosticSink;
 use crate::smallvec::{SmallVec, smallvec};
+use litemap::LiteMap;
 use std::borrow::Cow;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fmt::Write as _;
 use std::io;
 
 /// HTML renderer — generates diagnostic output as HTML.
 /// Inspired by Austral's Reporter.ml which produces interactive call trees.
 pub struct HtmlRenderer {
-    /// Number of source lines of context to show around a span.
-    context_lines: usize,
+    /// Explicit `with_context_lines` override.  When `None` the context
+    /// count comes from the batch `RenderCtx`'s `DiagOpts` (emitter path) or
+    /// from `fallback_context_lines` (single-shot path).
+    context_lines_override: Option<usize>,
+    /// `DiagOpts::context_lines` snapshot for the no-`RenderCtx` path.
+    fallback_context_lines: usize,
+    /// `DiagOpts::tab_width` snapshot for the no-`RenderCtx` path.
+    fallback_tab_width: usize,
 }
 
 impl HtmlRenderer {
     pub fn new() -> Self {
+        let opts = crate::diagnostics::DiagOpts::default();
         HtmlRenderer {
-            context_lines: crate::diagnostics::DiagOpts::default().context_lines,
+            context_lines_override: None,
+            fallback_context_lines: opts.context_lines,
+            fallback_tab_width: opts.tab_width.max(1),
+        }
+    }
+
+    /// Build a renderer whose `context_lines` and `tab_width` come from
+    /// `opts`, mirroring [`GlyphRenderer::with_opts`] — the CLI/config
+    /// `--context-lines` / `--tab-width` flags reach HTML output through
+    /// this constructor.  A batch `RenderCtx`'s `DiagOpts` still takes
+    /// precedence (see [`Self::with_context_lines`] for an explicit
+    /// override that beats both).
+    pub fn with_opts(opts: &crate::diagnostics::DiagOpts) -> Self {
+        HtmlRenderer {
+            context_lines_override: None,
+            fallback_context_lines: opts.context_lines,
+            fallback_tab_width: opts.tab_width.max(1),
         }
     }
 
     /// Override the number of source lines of context shown around a span,
     /// mirroring [`GlyphRenderer::with_context_lines`](crate::diagnostics::GlyphRenderer::with_context_lines).
     pub fn with_context_lines(mut self, n: usize) -> Self {
-        self.context_lines = n;
+        self.context_lines_override = Some(n);
         self
     }
 }
@@ -50,7 +73,7 @@ impl Default for HtmlRenderer {
 }
 
 impl Renderer for HtmlRenderer {
-    fn begin(&self, out: &mut impl DiagnosticSink) -> io::Result<()> {
+    fn begin(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
         out.write_str(
             "<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='utf-8'>\n\
              <title>Ponent Compiler Diagnostics</title>\n\
@@ -94,9 +117,12 @@ impl Renderer for HtmlRenderer {
              </style>\n\
              <script>\n\
              (function(){\n\
+               // Runs synchronously in <head>: it only touches\n\
+               // `document.documentElement`, which already exists, so the\n\
+               // light class is set before the body paints (no theme flash).\n\
                var t = localStorage.getItem('ponent-theme');\n\
                if (t === 'light' || (!t && matchMedia('(prefers-color-scheme: light)').matches)) {\n\
-                 document.body.classList.add('light');\n\
+                 document.documentElement.classList.add('light');\n\
                }\n\
              })();\n\
              </script>\n\
@@ -105,7 +131,7 @@ impl Renderer for HtmlRenderer {
              <script>\n\
              (function(){\n\
                function toggle() {\n\
-                 var light = document.body.classList.toggle('light');\n\
+                 var light = document.documentElement.classList.toggle('light');\n\
                  localStorage.setItem('ponent-theme', light ? 'light' : 'dark');\n\
                }\n\
                document.getElementById('theme-toggle-btn').addEventListener('click', toggle);\n\
@@ -156,7 +182,7 @@ impl Renderer for HtmlRenderer {
         )
     }
 
-    fn end(&self, out: &mut impl DiagnosticSink) -> io::Result<()> {
+    fn end(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
         out.write_str("</body>\n</html>")
     }
 
@@ -170,6 +196,7 @@ impl Renderer for HtmlRenderer {
 
 impl HtmlRenderer {
     /// Single-shot entry point (tests): builds its own line index.
+    #[cfg(test)]
     fn diagnostic_to_html(&self, diag: &Diagnostic<'_>) -> String {
         let mut out = String::new();
         self.diagnostic_to_html_impl(diag, None, &mut out);
@@ -192,7 +219,13 @@ impl HtmlRenderer {
             .map_or(512, |s| (s.len() / 4).clamp(512, 16 * 1024));
         out.reserve(hint);
         let html = out;
-        let level_class = diag.level.as_str();
+        let level_class = if matches!(diag.level, DiagnosticLevel::Fatal) {
+            // [3]6: the stylesheet defines `.diag.error`, not `.fatal`;
+            // fatal diagnostics must not lose their severity styling.
+            "error"
+        } else {
+            diag.level.as_str()
+        };
         // `with_code_str` explicitly supports untrusted input (unknown codes
         // are stored verbatim), so the code string must be escaped like any
         // other external text.
@@ -200,10 +233,6 @@ impl HtmlRenderer {
         // and the summary `[code]` — `escape` is a full scan, so two calls
         // per diagnostic is pure waste.
         let code_esc: Option<Cow<'_, str>> = diag.code.as_ref().map(|c| self.escape(c.code()));
-        let code_str = code_esc
-            .as_ref()
-            .map(|esc| format!("<span class='code'>{}</span> ", esc))
-            .unwrap_or_default();
 
         html.push_str("<details class='diag ");
         html.push_str(level_class);
@@ -212,22 +241,30 @@ impl HtmlRenderer {
         // Collapsible summary line — `error[E030]: boom` (rustc form); the
         // diagnostic starts expanded (`open`) so streaming output keeps
         // the same visible content, users just gain the collapse control.
+        // `diag.message` is escaped once and reused for both the summary and
+        // the body — `escape` is a full scan, so two calls per diagnostic is
+        // pure waste.
         let level_label = diag.level.label();
-        let summary_code = code_esc
-            .as_ref()
-            .map(|esc| format!(" [{}]", esc))
-            .unwrap_or_default();
+        // Route through the accessors so a kind-built diagnostic that was
+        // never humanized fails the same debug assert as the JSON renderer
+        // instead of silently rendering an empty message.
+        let msg_esc = self.escape(diag.message());
         html.push_str("<summary><span class='code'>");
-        html.push_str(&level_label);
+        html.push_str(level_label);
         html.push_str("</span>: <span class='message'>");
-        html.push_str(&self.escape(&diag.message));
+        html.push_str(&msg_esc);
         html.push_str("</span></summary>\n");
 
-        // Main message — `code_str` already carries its own `<span class='code'>`.
+        // Main message — `code_esc` carries its own `<span class='code'>` when
+        // present; pushed in three pieces to avoid a per-diagnostic `format!`.
         html.push_str("<div>");
-        html.push_str(&code_str);
+        if let Some(esc) = &code_esc {
+            html.push_str("<span class='code'>");
+            html.push_str(esc);
+            html.push_str("</span> ");
+        }
         html.push_str("<span class='message'>");
-        html.push_str(&self.escape(&diag.message));
+        html.push_str(&msg_esc);
         html.push_str("</span></div>\n");
 
         // Span location.  When the diagnostic carries a source buffer we can
@@ -244,30 +281,36 @@ impl HtmlRenderer {
         }
 
         if let Some(span) = diag.spans.first() {
-            let location = match (&idx_opt, diag.source.as_ref()) {
-                (Some(idx), Some(_)) => {
-                    let file = diag.file_name();
-                    let (line, col) = idx.linecol_display(span.start_as_usize());
-                    if file.is_empty() {
-                        format!("{}:{}", line + 1, col + 1)
-                    } else {
-                        format!("{file}:{}:{}", line + 1, col + 1)
-                    }
-                }
-                _ => span.to_string(),
-            };
             html.push_str("<div class='span'>at ");
-            html.push_str(&self.escape(&location));
+            match (&idx_opt, diag.source.as_ref()) {
+                (Some(idx), Some(source)) => {
+                    // Stream the location: the old `format!` built one
+                    // `String` and `escape` built a second, per diagnostic.
+                    let file = diag.file_name();
+                    if !file.is_empty() {
+                        // [1]2: the visible `at file:line:col` must be
+                        // sanitized like every other renderer; a raw
+                        // control/bidi filename could forge terminal state in
+                        // the HTML body even though the attribute is clean.
+                        html.push_str(&self.escape(file));
+                        html.push(':');
+                    }
+                    let (line, col) =
+                        idx.linecol_display(span.start_as_usize().min(source.len()));
+                    fmt::push_uint(html, (line + 1) as u64);
+                    html.push(':');
+                    fmt::push_uint(html, (col + 1) as u64);
+                }
+                _ => {
+                    let opaque = span.to_string();
+                    html.push_str(&self.escape(&opaque));
+                }
+            }
             html.push_str("</div>\n");
         }
 
         // Source context — render directly from Diagnostic struct fields
         if let Some(source) = source_ctx {
-            // Multi-file guard: the source buffer belongs to the first
-            // primary span's file (emitter contract), so only labels from
-            // that file can be located in it.  Labels from other files are
-            // rendered below as byte-range notes instead of bogus
-            // line/column positions.
             let idx = idx_opt
                 .as_ref()
                 .expect("idx_opt is Some whenever a source is present");
@@ -276,27 +319,65 @@ impl HtmlRenderer {
             // that file can be located in it.  Labels from other files are
             // rendered below as byte-range notes instead of bogus
             // line/column positions.
-            let primary_spans = diag.spans.primary();
+            let primary_spans = diag.spans.primary_ref();
             let anchor_file = primary_spans.first().map(|sp| sp.file);
-            // Borrowed view — one pointer per label, no clone.
-            let labels: SmallVec<[&Label<'_>; 4]> = diag
-                .labels
+            // Multi-file guard (mirrors the glyph renderer): `source` is the
+            // anchor file's buffer, so primary spans from other files have
+            // meaningless offsets in it — they would be clamped into bogus
+            // sections/columns.  Filter them out here; the foreign-source
+            // loop below renders them against their own buffers.
+            let anchor_primary_spans: SmallVec<[Span; 4]> = primary_spans
                 .iter()
-                .filter(|l| anchor_file.is_none_or(|anchor| l.span.file == anchor))
+                .copied()
+                .filter(|&sp| Some(sp.file) == anchor_file)
                 .collect();
+            // Borrowed view — one pointer per label, no clone.  Single pass:
+            // anchor-file labels feed the source section, foreign labels are
+            // grouped by file in the same walk (`LiteMap`, matching the
+            // glyph renderer) instead of a second O(L) filter pass later.
+            // A handful of `FileId` keys makes a sorted flat vector cheaper
+            // than Fx's SipHash setup.
+            let mut labels: SmallVec<[&Label<'_>; 4]> = SmallVec::new();
+            let mut foreign_labels_by_file: LiteMap<FileId, SmallVec<[&Label<'_>; 4]>> =
+                LiteMap::new();
+            for lbl in &diag.labels {
+                if anchor_file.is_none_or(|anchor| lbl.span.file == anchor) {
+                    labels.push(lbl);
+                } else {
+                    foreign_labels_by_file
+                        .entry(lbl.span.file)
+                        .or_insert_with(SmallVec::new)
+                        .push(lbl);
+                }
+            }
             let pre_start = html.len();
             html.push_str("<pre class='source-line'>");
             if self.render_source_html_into(
                 source,
-                &primary_spans,
+                &anchor_primary_spans,
                 &labels,
                 idx,
                 diag.file_name(),
+                cx,
                 html,
             ) {
                 html.push_str("</pre>\n");
             } else {
                 html.truncate(pre_start);
+                // No source section could be drawn (no primary span in this
+                // buffer, or an empty source) — but the anchor-file labels
+                // still own user-visible text.  Emit them as notes so no
+                // label message silently disappears.
+                for lbl in &labels {
+                    if lbl.message.is_empty() {
+                        continue;
+                    }
+                    html.push_str("<span class='label'>= note: ");
+                    html.push_str(&self.escape(&lbl.message));
+                    html.push_str(" at ");
+                    html.push_str(&self.escape(&lbl.span.to_string()));
+                    html.push_str("</span>\n");
+                }
             }
             // Labels filtered out of the source section (from other files)
             // stay visible as range notes; their line/col would be
@@ -311,49 +392,32 @@ impl HtmlRenderer {
                 // Partition spans/labels by file once so each foreign file's
                 // section does not re-scan the full `primary_spans` /
                 // `diag.labels` lists.  Turns the foreign loop from
-                // O(F·(S+L)) into O(S+L+F).
-                let mut foreign_spans_by_file: SmallVec<[(FileId, SmallVec<[Span; 2]>); 2]> =
-                    SmallVec::new();
-                for &sp in &primary_spans {
+                // O(F·(S+L)) into O(S+L+F).  `LiteMap` over a handful of
+                // `FileId` keys: O(log n) binary search, no hash-table shell.
+                let mut foreign_spans_by_file: LiteMap<FileId, SmallVec<[Span; 2]>> =
+                    LiteMap::new();
+                for &sp in primary_spans.iter() {
                     if Some(sp.file) != anchor_file {
-                        if let Some(slot) = foreign_spans_by_file
-                            .iter_mut()
-                            .find(|(f, _)| *f == sp.file)
-                        {
-                            slot.1.push(sp);
-                        } else {
-                            foreign_spans_by_file.push((sp.file, smallvec![sp]));
-                        }
-                    }
-                }
-                let mut foreign_labels_by_file: SmallVec<[(FileId, SmallVec<[&Label<'_>; 4]>); 2]> =
-                    SmallVec::new();
-                for lbl in &diag.labels {
-                    if Some(lbl.span.file) != anchor_file {
-                        if let Some(slot) = foreign_labels_by_file
-                            .iter_mut()
-                            .find(|(f, _)| *f == lbl.span.file)
-                        {
-                            slot.1.push(lbl);
-                        } else {
-                            foreign_labels_by_file.push((lbl.span.file, smallvec![lbl]));
-                        }
+                        foreign_spans_by_file
+                            .entry(sp.file)
+                            .or_insert_with(SmallVec::new)
+                            .push(sp);
                     }
                 }
                 for (fid, fname, fsource) in foreign.iter() {
                     if Some(*fid) == anchor_file {
                         continue;
                     }
+                    let empty_spans: SmallVec<[Span; 2]> = SmallVec::new();
                     let f_primaries: &[Span] = foreign_spans_by_file
-                        .iter()
-                        .find(|(f, _)| *f == *fid)
-                        .map(|(_, v)| v.as_slice())
-                        .unwrap_or(&[]);
+                        .get(fid)
+                        .unwrap_or(&empty_spans)
+                        .as_slice();
+                    let empty_labels: SmallVec<[&Label<'_>; 4]> = SmallVec::new();
                     let f_labels: &[&Label<'_>] = foreign_labels_by_file
-                        .iter()
-                        .find(|(f, _)| *f == *fid)
-                        .map(|(_, v)| v.as_slice())
-                        .unwrap_or(&[]);
+                        .get(fid)
+                        .unwrap_or(&empty_labels)
+                        .as_slice();
                     if f_primaries.is_empty() && f_labels.is_empty() {
                         continue;
                     }
@@ -369,13 +433,18 @@ impl HtmlRenderer {
                         f_labels,
                         &f_idx,
                         fname.as_ref(),
+                        cx,
                         html,
                     ) {
                         html.push_str("</pre>\n");
+                        // Only a file whose section actually drew suppresses
+                        // the fallback note path below; a file whose render
+                        // failed (e.g. no primary span and empty source)
+                        // must fall through so its labels stay visible.
+                        foreign_rendered_files.push(*fid);
                     } else {
                         html.truncate(pre_start);
                     }
-                    foreign_rendered_files.push(*fid);
                 }
             }
             for lbl in diag
@@ -395,6 +464,52 @@ impl HtmlRenderer {
                 html.push_str(&self.escape(&lbl.span.to_string()));
                 html.push_str("</span>\n");
             }
+            // Primary spans whose foreign file was never registered (or whose
+            // section could not draw) must not vanish: surface each as a
+            // location-only note, mirroring the glyph renderer's fallback.
+            for sp in primary_spans.iter() {
+                if Some(sp.file) == anchor_file
+                    || foreign_rendered_files.contains(&sp.file)
+                {
+                    continue;
+                }
+                // Per-span file name: a foreign span must keep its own name,
+                // never the anchor's.
+                let loc = match diag.file_name_for(sp.file) {
+                    Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {sp}"),
+                    _ => sp.to_string(),
+                };
+                html.push_str("<span class='label'>at ");
+                html.push_str(&self.escape(&loc));
+                html.push_str("</span>\n");
+            }
+        } else {
+            // No source attached: labels and additional primary spans would
+            // otherwise vanish (only the first span's location header above
+            // survives).  Mirror the glyph renderer's no-source fallback.
+            for sp in diag.spans.primary_ref().iter().skip(1) {
+                let loc = match diag.file_name_for(sp.file) {
+                    Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {sp}"),
+                    _ => sp.to_string(),
+                };
+                html.push_str("<div class='span'>at ");
+                html.push_str(&self.escape(&loc));
+                html.push_str("</div>\n");
+            }
+            for lbl in &diag.labels {
+                if lbl.message.is_empty() {
+                    continue;
+                }
+                let loc = match diag.file_name_for(lbl.span.file) {
+                    Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {}", lbl.span),
+                    _ => lbl.span.to_string(),
+                };
+                html.push_str("<span class='label'>= note: ");
+                html.push_str(&self.escape(&lbl.message));
+                html.push_str(" at ");
+                html.push_str(&self.escape(&loc));
+                html.push_str("</span>\n");
+            }
         }
 
         // Related errors (Zig-style numbered context, matching the human
@@ -402,13 +517,12 @@ impl HtmlRenderer {
         if !diag.related_errors.is_empty() {
             html.push_str("<ul class='related'>\n");
             for rel in &diag.related_errors {
-                let code_part = rel
-                    .code
-                    .as_ref()
-                    .map(|c| format!("<span class='code'>{}</span> ", self.escape(c.code())))
-                    .unwrap_or_default();
                 html.push_str("<li class='related-entry'>");
-                html.push_str(&code_part);
+                if let Some(c) = &rel.code {
+                    html.push_str("<span class='code'>");
+                    html.push_str(&self.escape(c.code()));
+                    html.push_str("</span> ");
+                }
                 html.push_str("<span class='message'>");
                 html.push_str(&self.escape(&rel.message));
                 html.push_str("</span>");
@@ -422,15 +536,26 @@ impl HtmlRenderer {
             html.push_str("</ul>\n");
         }
 
-        // Suggestions
+        // Suggestions.  Mirror the human renderer's visibility policy: a
+        // `HideCodeAlways` / `CompletelyHidden` suggestion is internal and must
+        // not become user-facing HTML.  `Suggestion`'s `Display` also carries
+        // the applicability tag (`(maybe incorrect)`, …), so a consumer sees
+        // the same confidence signal as the terminal output.
         for suggestion in &diag.suggestions {
+            if matches!(
+                suggestion.style,
+                crate::diagnostics::SuggestionStyle::HideCodeAlways
+                    | crate::diagnostics::SuggestionStyle::CompletelyHidden
+            ) {
+                continue;
+            }
             html.push_str("<div class='suggestion'>suggestion: ");
-            html.push_str(&self.escape(&suggestion.message));
+            html.push_str(&self.escape(&suggestion.to_string()));
             html.push_str("</div>\n");
         }
 
         // Help
-        if let Some(help) = &diag.help {
+        if let Some(help) = diag.help() {
             html.push_str("<div class='help-text'>help: ");
             html.push_str(&self.escape(help));
             html.push_str("</div>\n");
@@ -443,6 +568,11 @@ impl HtmlRenderer {
             && !chain.is_empty()
         {
             let file_name = diag.file_name();
+            // Coordinate resolution is only valid against the anchor file's
+            // line index; a foreign-file entry would otherwise print a
+            // plausible but wrong `line:col` (the human and JSON renderers
+            // already guard this).
+            let anchor_file = diag.spans().first().map(|s| s.file);
             let idx = idx_opt.as_ref();
             html.push_str("<div class='chain'>referenced by:\n");
             for entry in chain.entries() {
@@ -450,8 +580,11 @@ impl HtmlRenderer {
                 html.push_str(&self.escape(&entry.message));
                 html.push_str("</span>: ");
                 html.push_str(&entry.kind.as_str());
-                if let (Some(idx), Some(span)) = (idx, entry.span) {
-                    let (line, col) = idx.linecol_display(span.start_as_usize());
+                if let (Some(idx), Some(span)) = (idx, entry.span)
+                    && anchor_file == Some(span.file)
+                {
+                    let limit = diag.source().map_or(span.start_as_usize(), |s| s.len());
+                    let (line, col) = idx.linecol_display(span.start_as_usize().min(limit));
                     html.push_str(" at ");
                     if !file_name.is_empty() {
                         html.push_str(&self.escape(file_name));
@@ -460,6 +593,13 @@ impl HtmlRenderer {
                     fmt::push_uint(html, (line + 1) as u64);
                     html.push(':');
                     fmt::push_uint(html, (col + 1) as u64);
+                } else if let Some(span) = entry.span
+                    && let Some(name) = diag.file_name_for(span.file)
+                {
+                    // No index for a foreign file: name it without inventing a
+                    // line/column rather than silently dropping the location.
+                    html.push_str(" at ");
+                    html.push_str(&self.escape(name));
                 }
                 html.push_str("</div>\n");
             }
@@ -471,7 +611,12 @@ impl HtmlRenderer {
             let explain = code.explain();
             if !explain.is_empty() {
                 html.push_str("<details class='explain'>\n<summary>Explain ");
-                html.push_str(&self.escape(code.code()));
+                // `code_esc` (escaped once at the top of this function) is
+                // still in scope and borrows `diag.code` — reuse it instead
+                // of paying a second full escape scan per diagnostic.
+                if let Some(esc) = &code_esc {
+                    html.push_str(esc);
+                }
                 html.push_str("</summary>\n<pre>");
                 html.push_str(&self.escape(explain));
                 html.push_str("</pre>\n</details>\n");
@@ -491,6 +636,7 @@ impl HtmlRenderer {
         labels: &[&Label<'src>],
         idx: &LineIndex<'_>,
         file_name: &str,
+        cx: Option<&RenderCtx<'_>>,
         out: &mut String,
     ) -> bool {
         let Some(&span) = primary_spans.first() else {
@@ -503,19 +649,48 @@ impl HtmlRenderer {
             return false;
         }
 
-        // §8: the caller supplies the line index (built once per source, not
+        // The caller supplies the line index (built once per source, not
         // per diagnostic); every conversion below is O(log n).
         let starts = idx.starts();
 
         // Character column, not `to_linecol`'s byte column: the start
         // position is printed as `file:line:col` (the `data-location`
         // click-to-copy target), which editors count in characters.
-        let (start_line, start_col) = idx.linecol_display(span.start_as_usize());
-        let end_pos = idx.to_linecol(span.end_as_usize());
+        // Clamp: a malformed or foreign span can carry an offset past the
+        // registered source, and `linecol_display` would index out of range
+        // (the JSON renderer already guards this).
+        let (start_line, start_col) =
+            idx.linecol_display(span.start_as_usize().min(source.len()));
 
-        let context_lines = self.context_lines;
-        let first_line = start_line.saturating_sub(context_lines);
+        // Option resolution: an explicit `with_context_lines` beats the
+        // batch `DiagOpts`, which beats this renderer's constructor snapshot
+        // (the single-shot `diagnostic_to_html` path has no `RenderCtx`).
+        let context_lines = self.context_lines_override.unwrap_or(match cx {
+            Some(c) => c.opts.context_lines,
+            None => self.fallback_context_lines,
+        });
+        let tab_width = match cx {
+            Some(c) => c.opts.tab_width.max(1),
+            None => self.fallback_tab_width,
+        };
         let text_last_line = idx.text_line_count().saturating_sub(1);
+
+        // One `to_linecol` pair per primary span, computed once: the
+        // last-line clamp loop and the section-merge loop below both need
+        // exactly these (start_line, end_line) values, so resolving them
+        // inline there paid `3·S` binary searches where `2·S` suffice.
+        let primary_lines: SmallVec<[(usize, usize); 4]> = primary_spans
+            .iter()
+            .map(|&sp| {
+                let s = idx.to_linecol(sp.start_as_usize());
+                // End line comes from `span_lines`, not `to_linecol(end)`:
+                // the exclusive-end byte can land on a line start, which
+                // would over-count one line — the same distinction the glyph
+                // renderer handles with `span_lines` for its window.
+                let e = idx.span_lines(sp).1;
+                (s.line, e)
+            })
+            .collect();
 
         // Additional primary spans are rendered as extra `^` annotations —
         // mirroring glyph.rs's `extras_labels`.  Without this, only the
@@ -529,20 +704,64 @@ impl HtmlRenderer {
         let all_labels: SmallVec<[&Label<'src>; 4]> =
             labels.iter().copied().chain(extra_labels.iter()).collect();
 
-        // Window covers every primary span, not just the first.
-        let mut last_line = std::cmp::min(end_pos.line + 1 + context_lines, text_last_line);
-        for &sp in primary_spans {
-            let e = idx.to_linecol(sp.end_as_usize());
-            last_line = last_line.max(std::cmp::min(e.line + 1 + context_lines, text_last_line));
+        // Window covers every primary span, not just the first.  The anchor is
+        // `primary_lines[0]` (insertion order) — spans added with
+        // `with_additional_span` may be out of source order, so the anchor is
+        // snapshotted before the section list is sorted below.
+        let primary_first_lines = primary_lines[0];
+        let mut last_line = std::cmp::min(
+            primary_first_lines.1.saturating_add(context_lines),
+            text_last_line,
+        );
+        for &(_, e_line) in &primary_lines {
+            last_line = last_line.max(std::cmp::min(
+                e_line.saturating_add(context_lines),
+                text_last_line,
+            ));
         }
         let line_num_width = (last_line + 1).checked_ilog10().unwrap_or(0) as usize + 1;
 
-        // §4: per-label (start_line, end_line), converted once.
+        // ── Disjoint context sections (gap folding) ──────────────
+        // Each primary span contributes a `[start − ctx, end + ctx]` window;
+        // overlapping or adjacent windows merge (same rule the glyph renderer
+        // uses for its source sections).  The rows *between* disjoint
+        // sections are not drawn: a fold marker (`... (N lines omitted)`)
+        // stands in for them, mirroring the human renderer.  Without this,
+        // one primary on line 10 and another on line 1000 made the HTML
+        // renderer walk and emit every one of the ~990 gap rows — O(gap)
+        // work and output where the glyph renderer pays O(sections).
+        // Section construction must see ascending start lines: the merge only
+        // extends `sections.last_mut()`, so an out-of-source-order span (e.g.
+        // a `with_additional_span` at line 5 added after one at line 10)
+        // would otherwise fold into a section that starts *after* it and drop
+        // its rows entirely.
+        let mut sorted_lines: SmallVec<[(usize, usize); 4]> = primary_lines.clone();
+        sorted_lines.sort_by_key(|&(s, _)| s);
+        let mut sections: SmallVec<[(usize, usize); 4]> = SmallVec::new();
+        for &(s_line, e_line) in &sorted_lines {
+            let s0 = s_line.saturating_sub(context_lines);
+            let e0 = std::cmp::min(e_line.saturating_add(context_lines), text_last_line);
+            if let Some(last) = sections.last_mut()
+                && s0 <= last.1.saturating_add(1)
+            {
+                last.1 = last.1.max(e0);
+            } else {
+                sections.push((s0, e0));
+            }
+        }
+
+        // Per-label (start_line, end_line), converted once.
         // `SmallVec<[(usize, usize); 4]>`: labels-per-diagnostic rarely exceeds
         // 4, so the common case stays inline — one fewer heap allocation per
         // source section.
         let label_line_ranges: SmallVec<[(usize, usize); 4]> =
             all_labels.iter().map(|l| idx.span_lines(l.span)).collect();
+        // Start-line-sorted permutation, computed once and shared by every
+        // section so `LabelWindow` merges into a pre-sorted order instead of
+        // re-sorting the union per section (`K·L log L` → `L log L + K·L`),
+        // mirroring the glyph renderer.
+        let mut label_order: SmallVec<[usize; 4]> = (0..label_line_ranges.len()).collect();
+        label_order.sort_by_key(|&i| label_line_ranges[i].0);
         // Per-label "message emitted inline" flags: the fallback below must
         // not re-emit a message that a source row already rendered, but a
         // line-range test is not enough — a label point on the phantom line
@@ -555,74 +774,149 @@ impl HtmlRenderer {
         } else {
             smallvec![]
         };
+        // One definition of the two-tier bitset (inline u64 + spill Vec), so
+        // the set and query sites cannot drift on the `- 64` offset.
+        let mark_label = |bits: &mut u64, extra: &mut SmallVec<[bool; 4]>, i: usize| {
+            if i < 64 {
+                *bits |= 1u64 << i;
+            } else if let Some(slot) = extra.get_mut(i - 64) {
+                *slot = true;
+            }
+        };
+        let label_rendered = |bits: u64, extra: &SmallVec<[bool; 4]>, i: usize| -> bool {
+            if i < 64 {
+                (bits >> i) & 1 != 0
+            } else {
+                extra.get(i - 64).copied().unwrap_or(false)
+            }
+        };
+
+        // ── Per-batch `SectionScratch` ────────────────────────────
+        // Threaded through the `RenderCtx` exactly as the glyph renderer's
+        // `write_source_section` does: the emitter path grows the heap
+        // buffers once per batch instead of reallocating per diagnostic.
+        // The no-ctx path (`diagnostic_to_html`) falls back to a fresh
+        // local.  `underlines_buf` / `meta_buf` cannot be threaded — they
+        // hold `&'a str` borrows into `extra_labels` / `labels`, which are
+        // function-local — but both are `SmallVec<…; 8>`, inline for ≤7
+        // annotations (the common case), so they contribute no heap.
+        let mut local_scratch;
+        let mut guard = cx.map(|c| c.scratch.borrow_mut());
+        let scratch: &mut SectionScratch = match guard.as_deref_mut() {
+            Some(s) => s,
+            None => {
+                local_scratch = SectionScratch::new();
+                &mut local_scratch
+            }
+        };
+        // `LabelWindow` takes its scratch by value; `mem::take` moves the
+        // container out (no alloc) and we hand it back at the end so the
+        // next section reuses its capacity.
+        let window_scratch = std::mem::take(&mut scratch.label_window);
+        let mut label_window = LabelWindow::new(&label_line_ranges, &label_order, window_scratch);
 
         let html = out;
-        // Hoisted out of the row loop to avoid per-iteration allocation.
-        let mut rendered = String::with_capacity(256);
-        // Underline lane allocator — owns the interval-graph colouring scratch
-        // so the row loop reuses it across lines.
-        let mut lanes = UnderlineLanes::new();
-        let mut row_buf = String::new();
-        let spaces = " ".repeat(line_num_width + 1);
-        // Scratch buffers — reused each iteration; `clear()` preserves capacity.
-        let cap = all_labels.len() + 1;
-        let mut underlines_buf: SmallVec<[(usize, usize, char, &str, Option<usize>); 8]> =
-            SmallVec::with_capacity(cap);
-        let mut ranges_buf: Vec<(usize, usize)> = Vec::with_capacity(cap);
-        let mut meta_buf: SmallVec<[(char, &str, Option<usize>); 8]> = SmallVec::with_capacity(cap);
-        let mut display_buf: Vec<(usize, usize)> = Vec::with_capacity(cap);
-        let mut order_buf: Vec<usize> = Vec::with_capacity(cap);
-        let mut done_buf: Vec<bool> = Vec::with_capacity(cap);
-        let mut active_buf: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
-        // Sliding window over `all_labels`, ordered by start line once here;
-        // each row then only visits the labels that can cover it, not all of
-        // them.  No pre-sorted prefix: the HTML renderer draws one source
-        // section per diagnostic, so there is no K-section loop to amortise
-        // over.
-        let mut label_window = LabelWindow::new(&label_line_ranges, &[]);
+        // Underline lane allocator — the row loop reuses it across lines.
+        let lanes = &mut scratch.lanes;
+        let row_buf = &mut scratch.row_buf;
+        // Scratch buffers — reused across the batch like every other
+        // `SectionScratch` field.  The payload carries only the label index;
+        // messages resolve from `all_labels` at use sites, so neither buffer
+        // holds a borrow into the per-section label list.
+        let mut underlines_buf = std::mem::take(&mut scratch.underlines_buf);
+        let mut meta_buf = std::mem::take(&mut scratch.meta_buf);
 
         // The filename is constant across every source row, so escape it once
         // here and reuse the (borrowed, allocation-free) result per row instead
         // of `format!`-ing a fresh `file:line:col` string only to escape and
         // discard it on each iteration.
         let escaped_file = self.escape(file_name);
+        // The `file:` prefix of the `data-location` attribute is also constant
+        // per row; building it once keeps the row loop to pointer copies.
+        // Built from parts — a clean path (the overwhelmingly common shape)
+        // keeps `escape` borrowed, so the whole prefix is one small `String`
+        // with no `format!` machinery.
+        let mut escaped_file_prefix = if file_name.is_empty() {
+            String::new()
+        } else {
+            let mut p = String::with_capacity(escaped_file.len() + 1);
+            p.push_str(&escaped_file);
+            p.push(':');
+            p
+        };
 
-        for line_idx in first_line..=last_line {
+        // Walk the disjoint sections; a counted fold marker stands in for
+        // every gap (mirrors the glyph renderer's
+        // `... (N lines omitted)` between its source sections).
+        let mut prev_section_last: Option<usize> = None;
+        for &(sec_first, sec_last) in &sections {
+            if let Some(pl) = prev_section_last {
+                let gap = sec_first.saturating_sub(pl + 1);
+                if gap > 0 {
+                    html.push_str("<span class='line-num'>");
+                    fmt::push_spaces(html, line_num_width);
+                    html.push_str(" │ </span>");
+                    html.push_str("<span class='fold'>");
+                    fmt::push_fold_marker(html, gap);
+                    html.push_str("</span>\n");
+                }
+            }
+            prev_section_last = Some(sec_last);
+
+        for line_idx in sec_first..=sec_last {
             // O(1) slice via the shared index instead of indexing a
             // whole-file `Vec<&str>` that was collected only for this.
             let line = idx.line(line_idx);
-            compute_line_annotation_ranges(
-                span,
-                &all_labels,
-                &mut label_window,
-                source,
-                line,
-                line_idx,
-                starts,
-                &mut ranges_buf,
-                &mut meta_buf,
-            );
+            // Fast skip: when the primary span's line range does not cover
+            // this row *and* no label window covers it, the full computation
+            // would produce empty ranges — so clear the buffers directly and
+            // keep the output byte-identical.  `LabelWindow::advance` is
+            // idempotent for the same row (its cursor and expiry heap only
+            // move forward), so pre-advancing here does not disturb the
+            // re-advance inside `compute_line_annotation_ranges` on the rows
+            // that do need it.  The advance itself must happen every row to
+            // keep later rows' active-label state correct.
+            if line_idx < primary_first_lines.0 || line_idx > primary_first_lines.1 {
+                label_window.advance(line_idx);
+                if label_window.active().is_empty() {
+                    scratch.ranges_buf.clear();
+                    meta_buf.clear();
+                } else {
+                    compute_line_annotation_ranges(
+                        span,
+                        &all_labels,
+                        &mut label_window,
+                        source,
+                        line,
+                        line_idx,
+                        starts,
+                        &mut scratch.ranges_buf,
+                        &mut meta_buf,
+                        false,
+                    );
+                }
+            } else {
+                compute_line_annotation_ranges(
+                    span,
+                    &all_labels,
+                    &mut label_window,
+                    source,
+                    line,
+                    line_idx,
+                    starts,
+                    &mut scratch.ranges_buf,
+                    &mut meta_buf,
+                    true,
+                );
+            }
             // One fused grapheme walk resolves this row's byte ranges to
             // display columns, measures the line width, and emits the
             // HTML-escaped, highlight-wrapped source — the same core the glyph
             // renderer uses, with `push_html_escaped` as its emit callback.
-            let display_width = render_line_merged_with(
-                line,
-                &ranges_buf,
-                &meta_buf,
-                &mut underlines_buf,
-                &mut rendered,
-                "<span class='highlight'>",
-                "</span>",
-                &mut display_buf,
-                &mut order_buf,
-                &mut done_buf,
-                &mut active_buf,
-                DEFAULT_TAB_WIDTH,
-                push_html_escaped,
-            );
-            let underlines = &underlines_buf;
-
+            // The row is rendered straight into `html` (`append = true`
+            // preserves the gutter pushed just above), so the old
+            // `scratch.rendered` → `html` full-row copy is gone.
+            //
             // ── Line number ─────────────────────────────────────
             // write! straight into the output buffer (reuses its
             // capacity) instead of two per-row format! allocations.
@@ -640,8 +934,7 @@ impl HtmlRenderer {
                     html.push(':');
                     fmt::push_uint(html, (start_col + 1) as u64);
                 } else {
-                    html.push_str(&escaped_file);
-                    html.push(':');
+                    html.push_str(&escaped_file_prefix);
                     fmt::push_uint(html, (line_idx + 1) as u64);
                     html.push(':');
                     fmt::push_uint(html, (start_col + 1) as u64);
@@ -649,8 +942,7 @@ impl HtmlRenderer {
             } else if file_name.is_empty() {
                 fmt::push_uint(html, (line_idx + 1) as u64);
             } else {
-                html.push_str(&escaped_file);
-                html.push(':');
+                html.push_str(&escaped_file_prefix);
                 fmt::push_uint(html, (line_idx + 1) as u64);
             }
             html.push_str("' aria-label='Line ");
@@ -659,8 +951,27 @@ impl HtmlRenderer {
             fmt::push_uint_padded(html, (line_idx + 1) as u64, line_num_width);
             html.push_str(" │ </span>");
 
-            // ── Source line (rendered by the fused walk above) ──
-            html.push_str(&rendered);
+            let display_width = render_line_merged_with(
+                line,
+                &scratch.ranges_buf,
+                &meta_buf,
+                &mut underlines_buf,
+                html,
+                "<span class='highlight'>",
+                "</span>",
+                &mut scratch.display_buf,
+                &mut scratch.order_buf,
+                &mut scratch.done_buf,
+                &mut scratch.active_buf,
+                tab_width,
+                // Gutter width: `<num> │ ` (padded number + space + `│` +
+                // space) — the terminal column the source text starts at,
+                // so tab stops advance from the absolute cursor column.
+                line_num_width + 3,
+                true,
+                push_html_escaped,
+            );
+            let underlines = &underlines_buf;
             html.push('\n');
 
             // ── Underline annotations (one row per overlap depth) ───
@@ -668,7 +979,7 @@ impl HtmlRenderer {
                 let lane_count = lanes.assign(underlines);
                 for lane_idx in 0..lane_count {
                     html.push_str("<span class='line-num'>");
-                    html.push_str(&spaces);
+                    fmt::push_spaces(html, line_num_width);
                     html.push_str(" │ </span>");
                     // Plain (uncoloured) row for HTML — per-char colouring
                     // is the terminal renderer's job; here the CSS class
@@ -677,24 +988,41 @@ impl HtmlRenderer {
                         underlines,
                         lane_idx,
                         display_width,
-                        &mut row_buf,
+                        row_buf,
                         |_ch| "",
                         "",
                     );
                     if visible {
+                        // `row` is called with `color_for = |_| ""` and
+                        // `reset = ""`, so `row_buf` contains only padding
+                        // spaces and the underline chars `^` / `~` / `-`
+                        // (see `AnnotationKind::underline_char`) — none of
+                        // which need HTML escaping.  Skipping `escape` avoids
+                        // two dead SIMD scans per underline row.
+                        debug_assert!(
+                            row_buf.bytes().all(|b| matches!(b, b' ' | b'^' | b'~' | b'-')),
+                            "row_buf contains a char requiring escape: {row_buf:?}"
+                        );
                         html.push_str("<span class='underline'>");
-                        html.push_str(&self.escape(&row_buf));
+                        html.push_str(&row_buf);
                         html.push_str("</span>");
                     }
                     html.push('\n');
                 }
 
                 // ── Label messages ──────────────────────────────
-                for (col, _ulen, _ch, msg, label_idx) in underlines {
+                for (col, _ulen, _ch, label_idx) in underlines.iter().copied() {
+                    // The payload carries only the label index; the message
+                    // resolves from the section's `all_labels` (the synthetic
+                    // primary has `None` and an empty message).
+                    let msg: &str = match label_idx {
+                        Some(i) => all_labels[i].message.as_ref(),
+                        None => "",
+                    };
                     if msg.is_empty() {
                         continue;
                     }
-                    // §4: suppress the message on every line except the label's
+                    // Suppress the message on every line except the label's
                     // final covered line — mirrors `GlyphRenderer`'s
                     // `is_multiline_nonfinal`. Keyed by label index so two
                     // labels sharing one message stay distinct.
@@ -704,28 +1032,51 @@ impl HtmlRenderer {
                         continue;
                     }
                     if let Some(i) = label_idx {
-                        if *i < 64 {
-                            label_bits |= 1u64 << *i;
-                        } else {
-                            label_extra[*i - 64] = true;
-                        }
+                        mark_label(&mut label_bits, &mut label_extra, i);
                     }
                     html.push_str("<span class='line-num'>");
-                    html.push_str(&spaces);
+                    fmt::push_spaces(html, line_num_width);
                     html.push_str(" │ </span>");
                     // `col` is a display column → pad with that many spaces.
                     // Write the connector directly into `html` — `escape`'s
                     // fast path (no allocation for space/`|`) made the
                     // intermediate `String` the only real cost here.
                     html.push_str("<span class='label'>");
-                    fmt::push_spaces(html, *col);
+                    fmt::push_spaces(html, col);
                     html.push('|');
                     html.push(' ');
-                    html.push_str(&self.escape(msg));
+                    self.push_escaped_cached(html, msg);
                     html.push_str("</span>\n");
                 }
             }
+
+            // Multi-line label middle rows: connector only.  The shared
+            // range policy suppresses middle-line underlines, so derive the
+            // connector column from the label span, matching the glyph
+            // renderer's policy exactly.
+            let line_start = starts.get(line_idx).map_or(source.len(), |&s| s as usize);
+            let line_end = line_start + line.len();
+            for &i in label_window.active() {
+                let (start, end) = label_line_ranges[i];
+                if line_idx <= start
+                    || line_idx >= end
+                    || all_labels[i].message.is_empty()
+                {
+                    continue;
+                }
+                let span_start = all_labels[i].span.start_as_usize();
+                let off = span_start.clamp(line_start, line_end) - line_start;
+                let col = byte_offset_to_display(line, off, tab_width);
+                html.push_str("<span class='line-num'>");
+                fmt::push_spaces(html, line_num_width);
+                html.push_str(" │ </span>");
+                html.push_str("<span class='label'>");
+                fmt::push_spaces(html, col);
+                html.push('|');
+                html.push_str("</span>\n");
+            }
         }
+        } // section loop
 
         // A label whose lines fall outside the rendered rows still owns
         // user-visible text (e.g. a span at EOF lands on the phantom line).
@@ -735,25 +1086,60 @@ impl HtmlRenderer {
         // inside the range yet still miss every drawn row (e.g. an EOF
         // point) and must fall back too.
         for (i, lbl) in all_labels.iter().enumerate() {
-            let rendered = if i < 64 {
-                (label_bits >> i) & 1 != 0
-            } else {
-                label_extra[i - 64]
-            };
+            let rendered = label_rendered(label_bits, &label_extra, i);
             if lbl.message.is_empty() || rendered {
                 continue;
             }
-            let (end_line, end_col) = idx.linecol_display(lbl.span.end_as_usize());
+            // `start`, matching the glyph fallback (`at start` is the
+            // conventional diagnostic location); the old `end` here made the
+            // HTML note point one span past where the terminal note points
+            // for the same label.
+            let (start_line, start_col) =
+                idx.linecol_display(lbl.span.start_as_usize().min(source.len()));
             html.push_str("<span class='label'>= note: ");
-            html.push_str(&self.escape(&lbl.message));
+            self.push_escaped_cached(html, &lbl.message);
             html.push_str(" at ");
-            fmt::push_uint(html, (end_line + 1) as u64);
+            fmt::push_uint(html, (start_line + 1) as u64);
             html.push(':');
-            fmt::push_uint(html, (end_col + 1) as u64);
+            fmt::push_uint(html, (start_col + 1) as u64);
             html.push_str("</span>\n");
         }
 
+        // Restore the taken label-window scratch so the next section reuses
+        // its capacity.
+        scratch.label_window = label_window.into_scratch();
+        scratch.underlines_buf = underlines_buf;
+        scratch.meta_buf = meta_buf;
         true
+    }
+
+    /// Escape into `out` through a bounded process-wide memo.  Static
+    /// label/help strings recur across every diagnostic in a batch; caching
+    /// the sanitized+escaped form turns the second..Nth occurrence into a
+    /// copy instead of a sanitize scan + escape.  Bounded so hostile dynamic
+    /// messages cannot grow it without limit.
+    fn push_escaped_cached(&self, out: &mut String, s: &str) {
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<rustc_hash::FxHashMap<String, std::sync::Arc<str>>>> =
+            OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(rustc_hash::FxHashMap::default()));
+        if let Ok(guard) = cache.lock()
+            && let Some(v) = guard.get(s)
+        {
+            out.push_str(v);
+            return;
+        }
+        let escaped = self.escape(s);
+        if escaped.len() > 4096 {
+            out.push_str(escaped.as_ref());
+            return;
+        }
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= 1024 {
+            guard.clear();
+        }
+        guard.insert(s.to_string(), std::sync::Arc::from(escaped.as_ref()));
+        out.push_str(escaped.as_ref());
     }
 
     /// Escape text for HTML element content *and* single/double-quoted
@@ -761,14 +1147,36 @@ impl HtmlRenderer {
     /// this helper stays safe if it is ever used inside a `class='…'`
     /// attribute.
     fn escape<'a>(&self, s: &'a str) -> Cow<'a, str> {
-        if next_html_escape_byte(s.as_bytes()).is_none() {
-            return Cow::Borrowed(s);
+        // Control bytes (C0/DEL/C1, excluding the layout-intended tab/newline
+        // the multiline sanitizer keeps) are replaced with U+FFFD before
+        // escaping: HTML output must not carry raw terminal control sequences,
+        // and this matches the human/short/JSON renderers' hygiene.  The
+        // sanitizer borrows when the input is already clean; when it owns, the
+        // escaped result must be owned too (it cannot borrow the temporary).
+        match crate::diagnostics::sanitize_for_terminal_multiline(s) {
+            Cow::Borrowed(clean) => self.escape_clean(clean),
+            Cow::Owned(clean) => match self.escape_clean(&clean) {
+                Cow::Borrowed(_) => Cow::Owned(clean),
+                Cow::Owned(escaped) => Cow::Owned(escaped),
+            },
         }
-        let mut out = String::with_capacity(s.len() + s.len() / 4);
+    }
+
+    fn escape_clean<'a>(&self, s: &'a str) -> Cow<'a, str> {
         let bytes = s.as_bytes();
+        // Merged iterator: a single O(len) pass over the haystack regardless
+        // of which escape class dominates (see [`HtmlEscapeIter`]).
+        let mut iter = HtmlEscapeIter::new(bytes);
+        let Some(first) = iter.next() else {
+            return Cow::Borrowed(s);
+        };
+        // `&` expands 5×, so the old `len + len/4` guarantee under-reserved
+        // for escape-dense label text; 2× avoids the realloc for the common
+        // `<`/`>`/`"`/`'` cases at a small cost on clean strings.
+        let mut out = String::with_capacity(s.len().saturating_mul(2));
         let mut start = 0;
-        while let Some(offset) = next_html_escape_byte(&bytes[start..]) {
-            let idx = start + offset;
+        let mut idx = first;
+        loop {
             out.push_str(&s[start..idx]);
             match bytes[idx] {
                 b'&' => out.push_str("&amp;"),
@@ -779,9 +1187,66 @@ impl HtmlRenderer {
                 _ => unreachable!(),
             }
             start = idx + 1;
+            let Some(next) = iter.next() else {
+                break;
+            };
+            idx = next;
         }
         out.push_str(&s[start..]);
         Cow::Owned(out)
+    }
+}
+
+/// Lazily yields the byte positions of the full HTML escape set
+/// (`& < > " '`) in a haystack.
+///
+/// Two `memchr` iterators — one for the tag class (`& < >`), one for the
+/// quote class (`" '`) — advance independently and a merge selects the
+/// earlier match, so every byte of the haystack is loaded at most once no
+/// matter which class dominates.  This is what keeps [`HtmlRenderer::escape`]
+/// O(len) for *every* input shape: the per-call two-step probe
+/// ([`next_html_escape_byte`]) degrades to O(len·E) when quotes are dense
+/// and `<>&` are absent (e.g. a line of string literals), because each
+/// probe's `memchr3` scans the whole remaining suffix while finding nothing.
+pub(crate) struct HtmlEscapeIter<'a> {
+    tag: memchr::Memchr3<'a>,
+    quote: memchr::Memchr2<'a>,
+    next_tag: Option<usize>,
+    next_quote: Option<usize>,
+}
+
+impl<'a> HtmlEscapeIter<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        let mut tag = memchr::memchr3_iter(b'&', b'<', b'>', bytes);
+        let mut quote = memchr::memchr2_iter(b'"', b'\'', bytes);
+        let next_tag = tag.next();
+        let next_quote = quote.next();
+        Self {
+            tag,
+            quote,
+            next_tag,
+            next_quote,
+        }
+    }
+}
+
+impl Iterator for HtmlEscapeIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        let idx = match (self.next_tag, self.next_quote) {
+            (Some(a), Some(q)) => a.min(q),
+            (Some(a), None) => a,
+            (None, Some(q)) => q,
+            (None, None) => return None,
+        };
+        if self.next_tag == Some(idx) {
+            self.next_tag = self.tag.next();
+        }
+        if self.next_quote == Some(idx) {
+            self.next_quote = self.quote.next();
+        }
+        Some(idx)
     }
 }
 
@@ -792,9 +1257,23 @@ impl HtmlRenderer {
 /// `>`, `"`); the all-clean fast path avoids the char walk entirely.
 fn push_html_escaped(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
+    // Merged iterators for the source-content escape set (`& < > "`): the
+    // tag and quote classes advance independently and each byte of the
+    // haystack is loaded at most once, so the pass stays O(len) even when
+    // quotes are dense and `<>&` are absent (the per-call
+    // `next_html_source_escape_byte` probe degraded to O(len·E) there).
+    let mut tag = memchr::memchr3_iter(b'&', b'<', b'>', bytes);
+    let mut quote = memchr::memchr_iter(b'"', bytes);
+    let mut next_tag = tag.next();
+    let mut next_quote = quote.next();
     let mut start = 0;
-    while let Some(offset) = next_html_source_escape_byte(&bytes[start..]) {
-        let idx = start + offset;
+    loop {
+        let idx = match (next_tag, next_quote) {
+            (Some(a), Some(q)) => a.min(q),
+            (Some(a), None) => a,
+            (None, Some(q)) => q,
+            (None, None) => break,
+        };
         out.push_str(&s[start..idx]);
         match bytes[idx] {
             b'&' => out.push_str("&amp;"),
@@ -804,37 +1283,49 @@ fn push_html_escaped(out: &mut String, s: &str) {
             _ => unreachable!(),
         }
         start = idx + 1;
+        if next_tag == Some(idx) {
+            next_tag = tag.next();
+        }
+        if next_quote == Some(idx) {
+            next_quote = quote.next();
+        }
     }
     out.push_str(&s[start..]);
 }
 
 /// Next byte in `hay` that is one of `&`, `<`, `>`, `"`, `'` (full HTML
 /// escape set).  SIMD-accelerated via `memchr3` + `memchr2`.
+///
+/// The second scan is **bounded by the first hit**: once an `&<>` is found
+/// at `a`, any `"`/`'` after `a` is irrelevant — the first escape byte is
+/// at or before `a`.  Only `hay[..a]` is searched for quotes, so each call
+/// scans at most `2·a` bytes while the outer escape loop consumes `a+1`;
+/// total work across the loop is O(len), not O(E·len) (a lone quote near
+/// the end of a line full of `<` used to force a full suffix rescan per
+/// escape byte).
+/// Test-only: the bounded-second-scan reference the production
+/// fused-iterator path replaced.  No in-crate caller remains —
+/// `HtmlEscapeIter` subsumed it — but the differential test keeps pinning
+/// the discipline against a naive reference, so it stays compiled under
+/// `cfg(test)` only.
+#[cfg(test)]
 #[inline]
 fn next_html_escape_byte(hay: &[u8]) -> Option<usize> {
-    match (
-        memchr::memchr3(b'&', b'<', b'>', hay),
-        memchr::memchr2(b'"', b'\'', hay),
-    ) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    match memchr::memchr3(b'&', b'<', b'>', hay) {
+        Some(a) => memchr::memchr2(b'"', b'\'', &hay[..a]).or(Some(a)),
+        None => memchr::memchr2(b'"', b'\'', hay),
     }
 }
 
-/// Next byte in `hay` that is one of `&`, `<`, `>`, `"` (source-content
-/// escape set, no apostrophe).
+/// Test-only: next byte in `hay` that is one of `&`, `<`, `>`, `"`
+/// (source-content escape set, no apostrophe).  Same bounded-second-scan
+/// discipline as [`next_html_escape_byte`].
+#[cfg(test)]
 #[inline]
 fn next_html_source_escape_byte(hay: &[u8]) -> Option<usize> {
-    match (
-        memchr::memchr3(b'&', b'<', b'>', hay),
-        memchr::memchr(b'"', hay),
-    ) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    match memchr::memchr3(b'&', b'<', b'>', hay) {
+        Some(a) => memchr::memchr(b'"', &hay[..a]).or(Some(a)),
+        None => memchr::memchr(b'"', hay),
     }
 }
 
@@ -844,6 +1335,207 @@ mod tests {
     use crate::ast::Span;
     use crate::diagnostics::Diagnostic;
     use crate::diagnostics::ErrCode;
+
+    /// Multi-file guard, HTML analog of the glyph renderer's
+    /// `foreign_primary_spans_render_as_location_only_notes`: a primary span
+    /// from another file has meaningless offsets in this diagnostic's buffer.
+    /// It must not stretch the context window or draw bogus sections/columns;
+    /// the anchor file's own content still renders exactly once.
+    #[test]
+    fn foreign_primary_spans_do_not_distort_the_anchor_source() {
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::from_raw(1), 0, 3))
+            .with_additional_span(Span::new(FileId::from_raw(2), 500, 505))
+            .with_source("def x\nset y\n");
+        let html = HtmlRenderer::new().diagnostic_to_html(&diag);
+        // `def` is keyword-highlighted, so the raw string "def x" never
+        // appears contiguously; assert on the highlighted form instead.
+        assert_eq!(
+            html.matches("<span class='highlight'>def</span> x").count(),
+            1,
+            "html: {html}"
+        );
+        assert_eq!(html.matches("set y").count(), 1, "html: {html}");
+        // A foreign offset clamped through the anchor's line index blew the
+        // context window up to the last source line; two adjacent lines leave
+        // nothing to fold, so any fold marker means a bogus foreign section.
+        assert!(!html.contains("lines omitted"), "html: {html}");
+    }
+
+    /// A diagnostic with no primary span must not drop its labels: they are
+    /// emitted as `= note:` fallback lines instead of a source section.
+    #[test]
+    fn labels_survive_a_missing_primary_span() {
+        let diag = Diagnostic::error("boom")
+            .with_label(Span::new(FileId::DUMMY, 0, 3), "look here")
+            .with_source("abc\ndef\n");
+        let html = HtmlRenderer::new().diagnostic_to_html(&diag);
+        assert!(html.contains("look here"), "label dropped: {html}");
+        assert!(html.contains("= note:"), "html: {html}");
+    }
+
+    /// `with_opts` must drive the context window exactly like an explicit
+    /// `with_context_lines`, and a wider default context must render more
+    /// rows — the CLI's `--context-lines` reaches HTML output.
+    #[test]
+    fn with_opts_reaches_context_lines() {
+        use crate::diagnostics::DiagOpts;
+
+        let src = "a\nb\nc\nd\ne\n";
+        let diag = Diagnostic::error("x")
+            .with_span(Span::new(FileId::DUMMY, 7, 8))
+            .with_source(src);
+        let mut opts = DiagOpts::default();
+        opts.context_lines = 0;
+        let via_opts = HtmlRenderer::with_opts(&opts).diagnostic_to_html(&diag);
+        let via_override = HtmlRenderer::new().with_context_lines(0).diagnostic_to_html(&diag);
+        assert_eq!(via_opts, via_override);
+        let wide = HtmlRenderer::new().diagnostic_to_html(&diag);
+        assert!(
+            wide.lines().count() > via_opts.lines().count(),
+            "default context must render more rows than context_lines=0"
+        );
+    }
+
+    /// `context_lines = 0` must show exactly the covered lines — the old
+    /// `e_line + 1 + context_lines` window (with `e_line` taken from the
+    /// exclusive-end byte) dragged one or two lines below the span even at
+    /// zero context.  Mirrors glyph's `zero_context_shows_no_line_below_the_span`.
+    /// Rows are counted via the per-row `data-location` line-number spans
+    /// (fold markers use a `line-num` span *without* `data-location`, so they
+    /// don't pollute the count).
+    #[test]
+    fn zero_context_shows_exactly_the_covered_lines() {
+        let src = "a\nb\nc\nd\ne\n";
+        // Span covering `c` (line 2) mid-line: end byte 5 is the newline.
+        let diag = Diagnostic::error("x")
+            .with_span(Span::new(FileId::DUMMY, 4, 5))
+            .with_source(src);
+        let html = HtmlRenderer::new().with_context_lines(0).diagnostic_to_html(&diag);
+        assert_eq!(
+            html.matches("<span class='line-num' data-location=").count(),
+            1,
+            "ctx=0 must render exactly the span's line: {html}"
+        );
+        assert!(html.contains(">c<") || html.contains("c\n"), "row text: {html}");
+
+        // Span ending exactly on a line start (exclusive end at byte 6,
+        // the start of line 3): the last *covered* byte is line 2's
+        // newline, so ctx=0 must render exactly one row — the old
+        // `to_linecol(end)` + `+1` window rendered two.
+        let diag = Diagnostic::error("x")
+            .with_span(Span::new(FileId::DUMMY, 4, 6))
+            .with_source(src);
+        let html = HtmlRenderer::new().with_context_lines(0).diagnostic_to_html(&diag);
+        assert_eq!(
+            html.matches("<span class='line-num' data-location=").count(),
+            1,
+            "line-start-ending span must not drag line 3 in at ctx=0: {html}"
+        );
+    }
+
+    /// `context_lines = 1` shows exactly one line below the covered lines —
+    /// not two (the second compounding `+1` the old window had).
+    #[test]
+    fn context_lines_one_shows_exactly_one_line_below() {
+        let src = "a\nb\nc\nd\ne\n";
+        let diag = Diagnostic::error("x")
+            .with_span(Span::new(FileId::DUMMY, 4, 5)) // `c` on line 2
+            .with_source(src);
+        let html = HtmlRenderer::new().with_context_lines(1).diagnostic_to_html(&diag);
+        assert_eq!(
+            html.matches("<span class='line-num' data-location=").count(),
+            3,
+            "ctx=1 must render lines 1-3 exactly: {html}"
+        );
+    }
+
+    /// `tab_width` from the batch `DiagOpts` reaches the row renderer (the
+    /// old code hardcoded `DEFAULT_TAB_WIDTH`), so tab-expanded underlines
+    /// differ between tab stop widths.
+    #[test]
+    fn tab_width_follows_ctx_opts() {
+        use crate::diagnostics::DiagOpts;
+
+        let src = "\tfoo\nbar\n";
+        let diag = Diagnostic::error("x")
+            .with_span(Span::new(FileId::DUMMY, 1, 4))
+            .with_source(src);
+        let render = |tab: usize| {
+            let opts = DiagOpts {
+                tab_width: tab,
+                ..Default::default()
+            };
+            let cx = RenderCtx::new(&opts, None);
+            HtmlRenderer::new().render(&diag, &cx)
+        };
+        assert_ne!(render(1), render(8), "tab_width must reach the HTML rows");
+    }
+
+    /// The bounded-second-scan discipline of [`next_html_escape_byte`] and
+    /// [`next_html_source_escape_byte`]: with a lone quote near the end of a
+    /// line full of `<`, the old unbounded `memchr2`/`memchr` rescanned the
+    /// whole suffix per escape byte — O(E·len).  Pinned two ways: the result
+    /// must equal a naive reference for every interleave, and a 10⁴-byte
+    /// adversarial input must finish under a generous wall-clock bound that
+    /// the quadratic behaviour would blow by orders of magnitude.
+    #[test]
+    fn bounded_escape_scan_matches_naive_reference() {
+        fn naive(hay: &[u8]) -> Option<usize> {
+            hay.iter()
+                .position(|&b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
+        }
+        fn naive_source(hay: &[u8]) -> Option<usize> {
+            hay.iter().position(|&b| matches!(b, b'&' | b'<' | b'>' | b'"'))
+        }
+        // Every short interleave of one trigger byte and one quote.
+        for a in [b'&', b'<', b'>'] {
+            for q in [b'"', b'\''] {
+                for (i, hay) in [
+                    vec![a, q],
+                    vec![q, a],
+                    vec![a, b'x', q],
+                    vec![q, b'x', a],
+                    vec![b'x', a, b'y', q, b'z'],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert_eq!(
+                        next_html_escape_byte(&hay),
+                        naive(&hay),
+                        "case {i} ({}, {})",
+                        a as char,
+                        q as char
+                    );
+                }
+                let hay = vec![a, b'x', b'"'];
+                assert_eq!(next_html_source_escape_byte(&hay), naive_source(&hay));
+            }
+        }
+        // None cases.
+        assert_eq!(next_html_escape_byte(b"plain text"), None);
+        assert_eq!(next_html_source_escape_byte(b"plain 'text'"), None);
+
+        // Quadratic-regression guard: 10⁴ bytes, escapes densely at the front
+        // and a single trailing quote.  The old code rescans the ~5 KB suffix
+        // once per escape byte; the bounded scan touches each byte O(1)
+        // times.  The bound is deliberately loose (50 ms) — the quadratic
+        // shape costs seconds, so only a regression trips it.
+        let adversarial: String =
+            std::iter::repeat('<').take(10_000).chain(std::iter::once('"')).collect();
+        let start = std::time::Instant::now();
+        let mut sink = String::new();
+        push_html_escaped(&mut sink, &adversarial);
+        assert_eq!(sink.matches("&lt;").count(), 10_000);
+        assert!(sink.ends_with("&quot;"));
+        assert!(
+            start.elapsed().as_millis() < 50,
+            "escape pass took {:?} — quadratic rescan regressed?",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn test_code_not_double_wrapped() {

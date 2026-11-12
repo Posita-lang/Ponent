@@ -45,14 +45,17 @@ impl std::error::Error for SourceMapError {}
 /// One registered source file: its display name, full text, and the
 /// precomputed byte offset of each line start (always begins with `0`).
 #[derive(Debug, Clone)]
-pub struct SourceFile {
+pub struct SourceFile<'a> {
     name: String,
-    source: String,
+    /// Borrowed from the caller's arena.  The CLI copies the file into the
+    /// session arena once and registers this borrow, instead of retaining a
+    /// second owned `String` for the whole compilation.
+    source: &'a str,
     line_starts: Vec<usize>,
 }
 
-impl SourceFile {
-    fn new(name: String, source: String) -> Self {
+impl<'a> SourceFile<'a> {
+    fn new(name: String, source: &'a str) -> Self {
         let mut line_starts = Vec::with_capacity(source.len() / 40 + 1);
         line_starts.push(0);
         for i in memchr_iter(b'\n', source.as_bytes()) {
@@ -72,7 +75,7 @@ impl SourceFile {
 
     /// The file's full text.
     pub fn source(&self) -> &str {
-        &self.source
+        self.source
     }
 
     /// 0-based (line, byte-column) for a byte offset into this file.
@@ -81,7 +84,7 @@ impl SourceFile {
     /// and clamped to the file length. `col` is a byte offset from the
     /// start of the line, matching [`SourcePos`]'s contract.
     pub fn line_col(&self, offset: u32) -> SourcePos {
-        let clamped = floor_char_boundary(&self.source, offset as usize);
+        let clamped = floor_char_boundary(self.source, offset as usize);
         let line = match self.line_starts.binary_search(&clamped) {
             Ok(line) => line,
             Err(0) => 0,
@@ -102,34 +105,35 @@ impl SourceFile {
 /// [`FileId::DUMMY`] is not a vector index; it is mapped to slot 0.
 /// Real ids start at [`FileId::FIRST_REAL`] and equal their vector index.
 #[derive(Debug, Clone)]
-pub struct SourceMap {
-    files: Vec<SourceFile>,
+pub struct SourceMap<'a> {
+    files: Vec<SourceFile<'a>>,
 }
 
-impl Default for SourceMap {
+impl<'a> Default for SourceMap<'a> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SourceMap {
+impl<'a> SourceMap<'a> {
     /// An empty map whose slot 0 is the dummy file for [`FileId::DUMMY`].
     pub fn new() -> Self {
         SourceMap {
-            files: vec![SourceFile::new("<dummy>".to_owned(), String::new())],
+            files: vec![SourceFile::new("<dummy>".to_owned(), "")],
         }
     }
 
     /// Register a file and return its [`FileId`].
     ///
-    /// Ids are assigned in load order starting at [`FileId::FIRST_REAL`]
-    /// (the dummy occupies slot 0, so a file's id equals its vector index).
+    /// `source` is borrowed: the caller keeps ownership (usually by allocating
+    /// it in the session arena first).  Ids are assigned in load order starting
+    /// at [`FileId::FIRST_REAL`] (the dummy occupies slot 0, so a file's id
+    /// equals its vector index).
     pub fn add_file(
         &mut self,
         name: impl Into<String>,
-        source: impl Into<String>,
+        source: &'a str,
     ) -> Result<FileId, SourceMapError> {
-        let source = source.into();
         if source.len() > MAX_FILE_LEN {
             return Err(SourceMapError::FileTooLarge { len: source.len() });
         }
@@ -150,7 +154,7 @@ impl SourceMap {
     ///
     /// Infallible: the sentinel maps to the dummy file in slot 0, and every
     /// other id is only ever produced by [`SourceMap::add_file`].
-    pub fn file(&self, id: FileId) -> &SourceFile {
+    pub fn file(&self, id: FileId) -> &SourceFile<'a> {
         if id == FileId::DUMMY {
             return &self.files[0];
         }

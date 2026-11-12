@@ -1,14 +1,14 @@
-use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::fmt;
 
 /// The severity or kind of a diagnostic message.
 ///
-/// The derived `Ord` still follows declaration order, but **variant order
-/// is no longer load-bearing for severity semantics**: use
-/// [`DiagnosticLevel::severity`] (or [`DiagnosticLevel::is_error`]) to
-/// reason about severity, so reordering the enum can never silently change
-/// behaviour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// **Variant order is not load-bearing for severity semantics**: the `Ord`/
+/// `PartialOrd` impls below delegate to [`DiagnosticLevel::severity`], so a
+/// `sort_by_key`/`max()`/range over the enum is reorder-proof.  Prefer
+/// [`DiagnosticLevel::severity`] or [`DiagnosticLevel::is_error`] for explicit
+/// severity reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticLevel {
     Info,
     Note,
@@ -16,6 +16,21 @@ pub enum DiagnosticLevel {
     Warning,
     Error,
     Fatal,
+}
+
+impl Ord for DiagnosticLevel {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Delegate to the explicit severity mapping so a future reorder of the
+        // declaration cannot silently change ordering semantics (the doc
+        // promise this replaces).
+        self.severity().cmp(&other.severity())
+    }
+}
+
+impl PartialOrd for DiagnosticLevel {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl DiagnosticLevel {
@@ -84,14 +99,32 @@ impl DiagnosticLevel {
         }
     }
 
-    pub fn ansi_reset() -> &'static str {
-        "\x1b[0m"
+    #[inline(always)]
+    pub const fn ansi_reset() -> &'static [u8; 4] {
+        b"\x1b[0m"
     }
 
-    pub fn label(&self) -> Cow<'static, str> {
-        crate::diagnostics::i18n::cached_label! {
+    /// Localized human-readable label for this level.
+    ///
+    /// Returns `&'static str` (not `Cow`): the label always comes from the
+    /// per-language cache, so the `Cow::Owned` branch would be dead and the
+    /// `Cow` shell pure overhead on the per-diagnostic hot path
+    /// (`prefix_cols` / `write_header` / `Display`).
+    pub fn label(&self) -> &'static str {
+        // Explicit variant → index mapping: `*self as usize` would silently
+        // swap labels if the enum were ever reordered; a match arms the
+        // reorder into a non-exhaustive compile error instead.
+        let idx = match self {
+            DiagnosticLevel::Info => 0,
+            DiagnosticLevel::Note => 1,
+            DiagnosticLevel::Help => 2,
+            DiagnosticLevel::Warning => 3,
+            DiagnosticLevel::Error => 4,
+            DiagnosticLevel::Fatal => 5,
+        };
+        crate::diagnostics::i18n::cached_label_static! {
             n = 6,
-            variant = *self as usize,
+            variant = idx,
             init = [
                 crate::diagnostics::i18n::fluent::level_info().into_owned(),
                 crate::diagnostics::i18n::fluent::level_note().into_owned(),

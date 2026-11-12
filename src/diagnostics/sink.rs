@@ -9,6 +9,22 @@
 //! hours, but each `emit_all` gets an exclusive sink, so locking and channel
 //! lifetimes stay at the call site.  This is the `tracing-subscriber`
 //! `MakeWriter` pattern.
+//!
+//! ## Emission atomicity
+//!
+//! Atomicity is a *per-sink* property, not a trait guarantee:
+//!
+//! * [`StringSink`] is infallible, so a batch is always complete.
+//! * A generic `Write` sink (including `stderr`/`BufWriter`) can fail
+//!   mid-batch; the bytes written before the error stay written.  The
+//!   emitter stops the batch on the first error, so partial output is a
+//!   prefix, never an interleaving of later diagnostics.
+//! * [`ChannelSink`] deliberately streams one message per rendered chunk;
+//!   a receiver that drops mid-batch keeps the chunks it already received.
+//!   This is the desired LSP/streaming semantics, not a bug.
+//!
+//! Callers that need all-or-nothing output must render into a
+//! [`StringSink`] (or a local `String`) and publish it in one operation.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -30,6 +46,9 @@ pub trait DiagnosticSink {
     fn write_str(&mut self, s: &str) -> io::Result<()>;
 
     /// Write formatted arguments to the sink.
+    ///
+    /// The default allocates a temporary `String`; override it to stream
+    /// directly (as the `Write`, `StringSink`, and `ChannelSink` impls do).
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
         self.write_str(&args.to_string())
     }
@@ -170,7 +189,8 @@ mod tests {
 
     #[test]
     fn write_types_are_sinks() {
-        // The blanket impl makes any `Write + Send` a sink.
+        // The blanket impl makes any `Write` a sink (the trait itself is
+        // intentionally not `Send`-bound; see the module docs).
         fn assert_sink<S: DiagnosticSink>(_: &S) {}
         let buf: Vec<u8> = Vec::new();
         assert_sink(&buf);

@@ -6,3 +6,19 @@ Cargo.lock
 schedule*.txt
 src/.vscode/
 *.dl
+__pycache__/
+*.pyc
+
+# Local agent/tooling state (never part of the repository)
+.atomcode/
+.crabmap/
+.agents/
+.claude/
+.codebuddy/
+.codeartsdoer/
+.omo/
+.mcp.json
+agent/
+skills-lock.json
+CLAUDE.md
+.lake/

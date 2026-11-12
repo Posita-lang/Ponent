@@ -1,3 +1,4 @@
+use as_variant::as_variant;
 use crate::sync::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::collections::HashSet;
@@ -395,6 +396,16 @@ pub(crate) struct AdtDef {
     pub has_drop: bool,
 }
 
+/// Monotonic session identity for [`TypeContext`] (`session_id` field):
+/// minted once per fresh context, propagated by `new_sharing`.  Replaces
+/// the address-based session stamp the body-check harness used — an
+/// address is reused after the old context drops, so a stale harness
+/// from a dead session could pass an address tripwire silently; a
+/// monotonic id cannot.  Relaxed: the id is diagnostic identity, it
+/// enters no ordering.
+pub(crate) static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1);
+
 /// The PER-QUERY half of the type system.
 ///
 /// `TypeContext<'input>` owns the mutable inference state — bindings,
@@ -429,6 +440,14 @@ pub struct TypeContext<'input> {
     /// across binding changes — including across a rolled-back snapshot,
     /// which must not serve pre-rollback verdicts.
     pub binding_epoch: std::sync::atomic::AtomicU64,
+    /// Monotonic session identity (crate::hir::types::NEXT_SESSION_ID),
+    /// minted once per `TypeContext::new*` and PROPAGATED by
+    /// `new_sharing` (a sharing clone is the SAME session by definition).
+    /// This is the reliable face of the identity the body-check harness
+    /// used to stamp with an ADDRESS — an address is reused after the
+    /// old context is dropped, so a stale harness from a dead session
+    /// could pass an address tripwire silently; a monotonic id cannot.
+    pub session_id: usize,
     pub builtin_unit: TypeId,
     pub builtin_never: TypeId,
     pub builtin_error: TypeId,
@@ -605,6 +624,7 @@ impl<'input> TypeContext<'input> {
             opaque_hidden_undo: Vec::new(),
             transaction_stack: Vec::new(),
             binding_epoch: std::sync::atomic::AtomicU64::new(0),
+            session_id: NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             unify_seen: HashSet::default(),
             adt_expansions: HashMap::default(),
             current_unify_span: None,
@@ -684,6 +704,11 @@ impl<'input> TypeContext<'input> {
             opaque_hidden_undo: Vec::new(),
             transaction_stack: Vec::new(),
             binding_epoch: std::sync::atomic::AtomicU64::new(0),
+            // SAME session by definition: a sharing clone shares the
+            // interner and minted TypeIds with its origin, so the harness
+            // pairing (see `BodyCheckHarness::session_stamp`) must treat
+            // the clone as the origin's session.
+            session_id: other.session_id,
             unify_seen: HashSet::default(),
             // Copied (not fresh): the expansion table is keyed by shared
             // TypeIds from the shared arena, so a per-query context must
@@ -704,6 +729,46 @@ impl<'input> TypeContext<'input> {
             binder_stack: Vec::new(),
             gadt: GadtContext::new(),
         }
+    }
+
+    /// Reset a pooled worker context (built with [`Self::new_sharing`] from
+    /// the same `origin`) back to the exact state `new_sharing` would
+    /// produce, reusing its allocations (2b of the query-layer perf pass):
+    /// per-worker inference state is cleared (capacity kept), the shared
+    /// registration table is re-synced from the origin (it may have grown
+    /// since the context was built), and the shared half — interner, arena,
+    /// builtins, session id — is untouched, so the harness pairing
+    /// (`BodyCheckHarness::session_stamp`) still holds.
+    ///
+    /// The caller must have verified the pool stamp `(origin.session_id,
+    /// program epoch)`; this method only restores CONTENT.
+    pub fn reset_for_worker_reuse(&mut self, origin: &Self) {
+        // Per-worker inference state → empty, capacities retained.
+        self.bindings.clear();
+        self.opaque_hidden.clear();
+        self.opaque_hidden_undo.clear();
+        self.transaction_stack.clear();
+        self.unify_seen.clear();
+        self.generic_binding_origins.clear();
+        self.kappa_cache.clear();
+        self.type_flags.clear();
+        self.binder_stack.clear();
+        self.region_subtype_outlives.clear();
+        self.region_subtype_collect = false;
+        self.current_unify_span = None;
+        self.current_coercion_ctx = std::sync::atomic::AtomicU8::new(
+            CoercionContext::Structural.to_u8(),
+        );
+        self.seal_violations = 0;
+        self.auto_ro = false;
+        self.auto_coerce = false;
+        self.binding_epoch = std::sync::atomic::AtomicU64::new(0);
+        // Fresh GADT state, exactly as `new_sharing` builds it.
+        self.gadt = GadtContext::new();
+        // Shared registration table: re-clone from the origin (the clone
+        // reuses the destination's allocation via `clone_from`).
+        self.adt_expansions.clone_from(&origin.adt_expansions);
+        debug_assert_eq!(self.session_id, origin.session_id);
     }
 
     /// Returns the refinement invariant recorded for `id`, if any.
@@ -1727,10 +1792,7 @@ impl<'input> TypeContext<'input> {
     /// of pattern-matching with `mutable: false` (which silently reads
     /// `*mut` as `*const`).
     pub fn mutability_of_pointer(&self, ty: TypeId) -> Option<bool> {
-        match self.get(ty) {
-            TypeData::Pointer { mutable, .. } => Some(*mutable),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Pointer { mutable, .. } => *mutable)
     }
 
     /// Classify `ty` as a raw pointer (§4.6 landing support; enum
@@ -3440,17 +3502,11 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn bits_of_rational_int(&self, ty: TypeId) -> Option<u8> {
-        match self.get(ty) {
-            TypeData::Rational { int_bits, .. } => Some(*int_bits),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Rational { int_bits, .. } => *int_bits)
     }
 
     pub fn bits_of_rational_frac(&self, ty: TypeId) -> Option<u8> {
-        match self.get(ty) {
-            TypeData::Rational { frac_bits, .. } => Some(*frac_bits),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Rational { frac_bits, .. } => *frac_bits)
     }
 
     pub fn is_generic_param(&self, ty: TypeId) -> bool {
@@ -3462,10 +3518,7 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn bits_of_int(&self, ty: TypeId) -> Option<u32> {
-        match self.get(ty) {
-            TypeData::Int { bits, .. } | TypeData::UInt { bits, .. } => Some(*bits),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Int { bits, .. } | TypeData::UInt { bits, .. } => *bits)
     }
 
     pub fn signedness_of_int(&self, ty: TypeId) -> Option<bool> {
@@ -3477,87 +3530,51 @@ impl<'input> TypeContext<'input> {
     }
 
     pub fn bits_of_float(&self, ty: TypeId) -> Option<u32> {
-        match self.get(ty) {
-            TypeData::Float { bits } => Some(*bits),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Float { bits } => *bits)
     }
 
     pub fn size_of_array(&self, ty: TypeId) -> Option<u64> {
-        match self.get(ty) {
-            TypeData::Array { size, .. } => Some(*size),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Array { size, .. } => *size)
     }
 
     pub fn elem_of_array(&self, ty: TypeId) -> Option<TypeId> {
-        match self.get(ty) {
-            TypeData::Array { elem, .. } => Some(*elem),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Array { elem, .. } => *elem)
     }
 
     pub fn elem_of_slice(&self, ty: TypeId) -> Option<TypeId> {
-        match self.get(ty) {
-            TypeData::Slice { elem } => Some(*elem),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Slice { elem } => *elem)
     }
 
     pub fn pointee_of_ref(&self, ty: TypeId) -> Option<TypeId> {
-        match self.get(ty) {
-            TypeData::Ref { ty: t, .. } => Some(*t),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Ref { ty: t, .. } => *t)
     }
 
     pub fn mutability_of_ref(&self, ty: TypeId) -> Option<bool> {
-        match self.get(ty) {
-            TypeData::Ref { mutable, .. } => Some(*mutable),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Ref { mutable, .. } => *mutable)
     }
 
     pub fn pointee_of_pointer(&self, ty: TypeId) -> Option<TypeId> {
-        match self.get(ty) {
-            TypeData::Pointer { ty: t, .. } => Some(*t),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Pointer { ty: t, .. } => *t)
     }
 
     pub fn params_of_fn(&self, ty: TypeId) -> Option<&[TypeId]> {
-        match self.get(ty) {
-            TypeData::Fn { params, .. } => Some(params),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Fn { params, .. } => params)
     }
 
     pub fn ret_of_fn(&self, ty: TypeId) -> Option<TypeId> {
-        match self.get(ty) {
-            TypeData::Fn { ret, .. } => Some(*ret),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Fn { ret, .. } => *ret)
     }
 
     pub fn tuple_elems(&self, ty: TypeId) -> Option<&[TypeId]> {
-        match self.get(ty) {
-            TypeData::Tuple { elems } => Some(elems),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Tuple { elems } => elems)
     }
 
     pub fn base_of_exists(&self, ty: TypeId) -> Option<TypeId> {
-        match self.get(ty) {
-            TypeData::Exists { base, .. } => Some(*base),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Exists { base, .. } => *base)
     }
 
     pub fn name_of_exists(&self, ty: TypeId) -> Option<&Symbol> {
-        match self.get(ty) {
-            TypeData::Exists { name, .. } => Some(name),
-            _ => None,
-        }
+        as_variant!(self.get(ty), TypeData::Exists { name, .. } => name)
     }
 
     pub fn set_meta(&mut self, id: TypeId, meta: TypeMeta<'input>) {

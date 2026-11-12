@@ -121,7 +121,12 @@ fn resolve_and_expand<'src, 'input>(
 ) {
     // Phase 1: expand `generate` blocks before name resolution.
     let mut expander = hir::generate::GenerateExpander::new_phase1(ctx);
-    let (expanded_items, _) = expander.expand_program(program.items);
+    // The second component is `new_items` (the items the expander produced),
+    // not diagnostics: phase 1 has no resolver, so those items are already in
+    // `expanded_items`, and phase 2 re-expands from the *expanded* program.
+    // Dropping the duplicate list is therefore lossless — there is no
+    // diagnostic channel to lose here.
+    let (expanded_items, _phase1_new_items) = expander.expand_program(program.items);
     let program = ast::Program {
         items: expanded_items,
         span: program.span,
@@ -163,7 +168,7 @@ fn resolve_target(target_opt: &Option<String>) -> Result<hir::target::Target, St
     match target_opt {
         Some(name) => {
             let path = std::path::Path::new(name);
-            if path.exists() {
+            if path.is_file() {
                 // Try loading as a JSON target spec.
                 match hir::target::Target::from_json(path) {
                     Ok(target) => Ok(target),
@@ -208,7 +213,7 @@ struct CompilerOptions {
     target: Option<String>,
     strict: bool,
     enable_experimental: bool,
-    feature: Vec<String>,
+    feature: std::sync::Arc<[String]>,
     debug: bool,
 }
 
@@ -222,7 +227,19 @@ fn main() {
     let session_sync_arena = crate::arena::SyncArena::new(&bump);
 
     let cli = cli::Cli::parse();
-    let color_choice = ColorChoice::from_str(&cli.color);
+    // `--fix` is only meaningful for the `check` subcommand; silently ignoring
+    // it elsewhere lets a user believe a file was patched when it was not.
+    if cli.fix && !matches!(&cli.command, cli::Command::Check { .. }) {
+        usage_error("--fix is only supported by `ponent check`");
+    }
+    let color_choice = match cli.color.as_str() {
+        "auto" => ColorChoice::Auto,
+        "always" => ColorChoice::Always,
+        "never" => ColorChoice::Never,
+        other => usage_error(format!(
+            "unknown --color value `{other}` (valid: auto, always, never)"
+        )),
+    };
 
     let mut diag_opts = DiagOpts::detect();
     diag_opts.use_color = color_choice.resolve();
@@ -234,10 +251,7 @@ fn main() {
         .collect::<Result<Vec<_>, _>>()
     {
         Ok(c) => c,
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            process::exit(2);
-        }
+        Err(msg) => usage_error(msg),
     };
     diag_opts.only_files = cli.only_file.clone();
     diag_opts.allow_codes = cli.allow.clone();
@@ -248,7 +262,7 @@ fn main() {
         target: cli.target,
         strict: cli.strict,
         enable_experimental: cli.enable_experimental,
-        feature: cli.feature,
+        feature: cli.feature.into(),
         debug: cli.debug,
     };
 
@@ -256,10 +270,9 @@ fn main() {
         "auto" => FixHints::Auto,
         "review" => FixHints::Review,
         "all" => FixHints::All,
-        other => {
-            eprintln!("error: unknown --fix-hints value `{other}` (valid: auto, review, all)");
-            process::exit(2);
-        }
+        other => usage_error(format!(
+            "unknown --fix-hints value `{other}` (valid: auto, review, all)"
+        )),
     };
 
     // Each handler returns the diagnostics to render instead of exiting:
@@ -289,20 +302,46 @@ fn main() {
             } else {
                 cli.error_format.clone()
             };
-            let outcome = run_check(&file, &opts, &session_sync_arena);
-            // `--fix` applies machine-applicable suggestions to the source
-            // file in place, then re-runs the check to confirm.
-            if cli.fix {
-                if let Err(ref diags) = outcome {
-                    let src = fs::read_to_string(&file).unwrap_or_default();
-                    let (fixed, n) = diagnostics::apply_fixes(diags, &src, fix_hints);
-                    if n > 0 {
-                        let _ = fs::write(&file, fixed.as_bytes());
-                        eprintln!(
-                            "applied {n} fix{} to `{}`",
-                            if n == 1 { "" } else { "es" },
-                            file
-                        );
+            let mut outcome = run_check(&file, &opts, &session_sync_arena);
+            // `--fix` applies machine-applicable suggestions to the source file
+            // in place, then re-runs the check to confirm the fix.
+            if cli.fix && let Err(ref diags) = outcome {
+                // Only fix what the user would actually see: the old code
+                // applied suggestions from diagnostics `--allow`/`--only-*`
+                // had filtered out.
+                let filter = DiagFilter::from_opts(&diag_opts);
+                let fixable: Vec<Diagnostic<'_>> = diags
+                    .iter()
+                    .filter(|d| d.matches_filter_with(&filter))
+                    .cloned()
+                    .collect();
+                // Use the exact source snapshot the diagnostics were produced
+                // from, not a fresh `read_to_string` that may have raced an
+                // editor/build-system write.
+                let src_owned = diags
+                    .iter()
+                    .find_map(|d| d.source())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| fs::read_to_string(&file).unwrap_or_default());
+                let (fixed, n) = diagnostics::apply_fixes(&fixable, &src_owned, fix_hints);
+                if n > 0 {
+                    match fs::write(&file, fixed.as_bytes()) {
+                        Ok(()) => {
+                            eprintln!(
+                                "applied {n} fix{} to `{}`",
+                                if n == 1 { "" } else { "es" },
+                                file
+                            );
+                            // Re-check: a fix that introduced a new error must
+                            // be surfaced instead of exiting 0 on the pre-fix
+                            // diagnostics.
+                            outcome = run_check(&file, &opts, &session_sync_arena);
+                        }
+                        Err(e) => {
+                            outcome = Err(vec![Diagnostic::error(format!(
+                                "failed to write fixes to `{file}`: {e}"
+                            ))]);
+                        }
                     }
                 }
             }
@@ -328,6 +367,18 @@ fn main() {
     if code != 0 {
         process::exit(code);
     }
+}
+
+/// Render a usage error through the diagnostic system and exit with status 2.
+///
+/// Usage errors are not compiler diagnostics, but routing them through the
+/// same renderer keeps colour/`--quiet`/format behaviour consistent and stops
+/// a second ad-hoc error format from drifting away from `report`.
+fn usage_error(msg: impl Into<String>) -> ! {
+    let mut opts = DiagOpts::detect();
+    opts.use_color = std::io::stderr().is_terminal();
+    let _ = report(Err(vec![Diagnostic::error(msg.into())]), "human", opts);
+    process::exit(2);
 }
 
 /// Render a handler's diagnostics and return the process exit code: `1` when
@@ -374,7 +425,7 @@ fn report<'a>(
 
 /// Lex a file, printing each token.  Never exits.
 fn run_lex(file: &str) -> Result<(), Vec<Diagnostic<'static>>> {
-    let source = fs::read_to_string(file).map_err(|e| {
+    let source_text = fs::read_to_string(file).map_err(|e| {
         // Don't attach source — the file couldn't be read, so there is no
         // source code to display.  The emitter closes the box with └─.
         vec![Diagnostic::error(format!(
@@ -382,7 +433,8 @@ fn run_lex(file: &str) -> Result<(), Vec<Diagnostic<'static>>> {
             file, e
         ))]
     })?;
-    let lexer = lexer::Token::lexer(&source);
+    let lexer = lexer::Token::lexer(&source_text);
+    let mut errors = Vec::new();
     for result in lexer {
         match result {
             Ok(token) => {
@@ -390,10 +442,10 @@ fn run_lex(file: &str) -> Result<(), Vec<Diagnostic<'static>>> {
                     println!("{:?}", token);
                 }
             }
-            Err(()) => eprintln!("ERROR: invalid token"),
+            Err(()) => errors.push(Diagnostic::error("invalid token")),
         }
     }
-    Ok(())
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
 /// Parse a file, and unless `--ast` was given, resolve and type-check it.
@@ -406,7 +458,7 @@ fn run_parse<'a>(
     opts: &CompilerOptions,
     sync_arena: &'a arena::SyncArena<'a>,
 ) -> Result<(), Vec<Diagnostic<'a>>> {
-    let source = fs::read_to_string(file).map_err(|e| {
+    let source_text = fs::read_to_string(file).map_err(|e| {
         vec![Diagnostic::error(format!(
             "failed to read `{}`: {}",
             file, e
@@ -415,6 +467,11 @@ fn run_parse<'a>(
     // Register the file with a SourceMap so every span carries a real
     // FileId, then copy the source into the leaked arena so the diagnostics
     // that borrow it can outlive this call and be rendered by `main`.
+    let source: &'a str = sync_arena.alloc_str(&source_text);
+    // The owned `String` is dropped here: the arena owns the text now, so
+    // keeping the original alive for the rest of the function would retain
+    // a second full copy of every source file.
+    drop(source_text);
     let mut source_map = sourcemap::SourceMap::new();
     let file_id = source_map.add_file(file, source).map_err(|e| {
         vec![Diagnostic::error(format!(
@@ -422,7 +479,6 @@ fn run_parse<'a>(
             file, e
         ))]
     })?;
-    let source: &'a str = sync_arena.alloc_str(source_map.file(file_id).source());
 
     let mut parser = parser::Parser::new(source, file_id, sync_arena);
     let program = match parser.parse_program() {
@@ -459,7 +515,8 @@ fn run_parse<'a>(
         file,
         opts.enable_experimental,
     );
-    attach_source_to_diags(&mut all_diags, source, file);
+    // `resolve_and_expand` already attached `source` to every phase's
+    // diagnostics; the old second pass here re-walked the vector for nothing.
 
     // From here the session owns the pipeline state, so a query can be handed
     // all of it through one provider.
@@ -472,10 +529,10 @@ fn run_parse<'a>(
         &mut session.trait_env,
         // `TypeChecker` takes the map by value, so the session keeps its own
         // copy for queries to read.
-        session.resolution_map.clone(),
+        std::sync::Arc::clone(&session.resolution_map),
         opts.strict,
         opts.enable_experimental,
-        opts.feature.clone(),
+        std::sync::Arc::clone(&opts.feature),
         opts.debug,
         Some(source),
     );
@@ -518,12 +575,17 @@ fn run_check<'a>(
     opts: &CompilerOptions,
     sync_arena: &'a arena::SyncArena<'a>,
 ) -> Result<(), Vec<Diagnostic<'a>>> {
-    let source = fs::read_to_string(file).map_err(|e| {
+    let source_text = fs::read_to_string(file).map_err(|e| {
         vec![Diagnostic::error(format!(
             "failed to read `{}`: {}",
             file, e
         ))]
     })?;
+    let source: &'a str = sync_arena.alloc_str(&source_text);
+    // The owned `String` is dropped here: the arena owns the text now, so
+    // keeping the original alive for the rest of the function would retain
+    // a second full copy of every source file.
+    drop(source_text);
     let mut source_map = sourcemap::SourceMap::new();
     let file_id = source_map.add_file(file, source).map_err(|e| {
         vec![Diagnostic::error(format!(
@@ -531,7 +593,6 @@ fn run_check<'a>(
             file, e
         ))]
     })?;
-    let source: &'a str = sync_arena.alloc_str(source_map.file(file_id).source());
 
     let mut parser = parser::Parser::new(source, file_id, sync_arena);
     let program = match parser.parse_program() {
@@ -548,18 +609,22 @@ fn run_check<'a>(
     let mut ctx = TypeContext::new_with_target(target.clone());
     ctx.arena = Some(sync_arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(
+    // Same phase pipeline as `run_parse`: phase-1 expansion → resolve →
+    // phase-2 expansion → incremental resolve.  Calling the resolver directly
+    // made `check` reject (or misresolve) files that `parse` accepts.
+    let (program, symbols, trait_env, mut all_diags, resolution_map) = resolve_and_expand(
         &mut ctx,
+        program,
         local_crate_id,
-        Some(source),
+        source,
+        file,
         opts.enable_experimental,
     );
-    let (symbols, trait_env, resolver_diags, resolution_map) = resolver.resolve_program(&program);
-    let mut all_diags = resolver_diags.into_inner();
-    attach_source_to_diags(&mut all_diags, source, file);
 
     // Same session plumbing as the `Parse` path above.
     let mut session = CompilerSession::new(ctx, symbols, trait_env, resolution_map, target);
+
+    let has_main = session.resolution_map.has_main;
 
     let mut checker = TypeChecker::new_with_source(
         &mut session.ctx,
@@ -567,10 +632,10 @@ fn run_check<'a>(
         &mut session.trait_env,
         // `TypeChecker` takes the map by value, so the session keeps its own
         // copy for queries to read.
-        session.resolution_map.clone(),
+        std::sync::Arc::clone(&session.resolution_map),
         opts.strict,
         opts.enable_experimental,
-        opts.feature.clone(),
+        std::sync::Arc::clone(&opts.feature),
         opts.debug,
         Some(source),
     );
@@ -581,6 +646,18 @@ fn run_check<'a>(
         Ok(_hir) => {
             let mut diags = checker_diag_vec;
             diags.extend(all_diags);
+            // `check` is a "compile this program" subcommand like `parse`;
+            // the old asymmetry (parse requires `main`, check does not) made
+            // `check library.po` succeed where `parse library.po` failed.
+            if !has_main {
+                let mut main_diag = vec![
+                    Diagnostic::error("`main` function not found in crate")
+                        .with_code_str(ErrCode::E062)
+                        .with_help("add a `def main() { ... }` function as the entry point"),
+                ];
+                attach_source_to_diags(&mut main_diag, source, file);
+                diags.extend(main_diag);
+            }
             if diags.is_empty() { Ok(()) } else { Err(diags) }
         }
         Err(errors) => {
@@ -597,12 +674,17 @@ fn run_mir<'a>(
     opts: &CompilerOptions,
     sync_arena: &'a arena::SyncArena<'a>,
 ) -> Result<(), Vec<Diagnostic<'a>>> {
-    let source = fs::read_to_string(file).map_err(|e| {
+    let source_text = fs::read_to_string(file).map_err(|e| {
         vec![Diagnostic::error(format!(
             "failed to read `{}`: {}",
             file, e
         ))]
     })?;
+    let source: &'a str = sync_arena.alloc_str(&source_text);
+    // The owned `String` is dropped here: the arena owns the text now, so
+    // keeping the original alive for the rest of the function would retain
+    // a second full copy of every source file.
+    drop(source_text);
     let mut source_map = sourcemap::SourceMap::new();
     let file_id = source_map.add_file(file, source).map_err(|e| {
         vec![Diagnostic::error(format!(
@@ -610,7 +692,6 @@ fn run_mir<'a>(
             file, e
         ))]
     })?;
-    let source: &'a str = sync_arena.alloc_str(source_map.file(file_id).source());
 
     let mut parser = parser::Parser::new(source, file_id, sync_arena);
     let program = match parser.parse_program() {
@@ -627,15 +708,16 @@ fn run_mir<'a>(
     let mut ctx = TypeContext::new_with_target(target.clone());
     ctx.arena = Some(sync_arena);
     let local_crate_id = CrateId(DefId(0));
-    let mut resolver = NameResolver::new(
+    // Same phase pipeline as `run_parse`/`run_check` (generate expansion is
+    // part of the language, not a parse-only nicety).
+    let (program, symbols, trait_env, mut all_diags, resolution_map) = resolve_and_expand(
         &mut ctx,
+        program,
         local_crate_id,
-        Some(source),
+        source,
+        file,
         opts.enable_experimental,
     );
-    let (symbols, trait_env, resolver_diags, resolution_map) = resolver.resolve_program(&program);
-    let mut all_diags = resolver_diags.into_inner();
-    attach_source_to_diags(&mut all_diags, source, file);
 
     let mut session = CompilerSession::new(ctx, symbols, trait_env, resolution_map, target);
 
@@ -643,10 +725,10 @@ fn run_mir<'a>(
         &mut session.ctx,
         &session.symbols,
         &mut session.trait_env,
-        session.resolution_map.clone(),
+        std::sync::Arc::clone(&session.resolution_map),
         opts.strict,
         opts.enable_experimental,
-        opts.feature.clone(),
+        std::sync::Arc::clone(&opts.feature),
         opts.debug,
         Some(source),
     );
@@ -683,12 +765,14 @@ fn run_explain(code: Option<String>, color: ColorChoice, serve: bool) {
         run_explain_serve(code);
         return;
     }
+    let use_color = color.resolve();
     match code {
         Some(code) => {
-            let use_color = color.resolve();
             // Start the local explain server on a random port.
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind explain server");
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => l,
+                Err(e) => usage_error(format!("failed to bind explain server: {e}")),
+            };
             let port = listener.local_addr().unwrap().port();
             // Called once per process; a re-set would be a bug, so surface it.
             if let Err(previous) = diagnostics::error_code::set_explain_port(port) {
@@ -711,9 +795,12 @@ fn run_explain(code: Option<String>, color: ColorChoice, serve: bool) {
             });
 
             // Spin a one-line ASCII spinner on stderr while the server waits
-            // for the browser to connect (~2 s), so the terminal does not
-            // look frozen.  Only when stderr is a real terminal: a pipe or
-            // log file must never receive cursor-movement control bytes.
+            // for the browser to connect.  The wait is bounded by
+            // `explain_server`'s `ACCEPT_BUDGET` (10 s) plus its short drain
+            // tails, so the spinner cannot run indefinitely even in a headless
+            // CI run where no browser ever connects.  Only when stderr is a
+            // real terminal: a pipe or log file must never receive
+            // cursor-movement control bytes.
             let spinner = if std::io::stderr().is_terminal() {
                 Some(spawn_explain_spinner(&url, &explain_code))
             } else {
@@ -730,7 +817,7 @@ fn run_explain(code: Option<String>, color: ColorChoice, serve: bool) {
             });
         }
         None => {
-            print!("{}", diagnostics::list_error_codes());
+            print!("{}", diagnostics::list_error_codes(use_color));
         }
     }
 }
@@ -738,8 +825,10 @@ fn run_explain(code: Option<String>, color: ColorChoice, serve: bool) {
 /// Persistent explain server: opens the browser, then blocks serving the
 /// index at `/` and per-code pages at `/<code>` until Ctrl+C.
 fn run_explain_serve(initial_code: Option<String>) {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind explain server");
+    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => usage_error(format!("failed to bind explain server: {e}")),
+    };
     let port = listener.local_addr().unwrap().port();
     let _ = diagnostics::error_code::set_explain_port(port);
 
@@ -835,8 +924,11 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 #[cfg(target_os = "windows")]
 fn open_browser(url: &str) -> std::io::Result<()> {
     std::process::Command::new("cmd")
-        .args(["/c", "start", url])
-        .spawn()?;
+                // `start`'s first quoted argument is the window *title*, so an
+                // empty title must be passed explicitly before the URL; otherwise
+                // Windows opens an empty console instead of the page.
+                .args(["/c", "start", "", url])
+                .spawn?;
     Ok(())
 }
 

@@ -2,6 +2,7 @@ use super::{Diagnostic, EmissionGuarantee};
 use crate::diagnostics::emitter::Emitter;
 use crate::diagnostics::render::Renderer;
 use crate::diagnostics::sink::MakeSink;
+use crate::smallvec::SmallVec;
 use std::borrow::Cow;
 use std::io;
 
@@ -33,18 +34,53 @@ use std::io;
 #[derive(Debug, Clone)]
 pub struct DiagCtxt<'src> {
     /// `[reported (0..reported_len) | unreported (reported_len..)]`.
-    diags: Vec<Diagnostic<'src>>,
+    ///
+    /// Inline capacity 2 carries the overwhelmingly common "zero or one
+    /// diagnostic per unit" batch on the stack, so constructing a context no
+    /// longer heap-allocates up front. `Diagnostic` is large, so the inline
+    /// store is kept at 2 rather than widened.
+    diags: SmallVec<[Diagnostic<'src>; 2]>,
     reported_len: usize,
     /// If false, warning-level diagnostics are suppressed.
-    pub can_emit_warnings: bool,
+    /// Push-time gate: when `false`, warning-level diagnostics pushed
+    /// *afterwards* are suppressed at `push` (returning a suppressed
+    /// [`EmissionGuarantee`]).  This is a "build started, warnings disabled"
+    /// compile-time flag: diagnostics already pushed before the flag was
+    /// cleared remain in the context and are emitted by `emit`/`emit_all_iter`
+    /// regardless.  Setting the flag back to `true` re-enables subsequent
+    /// pushes but does not retroactively restore anything.
+    can_emit_warnings: bool,
+    /// Push-time severity tally over *all* entries (reported + unreported).
+    /// `has_errors`, `error_count`, `warning_count`, `summary` and `check`
+    /// used to scan every `Diagnostic` per call (`check` runs once per
+    /// module), so the tally makes them O(1).  Mutators that add, remove or
+    /// change severity must update it; `summary` cross-checks it in debug.
+    errors: usize,
+    warnings: usize,
 }
 
+/// The inline `SmallVec<[Diagnostic; 2]>` is what keeps a zero/one-diagnostic
+/// context on the stack; fail the build if `DiagCtxt` (or `Diagnostic`) grows
+/// enough to make that a silent per-context stack cost.
+const _: () = assert!(std::mem::size_of::<DiagCtxt<'_>>() <= 1024);
+
 impl<'src> DiagCtxt<'src> {
+    /// Enable/disable warning emission for **subsequent** pushes.
+    ///
+    /// Push-time gate: diagnostics already pushed are unaffected, and
+    /// re-enabling does not restore suppressed ones. Encapsulated behind a
+    /// setter so a future invariant (e.g. forbidding mid-emit toggles) can be
+    /// added without a breaking field change.
+    pub fn set_can_emit_warnings(&mut self, enabled: bool) {
+        self.can_emit_warnings = enabled;
+    }
     pub fn new() -> Self {
         DiagCtxt {
-            diags: Vec::new(),
+            diags: SmallVec::new(),
             reported_len: 0,
             can_emit_warnings: true,
+            errors: 0,
+            warnings: 0,
         }
     }
 
@@ -53,6 +89,11 @@ impl<'src> DiagCtxt<'src> {
     pub fn push(&mut self, diag: Diagnostic<'src>) -> EmissionGuarantee {
         if diag.is_warning() && !self.can_emit_warnings {
             return EmissionGuarantee::suppressed();
+        }
+        if diag.is_error() {
+            self.errors += 1;
+        } else if diag.is_warning() {
+            self.warnings += 1;
         }
         self.diags.push(diag);
         EmissionGuarantee::emitted()
@@ -80,7 +121,16 @@ impl<'src> DiagCtxt<'src> {
     /// `can_emit_warnings` filter applies to the batch exactly as it does to
     /// single pushes.
     pub fn extend<I: IntoIterator<Item = Diagnostic<'src>>>(&mut self, diags: I) {
-        for diag in diags {
+        let iter = diags.into_iter();
+        // `Vec::extend` would reserve from `size_hint`; the manual `push`
+        // loop below must do it explicitly or a batch of N reallocates
+        // O(log N) times.  A warning-filtered batch may reserve slightly
+        // more than it keeps; that is cheaper than growing repeatedly.
+        let (lower, _) = iter.size_hint();
+        if lower > 0 {
+            self.diags.reserve(lower);
+        }
+        for diag in iter {
             self.push(diag);
         }
     }
@@ -88,6 +138,10 @@ impl<'src> DiagCtxt<'src> {
     /// Attach `source` to every diagnostic (reported and unreported) that does
     /// not already carry one.  Called at a producer's boundary so downstream
     /// emitters can render snippets without cloning the source buffer.
+    ///
+    /// The reported region is included on purpose: a caller may re-inspect
+    /// already-emitted diagnostics (e.g. to render them elsewhere), and source
+    /// attachment is idempotent.  It is not re-rendered in place.
     pub fn attach_source(&mut self, source: &'src str) {
         for diag in &mut self.diags {
             if diag.source().is_none() {
@@ -134,16 +188,19 @@ impl<'src> DiagCtxt<'src> {
     }
 
     /// Consume `self` and return all diagnostics (reported, then unreported).
+    #[must_use]
     pub fn into_inner(self) -> Vec<Diagnostic<'src>> {
-        self.diags
+        self.diags.into_vec()
     }
 
     /// Return true if any diagnostic (reported or unreported) is an error.
+    #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.diags.iter().any(|d| d.is_error())
+        self.errors > 0
     }
 
     /// Number of fresh (unreported) diagnostics.
+    #[must_use]
     pub fn unreported_len(&self) -> usize {
         self.diags.len() - self.reported_len
     }
@@ -152,12 +209,37 @@ impl<'src> DiagCtxt<'src> {
     /// expected failures during recursive type resolution (an ADT payload
     /// referencing the ADT itself, which is not yet registered).
     pub fn truncate_unreported(&mut self, len: usize) {
-        self.diags.truncate(self.reported_len + len);
+        // `Vec::truncate` is a no-op when `new_len >= len`, so a stale count
+        // captured before later pushes would silently keep too many
+        // diagnostics.  Callers pass a value from `unreported_len()`; assert
+        // that in debug builds to catch the stale-capture bug class.
+        debug_assert!(
+            len <= self.unreported_len(),
+            "truncate_unreported: stale count {len} > {}",
+            self.unreported_len()
+        );
+        // `saturating_add`, not `+`: an out-of-contract `len` (producer bug)
+        // must not wrap `reported_len + len` to a small value and truncate the
+        // reported prefix away.  Saturation yields `usize::MAX`, and
+        // `Vec::truncate` is a no-op when `new_len >= len`.
+        let keep = self.reported_len.saturating_add(len);
+        if keep < self.diags.len() {
+            for d in &self.diags[keep..] {
+                if d.is_error() {
+                    self.errors -= 1;
+                } else if d.is_warning() {
+                    self.warnings -= 1;
+                }
+            }
+            self.diags.truncate(keep);
+        }
     }
 
     pub fn clear(&mut self) {
         self.diags.clear();
         self.reported_len = 0;
+        self.errors = 0;
+        self.warnings = 0;
     }
 
     /// Emit all unreported diagnostics via the given emitter.
@@ -212,13 +294,15 @@ impl<'src> DiagCtxt<'src> {
     }
 
     /// Total count of error diagnostics.
+    #[must_use]
     pub fn error_count(&self) -> usize {
-        self.iter().filter(|d| d.is_error()).count()
+        self.errors
     }
 
     /// Total count of warning diagnostics.
+    #[must_use]
     pub fn warning_count(&self) -> usize {
-        self.iter().filter(|d| d.is_warning()).count()
+        self.warnings
     }
 
     /// One-pass `(error_count, warning_count)`.
@@ -230,16 +314,26 @@ impl<'src> DiagCtxt<'src> {
     /// still uses `has_errors`, which short-circuits on the first error and
     /// is therefore strictly cheaper than this full pass.
     pub fn summary(&self) -> (usize, usize) {
-        let mut errors = 0usize;
-        let mut warnings = 0usize;
-        for d in &self.diags {
-            if d.is_error() {
-                errors += 1;
-            } else if d.is_warning() {
-                warnings += 1;
+        // Debug-only invariant check: every mutator that adds/removes/changes
+        // a diagnostic must keep the tally exact.  Release pays nothing.
+        #[cfg(debug_assertions)]
+        {
+            let mut e = 0usize;
+            let mut w = 0usize;
+            for d in &self.diags {
+                if d.is_error() {
+                    e += 1;
+                } else if d.is_warning() {
+                    w += 1;
+                }
             }
+            debug_assert_eq!(
+                (self.errors, self.warnings),
+                (e, w),
+                "DiagCtxt severity tally drifted from the diagnostics"
+            );
         }
-        (errors, warnings)
+        (self.errors, self.warnings)
     }
 
     /// Get a mutable reference to the last **unreported** diagnostic, if any.
@@ -283,25 +377,56 @@ impl<'src> DiagCtxt<'src> {
     }
 
     /// Drain the unreported list and return it.
+    ///
+    /// **Retained deliberately** even though no in-tree caller uses it today:
+    /// it is part of the public collector API and an external batch/checkpoint
+    /// consumer may. The `mem::take` fast path below is pinned by
+    /// `drain_unreported_leaves_reported`, so it is not unowned maintenance
+    /// debt.
     pub fn drain_unreported(&mut self) -> Vec<Diagnostic<'src>> {
-        self.diags.split_off(self.reported_len)
+        // `SmallVec` here has no `split_off`, so drain through `into_vec`:
+        // the take still avoids a per-element copy, and the split is a Vec
+        // move. This path runs at most once per batch.
+        let mut all = std::mem::take(&mut self.diags).into_vec();
+        if self.reported_len == 0 {
+            self.errors = 0;
+            self.warnings = 0;
+            return all;
+        }
+        let unreported = all.split_off(self.reported_len);
+        for d in &unreported {
+            if d.is_error() {
+                self.errors -= 1;
+            } else if d.is_warning() {
+                self.warnings -= 1;
+            }
+        }
+        // Put the still-reported prefix back: `split_off` left it in `all`.
+        self.diags = SmallVec::from_vec(all);
+        unreported
     }
 
     /// Drain the reported list and return it.
     pub fn drain_reported(&mut self) -> Vec<Diagnostic<'src>> {
-        // Fast paths avoid a whole-buffer memmove when the split is at
-        // either end: `split_off(0)` and `split_off(len)` would each move
-        // the entire vec for nothing.
         if self.reported_len == 0 {
             return Vec::new();
         }
-        if self.reported_len == self.diags.len() {
+        let mut all = std::mem::take(&mut self.diags).into_vec();
+        if self.reported_len == all.len() {
             self.reported_len = 0;
-            return std::mem::take(&mut self.diags);
+            self.errors = 0;
+            self.warnings = 0;
+            return all;
         }
-        let mut all = std::mem::take(&mut self.diags);
         let unreported = all.split_off(self.reported_len);
-        self.diags = unreported;
+        for d in &all {
+            if d.is_error() {
+                self.errors -= 1;
+            } else if d.is_warning() {
+                self.warnings -= 1;
+            }
+        }
+        self.diags = SmallVec::from_vec(unreported);
         self.reported_len = 0;
         all
     }
@@ -313,29 +438,39 @@ impl<'src> DiagCtxt<'src> {
     /// This is the inverse of `--warn-as-error`: it can be used to forgive
     /// certain categories of errors (e.g. in a REPL or after a config change).
     pub fn errors_to_warnings(&mut self) {
+        let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
             if diag.is_error() {
                 diag.set_level(super::DiagnosticLevel::Warning);
+                moved += 1;
             }
         }
+        self.errors -= moved;
+        self.warnings += moved;
     }
 
     /// Downgrade all **unreported** error-level diagnostics to information.
     pub fn errors_to_infos(&mut self) {
+        let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
             if diag.is_error() {
                 diag.set_level(super::DiagnosticLevel::Info);
+                moved += 1;
             }
         }
+        self.errors -= moved;
     }
 
     /// Downgrade all **unreported** warning-level diagnostics to information.
     pub fn warnings_to_infos(&mut self) {
+        let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
             if diag.is_warning() {
                 diag.set_level(super::DiagnosticLevel::Info);
+                moved += 1;
             }
         }
+        self.warnings -= moved;
     }
 }
 
@@ -347,17 +482,28 @@ impl Default for DiagCtxt<'_> {
 
 impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
     fn from(diags: Vec<Diagnostic<'src>>) -> Self {
+        let mut errors = 0usize;
+        let mut warnings = 0usize;
+        for d in &diags {
+            if d.is_error() {
+                errors += 1;
+            } else if d.is_warning() {
+                warnings += 1;
+            }
+        }
         DiagCtxt {
-            diags,
+            diags: SmallVec::from_vec(diags),
             reported_len: 0,
             can_emit_warnings: true,
+            errors,
+            warnings,
         }
     }
 }
 
 impl<'src> IntoIterator for DiagCtxt<'src> {
     type Item = Diagnostic<'src>;
-    type IntoIter = std::vec::IntoIter<Diagnostic<'src>>;
+    type IntoIter = crate::smallvec::IntoIter<[Diagnostic<'src>; 2]>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.diags.into_iter()
@@ -464,7 +610,7 @@ mod tests {
     #[test]
     fn extend_applies_warning_filter() {
         let mut c = DiagCtxt::new();
-        c.can_emit_warnings = false;
+        c.set_can_emit_warnings(false);
         c.extend(vec![Diagnostic::error("e"), Diagnostic::warning("w")]);
         assert_eq!(c.len(), 1);
         assert_eq!(c.unreported_len(), 1);
@@ -472,6 +618,53 @@ mod tests {
         // Any IntoIterator works, and each item still goes through `push`.
         c.extend(std::iter::once(Diagnostic::warning("w2")));
         assert_eq!(c.len(), 1);
+    }
+
+    /// `can_emit_warnings` is a *push-time* gate: diagnostics pushed before
+    /// the flag was cleared stay in the context and are emitted; only later
+    /// pushes are suppressed.  Pinning this so the doc contract cannot drift
+    /// into an emit-time filter silently.
+    #[test]
+    fn warning_gate_is_push_time_not_emit_time() {
+        use crate::diagnostics::DiagOpts;
+        use crate::diagnostics::renderers::JsonRenderer;
+        use crate::diagnostics::sink::DiagnosticSink;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct SharedSink(Rc<RefCell<String>>);
+        impl DiagnosticSink for SharedSink {
+            fn write_str(&mut self, s: &str) -> io::Result<()> {
+                self.0.borrow_mut().push_str(s);
+                Ok(())
+            }
+        }
+
+        let out = Rc::new(RefCell::new(String::new()));
+        let captured = Rc::clone(&out);
+        let mut emitter = Emitter::new(
+            JsonRenderer::new(false),
+            move || SharedSink(Rc::clone(&captured)),
+            DiagOpts::default(),
+        );
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::warning("early"));
+        c.set_can_emit_warnings(false);
+        c.push(Diagnostic::warning("late"));
+        // The late push was suppressed...
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.unreported_len(), 1);
+        // ...but the early warning is still emitted.
+        c.emit(&mut emitter).unwrap();
+        assert!(!c.has_unreported());
+        assert!(
+            out.borrow().contains("early"),
+            "pre-existing warning must still be emitted: {out:?}"
+        );
+        assert!(
+            !out.borrow().contains("late"),
+            "suppressed push must not be emitted: {out:?}"
+        );
     }
 
     #[test]
