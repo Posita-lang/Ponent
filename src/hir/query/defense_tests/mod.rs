@@ -3220,6 +3220,77 @@ fn d20_rerequest_lands_on_verifying_system() {
     );
 }
 
+/// d20b: a reader with TWO dirty dependencies.  The batch re-request runs
+/// them concurrently in non-shuttle builds; both must be recomputed exactly
+/// once and the cached reader must then serve green (no recompute).
+#[test]
+fn d20b_parallel_rerequest_recomputes_all_dirty_dependencies() {
+    static K_RUNS: AtomicU64 = AtomicU64::new(0);
+    static E_RUNS: AtomicU64 = AtomicU64::new(0);
+    K_RUNS.store(0, Ordering::SeqCst);
+    E_RUNS.store(0, Ordering::SeqCst);
+
+    struct EQ;
+    impl<'q, 'src: 'q> Query<'q, 'src> for EQ {
+        type Storage = Owned;
+        type Key = DKey;
+        type Value = FpValue;
+        type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("d20b_e", "parallel rerequest leaf")
+        }
+        fn compute<S: Scheduler>(_key: &DKey, _: &dyn QueryProvider<'q, 'src, S>) -> FpValue {
+            E_RUNS.fetch_add(1, Ordering::SeqCst);
+            FpValue {
+                raw: String::new(),
+                semantic: 7,
+            }
+        }
+    }
+    struct KQ;
+    impl<'q, 'src: 'q> Query<'q, 'src> for KQ {
+        type Storage = Owned;
+        type Key = DKey;
+        type Value = FpValue;
+        type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("d20b_k", "parallel rerequest reader")
+        }
+        fn compute<S: Scheduler>(key: &DKey, provider: &dyn QueryProvider<'q, 'src, S>) -> FpValue {
+            K_RUNS.fetch_add(1, Ordering::SeqCst);
+            let a = query_get::<EQ, _>(provider, key.clone()).unwrap();
+            let b = query_get::<EQ, _>(provider, DKey(key.0 + 1)).unwrap();
+            FpValue {
+                raw: String::new(),
+                semantic: a.semantic + b.semantic,
+            }
+        }
+    }
+
+    let sys = leak_system();
+    let prov = leak_provider(sys);
+    let first = sys.get::<KQ>(DKey(0), prov).unwrap();
+    assert_eq!(first.semantic, 14);
+    assert_eq!(K_RUNS.load(Ordering::SeqCst), 1);
+    assert_eq!(E_RUNS.load(Ordering::SeqCst), 2);
+
+    sys.invalidate::<EQ>(&DKey(0));
+    sys.invalidate::<EQ>(&DKey(1));
+
+    let served = sys.get::<KQ>(DKey(0), prov).unwrap();
+    assert_eq!(served.semantic, 14);
+    assert_eq!(
+        E_RUNS.load(Ordering::SeqCst),
+        4,
+        "both dirty dependencies must be re-requested exactly once"
+    );
+    assert_eq!(
+        K_RUNS.load(Ordering::SeqCst),
+        1,
+        "a green re-verify after the batched re-request must serve the cached reader"
+    );
+}
+
 /// d21: the green bit must never be published before the new cache entry
 /// is staged — doing so lets a getter see a GREEN node whose value is
 /// still the pre-recompute stale Arc.

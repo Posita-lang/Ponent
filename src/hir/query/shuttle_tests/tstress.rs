@@ -49,7 +49,7 @@ struct QuietPanics {
     _lock: parking_lot::MutexGuard<'static, ()>,
 }
 
-static QUIET_PANICS_LOCK: parking_lot::Mutex<> = parking_lot::Mutex::new;
+static QUIET_PANICS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 impl QuietPanics {
     fn install() -> Option<Self> {

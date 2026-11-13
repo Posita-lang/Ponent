@@ -357,7 +357,7 @@ fn d15_clear_all_waits_for_quiesced_reader() {
             let sys = system;
             shuttle::thread::spawn(move || {
                 sys.clear_all();
-                let _ = ctx.send;
+                let _ = ctx.send(());
             });
         }
         for _ in 0..100 {

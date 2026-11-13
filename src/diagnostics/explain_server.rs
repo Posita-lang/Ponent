@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 
 use crate::diagnostics::error_code::ErrCode;
 use crate::smallvec::SmallVec;
@@ -65,6 +65,40 @@ impl PendingConn {
 /// non-blocking for the poll loop and leaves it in blocking mode on return
 /// (`TcpListener` has no getter for the previous mode, so a caller that
 /// supplied a non-blocking listener gets a blocking one back).
+#[cfg(target_os = "linux")]
+fn epoll_ctl_checked(epfd: i32, op: i32, fd: i32, event: *mut libc::epoll_event) -> i32 {
+    let rc = unsafe { libc::epoll_ctl(epfd, op, fd, event) };
+    debug_assert_eq!(rc, 0, "epoll_ctl(op={op}, fd={fd}) failed");
+    rc
+}
+
+/// Accept one connection already non-blocking.  Linux folds `accept` +
+/// `set_nonblocking` + `CLOEXEC` into one `accept4` syscall; other Unix
+/// targets keep the two-step fallback.
+#[cfg(unix)]
+fn accept_nonblocking(listener: &TcpListener) -> std::io::Result<TcpStream> {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let fd = libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        );
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(TcpStream::from_raw_fd(fd))
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let (stream, _) = listener.accept()?;
+        stream.set_nonblocking(true)?;
+        Ok(stream)
+    }
+}
+
 pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> {
     // `ErrCode::new` carries a `debug_assert!` that aborts on unknown codes;
     // `code` here comes from the CLI (`ponent explain <CODE>`), so a typo
@@ -223,13 +257,9 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 // preconnects would otherwise be accepted one deadline-tick
                 // at a time.
                 while pending.len() < MAX_PENDING {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
+                    match accept_nonblocking(listener) {
+                        Ok(stream) => {
                             accept_errors = 0;
-                            if stream.set_nonblocking(true).is_err() {
-                                let _ = stream.shutdown(Shutdown::Both);
-                                continue;
-                            }
                             pending.push(PendingConn {
                                 stream,
                                 accepted_at: Instant::now(),
@@ -307,8 +337,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 }
             }
 
-            let mut handoff: SmallVec<[(TcpStream, SmallVec<[u8; 512]>); MAX_PENDING]> =
-                SmallVec::new();
+            let mut handoff: SmallVec<[(TcpStream, SmallVec<[u8; 512]>); 8]> = SmallVec::new();
             for &(i, complete) in remove.iter().rev() {
                 let p = pending.swap_remove(i);
                 if complete {
@@ -327,14 +356,18 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 std::thread::scope(|scope| {
                     for (mut stream, buf) in handoff.drain(..) {
                         let expected = &expected_path;
-                        let is_target = request_line_targets(buf.as_ref(), expected);
                         let delivered_ref = &delivered;
                         let html = &html;
                         scope.spawn(move || {
                             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 serve_page_after_prefix(&mut stream, html, Some(expected), &buf)
                             }));
-                            if is_target && matches!(r, Ok(Ok(true))) {
+                            // `serve_page_after_prefix` parses the request
+                            // line exactly once and returns true only after
+                            // serving the expected target, so the old
+                            // pre-parse (`request_line_targets`) was a second
+                            // parse of the same bytes.
+                            if matches!(r, Ok(Ok(true))) {
                                 delivered_ref.store(true, Ordering::Release);
                             }
                         });
@@ -1171,31 +1204,7 @@ fn serve_page_after_prefix(
     }
 }
 
-/// Whether a complete request line in `buf` targets the expected page.
-fn request_line_targets(buf: &[u8], expected: &str) -> bool {
-    let Some(nl) = memchr::memchr(b'\n', buf) else {
-        return false;
-    };
-    let raw = &buf[..nl];
-    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-    let Ok(line) = std::str::from_utf8(raw) else {
-        return false;
-    };
-    let Some(req) = parse_request_line(line) else {
-        return false;
-    };
-    if req.method != "GET"
-        || !matches!(req.version, "HTTP/1.0" | "HTTP/1.1")
-        || !req.target.starts_with('/')
-    {
-        return false;
-    }
-    let expected_code = expected.trim_matches('/');
-    let raw_path = req.target.split('?').next().unwrap_or("/");
-    canonical_path_code(req.target).as_deref() == Some(expected_code)
-        || raw_path == expected
-        || raw_path.strip_suffix('/') == Some(expected)
-}
+
 
 /// Decode and normalize a request target to a canonical error code.
 ///
@@ -1811,7 +1820,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
         events: libc::EPOLLIN as u32,
         u64: listener_fd as u64,
     };
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, listener_fd, &mut interest) } < 0 {
+    if epoll_ctl_checked(epfd, libc::EPOLL_CTL_ADD, listener_fd, &mut interest) < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -1849,10 +1858,9 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
             let fd = event.u64 as i32;
             if fd == listener_fd {
                 loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
+                    match accept_nonblocking(listener) {
+                        Ok(stream) => {
                             consecutive_accept_errors = 0;
-                            let _ = stream.set_nonblocking(true);
                             let _ = stream.set_nodelay(true);
                             let conn_fd = stream.as_raw_fd();
                             if conns.len() >= MAX_CONCURRENT_CONNECTIONS {
@@ -1901,14 +1909,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                                 },
                                 u64: conn_fd as u64,
                             };
-                            unsafe {
-                                libc::epoll_ctl(
-                                    epfd,
-                                    libc::EPOLL_CTL_ADD,
-                                    conn_fd,
-                                    &mut conn_event,
-                                );
-                            }
+                            epoll_ctl_checked(epfd, libc::EPOLL_CTL_ADD, conn_fd, &mut conn_event);
                         }
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2063,9 +2064,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                     events: libc::EPOLLOUT as u32,
                     u64: fd as u64,
                 };
-                unsafe {
-                    libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
-                }
+                epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
             }
 
             if conn.state == WRITING {
@@ -2124,9 +2123,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,
                         };
-                        unsafe {
-                            libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
-                        }
+                        epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
                     } else {
                         // Half-close and drain inbound bytes: closing with
                         // unread request/body bytes makes the kernel emit RST,
@@ -2139,9 +2136,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,
                         };
-                        unsafe {
-                            libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
-                        }
+                        epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
                     }
                 }
             }
@@ -2157,9 +2152,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
         close.dedup();
         for fd in close {
             if let Some(conn) = conns.remove(&fd) {
-                unsafe {
-                    libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
-                }
+                epoll_ctl_checked(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
                 let _ = conn.stream.shutdown(Shutdown::Both);
             }
         }
@@ -2776,7 +2769,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     // map key.  A cache hit sets the referenced bit; eviction sweeps the ring,
     // clearing bits and skipping referenced entries.
     struct Entry {
-        page: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<OwnedPage>>>,
+        page: std::sync::OnceLock<std::sync::Arc<OwnedPage>>,
         referenced: std::sync::atomic::AtomicBool,
     }
     struct Shard {
@@ -2854,7 +2847,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         }
     }
     let entry = std::sync::Arc::new(Entry {
-        page: std::sync::Arc::new(std::sync::OnceLock::new()),
+        page: std::sync::OnceLock::new(),
         referenced: std::sync::atomic::AtomicBool::new(true),
     });
     let key = CompactString::from(code);
@@ -3145,6 +3138,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persistent_server_sheds_at_connection_cap_with_503() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = serve_explain_persistent(&listener);
+        });
+        // Hold the reactor at its connection cap without sending anything.
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while let Ok(n) = client.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..n]);
+            if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(
+            response.starts_with(b"HTTP/1.1 503"),
+            "shed path must deliver the 503, got {:?}",
+            &response[..response.len().min(32)]
+        );
+        drop(idle);
+    }
+
+    #[test]
+    fn thread_per_connection_path_serves_a_request_on_linux() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let server = std::thread::spawn(move || handle_persistent_connection(&mut server));
+        client
+            .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        // `read_to_end` rides the server's close; the 2 s timeout keeps a
+        // regression from wedging the suite.
+        let _ = client.read_to_end(&mut response);
+        server.join().unwrap().unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK"),
+            "thread path response: {:?}",
+            &response[..response.len().min(40)]
+        );
+    }
+
+    #[test]
+    fn reactor_rejects_request_line_over_8_kib() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = serve_explain_persistent(&listener);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = b"GET /".to_vec();
+        request.extend(std::iter::repeat(b'a').take(9 * 1024));
+        request.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
+        let _ = client.write_all(&request);
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        assert!(
+            !response.starts_with(b"HTTP/1.1 200"),
+            "oversized request line must not be served"
+        );
+    }
+
+    #[test]
+    fn zero_copy_output_survives_short_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = serve_explain_persistent(&listener);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"GET /NO_SUCH_CODE HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        // One byte per read starves the socket deliberately, exercising the
+        // write cursor across partial `write_vectored` progress.
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = client.read(&mut byte) {
+            response.push(byte[0]);
+            if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(
+            response.starts_with(b"HTTP/1.1 404"),
+            "short-read response: {:?}",
+            &response[..response.len().min(40)]
+        );
+    }
+
     /// Security: the explain page is an HTTP endpoint, so a listener bound
     /// to a non-loopback (wildcard) address must be refused rather than
     /// served to the whole network.
@@ -3279,6 +3390,10 @@ mod tests {
         assert!(
             scan_framing(b"Content-Length: +5\r\n\r\n").ambiguous,
             "signed Content-Length must be rejected"
+        );
+        assert!(
+            scan_framing(b"Content-Length: 999999999999999999999999999999\r\n\r\n").oversized,
+            "a Content-Length beyond the body cap must be marked oversized"
         );
     }
 }

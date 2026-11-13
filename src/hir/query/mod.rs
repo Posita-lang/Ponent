@@ -417,6 +417,184 @@ impl std::fmt::Debug for ActiveKey {
     }
 }
 
+/// One open-addressing slot.  Tombstones keep linear probing correct across
+/// removals; the table is rehashed when they outnumber live entries.
+enum ActiveSlot {
+    Vacant,
+    Tombstone,
+    Occupied(ActiveKey, ActiveKeyStatus),
+}
+
+/// Per-shard open-addressing table for active query keys.
+///
+/// Replaces `FxHashMap<ActiveKey, ActiveKeyStatus>`: lookups probe by the
+/// precomputed `shard_hash`, compare the exact `ActiveKey` only on a hash
+/// match, and insert in place without hashing or cloning on the hit path.
+/// `ActiveKey` itself already carries the digest, so the map was re-hashing a
+/// digest it had; this table consumes it directly.
+struct ActiveShard {
+    slots: Vec<ActiveSlot>,
+    len: usize,
+    tombstones: usize,
+}
+
+impl ActiveShard {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            len: 0,
+            tombstones: 0,
+        }
+    }
+
+    #[inline]
+    fn mask(&self) -> usize {
+        self.slots.len() - 1
+    }
+
+    fn find(&self, akey: &ActiveKey) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut i = akey.shard_hash as usize & self.mask();
+        loop {
+            match &self.slots[i] {
+                ActiveSlot::Vacant => return None,
+                ActiveSlot::Tombstone => {}
+                ActiveSlot::Occupied(key, _) => {
+                    if key.shard_hash == akey.shard_hash && key == akey {
+                        return Some(i);
+                    }
+                }
+            }
+            i = (i + 1) & self.mask();
+        }
+    }
+
+    #[inline]
+    fn get(&self, akey: &ActiveKey) -> Option<&ActiveKeyStatus> {
+        let i = self.find(akey)?;
+        match &self.slots[i] {
+            ActiveSlot::Occupied(_, status) => Some(status),
+            _ => unreachable!("find returned a non-occupied slot"),
+        }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, akey: &ActiveKey) -> Option<&mut ActiveKeyStatus> {
+        let i = self.find(akey)?;
+        match &mut self.slots[i] {
+            ActiveSlot::Occupied(_, status) => Some(status),
+            _ => unreachable!("find returned a non-occupied slot"),
+        }
+    }
+
+    fn grow(&mut self) {
+        let capacity = if self.slots.is_empty() {
+            16
+        } else {
+            self.slots.len() * 2
+        };
+        self.rehash(capacity);
+    }
+
+    fn rehash(&mut self, capacity: usize) {
+        let mut fresh = Vec::with_capacity(capacity);
+        fresh.resize_with(capacity, || ActiveSlot::Vacant);
+        let old = std::mem::replace(&mut self.slots, fresh);
+        self.len = 0;
+        self.tombstones = 0;
+        for slot in old {
+            if let ActiveSlot::Occupied(key, status) = slot {
+                self.insert(key, status);
+            }
+        }
+    }
+
+    /// Insert or replace.  Moves an already-owned key, so the rehash path
+    /// does not clone.
+    fn insert(&mut self, akey: ActiveKey, status: ActiveKeyStatus) {
+        // Keep the load factor (live + tombstones) below 70%.
+        if self.slots.is_empty() || (self.len + self.tombstones + 1) * 10 >= self.slots.len() * 7 {
+            self.grow();
+        }
+        let mut i = akey.shard_hash as usize & self.mask();
+        let mut reuse = None;
+        loop {
+            match &self.slots[i] {
+                ActiveSlot::Occupied(key, _) => {
+                    if key.shard_hash == akey.shard_hash && *key == akey {
+                        self.slots[i] = ActiveSlot::Occupied(akey, status);
+                        return;
+                    }
+                }
+                ActiveSlot::Tombstone => {
+                    if reuse.is_none() {
+                        reuse = Some(i);
+                    }
+                }
+                ActiveSlot::Vacant => {
+                    let at = reuse.unwrap_or(i);
+                    if reuse.is_some() {
+                        self.tombstones = self.tombstones.saturating_sub(1);
+                    }
+                    self.slots[at] = ActiveSlot::Occupied(akey, status);
+                    self.len += 1;
+                    return;
+                }
+            }
+            i = (i + 1) & self.mask();
+        }
+    }
+
+    /// Insert a fresh registration, cloning `akey` only on this cold path.
+    #[inline]
+    fn insert_new(&mut self, akey: &ActiveKey, status: ActiveKeyStatus) {
+        self.insert(akey.clone(), status);
+    }
+
+    fn remove(&mut self, akey: &ActiveKey) -> Option<ActiveKeyStatus> {
+        let i = self.find(akey)?;
+        match std::mem::replace(&mut self.slots[i], ActiveSlot::Tombstone) {
+            ActiveSlot::Occupied(_, status) => {
+                self.len -= 1;
+                self.tombstones += 1;
+                if self.tombstones > self.len && self.slots.len() > 16 {
+                    self.rehash(self.slots.len());
+                }
+                Some(status)
+            }
+            _ => unreachable!("find returned a non-occupied slot"),
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&ActiveKey, &ActiveKeyStatus) -> bool) {
+        let old = std::mem::take(&mut self.slots);
+        self.len = 0;
+        self.tombstones = 0;
+        for slot in old {
+            if let ActiveSlot::Occupied(key, status) = slot {
+                if keep(&key, &status) {
+                    self.insert(key, status);
+                }
+            }
+        }
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut ActiveKeyStatus> {
+        self.slots.iter_mut().filter_map(|slot| match slot {
+            ActiveSlot::Occupied(_, status) => Some(status),
+            _ => None,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.len = 0;
+        self.tombstones = 0;
+    }
+}
+
 /// Monotonic id source for `QuerySystem` instances.  Replaces the
 /// address-based id: ids are also the key of a thread's deferred-mutation
 /// presence marker, and an id derived from an address would collide
@@ -5617,7 +5795,7 @@ pub struct QuerySystem<'q, 'src: 'q, S: Scheduler> {
     /// neighbouring lock words on the same cache line, so two threads
     /// locking *different* shards still invalidate each other — which
     /// would silently undo the striping (Perf Book §13.7.3).
-    active_keys: Vec<CachePadded<RwLock<FxHashMap<ActiveKey, ActiveKeyStatus>>>>,
+    active_keys: Vec<CachePadded<RwLock<ActiveShard>>>,
     /// Cross-thread wait graph: `waiter thread → WaitEdge` for every
     /// thread currently blocked on another thread's job latch.  Each
     /// edge names the owner thread AND the specific job waited on, so
@@ -5971,7 +6149,7 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             body_worker_pool: thread_local::ThreadLocal::new(),
             dep_graph: dep_graph::DepGraph::with_owner(id, shared),
             active_keys: (0..ACTIVE_SHARDS)
-                .map(|_| CachePadded(RwLock::new(FxHashMap::default())))
+                .map(|_| CachePadded(RwLock::new(ActiveShard::new())))
                 .collect(),
             wait_graph: (0..WAIT_SHARDS)
                 .map(|_| CachePadded(RwLock::new(FxHashMap::default())))
@@ -6643,6 +6821,12 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
             if !all_found {
                 return None; // unresolvable dep: recompute (conservative)
             }
+            // Re-request dirty deps sequentially.  A rayon fan-out here was
+            // implemented and reverted: worker threads calling `get_shared`
+            // can block on latches owned by the verifying thread's closure,
+            // changing the wait-graph topology and deadlocking under the
+            // random concurrent-graph stress test.  A safe parallel form
+            // needs a non-blocking scheduling design, not a drop-in par_iter.
             for tag in &tags {
                 self.rerequest_dirty_dependency(tag, provider);
             }
@@ -6785,21 +6969,12 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         let _tw = sync_order::Acquired::acquire(sync_order::Fam::ActiveShard, "acquire_key_slot");
         let mut active = self.active_keys[active_shard(akey)].write();
 
-        // `entry` hashes the key ONCE for the get-or-insert below (a `get`
-        // followed by `insert` would hash twice per miss acquisition).  The
-        // `akey.clone()` is an inline `SmallBox` copy for identity-shaped
-        // keys (a heap allocation only for keys larger than 32 bytes); the
-        // Wait arms borrow it and drop it, same as before.
-        use std::collections::hash_map::Entry;
-        match active.entry(akey.clone()) {
-            Entry::Occupied(o) => match o.get() {
+        if let Some(status) = active.get(akey) {
+            match status {
                 ActiveKeyStatus::Started(job) if job.owner == me => {
-                    // Double-safety guard: `validate_enter` should already catch
-                    // same-thread re-entry, but keep the explicit check.  With
-                    // the map keyed by the EXACT key this arm is unreachable
-                    // through correct input — a different key can no longer
-                    // land on this entry (that was the hash-collision false
-                    // cycle).
+                    // Double-safety guard: `validate_enter` should already
+                    // catch same-thread re-entry.  Exact-key lookup makes
+                    // this unreachable through correct input.
                     return Err(QueryError::Cycle {
                         query_name: Q::descriptor().name,
                         key: format!("{:?}", key),
@@ -6812,67 +6987,32 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                     return Ok(KeySlot::Wait(job.clone()));
                 }
                 ActiveKeyStatus::Poisoned => {
-                    // Exact-key hit: the poison BELONGS to this key.
-                    // Deliberately NOT cleared here — that is the whole
-                    // point of a sticky marker.  Only [`Self::invalidate`]
-                    // and [`Self::clear`] (and `clear_all`, by wiping
-                    // every marker) lift it.  Return `Err` so the caller
-                    // STOPS: re-activating the key here would hide the
-                    // panic that installed the poison, and the latch watch
-                    // in the caller would see no waiter, both making the
-                    // failure mode silent instead of remembered.
+                    // Sticky marker: only invalidate/clear lifts it.
                     return Err(QueryError::Poisoned {
                         query_name: Q::descriptor().name,
                         key: format!("{:?}", key),
                     });
                 }
-            },
-            Entry::Vacant(v) => {
-                // We become the owner — commit the active-stack entry.
-                // The key was cloned once for the entry lookup above; the
-                // Wait paths borrow it and drop it.
-                //
-                // Panic safety: `commit_enter` (TLS push) and `v.insert`
-                // (allocation) are wrapped so a panic between them cannot
-                // strand a half-acquired slot.  There is no
-                // `catch_unwind`-to-`abort_with_poison` staging guard AFTER
-                // this point that could clean the `Started` entry (the
-                // entry is only inserted at the end of this arm), so the
-                // cleanup happens here: undo the commit via `leave` and
-                // resume.  If the map insert panicked, the entry is still
-                // vacant — no `Started` row exists to strand waiters on.
-                // The job is allocated here (inside the lock) — see the
-                // LAZY ALLOCATION note above for why the owner, not every
-                // waiter, pays it.
-                // Allocate the job OUTSIDE the guard.
-                // `QueryJob::new` can only unwind before anything is
-                // committed; if it does, this arm unwinds with no TLS
-                // frame pushed and no `Started` row, so the unconditional
-                // `leave` in the Err arm below must not run.  Keeping it
-                // inside the guard made that arm pop the CALLER's frame.
-                let pre_job = job::QueryJob::new();
-                let mut entered = false;
-                let committed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    vtable.commit_enter(self.system_id(), epoch, key);
-                    // `commit_enter` clones before mutating, so reaching here
-                    // means exactly one frame was pushed.
-                    entered = true;
-                    v.insert(ActiveKeyStatus::Started(pre_job));
-                }));
-                match committed {
-                    Ok(()) => Ok(KeySlot::Compute),
-                    Err(payload) => {
-                        // Only pop if a frame was actually pushed.  The old
-                        // unconditional `leave` would pop the CALLER's frame
-                        // if `commit_enter` panicked before pushing; with the
-                        // clone-before-mutate contract above, `entered ==
-                        // false` now means the stack is untouched.
-                        if entered {
-                            vtable.leave(self.system_id(), epoch);
-                        }
-                        std::panic::resume_unwind(payload);
-                    }
+            }
+        }
+
+        // Vacant: we become the owner.  `commit_enter` (TLS push) and the
+        // table insert are wrapped so a panic between them cannot strand a
+        // half-acquired slot; the cleanup undoes the TLS frame.
+        let pre_job = job::QueryJob::new();
+        let mut entered = false;
+        let committed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vtable.commit_enter(self.system_id(), epoch, key);
+            entered = true;
+            active.insert_new(akey, ActiveKeyStatus::Started(pre_job));
+        }));
+        match committed {
+            Ok(()) => Ok(KeySlot::Compute),
+            Err(payload) => {
+                if entered {
+                    vtable.leave(self.system_id(), epoch);
                 }
+                std::panic::resume_unwind(payload);
             }
         }
     }
@@ -7697,21 +7837,16 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                 // and preserves the load-bearing order: latch resolved
                 // BEFORE the entry leaves the map (see the ORDER comment
                 // above).
-                use std::collections::hash_map::Entry;
                 let mut completed_job_id: Option<job::QueryJobId> = None;
-                match active.entry(akey.clone()) {
-                    Entry::Occupied(mut o) => {
-                        if let ActiveKeyStatus::Started(job) = o.get() {
-                            job.latch.set();
-                        }
-                        if let ActiveKeyStatus::Started(job) = o.remove() {
-                            // The sweep is DEFERRED below the lock drop.
-                            completed_job_id = Some(job.id);
-                        }
-                    }
-                    // eval_always queries never insert — tolerate absence,
-                    // same as the old get-None/remove-None path.
-                    Entry::Vacant(_) => {}
+                // Latch resolution BEFORE the entry leaves the table (the
+                // ORDER argument above).  `get` borrows the slot; the
+                // subsequent `remove` re-probes, which is fine on this cold
+                // completion path.
+                if let Some(ActiveKeyStatus::Started(job)) = active.get(&akey) {
+                    job.latch.set();
+                }
+                if let Some(ActiveKeyStatus::Started(job)) = active.remove(&akey) {
+                    completed_job_id = Some(job.id);
                 }
                 drop(active);
                 // Edges for the completed job are now walker-invisible
@@ -8519,7 +8654,7 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         &self,
         vtable: &QueryVTable<'q, 'src, Q>,
         akey: &ActiveKey,
-        active: &mut FxHashMap<ActiveKey, ActiveKeyStatus>,
+        active: &mut ActiveShard,
     ) -> Option<job::QueryJobId> {
         // ORDER IS LOAD-BEARING (mirror of the success path): resolve
         // the latch while the entry is still present, so the window in
@@ -11252,5 +11387,97 @@ mod tests {
         let t_provider = DefaultQueryProvider::new(t);
         let i = t.get::<InnerQ>(TestKey(7), &t_provider).unwrap();
         assert_eq!(i, TestValue("i".into()));
+    }
+}
+
+#[cfg(all(test, not(feature = "shuttle")))]
+mod active_shard_tests {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+    struct K(u64);
+    impl QueryKey for K {}
+
+    fn akey(k: u64) -> ActiveKey {
+        ActiveKey {
+            shard_hash: k.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            type_id: TypeId::of::<K>(),
+            key: smallbox::smallbox!(K(k)),
+        }
+    }
+
+    #[test]
+    fn insert_get_remove_and_rehash_preserve_exact_keys() {
+        let mut shard = ActiveShard::new();
+        for i in 0..512 {
+            shard.insert_new(&akey(i), ActiveKeyStatus::Poisoned);
+        }
+        assert_eq!(shard.len, 512);
+        for i in 0..512 {
+            assert!(shard.get(&akey(i)).is_some(), "missing key {i}");
+        }
+        for i in (0..512).step_by(2) {
+            assert!(shard.remove(&akey(i)).is_some());
+        }
+        assert_eq!(shard.len, 256);
+        for i in 0..512 {
+            assert_eq!(shard.get(&akey(i)).is_some(), i % 2 == 1);
+        }
+        // Tombstone-heavy table: reinserting evens exercises the rehash and
+        // proves tombstones never shadow a live probe.
+        for i in (0..512).step_by(2) {
+            shard.insert_new(&akey(i), ActiveKeyStatus::Poisoned);
+        }
+        assert_eq!(shard.len, 512);
+        for i in 0..512 {
+            assert!(shard.get(&akey(i)).is_some(), "lost key {i} after rehash");
+        }
+        shard.retain(|_, _| false);
+        assert_eq!(shard.len, 0);
+        for i in 0..512 {
+            assert!(shard.get(&akey(i)).is_none());
+        }
+    }
+
+    #[test]
+    fn concurrent_insert_get_remove_is_consistent() {
+        use std::sync::{Arc, Barrier, RwLock};
+
+        let table = Arc::new(RwLock::new(ActiveShard::new()));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        for thread in 0..8u64 {
+            let table = Arc::clone(&table);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let base = thread * 256;
+                for i in 0..256 {
+                    table
+                        .write()
+                        .unwrap()
+                        .insert_new(&akey(base + i), ActiveKeyStatus::Poisoned);
+                }
+                for i in 0..256 {
+                    assert!(table.read().unwrap().get(&akey(base + i)).is_some());
+                }
+                for i in 0..256 {
+                    if i % 2 == 0 {
+                        assert!(table.write().unwrap().remove(&akey(base + i)).is_some());
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let shard = table.read().unwrap();
+        assert_eq!(shard.len, 8 * 128);
+        for thread in 0..8u64 {
+            let base = thread * 256;
+            for i in 0..256 {
+                assert_eq!(shard.get(&akey(base + i)).is_some(), i % 2 == 1);
+            }
+        }
     }
 }

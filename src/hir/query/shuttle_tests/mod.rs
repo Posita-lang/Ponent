@@ -97,6 +97,93 @@ fn spin_until(flag: &AtomicBool, what: &str) {
     panic!("shuttle rendezvous failed: {what}");
 }
 
+/// Shuttle version of the batched re-request: under `feature = "shuttle"`
+/// the parallel branch is compiled out, so this also proves the sequential
+/// fallback still recomputes every dirty dependency exactly once.
+#[test]
+fn rerequest_recomputes_all_dirty_dependencies() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static K_RUNS: AtomicU64 = AtomicU64::new(0);
+    static E_RUNS: AtomicU64 = AtomicU64::new(0);
+
+    struct EQ;
+    impl<'q, 'src: 'q> Query<'q, 'src> for EQ {
+        type Storage = Owned;
+        type Key = DKey;
+        type Value = FpValue;
+        type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("shuttle_rerequest_e", "shuttle rerequest leaf")
+        }
+        fn compute<S: Scheduler>(_key: &DKey, _: &dyn QueryProvider<'q, 'src, S>) -> FpValue {
+            E_RUNS.fetch_add(1, Ordering::SeqCst);
+            FpValue {
+                raw: String::new(),
+                semantic: 7,
+            }
+        }
+    }
+    struct KQ;
+    impl<'q, 'src: 'q> Query<'q, 'src> for KQ {
+        type Storage = Owned;
+        type Key = DKey;
+        type Value = FpValue;
+        type Cache = DefaultCache<DKey, Stored<'q, 'src, Self>>;
+        fn descriptor() -> QueryDescriptor {
+            QueryDescriptor::new("shuttle_rerequest_k", "shuttle rerequest reader")
+        }
+        fn compute<S: Scheduler>(key: &DKey, provider: &dyn QueryProvider<'q, 'src, S>) -> FpValue {
+            K_RUNS.fetch_add(1, Ordering::SeqCst);
+            let a = query_get::<EQ, _>(provider, key.clone()).unwrap();
+            let b = query_get::<EQ, _>(provider, DKey(key.0 + 1)).unwrap();
+            FpValue {
+                raw: String::new(),
+                semantic: a.semantic + b.semantic,
+            }
+        }
+    }
+
+    run_check(|| {
+        K_RUNS.store(0, Ordering::SeqCst);
+        E_RUNS.store(0, Ordering::SeqCst);
+        let sys = leak_system();
+        let prov = leak_provider(sys);
+        assert_eq!(sys.get::<KQ>(DKey(0), prov).unwrap().semantic, 14);
+        assert_eq!(E_RUNS.load(Ordering::SeqCst), 2);
+        assert_eq!(K_RUNS.load(Ordering::SeqCst), 1);
+        sys.invalidate::<EQ>(&DKey(0));
+        sys.invalidate::<EQ>(&DKey(1));
+
+        // The query itself must stay on ONE shuttle task: TASK_STACK is
+        // per-OS-thread, so two concurrent computes interleave frames and
+        // trip `finish_task_and_publish`'s owner assert.  A second task that
+        // only yields still gives the scheduler real interleavings to
+        // explore around the sequential (shuttle) re-request path.
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let release_noise = std::sync::Arc::clone(&release);
+        let noise = shuttle::thread::spawn(move || {
+            while !release_noise.load(Ordering::SeqCst) {
+                shuttle::thread::yield_now();
+            }
+        });
+        let served = sys.get::<KQ>(DKey(0), prov).unwrap();
+        release.store(true, Ordering::SeqCst);
+        noise.join().unwrap();
+
+        assert_eq!(served.semantic, 14);
+        assert_eq!(
+            E_RUNS.load(Ordering::SeqCst),
+            4,
+            "every dirty dependency must be re-requested exactly once"
+        );
+        assert_eq!(
+            K_RUNS.load(Ordering::SeqCst),
+            1,
+            "the cached reader must serve green after the batched re-request"
+        );
+    });
+}
+
 mod aclass;
 mod b1;
 mod b2;
