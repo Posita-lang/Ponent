@@ -13,45 +13,131 @@ minimising
 This is minimum sum coloring on interval graphs with the number of colours
 fixed to exactly `χ`, and with the rank-1 (Monge) cost matrix `c(v,j)=w_v·j`.
 
-## Answer
+## Three different questions
 
-The problem is **NP-hard even when all weights are 1**, and the natural
-maximal-clique LP is **not value-exact**. Therefore there is no polynomial-size
-LP (or polynomially separable cutting-plane description) that is exact for
-all rank-1 weights unless P = NP. The exact algorithm remains the
-`O(n · k! · k)` sweep DP; it is FPT in `k` and is effectively linear in `n`
-for the diagnostic regime (`k ≤ 5`).
+The literature and the experiments answer three things that must not be
+conflated:
 
-### Why exact `χ` does not avoid hardness
+1. **General interval graphs.** The problem is NP-hard even with unit
+   weights. The padding construction below forces `χ = ω = k` without
+   removing the hardness.
+2. **Fully saturated interval graphs** (every maximal clique has size exactly
+   `k`). The padding construction no longer applies; this subclass is
+   polynomial, even though its clique LP polyhedron is not integral.
+3. **The clique LP on general instances.** It is not value-exact; an explicit
+   half-integral counterexample is included below. Hence no compact exact LP
+   exists for the general problem unless P = NP.
+
+---
+
+## 1. General intervals: NP-hardness
 
 Take any `p`-colour sum-colouring instance `(G₀,p)` with `p ≥ 2ω(G₀)−1`.
-Add a disjoint clique `Q` of `p` pairwise-overlapping intervals and give every
-new interval weight 1. Then:
+Add a disjoint clique `Q` of `p` pairwise-overlapping intervals, all weight 1.
+Then:
 
-- `ω(G) = χ(G) = p = k` (interval graphs are perfect);
+- `ω(G) = χ(G) = p = k`;
 - every proper `k`-colouring uses all `k` colours on `Q`, contributing the
   constant `k(k+1)/2`;
 - `Q` is disconnected from `G₀`, so the restriction to `G₀` is an arbitrary
   proper `p`-colouring.
 
-Hence
+Thus
 
 ```
 OPT_{k=χ}(G) = OPT_{p-colour}(G₀) + k(k+1)/2,
 ```
 
-and `p`-colour minimum sum coloring on interval graphs is NP-hard. Padding
-turns any hardness instance into one with `χ = ω = p`; the `p > χ` caveat is
-not an escape.
+so the exact-`χ` problem is NP-hard. The hardness lives in the **unsaturated**
+maximal cliques of `G₀`: they leave idle colour slots, which are exactly what
+the padding construction preserves.
 
-### The clique LP is not value-exact
+### FPT/ETH status
+
+The exact algorithm is the sweep DP with `O(n · k! · k)` time and
+`O(k!)` states; for fixed `k` it is linear in `n`. Since `k! = 2^{Θ(k log k)}`,
+this is an FPT algorithm, not a polynomial one in `(n,k)`.
+
+The state is a labelled bijection “active intervals ↔ colours”, not a set or
+an unlabeled partition. Two states with the same idle set but different
+bijections can be distinguished by a future interval that overlaps one holder
+and not the other, so idle-set compression and dominance pruning are not
+available. Permutation-state DPs of this shape are the standard
+`2^{Ω(k log k)}`-under-ETH family (e.g. Chromatic Number parameterised by
+treewidth); representative-set compression exploits interchangeable blocks,
+which a labelled bijection does not have.
+
+Caveat: the general permutation-state lower-bound machinery is established,
+but a published reduction to *this exact* rank-1-weighted, exact-`χ`,
+interval-graph statement was not located. The `k!` dependence is therefore
+expected to be asymptotically optimal; the final ETH-tightness reduction for
+this exact variant remains to be written down.
+
+---
+
+## 2. Fully saturated intervals: polynomial
+
+Assume every maximal clique has exactly `k` vertices. Summing
+`Σ_j x_{v,j}=1` over a maximal clique `K` gives
+
+```
+Σ_{v∈K} Σ_j x_{v,j} = k,
+```
+
+while each lane column satisfies `Σ_{v∈K} x_{v,j} ≤ 1`. The `k` column sums
+add to `k`, so every one is exactly 1:
+
+```
+Σ_{v∈K} x_{v,j} = 1     for every maximal clique K and lane j.
+```
+
+There are no idle slots in any maximal clique.
+
+This does **not** make the LP polytope integral. For `k=5`, three maximal
+cliques `C₁={a₁..a₅}`, `C₂={b₁,b₂,b₃,c₁,c₂}`, `C₃={b₁,b₂,b₃,d₁,d₂}` and the
+half-integral assignment in which the `b`/`c`/`d` blocks carry `1/2` entries
+is a feasible fractional vertex. It is not optimal for any rank-1 cost, but it
+shows that “fully saturated” and “integral polytope” are different statements.
+Fractional vertices first appear at `k ≥ 4`.
+
+For the rank-1 objective, introduce cumulative variables
+
+```
+y_{v,t} = Σ_{j>t} x_{v,j},    t = 1..k−1.
+```
+
+Then
+
+```
+Σ_{v,j} w_v j x_{v,j}
+  = Σ_v w_v + Σ_{t=1}^{k−1} Σ_v w_v y_{v,t}.
+```
+
+At each level `t`, full saturation turns the clique equations into
+`A y_{·,t} = (k−t)·1`, where `A` is the maximal-clique/vertex incidence
+matrix. Interval graphs have consecutive ones, so after taking consecutive row
+differences `A` is a path-incidence matrix; with `0≤y≤1` this is a
+`(k−t)`-unit s–t flow polytope, hence integral. The chain condition
+`y_{·,t} ≥ y_{·,t+1}` asks for nested integral flows, i.e. a proper
+`k`-colouring. Because all coefficients are nonnegative, a min-cost-flow /
+successive-shortest-path argument preserves an integral optimum.
+
+Therefore, on the fully saturated subclass the rank-1 LP has zero integrality
+gap and the problem is polynomial: solve the LP, or equivalently run a
+`poly(n,k)` nested flow / matching on the clique path. The NP-hardness padding
+cannot be applied while keeping every maximal clique at size `k`; enlarging the
+hard core to enforce saturation transforms it into this flow problem.
+
+---
+
+## 3. The general clique LP is not value-exact
 
 LP:
 
 ```
 min   Σ_{v,j} w_v · j · x_{v,j}
-s.t.  Σ_j x_{v,j} = 1                         for every v
-      Σ_{v ∈ K} x_{v,j} ≤ 1                   for every maximal clique K, lane j
+s.t.  Σ_j x_{v,j} = 1
+      Σ_{v ∈ K} x_{v,j} ≤ 1     (maximal clique K, lane j)
       x_{v,j} ≥ 0
 ```
 
@@ -73,21 +159,53 @@ v2:  0  1/2  0  1/2     v5:  0   0   0   1      v8:  0   0  1/2 1/2
 ```
 
 with mean colours `(1.5, 2, 3, 3, 4, 4, 2.5, 4, 3.5)` and
-`w·μ = -100.5`. Exhaustive enumeration of all `4^9` assignments gives the
-integral optimum `-100`, so the LP gap is `0.5`.
+`w·μ = -100.5`. Exhaustive enumeration gives the integral optimum `-100`, so
+the LP gap is `0.5`.
 
-The LP is not integral because only one maximal clique has size `k`; the
-unsaturated cliques let a lane split fractional mass between two chains, which
-no injection can replicate. Saturated-clique blocks are doubly stochastic, but
-they do not glue across an unsaturated clique.
+The fractional mass exists because only one maximal clique has size `k`; the
+unsaturated cliques let a lane split between two chains. This is the same
+mechanism that makes the general problem NP-hard.
 
-## What to use
+---
 
-- Exact engine: the `O(n · k! · k)` sweep DP (reconstruction included).
-- For `n ≤ 50`, `k ≤ 5` the DP is already linear in `n` with ≤ 120 states.
-- An LP may be used only as a fast path: solve it, verify the solution is
-  integral and proper, and **fall back to the DP on any fractional optimum**.
-  The LP alone is not a certificate of optimality.
+## 4. How large can the additive gap be?
 
-`scripts/verify_counterexample.py` checks the LP point and recomputes the IP
-by brute force; it needs only the Python standard library.
+Scale first matters. The objective is homogeneous: `w ↦ M w` multiplies both
+the LP and IP optima, hence the gap, by `M`. Without a weight bound the gap is
+unbounded.
+
+With normalized weights (e.g. `|w_v| ≤ 1`), the gap still grows at least
+linearly in `n`: take `m` vertex-disjoint copies of the `0.5`-gap gadget above.
+The LP and IP are additive across components, so the gap is `Ω(n)` while `k`
+stays 4. A trivial upper bound is `O(nK)` with `K ≤ 2k−1`, so `O(nk)`.
+
+A uniform gap `< 1` is impossible unless P = NP: with integer weights the IP
+is integral, the fractional vertices are half-integral, and a gap below 1
+would let one read the optimum off the LP. This does not prove a gap ≤ 1; it
+only rules out a universal sub-unit bound.
+
+Known strengthening directions:
+
+- maximal-clique constraints (already in this LP);
+- odd-hole/odd-cycle cuts on the conflict graph `K_K □ G`, which is the
+  precise source of half-integrality;
+- exponential set-partitioning / column-generation LPs, strong in practice
+  but not compact.
+
+No polynomially separable compact cut family can make the LP exact for the
+general problem unless P = NP.
+
+---
+
+## 5. What to use
+
+- General instances: exact engine is the `O(n · k! · k)` sweep DP; for
+  `n ≤ 50`, `k ≤ 5` it is already linear in `n` with ≤ 120 states.
+- Fully saturated instances: the rank-1 LP / nested flow is exact and
+  polynomial; this is the tractable special case.
+- If an LP is used as a fast path, check integrality and **fall back to the DP
+  on any fractional optimum**. The LP alone is not a certificate of optimality
+  outside the fully saturated subclass.
+
+`scripts/verify_counterexample.py` checks the explicit `-100.5 / -100`
+instance with only the Python standard library.

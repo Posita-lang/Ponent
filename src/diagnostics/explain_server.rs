@@ -977,11 +977,20 @@ fn write_response(
     let header = render_head(status, extra_headers, body.len());
     // Finding 7: every one-shot response closes the connection, so it must
     // say so; route through the same writer the cached pages use.
-    write_prepared_conn(stream, &header, body, false)
+    write_prepared_conn(stream, [&header, "", ""], body, false)
 }
 
 /// Write a pre-rendered head and a body (persistent-server hot path, ).
 fn write_prepared(stream: &mut TcpStream, head: &str, body: &str) -> std::io::Result<()> {
+    write_prepared_conn(stream, [head, "", ""], body, false)
+}
+
+/// Cached-page writer for a split head (prefix, shared style, suffix).
+fn write_prepared_parts(
+    stream: &mut TcpStream,
+    head: [&str; 3],
+    body: &str,
+) -> std::io::Result<()> {
     write_prepared_conn(stream, head, body, false)
 }
 
@@ -993,7 +1002,7 @@ fn write_prepared(stream: &mut TcpStream, head: &str, body: &str) -> std::io::Re
 /// so).  Still one vectored write.
 fn write_prepared_conn(
     stream: &mut TcpStream,
-    head: &str,
+    head: [&str; 3],
     body: &str,
     keep_alive: bool,
 ) -> std::io::Result<()> {
@@ -1003,7 +1012,9 @@ fn write_prepared_conn(
     write_all_vectored(
         stream,
         [
-            IoSlice::new(head.as_bytes()),
+            IoSlice::new(head[0].as_bytes()),
+            IoSlice::new(head[1].as_bytes()),
+            IoSlice::new(head[2].as_bytes()),
             IoSlice::new(conn.as_bytes()),
             IoSlice::new(body.as_bytes()),
         ],
@@ -1206,11 +1217,11 @@ fn serve_page_after_prefix(
                         let _ = stream.shutdown(Shutdown::Both);
                     }
                     DrainOutcome::HeadersOnly => {
-                        let _ = write_prepared(stream, &page.head, &page.body);
+                        let _ = write_prepared_parts(stream, page.head_parts(), &page.body);
                         linger_after_half_close(stream);
                     }
                     DrainOutcome::Complete => {
-                        let _ = write_prepared(stream, &page.head, &page.body);
+                        let _ = write_prepared_parts(stream, page.head_parts(), &page.body);
                         drain_residual(stream);
                         let _ = stream.shutdown(Shutdown::Both);
                     }
@@ -1663,7 +1674,7 @@ pub fn serve_explain_persistent(listener: &TcpListener) -> std::io::Result<()> {
                         // tell the client we are overloaded so a browser
                         // can retry, instead of an empty close.
                         let page = shed_page();
-                        let _ = write_prepared(&mut stream, &page.head, &page.body);
+                        let _ = write_prepared_parts(&mut stream, page.head_parts(), &page.body);
                         let _ = drain_residual(&mut stream);
                         if outcome == DrainOutcome::Complete {
                             let _ = stream.shutdown(Shutdown::Both);
@@ -1805,7 +1816,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
         /// directly with `write_vectored` (head, Connection header, body).
         response: Option<HttpResponse>,
         conn_hdr: &'static [u8],
-        progress: [usize; 3],
+        progress: [usize; 5],
         state: u8,
         keep_alive: bool,
         consumed: usize,
@@ -1888,7 +1899,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                                             buf: Vec::new(),
                                             response: None,
                                             conn_hdr: b"",
-                                            progress: [0; 3],
+                                            progress: [0; 5],
                                             state: READING,
                                             keep_alive: false,
                                             consumed: 0,
@@ -1908,7 +1919,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                                         buf: Vec::with_capacity(1024),
                                         response: None,
                                         conn_hdr: b"",
-                                        progress: [0; 3],
+                                        progress: [0; 5],
                                         state: READING,
                                         keep_alive: false,
                                         consumed: 0,
@@ -2068,7 +2079,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                     conn.conn_hdr = b"Connection: close\r\n\r\n";
                     conn.keep_alive = false;
                     conn.consumed = head_end;
-                    conn.progress = [0; 3];
+                    conn.progress = [0; 5];
                     conn.state = WRITING;
                     conn.header_deadline = None;
                     conn.deadline = Instant::now() + WRITE_TIMEOUT;
@@ -2143,7 +2154,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                 } else {
                     b"Connection: close\r\n\r\n"
                 };
-                conn.progress = [0; 3];
+                conn.progress = [0; 5];
                 conn.state = WRITING;
                 conn.deadline = Instant::now() + WRITE_TIMEOUT;
                 let mut conn_event = libc::epoll_event {
@@ -2162,20 +2173,30 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                         finished = true;
                         break;
                     };
-                    let head = response.head().as_bytes();
+                    let head = response.head_parts();
                     let body = response.body().as_bytes();
-                    let lengths = [head.len(), conn.conn_hdr.len(), body.len()];
+                    let lengths = [
+                        head[0].len(),
+                        head[1].len(),
+                        head[2].len(),
+                        conn.conn_hdr.len(),
+                        body.len(),
+                    ];
                     if conn.progress[0] >= lengths[0]
                         && conn.progress[1] >= lengths[1]
                         && conn.progress[2] >= lengths[2]
+                        && conn.progress[3] >= lengths[3]
+                        && conn.progress[4] >= lengths[4]
                     {
                         finished = true;
                         break;
                     }
                     let slices = [
-                        std::io::IoSlice::new(&head[conn.progress[0]..]),
-                        std::io::IoSlice::new(&conn.conn_hdr[conn.progress[1]..]),
-                        std::io::IoSlice::new(&body[conn.progress[2]..]),
+                        std::io::IoSlice::new(&head[0].as_bytes()[conn.progress[0]..]),
+                        std::io::IoSlice::new(&head[1].as_bytes()[conn.progress[1]..]),
+                        std::io::IoSlice::new(&head[2].as_bytes()[conn.progress[2]..]),
+                        std::io::IoSlice::new(&conn.conn_hdr[conn.progress[3]..]),
+                        std::io::IoSlice::new(&body[conn.progress[4]..]),
                     ];
                     match conn.stream.write_vectored(&slices) {
                         Ok(0) => {
@@ -2204,7 +2225,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                     if conn.keep_alive {
                         conn.buf.drain(..conn.consumed);
                         conn.response = None;
-                        conn.progress = [0; 3];
+                        conn.progress = [0; 5];
                         conn.state = READING;
                         conn.header_deadline = None;
                         conn.deadline = Instant::now() + KEEP_ALIVE_IDLE;
@@ -2314,7 +2335,7 @@ fn handle_persistent_connection(stream: &mut TcpStream) -> std::io::Result<()> {
         // : write the pre-rendered head + body — no per-request formatting.
         write_prepared_conn(
             stream,
-            response.head(),
+            response.head_parts(),
             response.body(),
             keep_alive,
         )?;
@@ -2499,6 +2520,44 @@ fn read_request_line(
     }
 }
 
+/// A page head split into `(prefix, shared style, suffix)`.
+///
+/// The `<style>` payload is byte-identical across the large prewarmed page
+/// set, so interning it once removes one CSS copy per page while keeping the
+/// bytes sent to the browser exactly the same.  This is one-shot-safe: unlike
+/// an external stylesheet it needs no second request.
+type HeadParts = [std::sync::Arc<str>; 3];
+
+fn intern_head_style(style: &str) -> std::sync::Arc<str> {
+    static STYLES: std::sync::OnceLock<
+        std::sync::Mutex<rustc_hash::FxHashMap<Box<str>, std::sync::Arc<str>>>,
+    > = std::sync::OnceLock::new();
+    let map = STYLES.get_or_init(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()));
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(shared) = map.get(style) {
+        return std::sync::Arc::clone(shared);
+    }
+    let shared: std::sync::Arc<str> = std::sync::Arc::from(style);
+    map.insert(style.into(), std::sync::Arc::clone(&shared));
+    shared
+}
+
+fn split_head(head: String) -> HeadParts {
+    let Some(open) = head.find("<style>") else {
+        return [std::sync::Arc::from(head), std::sync::Arc::from(""), std::sync::Arc::from("")];
+    };
+    let Some(close) = head[open + 7..].find("</style>") else {
+        return [std::sync::Arc::from(head), std::sync::Arc::from(""), std::sync::Arc::from("")];
+    };
+    let style_start = open + 7;
+    let style_end = style_start + close;
+    [
+        std::sync::Arc::from(&head[..style_start]),
+        intern_head_style(&head[style_start..style_end]),
+        std::sync::Arc::from(&head[style_end..]),
+    ]
+}
+
 /// Owned page for the bounded 404 cache.
 ///
 /// The explain/index pages are process-immortal and can stay `Box::leak`ed,
@@ -2506,8 +2565,14 @@ fn read_request_line(
 /// made the cap meaningless and leaked one page per distinct path forever.
 /// Owning `Arc<str>` lets eviction actually reclaim the strings.
 struct OwnedPage {
-    head: std::sync::Arc<str>,
+    head: HeadParts,
     body: std::sync::Arc<str>,
+}
+
+impl OwnedPage {
+    fn head_parts(&self) -> [&str; 3] {
+        [&self.head[0], &self.head[1], &self.head[2]]
+    }
 }
 
 /// A fully rendered response for a cached page (/F9): the head already
@@ -2518,15 +2583,19 @@ struct OwnedPage {
 /// three allocations.  The surrounding `OnceLock` is process-long anyway, so
 /// residency is unchanged while ownership/destruction become explicit.
 struct CachedPage {
-    head: Box<str>,
+    head: HeadParts,
     body: Box<str>,
 }
 
 impl CachedPage {
+    fn head_parts(&self) -> [&str; 3] {
+        [&self.head[0], &self.head[1], &self.head[2]]
+    }
+
     fn build(status: &str, extra_headers: &str, body: String) -> Self {
         let head = render_head(status, extra_headers, body.len());
         CachedPage {
-            head: head.into_boxed_str(),
+            head: split_head(head),
             body: body.into_boxed_str(),
         }
     }
@@ -2569,11 +2638,12 @@ enum PageRef {
 }
 
 impl PageRef {
-    fn head(&self) -> &str {
-        match self {
-            PageRef::Static(page) => page.head.as_ref(),
-            PageRef::Shared(page) => page.head.as_ref(),
-        }
+    fn head_parts(&self) -> [&str; 3] {
+        let head = match self {
+            PageRef::Static(page) => &page.head,
+            PageRef::Shared(page) => &page.head,
+        };
+        [&head[0], &head[1], &head[2]]
     }
 
     fn body(&self) -> &str {
@@ -2617,8 +2687,8 @@ impl HttpResponse {
         }
     }
 
-    fn head(&self) -> &str {
-        self.page.head()
+    fn head_parts(&self) -> [&str; 3] {
+        self.page.head_parts()
     }
 
     fn body(&self) -> &str {
@@ -2884,7 +2954,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         let body = build_not_found_page(code);
         let head = render_head("404 Not Found", "", body.len());
         OwnedPage {
-            head: std::sync::Arc::from(head),
+            head: split_head(head),
             body: std::sync::Arc::from(body),
         }
     };
