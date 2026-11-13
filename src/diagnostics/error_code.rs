@@ -85,10 +85,11 @@ fn cached_slot_string(
     slot: u16,
     build: impl FnOnce() -> CompactString,
 ) -> std::sync::Arc<str> {
-    // One `OnceLock` load, then the map read: the ordinary hit path costs no
-    // extra work, and a losing racer no longer pays the full `build()` before
-    // discovering the winner's entry.  (The double-checked insert below still
-    // guarantees exactly one stored value per slot.)
+    // One `OnceLock` load, then the map read for hits.  The double-checked
+    // insert guarantees exactly one stored value per slot; a losing racer has
+    // already paid `build()` before discovering the winner.  That duplicate
+    // work is intentional: building under the map write lock would serialize
+    // every miss, and `build` is a cheap pure `format_compact!`.
     let m = cache.get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashMap::default()));
     // Poison recovery: the guarded value is only `Arc<str>` built by a pure
     // function, so a poisoned map is still valid.  Silently bypassing the

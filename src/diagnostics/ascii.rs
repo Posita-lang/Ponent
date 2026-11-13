@@ -233,9 +233,9 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 
 /// Byte offset of the first byte ≥ 0x80 in `s`, or `None` if `s` is pure ASCII.
 ///
-/// SWAR over `u64` chunks: every non-ASCII UTF-8 byte (lead or continuation)
-/// has its high bit set, so one AND per 8-byte chunk decides whether the chunk
-/// holds a candidate; a `trailing_zeros` on the flagged lanes locates it.
+/// SWAR over `u128` chunks: every non-ASCII UTF-8 byte (lead or continuation)
+/// has its high bit set, so one AND per 16-byte chunk decides whether the
+/// chunk holds a candidate; a `trailing_zeros` on the flagged lanes locates it.
 /// Used by `char_col`'s sparse-table build to jump the ASCII runs of a mixed
 /// line without decoding every character — `O(chunk)` per non-ASCII char
 /// instead of `O(line_len)` char decodes.

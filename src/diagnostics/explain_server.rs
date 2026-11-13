@@ -19,6 +19,10 @@ struct PendingConn {
     stream: TcpStream,
     accepted_at: Instant,
     buf: SmallVec<[u8; 512]>,
+    /// Bytes already scanned for the header terminator; `buf` only grows, so
+    /// each poll round rescans the new suffix (with a 3-byte carry) instead of
+    /// the whole request, avoiding quadratic work for dribbling clients.
+    scanned: std::cell::Cell<usize>,
 }
 
 #[cfg(unix)]
@@ -35,7 +39,14 @@ impl PendingConn {
     }
 
     fn header_complete(&self) -> bool {
-        memchr::memmem::find(&self.buf, b"\r\n\r\n").is_some()
+        let start = self
+            .scanned
+            .get()
+            .min(self.buf.len())
+            .saturating_sub(3);
+        let complete = header_end(&self.buf[start..]).is_some();
+        self.scanned.set(self.buf.len());
+        complete
     }
 }
 
@@ -223,6 +234,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                                 stream,
                                 accepted_at: Instant::now(),
                                 buf: SmallVec::new(),
+                                scanned: std::cell::Cell::new(0),
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -247,14 +259,14 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             // expire on their per-connection deadline instead of pinning a
             // slot.
             let polled = fds.len().saturating_sub(listener_offset);
-            let mut remove: SmallVec<[usize; MAX_PENDING]> = SmallVec::new();
+            let mut remove: SmallVec<[(usize, bool); MAX_PENDING]> = SmallVec::new();
             for i in 0..polled.min(pending.len()) {
                 let revents = fds[listener_offset + i].revents;
                 if revents == 0 {
                     continue;
                 }
                 if revents & libc::POLLNVAL != 0 {
-                    remove.push(i);
+                    remove.push((i, false));
                     continue;
                 }
                 let mut closed = false;
@@ -282,19 +294,24 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                         break;
                     }
                 }
-                if closed
-                    || pending[i].header_complete()
-                    || Instant::now() >= pending[i].expiry()
-                {
-                    remove.push(i);
+                if closed {
+                    remove.push((i, false));
+                } else if pending[i].header_complete() {
+                    // The watermark advances on this call; the handoff below
+                    // must reuse this verdict instead of asking again (a second
+                    // call would only see the last three bytes and miss a
+                    // terminator straddling them).
+                    remove.push((i, true));
+                } else if Instant::now() >= pending[i].expiry() {
+                    remove.push((i, false));
                 }
             }
 
             let mut handoff: SmallVec<[(TcpStream, SmallVec<[u8; 512]>); MAX_PENDING]> =
                 SmallVec::new();
-            for &i in remove.iter().rev() {
+            for &(i, complete) in remove.iter().rev() {
                 let p = pending.swap_remove(i);
-                if p.header_complete() {
+                if complete {
                     handoff.push((p.stream, p.buf));
                 } else {
                     let mut stream = p.stream;
@@ -303,43 +320,22 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             }
 
             if !handoff.is_empty() {
-                // [2]1/[4]1: separate *claiming* the one-shot page from
-                // *delivering* it.  Claiming before the write prevents two
-                // workers from both committing a response; only a successful
-                // write sets `delivered`, and a failed attempt releases the
-                // claim so a later connection can retry.
-                let claimed = std::sync::atomic::AtomicBool::new(false);
+                // Every target request is served: the page is idempotent and two tabs or
+                // a retry may legitimately race.  `delivered` only records a
+                // successful write so the accept loop can stop.
                 let delivered = std::sync::atomic::AtomicBool::new(false);
                 std::thread::scope(|scope| {
                     for (mut stream, buf) in handoff.drain(..) {
                         let expected = &expected_path;
                         let is_target = request_line_targets(buf.as_ref(), expected);
-                        if is_target
-                            && claimed
-                                .compare_exchange(
-                                    false,
-                                    true,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_err()
-                        {
-                            let _ = stream.shutdown(Shutdown::Both);
-                            continue;
-                        }
-                        let claimed_ref = &claimed;
                         let delivered_ref = &delivered;
                         let html = &html;
                         scope.spawn(move || {
                             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 serve_page_after_prefix(&mut stream, html, Some(expected), &buf)
                             }));
-                            if is_target {
-                                if matches!(r, Ok(Ok(true))) {
-                                    delivered_ref.store(true, Ordering::Release);
-                                } else {
-                                    claimed_ref.store(false, Ordering::Release);
-                                }
+                            if is_target && matches!(r, Ok(Ok(true))) {
+                                delivered_ref.store(true, Ordering::Release);
                             }
                         });
                     }
@@ -477,6 +473,20 @@ const MAX_BODY_DRAIN: usize = 8 * 1024 * 1024;
 /// oversized `Content-Length` into a zero-length body, which `drain_request`
 /// then reported as `Complete` — a false completion that let the RST/RST-free
 /// close happen with request bytes still unread .
+/// End offset (just past the blank line) of a complete header block,
+/// accepting both CRLFCRLF and bare LFLF.  The thread path is deliberately
+/// LF-lenient; the reactor must not reject a request the thread path serves.
+fn header_end(buf: &[u8]) -> Option<usize> {
+    let crlf = memchr::memmem::find(buf, b"\r\n\r\n").map(|pos| pos + 4);
+    let lf = memchr::memmem::find(buf, b"\n\n").map(|pos| pos + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 struct HeaderFraming {
     content_length: Option<usize>,
     has_transfer_encoding: bool,
@@ -734,14 +744,16 @@ fn drain_request_tracked(
     DrainOutcome::Complete
 }
 
-/// Consume late/pipelined inbound bytes after the response is on the wire, so
-/// the linger overlaps client-side response delivery.  Closing with unread
-/// inbound bytes makes the kernel send RST, which can destroy the response
-/// .
-fn drain_residual(stream: &mut TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
-    let deadline = Instant::now() + Duration::from_millis(20);
-    let mut buf = [0u8; 512];
+/// Consume inbound bytes until EOF or `budget` expires.  `half_close` sends
+/// FIN first (the response is already written) and closes both directions
+/// afterwards; the non-half-close form is the residual pipelined drain.
+fn drain_until_eof(stream: &mut TcpStream, budget: Duration, half_close: bool) {
+    if half_close {
+        let _ = stream.shutdown(Shutdown::Write);
+    }
+    let _ = stream.set_read_timeout(Some(budget));
+    let deadline = Instant::now() + budget;
+    let mut buf = [0u8; 4096];
     while Instant::now() < deadline {
         match stream.read(&mut buf) {
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -749,6 +761,15 @@ fn drain_residual(stream: &mut TcpStream) {
             Ok(_) => {}
         }
     }
+    if half_close {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+/// Consume late/pipelined inbound bytes after the response is on the wire, so
+/// the linger overlaps client-side response delivery.
+fn drain_residual(stream: &mut TcpStream) {
+    drain_until_eof(stream, Duration::from_millis(20), false);
 }
 
 
@@ -1059,13 +1080,13 @@ fn serve_page_after_prefix(
         // Finding 6: validate the full three-token grammar and version before
         // any routing decision, exactly like the persistent dispatcher.
         let Some(req) = parse_request_line(line.as_ref()) else {
-            let _ = drain_request(stream, prefix, Duration::from_millis(50));
+            let _ = drain_request(stream, prefix, Duration::from_secs(1));
             let _ = write_prepared(stream, bad_request_head(), "");
             linger_after_half_close(stream);
             return Ok(false);
         };
         if !matches!(req.version, "HTTP/1.0" | "HTTP/1.1") {
-            let _ = drain_request(stream, prefix, Duration::from_millis(50));
+            let _ = drain_request(stream, prefix, Duration::from_secs(1));
             let _ = write_prepared(stream, bad_request_head(), "");
             linger_after_half_close(stream);
             return Ok(false);
@@ -1073,7 +1094,7 @@ fn serve_page_after_prefix(
         // [4]2: origin-form is required; `GET E030 HTTP/1.1` must not be
         // served by the one-shot while the persistent router rejects it.
         if !req.target.starts_with('/') {
-            let _ = drain_request(stream, prefix, Duration::from_millis(50));
+            let _ = drain_request(stream, prefix, Duration::from_secs(1));
             let _ = write_prepared(stream, bad_request_head(), "");
             linger_after_half_close(stream);
             return Ok(false);
@@ -1081,8 +1102,8 @@ fn serve_page_after_prefix(
         // A non-GET must not receive a full body (protocol violation); answer
         // 405 with `Allow: GET` and keep waiting for the real page request.
         if req.method != "GET" {
-            stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-            let _ = drain_request(stream, prefix, Duration::from_millis(50));
+            stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+            let _ = drain_request(stream, prefix, Duration::from_secs(1));
             let _ = write_prepared(stream, method_not_allowed_head(), "");
             linger_after_half_close(stream);
             return Ok(false);
@@ -1100,11 +1121,13 @@ fn serve_page_after_prefix(
                 // Drain the whole request before writing: closing with unread
                 // inbound bytes makes the kernel send RST, which can discard
                 // the 404 response (the discipline).
-                stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                 let decoded = percent_decode(raw);
                 let key = decoded.strip_prefix('/').unwrap_or(decoded.as_ref());
+                let key = key.trim_start_matches('/');
+                let key = if key.is_empty() { "/" } else { key };
                 let page = not_found_page_cached(key);
-                match drain_request(stream, prefix, Duration::from_millis(100)) {
+                match drain_request(stream, prefix, Duration::from_secs(1)) {
                     DrainOutcome::NoRequest => {
                         let _ = stream.shutdown(Shutdown::Both);
                     }
@@ -1182,14 +1205,18 @@ fn request_line_targets(buf: &[u8], expected: &str) -> bool {
 /// (the index) has no code and returns `None`; callers handle the index first.
 fn canonical_path_code(target: &str) -> Option<CompactString> {
     let raw = target.split('?').next().unwrap_or("/");
-    let decoded = percent_decode(raw);
-    let p = decoded.as_ref();
-    let p = p.strip_prefix('/').unwrap_or(p);
+    // Slash policy runs on the *encoded* path: `%2F` is an encoded slash and
+    // must not be normalised into a path separator (otherwise `/E030%2F`
+    // would alias `/E030/`).  Percent-decoding happens after the slash shape
+    // is fixed, so `%45%30%33%30` still resolves to `E030`.
+    let p = raw.strip_prefix('/').unwrap_or(raw);
     if p.starts_with('/') {
         // `//E030` names a different resource, not `E030`.
         return None;
     }
     let p = p.strip_suffix('/').unwrap_or(p);
+    let decoded = percent_decode(p);
+    let p = decoded.as_ref();
     if p.is_empty() {
         return None;
     }
@@ -1211,18 +1238,7 @@ fn method_not_allowed_head() -> &'static str {
 /// larger body, unread bytes remain and the final close can RST the response
 /// just written .
 fn linger_after_half_close(stream: &mut TcpStream) {
-    let _ = stream.shutdown(Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-    let deadline = Instant::now() + Duration::from_millis(50);
-    let mut buf = [0u8; 4096];
-    while Instant::now() < deadline {
-        match stream.read(&mut buf) {
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-    }
-    let _ = stream.shutdown(Shutdown::Both);
+    drain_until_eof(stream, Duration::from_millis(50), true);
 }
 
 /// Escape a string for HTML embedding.
@@ -1543,9 +1559,9 @@ pub fn serve_explain_persistent(listener: &TcpListener) -> std::io::Result<()> {
     }
     // the index and the CSP digests are otherwise paid on the first
     // request; both are pure functions of the static tables/constants.
-    let _ = build_index_page;
-    let _ = csp_style_src;
-    let _ = csp_script_src;
+    let _ = build_index_page();
+    let _ = csp_style_src();
+    let _ = csp_script_src();
     // Linux uses a single non-blocking epoll reactor: one event loop owns
     // every connection, so a slow client costs no thread and cannot delay
     // accepts.  Other platforms keep the scoped thread-per-connection path.
@@ -1768,12 +1784,16 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
     const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
     const READING: u8 = 0;
     const WRITING: u8 = 1;
+    const DRAINING: u8 = 2;
 
     struct Conn {
         stream: TcpStream,
         buf: Vec<u8>,
-        out: Vec<u8>,
-        out_pos: usize,
+        /// Response kept alive for the write duration; slices are written
+        /// directly with `write_vectored` (head, Connection header, body).
+        response: Option<HttpResponse>,
+        conn_hdr: &'static [u8],
+        progress: [usize; 3],
         state: u8,
         keep_alive: bool,
         consumed: usize,
@@ -1803,11 +1823,11 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
 
     loop {
         let now = Instant::now();
-        let mut wait = Duration::from_millis(200);
+        let mut wait = Duration::from_secs(5);
         for conn in conns.values() {
             wait = wait.min(conn.deadline.saturating_duration_since(now));
         }
-        let timeout_ms = wait.as_millis().min(200) as i32;
+        let timeout_ms = wait.as_millis().min(5_000) as i32;
         let ready = unsafe {
             libc::epoll_wait(
                 epfd,
@@ -1839,17 +1859,18 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                                 // Backpressure: answer 503 instead of silently
                                 // dropping the socket, then close it.
                                 let page = shed_page();
-                                let mut out = Vec::with_capacity(page.head.len() + page.body.len() + 32);
-                                out.extend_from_slice(page.head.as_bytes());
-                                out.extend_from_slice(b"Connection: close\r\n\r\n");
-                                out.extend_from_slice(page.body.as_bytes());
                                 conns.insert(
                                     conn_fd,
                                     Conn {
                                         stream,
                                         buf: Vec::new(),
-                                        out,
-                                        out_pos: 0,
+                                        response: Some(HttpResponse::from_cache(
+                                            "503 Service Unavailable",
+                                            "",
+                                            page,
+                                        )),
+                                        conn_hdr: b"Connection: close\r\n\r\n",
+                                        progress: [0; 3],
                                         state: WRITING,
                                         keep_alive: false,
                                         consumed: 0,
@@ -1862,8 +1883,9 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                                     Conn {
                                         stream,
                                         buf: Vec::with_capacity(1024),
-                                        out: Vec::new(),
-                                        out_pos: 0,
+                                        response: None,
+                                        conn_hdr: b"",
+                                        progress: [0; 3],
                                         state: READING,
                                         keep_alive: false,
                                         consumed: 0,
@@ -1890,7 +1912,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                         }
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(ref error)
+                        Err(error)
                             if matches!(
                                 error.raw_os_error(),
                                 Some(
@@ -1903,7 +1925,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                         {
                             consecutive_accept_errors += 1;
                             if consecutive_accept_errors >= 100 {
-                                return Err(std::io::Error::last_os_error());
+                                return Err(error);
                             }
                             std::thread::sleep(Duration::from_millis(50));
                             break;
@@ -1921,11 +1943,37 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                 continue;
             };
             let bits = event.events as i32;
-            if conn.state == READING
+            if (conn.state == READING || conn.state == DRAINING)
                 && bits & (libc::EPOLLERR | libc::EPOLLHUP) != 0
                 && bits & libc::EPOLLIN == 0
             {
                 close.push(fd);
+                continue;
+            }
+
+            if conn.state == DRAINING {
+                // The response is fully written; consume whatever the client
+                // still sends so the final close sends FIN instead of RST.
+                let mut eof = false;
+                loop {
+                    let mut chunk = [0u8; 4096];
+                    match conn.stream.read(&mut chunk) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            eof = true;
+                            break;
+                        }
+                    }
+                }
+                if eof {
+                    close.push(fd);
+                }
                 continue;
             }
 
@@ -1958,7 +2006,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                     close.push(fd);
                     continue;
                 }
-                let Some(end) = memchr::memmem::find(&conn.buf, b"\r\n\r\n") else {
+                let Some(head_end) = header_end(&conn.buf) else {
                     if eof {
                         close.push(fd);
                     } else {
@@ -1966,32 +2014,49 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                     }
                     continue;
                 };
-                let head_end = end + 4;
                 let head = conn.buf[..head_end].to_vec();
                 let line_end = memchr::memchr(b'\n', &head)
-                    .map(|position| position.saturating_sub(1))
+                    .map(|position| {
+                        if position > 0 && head[position - 1] == b'\r' {
+                            position - 1
+                        } else {
+                            position
+                        }
+                    })
                     .unwrap_or(0);
+                if line_end > 8 * 1024 {
+                    // Parity with the other backends: reject an oversized
+                    // request line instead of buffering it.
+                    close.push(fd);
+                    continue;
+                }
                 let Ok(request_line) = std::str::from_utf8(&head[..line_end]) else {
                     close.push(fd);
                     continue;
                 };
                 let response = dispatch_request(request_line);
-                // A body or a pipelined second request is not consumed here:
-                // close instead of letting those bytes desynchronise keep-alive.
-                let keep = reactor_keep_alive(&head, response.status)
-                    && !reactor_has_body(&head)
+                // One framing policy for all backends: the thread path's
+                // `scan_framing` decides body/TE/Connection semantics here too,
+                // so chunked or ambiguous requests close instead of desyncing
+                // keep-alive.
+                let framing = scan_framing(&head[line_end..head_end]);
+                let keep = response.status == "200 OK"
+                    && !framing.has_transfer_encoding
+                    && !framing.ambiguous
+                    && !framing.oversized
+                    && framing.content_length.map_or(true, |n| n == 0)
+                    && !framing.connection_close
+                    && request_is_http11(request_line)
                     && conn.buf.len() == head_end;
                 conn.keep_alive = keep;
                 conn.consumed = head_end;
-                conn.out.clear();
-                conn.out.extend_from_slice(response.head().as_bytes());
-                conn.out.extend_from_slice(if keep {
+                conn.response = Some(response);
+                conn.conn_hdr = if keep {
                     b"Connection: keep-alive\r\n\r\n"
                 } else {
                     b"Connection: close\r\n\r\n"
-                });
-                conn.out.extend_from_slice(response.body().as_bytes());
-                conn.out_pos = 0;
+                };
+                conn.progress = [0; 3];
                 conn.state = WRITING;
                 conn.deadline = Instant::now() + WRITE_TIMEOUT;
                 let mut conn_event = libc::epoll_event {
@@ -2006,16 +2071,40 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
             if conn.state == WRITING {
                 let mut finished = false;
                 loop {
-                    if conn.out_pos >= conn.out.len() {
+                    let Some(response) = conn.response.as_ref() else {
+                        finished = true;
+                        break;
+                    };
+                    let head = response.head().as_bytes();
+                    let body = response.body().as_bytes();
+                    let lengths = [head.len(), conn.conn_hdr.len(), body.len()];
+                    if conn.progress[0] >= lengths[0]
+                        && conn.progress[1] >= lengths[1]
+                        && conn.progress[2] >= lengths[2]
+                    {
                         finished = true;
                         break;
                     }
-                    match conn.stream.write(&conn.out[conn.out_pos..]) {
+                    let slices = [
+                        std::io::IoSlice::new(&head[conn.progress[0]..]),
+                        std::io::IoSlice::new(&conn.conn_hdr[conn.progress[1]..]),
+                        std::io::IoSlice::new(&body[conn.progress[2]..]),
+                    ];
+                    match conn.stream.write_vectored(&slices) {
                         Ok(0) => {
                             close.push(fd);
                             break;
                         }
-                        Ok(written) => conn.out_pos += written,
+                        Ok(mut written) => {
+                            for (i, len) in lengths.iter().enumerate() {
+                                let take = (len - conn.progress[i]).min(written);
+                                conn.progress[i] += take;
+                                written -= take;
+                                if written == 0 {
+                                    break;
+                                }
+                            }
+                        }
                         Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(_) => {
@@ -2027,8 +2116,8 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                 if finished {
                     if conn.keep_alive {
                         conn.buf.drain(..conn.consumed);
-                        conn.out.clear();
-                        conn.out_pos = 0;
+                        conn.response = None;
+                        conn.progress = [0; 3];
                         conn.state = READING;
                         conn.deadline = Instant::now() + KEEP_ALIVE_IDLE;
                         let mut conn_event = libc::epoll_event {
@@ -2039,7 +2128,20 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                             libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
                         }
                     } else {
-                        close.push(fd);
+                        // Half-close and drain inbound bytes: closing with
+                        // unread request/body bytes makes the kernel emit RST,
+                        // which can discard the response we just wrote (the
+                        // shed 503 path included).
+                        let _ = conn.stream.shutdown(Shutdown::Write);
+                        conn.state = DRAINING;
+                        conn.deadline = Instant::now() + Duration::from_millis(100);
+                        let mut conn_event = libc::epoll_event {
+                            events: libc::EPOLLIN as u32,
+                            u64: fd as u64,
+                        };
+                        unsafe {
+                            libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
+                        }
                     }
                 }
             }
@@ -2204,7 +2306,7 @@ fn read_request_line(
     // line completed inside a 64 KiB handoff buffer bypasses the cap while the
     // persistent path rejects it.
     if prefix.len() > 8192 {
-        let _ = drain_request(stream, prefix, Duration::from_millis(100));
+        let _ = drain_request(stream, prefix, Duration::from_secs(1));
         return None;
     }
     // /a caller may already hold the line prefix from an earlier probe
@@ -2509,6 +2611,8 @@ fn dispatch_request(request_line: &str) -> HttpResponse {
                 .as_ref()
                 .strip_prefix('/')
                 .unwrap_or(decoded.as_ref());
+            let key = key.trim_start_matches('/');
+            let key = if key.is_empty() { "/" } else { key };
             HttpResponse::from_owned("404 Not Found", "", not_found_page_cached(key))
         }
     }
@@ -2959,6 +3063,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn persistent_server_accepts_lf_only_request_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = serve_explain_persistent(&listener);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"GET /E030 HTTP/1.1\nHost: x\n\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    response.extend_from_slice(&chunk[..n]);
+                    if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK"),
+            "LF-only request line was rejected: {:?}",
+            &response[..response.len().min(40)]
+        );
+    }
+
+    #[test]
+    fn persistent_server_reuses_keep_alive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = serve_explain_persistent(&listener);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let request = b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+        client.write_all(request).unwrap();
+
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let count = |buf: &[u8]| {
+            buf.windows(b"HTTP/1.1 200 OK".len())
+                .filter(|w| *w == b"HTTP/1.1 200 OK")
+                .count()
+        };
+        // First response: wait for its head, then send the second request.
+        while Instant::now() < deadline && count(&response) < 1 {
+            match client.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => response.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert_eq!(count(&response), 1, "first request was not served");
+        client.write_all(request).unwrap();
+        while Instant::now() < deadline && count(&response) < 2 {
+            match client.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => response.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert_eq!(
+            count(&response),
+            2,
+            "keep-alive connection did not serve the second request"
+        );
+    }
+
     /// Security: the explain page is an HTTP endpoint, so a listener bound
     /// to a non-loopback (wildcard) address must be refused rather than
     /// served to the whole network.
@@ -3066,5 +3252,33 @@ mod tests {
 
         h.join().unwrap().unwrap();
         drop(pre);
+    }
+
+    #[test]
+    fn canonical_path_code_keeps_percent_encoded_slash_distinct() {
+        assert_eq!(canonical_path_code("/E030").as_deref(), Some("E030"));
+        assert_eq!(
+            canonical_path_code("/%45%30%33%30").as_deref(),
+            Some("E030")
+        );
+        // An encoded slash must not become a path separator and alias `/E030/`.
+        assert_eq!(canonical_path_code("/E030%2F"), None);
+        assert_eq!(canonical_path_code("//E030"), None);
+    }
+
+    #[test]
+    fn scan_framing_flags_transfer_encoding_and_ambiguous_lengths() {
+        assert!(
+            scan_framing(b"Transfer-Encoding: chunked\r\n\r\n").has_transfer_encoding,
+            "chunked request must not be reusable as keep-alive"
+        );
+        assert!(
+            scan_framing(b"Content-Length: 5\r\nContent-Length: 6\r\n\r\n").ambiguous,
+            "conflicting Content-Length must be rejected"
+        );
+        assert!(
+            scan_framing(b"Content-Length: +5\r\n\r\n").ambiguous,
+            "signed Content-Length must be rejected"
+        );
     }
 }

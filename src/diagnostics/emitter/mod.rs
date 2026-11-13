@@ -621,11 +621,24 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                     let mut pieces: Vec<(usize, String)> = Vec::with_capacity(chunk.len());
                     for (orig, diag) in chunk.iter_mut() {
                         let orig = *orig;
-                        diag.humanize();
-                        let mut buf = String::new();
-                        renderer.render_into(*diag, &cx, &mut buf);
-                        if !buf.is_empty() {
-                            pieces.push((orig, buf));
+                        // One malformed diagnostic must not abort the whole
+                        // batch: contain the panic and emit a placeholder for
+                        // that slot, keeping every other worker's output.
+                        let rendered = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| {
+                                diag.humanize();
+                                let mut buf = String::new();
+                                renderer.render_into(*diag, &cx, &mut buf);
+                                buf
+                            }),
+                        );
+                        match rendered {
+                            Ok(buf) if !buf.is_empty() => pieces.push((orig, buf)),
+                            Ok(_) => {}
+                            Err(_) => pieces.push((
+                                orig,
+                                "<ponent: diagnostic rendering panicked>\n".to_string(),
+                            )),
                         }
                     }
                     pieces

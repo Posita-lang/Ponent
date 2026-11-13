@@ -1143,6 +1143,9 @@ pub struct DefaultCache<K, V> {
     /// `admit_tick` drains it in `ADMIT_AGING_CHUNK`-sized chunks from the
     /// rotating cursor (see `admit_tick`).
     admit_clock: CachePadded<AtomicUsize>,
+    /// Precomputed `capacity.max(ADMIT_SKETCH_SIZE / ADMIT_AGING_CHUNK)`;
+    /// `admit_tick` runs on every stage and must not redo the division.
+    admit_period: usize,
     /// Counters still owed a halve in the current aging pass (0 = none).
     admit_aging_left: AtomicUsize,
     /// Rotating cursor into the `admit` sketch for the in-progress pass.
@@ -1229,6 +1232,7 @@ where
             staged_global: std::array::from_fn(|_| CachePadded(AtomicUsize::new(0))),
             admit: (0..ADMIT_SKETCH_SIZE).map(|_| AtomicU8::new(0)).collect(),
             admit_clock: CachePadded(AtomicUsize::new(0)),
+            admit_period: max_entries.max(ADMIT_SKETCH_SIZE / ADMIT_AGING_CHUNK),
             admit_aging_left: AtomicUsize::new(0),
             admit_aging_cursor: AtomicUsize::new(0),
             arena_id: NEXT_STAT_ARENA_ID.fetch_add(1, Ordering::Relaxed),
@@ -1532,11 +1536,7 @@ where
     #[inline]
     fn admit_tick(&self) {
         let n = self.admit_clock.0.fetch_add(1, Ordering::Relaxed);
-        if n % self
-            .capacity
-            .max(ADMIT_SKETCH_SIZE / ADMIT_AGING_CHUNK)
-            == 0
-        {
+        if n % self.admit_period == 0 {
             // `fetch_max`, not `store`: a concurrent chunk claim
             // that decremented between this decision and the reset must not
             // have its owed work discarded.  Over-restoring is the
@@ -2131,6 +2131,11 @@ where
         // slot; a wider sweep spills to the heap like `Vec`.
         let mut dropped: SmallVec<[V; 1]> = SmallVec::new();
         let mut evictions: usize = 0;
+        // Fresh-registration keys are cloned before the shard write lock so
+        // the exclusive section only moves them (stage is a cold path: one
+        // call per fresh compute).
+        let fresh_slot_key = key.clone();
+        let fresh_map_key = key.clone();
         // The raw shard write lock below is registered under
         // `Fam::CacheShard` so the tripwire sees it (the §0 #8 edge
         // CacheShard→StatRegistry is still exercised by
@@ -2190,7 +2195,7 @@ where
                     // so the map stays consistent.
                     let idx = shard.slots.len() as u32;
                     shard.slots.push(Slot {
-                        key: key.clone(),
+                        key: fresh_slot_key,
                         node,
                         value: Some(value),
                         referenced: AtomicBool::new(false),
@@ -2198,7 +2203,7 @@ where
                         next: NONE,
                         hash: h,
                     });
-                    shard.map.insert(key.clone(), idx);
+                    shard.map.insert(fresh_map_key, idx);
                     Self::link_head_fresh(&mut shard, idx);
                     shard.valued += 1;
                     self.staged_add(s, 1);
@@ -2475,6 +2480,10 @@ where
             let mut no_shard = ticket::Held::<ticket::CacheNoShard>::fresh();
             alloc(&mut no_shard)
         };
+        // Clone the two owned keys before the exclusive section; the write lock
+        // only moves them.  A race loser wastes two cheap identity-key clones.
+        let fresh_slot_key = key.clone();
+        let fresh_map_key = key.clone();
         let (mut shard, t2) = self.take_cache_shard_w(s, ticket::Held::fresh());
         if let Some(&idx) = shard.map.get(key) {
             // Race loser: the winner registered first.  Discard our
@@ -2503,7 +2512,9 @@ where
                 if let Some(v) = &slot.value {
                     let epoch = capture(slot.node);
                     let keep = green(slot.node);
-                    if !slot.referenced.load(Ordering::Relaxed) {
+                    // Match phase 1: a red entry is about to be re-staged, so
+                    // marking it referenced only wastes admission budget.
+                    if keep && !slot.referenced.load(Ordering::Relaxed) {
                         slot.referenced.store(true, Ordering::Relaxed);
                     }
                     (slot.node, keep.then(|| v.clone()), false, epoch)
@@ -2530,7 +2541,7 @@ where
         }
         let idx = shard.slots.len() as u32;
         shard.slots.push(Slot {
-            key: key.clone(),
+            key: fresh_slot_key,
             node: fresh_node,
             value: None,
             referenced: AtomicBool::new(false),
@@ -2538,7 +2549,7 @@ where
             next: NONE,
             hash: h,
         });
-        shard.map.insert(key.clone(), idx);
+        shard.map.insert(fresh_map_key, idx);
         let _ = Self::release_cache_shard_w(shard, t2);
         // Fresh registration: the caller's `cached` is `None`, so the C1
         // serve re-check is never consulted — return a zero epoch instead of
@@ -3541,11 +3552,36 @@ pub type CycleProcessorFn<'q, 'src, Q: Query<'q, 'src>> =
 pub type Stored<'q, 'src, Q: Query<'q, 'src>> =
     <<Q as Query<'q, 'src>>::Storage as Erasable<'q, <Q as Query<'q, 'src>>::Value>>::Erased;
 
+/// Debug-build gauge for [`super::erase::Arena`]'s documented orphan growth:
+/// every fresh compute allocates a new arena value while the invalidated one
+/// stays unreachable.  Warn once per 64 MiB so a watch-mode driver makes the
+/// documented RSS hazard observable instead of a chart mystery.
+#[cfg(debug_assertions)]
+fn note_arena_orphan(bytes: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    const WARN_EVERY: u64 = 64 << 20;
+    let prev = TOTAL.fetch_add(bytes as u64, Ordering::Relaxed);
+    let now = prev + bytes as u64;
+    if prev / WARN_EVERY != now / WARN_EVERY {
+        eprintln!(
+            "warning: arena-storage queries have orphaned ~{} MiB in this process; \
+             prefer Owned storage for an invalidation-hot query",
+            now >> 20
+        );
+    }
+}
+
 /// Provider side → cache side for `Q` (one `Arc` wrap on [`Owned`],
 /// identity on [`Arena`]).  Runs once per fresh compute.
 #[inline]
 fn erase_value<'q, 'src, Q: Query<'q, 'src>>(provided: Q::Value) -> Stored<'q, 'src, Q> {
-    <Q::Storage as Erasable<'q, Q::Value>>::provided_to_erased(provided)
+    let erased = <Q::Storage as Erasable<'q, Q::Value>>::provided_to_erased(provided);
+    #[cfg(debug_assertions)]
+    if <Q::Storage as Erasable<'q, Q::Value>>::IS_ARENA {
+        note_arena_orphan(std::mem::size_of::<Q::Value>());
+    }
+    erased
 }
 
 /// Cache side → provider side for `Q` (refcount bump on [`Owned`], copy
@@ -5243,68 +5279,99 @@ trait CloneAny: std::any::Any {
 /// fallback for function-local test queries.  Typed variants carry the
 /// key by value, so recovery is a match with zero `Any` downcast; only
 /// `Opaque` keeps the erased box.
-pub enum TaggedQueryKey {
-    TypeDefShape(crate::hir::types::DefId),
-    CheckFnSignature(queries::FnId),
-    CheckFnBody(queries::FnId),
-    DocTokens(queries::FnId),
-    Opaque(TypeId, Box<dyn CloneAny + Send + Sync>),
+// One manifest row list generates every hand-synced consumer, so a new query
+// cannot compile while silently missing a typed variant or its re-request.
+macro_rules! tagged_query_set {
+    ($($name:ident, $ty:ty, $key:ty;)*) => {
+        pub enum TaggedQueryKey {
+            $($name($key),)*
+            Opaque(TypeId, Box<dyn CloneAny + Send + Sync>),
+        }
+
+        impl TaggedQueryKey {
+            /// The owning query's `TypeId` — the vtable registry key.
+            pub fn query_type_id(&self) -> TypeId {
+                match self {
+                    $(Self::$name(_) => TypeId::of::<$ty>(),)*
+                    Self::Opaque(ty, _) => *ty,
+                }
+            }
+
+            /// Type-erased view for the `Opaque`-only `get_shared_erased` path.
+            pub fn as_any(&self) -> Option<&dyn std::any::Any> {
+                match self {
+                    Self::Opaque(_, boxed) => {
+                        let key_dyn: &(dyn CloneAny + Send + Sync) = &**boxed;
+                        Some(key_dyn as &dyn std::any::Any)
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        impl Clone for TaggedQueryKey {
+            fn clone(&self) -> Self {
+                match self {
+                    $(Self::$name(key) => Self::$name(Clone::clone(key)),)*
+                    Self::Opaque(ty, boxed) => {
+                        let key_dyn: &(dyn CloneAny + Send + Sync) = &**boxed;
+                        Self::Opaque(*ty, key_dyn.clone_box())
+                    }
+                }
+            }
+        }
+
+        impl std::fmt::Debug for TaggedQueryKey {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    $(
+                        Self::$name(key) => {
+                            f.debug_tuple(stringify!($name)).field(key).finish()
+                        }
+                    )*
+                    Self::Opaque(ty, _) => {
+                        f.debug_tuple("Opaque").field(ty).field(&"..").finish()
+                    }
+                }
+            }
+        }
+
+        pub const QUERY_COUNT: usize = [$(stringify!($name)),*].len();
+
+        macro_rules! for_each_query {
+            ($mac:ident) => {
+                $( $mac!($name, $ty, $key); )*
+            };
+        }
+
+        fn rerequest_tagged<'q, 'src, S: Scheduler>(
+            system: &QuerySystem<'q, 'src, S>,
+            tag: &TaggedQueryKey,
+            provider: &dyn QueryProvider<'q, 'src, S>,
+        ) {
+            match tag {
+                $(
+                    TaggedQueryKey::$name(key) => {
+                        let _ = system.get_shared::<$ty>(Clone::clone(key), provider);
+                    }
+                )*
+                TaggedQueryKey::Opaque(ty, _) => {
+                    if let (Some(vtable_dyn), Some(any)) =
+                        (system.find_vtable_dyn(*ty), tag.as_any())
+                    {
+                        let _ = vtable_dyn.get_shared_erased(system, any, provider);
+                    }
+                }
+            }
+        }
+    };
 }
 
-impl TaggedQueryKey {
-    /// The owning query's `TypeId` — the vtable registry key.
-    pub fn query_type_id(&self) -> TypeId {
-        match self {
-            TaggedQueryKey::TypeDefShape(_) => TypeId::of::<queries::TypeDefShape>(),
-            TaggedQueryKey::CheckFnSignature(_) => TypeId::of::<queries::CheckFnSignature>(),
-            TaggedQueryKey::CheckFnBody(_) => TypeId::of::<queries::CheckFnBody>(),
-            TaggedQueryKey::DocTokens(_) => TypeId::of::<queries::DocTokens>(),
-            TaggedQueryKey::Opaque(ty, _) => *ty,
-        }
-    }
-
-    /// Type-erased view for the `Opaque`-only `get_shared_erased` path.
-    /// Typed variants have no `Any` identity — returns `None` for them.
-    pub fn as_any(&self) -> Option<&dyn std::any::Any> {
-        match self {
-            TaggedQueryKey::Opaque(_, boxed) => {
-                let key_dyn: &(dyn CloneAny + Send + Sync) = &**boxed;
-                Some(key_dyn as &dyn std::any::Any)
-            }
-            _ => None,
-        }
-    }
-}
-
-impl Clone for TaggedQueryKey {
-    fn clone(&self) -> Self {
-        match self {
-            TaggedQueryKey::TypeDefShape(k) => TaggedQueryKey::TypeDefShape(*k),
-            TaggedQueryKey::CheckFnSignature(k) => TaggedQueryKey::CheckFnSignature(k.clone()),
-            TaggedQueryKey::CheckFnBody(k) => TaggedQueryKey::CheckFnBody(k.clone()),
-            TaggedQueryKey::DocTokens(k) => TaggedQueryKey::DocTokens(k.clone()),
-            TaggedQueryKey::Opaque(ty, boxed) => {
-                let key_dyn: &(dyn CloneAny + Send + Sync) = &**boxed;
-                TaggedQueryKey::Opaque(*ty, key_dyn.clone_box())
-            }
-        }
-    }
-}
-
-impl std::fmt::Debug for TaggedQueryKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TaggedQueryKey::TypeDefShape(k) => f.debug_tuple("TypeDefShape").field(k).finish(),
-            TaggedQueryKey::CheckFnSignature(k) => {
-                f.debug_tuple("CheckFnSignature").field(k).finish()
-            }
-            TaggedQueryKey::CheckFnBody(k) => f.debug_tuple("CheckFnBody").field(k).finish(),
-            TaggedQueryKey::DocTokens(k) => f.debug_tuple("DocTokens").field(k).finish(),
-            TaggedQueryKey::Opaque(ty, _) => {
-                f.debug_tuple("Opaque").field(ty).field(&"..").finish()
-            }
-        }
-    }
+tagged_query_set! {
+    TypeDefShape, queries::TypeDefShape, crate::hir::types::DefId;
+    CheckFnSignature, queries::CheckFnSignature, queries::FnId;
+    CheckFnBody, queries::CheckFnBody, queries::FnId;
+    DocTokens, queries::DocTokens, queries::FnId;
 }
 
 mod node_to_key {
@@ -5658,19 +5725,7 @@ pub struct QuerySystem<'q, 'src: 'q, S: Scheduler> {
 /// `tests` module's `TestQuery`, `storm_query`, …) are outside the
 /// manifest and keep registering lazily, so unit tests need no manifest
 /// edits.
-macro_rules! for_each_query {
-    // Hand-written literal: `macro_rules!` cannot count the expansion
-    // below, so adding/removing a query type must bump this by hand.
-    (count) => {
-        4
-    };
-    ($mac:ident) => {
-        $mac!(queries::TypeDefShape);
-        $mac!(queries::CheckFnSignature);
-        $mac!(queries::CheckFnBody);
-        $mac!(queries::DocTokens);
-    };
-}
+
 
 /// One cached vtable resolution: the generation stamp it was resolved
 /// under plus the type-erased `Arc`.  An entry whose stamp predates the
@@ -5998,14 +6053,14 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
     ///   loud — unless the drain itself is unwinding (a panic raised
     ///   from `Drop` while unwinding aborts the process; logging is the
     ///   best we can do there).
-    fn drain_deferred(&self) {
+    fn take_deferred_pending(&self) -> Vec<DeferredMutation<'q, 'src, S>> {
         // One `Cell` load on the common path: the set probe
         // below is paid only by threads that actually parked something.
         if DEFERRED_COUNT.with(|c| c.get()) == 0 {
-            return;
+            return Vec::new();
         }
         if !DEFERRED_PENDING.with(|p| p.borrow().contains(&self.id)) {
-            return;
+            return Vec::new();
         }
         debug_assert!(
             SESSION.with(|s| {
@@ -6036,12 +6091,17 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // forbidden).  Do not weaken that ban thinking the assert re-checks.
         DEFERRED_PENDING.with(|p| p.borrow_mut().remove(&self.id));
         DEFERRED_COUNT.with(|c| c.set(c.get().saturating_sub(1)));
-        let pending: Vec<DeferredMutation<S>> = self
-            .deferred
+        self.deferred
             .lock()
             .remove(&std::thread::current().id())
-            .unwrap_or_default();
-        self.run_deferred_batch(pending);
+            .unwrap_or_default()
+    }
+
+    fn drain_deferred(&self) {
+        let pending = self.take_deferred_pending();
+        if !pending.is_empty() {
+            self.run_deferred_batch(pending);
+        }
     }
 
     /// Run one batch of parked world-mutations under the quiesce WRITE
@@ -6113,6 +6173,12 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // current call graph, but the ordering restores the invariant
         // unconditionally.)
         let _write = self.quiesce.write();
+        self.run_deferred_batch_locked(pending);
+    }
+
+    /// [`Self::run_deferred_batch`] with the quiesce write lock already held
+    /// by the caller (`mutate_world`'s fused drain+mutate path).
+    fn run_deferred_batch_locked(&self, pending: Vec<DeferredMutation<'q, 'src, S>>) {
         let _drain_guard = DrainGuard::new(self.id);
         // Note: Fam::Deferred is not registered here — that family refers to
         // the `deferred` partition mutex itself (leaf, §0 #5/#17), not the
@@ -6258,8 +6324,11 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
                  a two-system ABBA"
             );
         }
-        self.drain_deferred();
+        let pending = self.take_deferred_pending();
         let _write = self.quiesce.write();
+        if !pending.is_empty() {
+            self.run_deferred_batch_locked(pending);
+        }
         // Compact any dep-graph shard whose reverse-edge log crossed the
         // threshold (log rework #10). This is the ONLY scheduled
         // compaction site; it runs under the quiesce WRITE lock, so it
@@ -6449,26 +6518,10 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         provider: &dyn QueryProvider<'q, 'src, S>,
     ) {
         // Errors ignored: on failure the re-verify below fails and the
-        // caller falls through to compute.
-        match tag {
-            TaggedQueryKey::TypeDefShape(key) => {
-                let _ = self.get_shared::<queries::TypeDefShape>(*key, provider);
-            }
-            TaggedQueryKey::CheckFnSignature(key) => {
-                let _ = self.get_shared::<queries::CheckFnSignature>(key.clone(), provider);
-            }
-            TaggedQueryKey::CheckFnBody(key) => {
-                let _ = self.get_shared::<queries::CheckFnBody>(key.clone(), provider);
-            }
-            TaggedQueryKey::DocTokens(key) => {
-                let _ = self.get_shared::<queries::DocTokens>(key.clone(), provider);
-            }
-            TaggedQueryKey::Opaque(ty, _) => {
-                if let (Some(vtable_dyn), Some(any)) = (self.find_vtable_dyn(*ty), tag.as_any()) {
-                    let _ = vtable_dyn.get_shared_erased(self, any, provider);
-                }
-            }
-        }
+        // caller falls through to compute.  The dispatch is generated from
+        // the same manifest rows as the enum, so a new query cannot take the
+        // erased fallback silently.
+        rerequest_tagged(self, tag, provider);
     }
 
     /// Shared validity gate for a cached value about to be served, keyed
@@ -9005,9 +9058,9 @@ impl<'q, 'src: 'q, S: Scheduler> QuerySystem<'q, 'src, S> {
         // Manifest-derived: adding a query type without
         // touching this line no longer silently reallocates on the last
         // push.
-        let mut names = Vec::with_capacity(for_each_query!(count));
+        let mut names = Vec::with_capacity(QUERY_COUNT);
         macro_rules! push_name {
-            ($q:ty) => {
+            ($name:ident, $q:ty, $key:ty) => {
                 names.push(<$q as Query>::descriptor().name);
             };
         }

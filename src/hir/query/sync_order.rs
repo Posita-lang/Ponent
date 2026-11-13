@@ -475,7 +475,15 @@ pub(crate) fn held_inc(f: Fam) {
 #[cfg(any(debug_assertions, feature = "shuttle"))]
 #[inline]
 pub(crate) fn held_dec(f: Fam) {
-    held_with(|h| h[f.idx()] -= 1);
+    held_with(|h| {
+        // Unconditional, like `Acquired::drop`: this must fire under
+        // `--release --features shuttle`, where debug_assert compiles out.
+        // A wrap would turn every later legal acquire into a phantom report.
+        if h[f.idx()] == 0 {
+            panic!("held_dec underflow: unbalanced release of {f:?}");
+        }
+        h[f.idx()] -= 1;
+    });
 }
 
 #[cfg(not(any(debug_assertions, feature = "shuttle")))]

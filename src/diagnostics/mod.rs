@@ -3269,12 +3269,13 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool) {
         bytes.len()
     );
     // Pre-size for large sources so the 16→2× growth chain doesn't pay ~16
-    // reallocations (and megabytes of copies) on a 50 MB / 1M-line file.  The
-    // 1 MB gate keeps typical small sources from paying the one extra `memchr`
-    // scan the counting pass requires.
+    // reallocations (and megabytes of copies) on a 50 MB / 1M-line file.  A
+    // heuristic average line length (~32 bytes) avoids the extra full `memchr`
+    // counting pass; `Vec` growth absorbs the residual.  The 1 MB gate keeps
+    // typical small sources from over-reserving.
     const LARGE_SOURCE_THRESHOLD: usize = 1 << 20;
     let capacity = if bytes.len() >= LARGE_SOURCE_THRESHOLD {
-        memchr::memchr_iter(b'\n', bytes).count() + 1
+        bytes.len() / 32 + 16
     } else {
         16
     };
@@ -3286,11 +3287,12 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool) {
         let x = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
         ascii &= (x & HI) == 0;
         let q = x ^ NL;
-        // Exact newline mask: `(q | HI)` is exactly 0x80 at a newline and
-        // ≥ 0x81 elsewhere, so the `- 1` never borrows across lanes and every
-        // flagged lane is a genuine `\n` — no per-candidate verification
-        // branch (the old `has_zero` mask flagged `0x0B` after a newline).
-        let mut mask = !((q | HI).wrapping_sub(ONES)) & HI;
+        // Exact newline mask.  `(q | HI)` is 0x80 at a newline and also at
+        // `x == 0x8A` (q == 0x80), a valid UTF-8 continuation byte (`Ċ`, `Ŋ`,
+        // `ꀀ`…).  `!q` has bit 7 set only for q < 0x80, so it keeps only the
+        // true newline lane while preserving the no-borrow property (`| HI`
+        // makes every lane ≥ 0x80 before the subtraction).
+        let mut mask = !((q | HI).wrapping_sub(ONES)) & !q & HI;
         while mask != 0 {
             let off = i + (mask.trailing_zeros() as usize / 8);
             starts.push((off + 1) as u32);
@@ -4343,6 +4345,36 @@ mod tests {
         assert_eq!(expected.len(), 1 + 2 * 8);
         assert_eq!(idx.starts(), expected.as_slice(), "src = {src:?}");
         // And the mapping round-trips for every line.
+        for i in 0..idx.line_count() {
+            let pos = idx.to_linecol(idx.starts()[i] as usize);
+            assert_eq!((pos.line, pos.col), (i, 0));
+        }
+    }
+
+    #[test]
+    fn line_scan_ignores_utf8_continuation_0x8a() {
+        // `Ċ` is C4 8A and `ꀀ` is F0 8A 80 80: `q = x ^ 0x0A` is 0x80 for the
+        // continuation byte, which the old `(q | HI)` mask mistook for `\n`.
+        // Lay the pattern across every 8-byte alignment and compare the whole
+        // table with a scalar newline scan.
+        let mut src = String::new();
+        for pad in 0..8 {
+            src.push_str(&"x".repeat(pad));
+            src.push('Ċ');
+            src.push('\n');
+            src.push('ꀀ');
+            src.push_str("z\n");
+        }
+        let idx = LineIndex::new(&src);
+        let expected: Vec<u32> = std::iter::once(0)
+            .chain(
+                src.bytes()
+                    .enumerate()
+                    .filter(|(_, byte)| *byte == b'\n')
+                    .map(|(i, _)| (i + 1) as u32),
+            )
+            .collect();
+        assert_eq!(idx.starts(), expected.as_slice(), "src = {src:?}");
         for i in 0..idx.line_count() {
             let pos = idx.to_linecol(idx.starts()[i] as usize);
             assert_eq!((pos.line, pos.col), (i, 0));

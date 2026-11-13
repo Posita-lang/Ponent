@@ -307,7 +307,14 @@ fn wrap_memo_put(key: (u64, usize, usize), text: &str, result: &[Cow<'_, str>]) 
         .iter()
         .map(|seg| {
             let s = seg.as_ref();
-            let off = (s.as_ptr() as usize).saturating_sub(text.as_ptr() as usize);
+            // Whitespace-only paragraphs push the `""` literal, which lives in
+            // `.rodata`, not inside `text`; its pointer must not be turned into
+            // an offset into the input.  `&text[0..0]` is the same empty slice.
+            let off = if s.is_empty() {
+                0
+            } else {
+                (s.as_ptr() as usize).saturating_sub(text.as_ptr() as usize)
+            };
             debug_assert!(
                 off + s.len() <= text.len(),
                 "wrap memo requires segments borrowed from the input text"
@@ -897,9 +904,15 @@ fn trimmed_len(s: &str) -> usize {
             // multi-byte whitespace character always ends in a byte ≥ 0x80, so
             // this branch cannot cut one in half.)
             0x00..=0x7F => return k,
-            // Something multi-byte behind the run: let the exact predicate
-            // decide.
-            _ => return s.trim_end_matches(char::is_whitespace).len(),
+            // Something multi-byte behind the run: decode the trailing character once.
+            // If it is not whitespace (the common CJK word ending), the answer
+            // is immediate; only a whitespace char needs the full predicate.
+            _ => {
+                if s.chars().next_back().is_some_and(|ch| !ch.is_whitespace()) {
+                    return k;
+                }
+                return s.trim_end_matches(char::is_whitespace).len();
+            }
         }
     }
     0
@@ -1514,6 +1527,16 @@ mod tests {
             wrap_optimal("", 10, 4).as_slice(),
             [Cow::Borrowed("")].as_slice()
         );
+    }
+
+    #[test]
+    fn whitespace_only_paragraph_memo_round_trips() {
+        // `" \n"` produces a `Cow::Borrowed("")` whose pointer lives in
+        // `.rodata`; the memo used to store a bogus offset and panic on a hit.
+        let first = wrap_optimal(" \n", 80, 4);
+        let second = wrap_optimal(" \n", 80, 4);
+        assert!(first.iter().all(|segment| segment.is_empty()));
+        assert_eq!(first, second);
     }
 
     #[test]

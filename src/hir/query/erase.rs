@@ -50,6 +50,8 @@ pub trait Erasable<'q, Provided>: Sized {
     /// asserts this at registration, converting the silent trap into a
     /// registration-time panic.
     const RECOVERY_SUPPORTED: bool;
+    /// `true` for [`Arena`] storage; drives the debug-build orphan gauge.
+    const IS_ARENA: bool;
 
     /// Provider side → cache side.  Runs once per fresh compute, inside
     /// the staging critical section.
@@ -78,6 +80,7 @@ where
     type Erased = Arc<V>;
     // Owned values: a handler returns the value like any compute would.
     const RECOVERY_SUPPORTED: bool = true;
+    const IS_ARENA: bool = false;
 
     #[inline]
     fn provided_to_erased(provided: V) -> Self::Erased {
@@ -128,6 +131,7 @@ where
     // without leaking or a static (see `RECOVERY_SUPPORTED`'s doc).
     // `QueryVTable::new` asserts this at registration.
     const RECOVERY_SUPPORTED: bool = false;
+    const IS_ARENA: bool = true;
 
     #[inline]
     fn provided_to_erased(provided: &'q V) -> Self::Erased {

@@ -4049,20 +4049,32 @@ impl<S: Scheduler> DepGraph<S> {
         // aggregation below REUSES this same snapshot: both
         // passes read the same epoch words, so one TLS setup serves both.
         let suspect_epochs = self.epochs_snapshot();
+        // Fused pre-lock pass: each epoch word is loaded once, serving both
+        // durability aggregation and the in-section suspect decision.  A mark
+        // landing after this pass and before `clear_dirty` is erased, but the
+        // late re-check plus `finishing` (d24) already repair exactly that
+        // window; this only widens it by the lock-acquisition latency.
+        let mut suspect = false;
         if fp.is_some() && !reads.is_empty() {
-            let snap = &suspect_epochs;
             let mut min_dur = Durability::HIGH;
-            for &r in reads.iter() {
-                let d = match snap.get(block_of(r.0)) {
-                    Some(b) => word_dur(b[epoch_word_of(r.0)].load(Ordering::Acquire)),
-                    None => Durability::LOW,
+            for (i, &r) in reads.iter().enumerate() {
+                let (epoch, durability) = match suspect_epochs.get(block_of(r.0)) {
+                    Some(block) => {
+                        let word = block[epoch_word_of(r.0)].load(Ordering::Acquire);
+                        (word & EPOCH_MASK, word_dur(word))
+                    }
+                    None => (0, Durability::LOW),
                 };
-                if d < min_dur {
-                    min_dur = d;
+                if durability < min_dur {
+                    min_dur = durability;
+                }
+                if epoch != read_epochs[i] {
+                    suspect = true;
                 }
             }
             self.lower_and_propagate(node, min_dur);
         }
+        let suspect = task_node.is_some() && suspect;
 
         // Stale forward edges dropped by the reconciliation below; the
         // pruning of their reverse edges runs AFTER the critical section
@@ -4136,31 +4148,10 @@ impl<S: Scheduler> DepGraph<S> {
                     // whose transitive verify runs inside the window sees the
                     // node as not-yet-verifiable and takes the compute/wait
                     // path instead of serving.
-                    let suspect = task_node.is_some() && {
-                        // The snapshot is HOISTED out of the shard
-                        // write closure (declared just above it) so the TLS
-                        // probe, the `table_gen` load and the `Arc` refcount
-                        // pair do not run under this node's write lock — the
-                        // lock every reader's own `flush_rev_edges` and every
-                        // verifier of the node must take.
-                        //
-                        // Taking it earlier is SOUND because this check is a
-                        // strict subset of the late re-check below, which runs
-                        // at a strictly later point (after the fan-out, the
-                        // rev-edge flush and the pruning) against the same
-                        // positional comparison.  A mark that lands between
-                        // this hoisted snapshot and the closure's lock
-                        // acquisition therefore costs at most one spurious
-                        // `clear_dirty`, which the late re-check restores
-                        // BEFORE `clear_finishing` — and `finishing` (d24)
-                        // already closes the whole method, so no verifier can
-                        // serve across that repair either way.
-                        reads.iter().zip(read_epochs.iter()).any(|(&r, &e)| {
-                            suspect_epochs.get(block_of(r.0)).map_or(0, |b| {
-                                b[epoch_word_of(r.0)].load(Ordering::Acquire) & EPOCH_MASK
-                            }) != e
-                        })
-                    };
+                    // `suspect` was fused with the durability aggregation above,
+                    // outside this node's shard write lock; the widened
+                    // erase-and-repair window is covered by the late
+                    // re-check below and by `finishing` (d24).
                     let suspect_dirty = suspect_dirty
                         .as_ref()
                         .expect("dirty snapshot is taken exactly when fp.is_some()");
@@ -5046,18 +5037,29 @@ impl<S: Scheduler> DepGraph<S> {
     /// and lowerings never mark.  A `false` verdict is advisory — the
     /// caller falls through to the full seqlock walk.
     fn is_globally_verified(&self, node: DepNodeIndex) -> bool {
+        self.global_verify_snapshot(node).0
+    }
+
+    /// Returns `(fast_path, snapshot)`.  On the negative verdict the snapshot
+    /// that proved it is handed to the first `verify_inner` attempt, saving a
+    /// second TLS probe + `table_gen` load on the invalidation-storm path.
+    fn global_verify_snapshot(
+        &self,
+        node: DepNodeIndex,
+    ) -> (bool, Option<(DirtySnap<'_>, StampSnap<'_>)>) {
         let current_gen = self.dirty_generation.load(Ordering::Acquire);
-        let (dirty_snap, stamps_all) = self.dirty_stamps_snapshot();
+        let snapshot = self.dirty_stamps_snapshot();
+        let (dirty_snap, stamps_all) = &snapshot;
         let slot = stamps_all
             .get(block_of(node.0))
             .map(|b| &b[stamp_word_of(node.0)]);
         // d24 read order: `finishing` FIRST — a node whose finish tail is
         // in flight must never be fast-pathed, its colour is not final.
         if slot.is_some_and(|s| s.finishing.load(Ordering::Acquire)) {
-            return false;
+            return (false, Some(snapshot));
         }
         if slot.map_or(0, |s| s.verified_gen.load(Ordering::Acquire)) < current_gen {
-            return false;
+            return (false, Some(snapshot));
         }
         // Ground truth: the node's own red bit.  A current stamp should
         // imply green (the stamp was written post-order over a fully
@@ -5065,7 +5067,11 @@ impl<S: Scheduler> DepGraph<S> {
         // generation) — this load is belt-and-braces that keeps this
         // path's contract byte-identical to `verify_inner`'s first
         // per-node check.
-        Self::is_green_on(&dirty_snap, node)
+        if Self::is_green_on(dirty_snap, node) {
+            (true, None)
+        } else {
+            (false, Some(snapshot))
+        }
     }
 
     pub fn verify_green_collect_dirty(
@@ -5116,7 +5122,8 @@ impl<S: Scheduler> DepGraph<S> {
         //
         // The `VerifyWindow` suspension is kept so scheduler-driven test
         // choreography observes the same park point it always did.
-        if self.is_globally_verified(node) {
+        let (globally_verified, mut pre_snapshot) = self.global_verify_snapshot(node);
+        if globally_verified {
             self.sched
                 .suspend(SchedulePoint::VerifyWindow { node: node.0 });
             return true;
@@ -5183,7 +5190,13 @@ impl<S: Scheduler> DepGraph<S> {
             }
             let s1 = self.lowering_epoch.load(Ordering::Acquire);
             let stamps = buf.cleared();
-            let clean = self.verify_inner(node, true, stamps, dirty_out.as_deref_mut());
+            let clean = self.verify_inner(
+                node,
+                true,
+                stamps,
+                dirty_out.as_deref_mut(),
+                pre_snapshot.take(),
+            );
             self.sched
                 .suspend(SchedulePoint::VerifyWindow { node: node.0 });
             let s2 = self.lowering_epoch.load(Ordering::Acquire);
@@ -5216,7 +5229,13 @@ impl<S: Scheduler> DepGraph<S> {
             d.clear();
         }
         let stamps = buf.cleared();
-        let clean = self.verify_inner(node, false, stamps, dirty_out.as_deref_mut());
+        let clean = self.verify_inner(
+            node,
+            false,
+            stamps,
+            dirty_out.as_deref_mut(),
+            None,
+        );
         if clean {
             self.flush_stamps(stamps);
             return true;
@@ -5250,6 +5269,7 @@ impl<S: Scheduler> DepGraph<S> {
         allow_durability_fast_path: bool,
         stamps: &mut Vec<PendingStamp>,
         mut dirty_out: Option<&mut SmallVec<[DepNodeIndex; 8]>>,
+        pre_snapshot: Option<(DirtySnap<'_>, StampSnap<'_>)>,
     ) -> bool {
         let mut dirty_seen = false;
         // Record a dirty dep, or (no-collect mode) just remember that one
@@ -5292,7 +5312,10 @@ impl<S: Scheduler> DepGraph<S> {
         // one TLS slot fetch now serve both snapshots (`dirty_stamps_snapshot`);
         // the seqlock retry loop re-hoists per attempt.  The epochs snapshot
         // stays lazy below — the dominant verify touches no epoch word.
-        let (dirty_snap, stamps_all) = self.dirty_stamps_snapshot();
+        let (dirty_snap, stamps_all) = match pre_snapshot {
+            Some(snapshot) => snapshot,
+            None => self.dirty_stamps_snapshot(),
+        };
 
         // Root fast paths, BEFORE the walk state is built.  Every
         // steady-state cached hit runs this function, and the vast
@@ -5321,16 +5344,15 @@ impl<S: Scheduler> DepGraph<S> {
         // sealed s1..s2 window.
         let mut epochs: Option<EpochSnap<'_>> = None;
         // Lazy snapshot: taken on first `dur_of` use so the dominant hit
-        // (root `verified_gen`) touches no epoch word.  Borrow safety with
-        // the walk's reentrancy: `get_or_insert_with` re-borrows the
-        // `Option` on each call, and the `Ref` inside an `EpochSnap::Cached`
-        // is dropped at the end of the SAME `dur_of` invocation — nothing
-        // escapes into the walk's state — so a later `dur_of` call simply
-        // re-borrows the already-taken snapshot.  (A parallel-vec epoch
-        // capture like `finish_task_and_publish`'s forbids a nested refill;
-        // this closure makes no such demand.)  The seqlock window
-        // (`s1..s2`) brackets every access, so all epoch reads inside one
-        // attempt linearize consistently.
+        // (root `verified_gen`) touches no epoch word.  The snapshot — and, in
+        // the `Cached` arm, its `Ref` into the TLS cell — is held for the whole
+        // walk, not one invocation.  That is safe because (a) the borrow is
+        // *shared*: other shared snapshot borrows (`flush_stamps`) coexist;
+        // (b) `refresh_shared_slot` uses `try_borrow_mut` and degrades to fresh
+        // `Owned` loads when the walk holds the cell, losing only a cache
+        // refresh (blocks are `Arc`-stable and append-only); (c) the seqlock
+        // (`s1..s2`) brackets every epoch read inside one attempt, so all
+        // reads linearize consistently.
         let mut dur_of = |n: DepNodeIndex| -> Durability {
             let snap = epochs.get_or_insert_with(|| self.epochs_snapshot());
             snap.get(block_of(n.0)).map_or(Durability::LOW, |b| {

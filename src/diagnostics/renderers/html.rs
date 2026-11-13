@@ -1119,14 +1119,23 @@ impl HtmlRenderer {
     /// copy instead of a sanitize scan + escape.  Bounded so hostile dynamic
     /// messages cannot grow it without limit.
     fn push_escaped_cached(&self, out: &mut String, s: &str) {
-        use std::sync::{Mutex, OnceLock};
-        static CACHE: OnceLock<Mutex<rustc_hash::FxHashMap<String, std::sync::Arc<str>>>> =
-            OnceLock::new();
-        let cache = CACHE.get_or_init(|| Mutex::new(rustc_hash::FxHashMap::default()));
-        if let Ok(guard) = cache.lock()
-            && let Some(v) = guard.get(s)
-        {
-            out.push_str(v);
+        use std::cell::RefCell;
+        // Thread-local mirrors `WRAP_MEMO`/`WIDTH_CACHE`: `render_parallel`
+        // workers otherwise contend on one global `Mutex` for the same static
+        // label strings.  Duplication is bounded and per-thread.
+        thread_local! {
+            static ESCAPE_CACHE: RefCell<rustc_hash::FxHashMap<String, std::sync::Arc<str>>> =
+                RefCell::new(rustc_hash::FxHashMap::default());
+        }
+        let mut hit = None;
+        ESCAPE_CACHE.with(|cell| {
+            let cache = cell.borrow();
+            if let Some(value) = cache.get(s) {
+                hit = Some(std::sync::Arc::clone(value));
+            }
+        });
+        if let Some(value) = hit {
+            out.push_str(&value);
             return;
         }
         let escaped = self.escape(s);
@@ -1134,11 +1143,13 @@ impl HtmlRenderer {
             out.push_str(escaped.as_ref());
             return;
         }
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() >= 1024 {
-            guard.clear();
-        }
-        guard.insert(s.to_string(), std::sync::Arc::from(escaped.as_ref()));
+        ESCAPE_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache.len() >= 1024 {
+                cache.clear();
+            }
+            cache.insert(s.to_string(), std::sync::Arc::from(escaped.as_ref()));
+        });
         out.push_str(escaped.as_ref());
     }
 
