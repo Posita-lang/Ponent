@@ -10,12 +10,12 @@ expression: out
 \e[2m│  │\e[0m \e[92m~~~~~~~~\e[0m\e[1;91m ^^^^^^^^^^^^^^^^^^^^\e[0m
 \e[2m│\e[0m  \e[2m│\e[0m \e[1;91mdeclared to \e[1mreturn\e[22m\e[39m\e[1;91m \e[94m`Int<32>`\e[22m\e[39m\e[1;91m\e[0m
 \e[2m│\e[0m\e[2m2\e[0m \e[2m│\e[0m    set j = x;
-\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m         |\e[0m
 \e[2m│\e[0m\e[2m3\e[0m \e[2m│\e[0m    \e[48;5;236mset i = j + 1; // 中\e[49m
 \e[2m│  │\e[0m \e[1;91m   ^^^^^^^^^^^^^^^^^^^^\e[0m
 \e[2m│  │\e[0m \e[92m   ~~~~~~~~~~~~~\e[0m
 \e[2m│\e[0m  \e[2m│\e[0m \e[1;91mduplicate definition of `i` [E019]\e[0m
-\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
+\e[2m│\e[0m  \e[2m│\e[0m \e[1;91m         |\e[0m
 \e[2m│\e[0m\e[2m4\e[0m \e[2m│\e[0m \e[48;5;236m   ret\e[49murn \e[48;5;236mi\e[49m;
 \e[2m│  │\e[0m \e[1;91m^^^^^\e[0m\e[1;91m     ^\e[0m
 \e[2m│  │\e[0m \e[1;91m^^^^^^\e[0m

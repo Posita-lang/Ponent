@@ -836,7 +836,7 @@ impl HtmlRenderer {
         // Built from parts — a clean path (the overwhelmingly common shape)
         // keeps `escape` borrowed, so the whole prefix is one small `String`
         // with no `format!` machinery.
-        let mut escaped_file_prefix = if file_name.is_empty() {
+        let escaped_file_prefix = if file_name.is_empty() {
             String::new()
         } else {
             let mut p = String::with_capacity(escaped_file.len() + 1);
@@ -1065,8 +1065,15 @@ impl HtmlRenderer {
                     continue;
                 }
                 let span_start = all_labels[i].span.start_as_usize();
-                let off = span_start.clamp(line_start, line_end) - line_start;
-                let col = byte_offset_to_display(line, off, tab_width);
+                // Middle rows are not the label's start line; measure the
+                // connector from the start line so it lines up with the
+                // opening caret instead of collapsing to column 0.
+                let start_line = idx.line(start);
+                let start_line_start = starts.get(start).map_or(0, |&s| s as usize);
+                let start_off = span_start
+                    .saturating_sub(start_line_start)
+                    .min(start_line.len());
+                let col = byte_offset_to_display(start_line, start_off, tab_width);
                 html.push_str("<span class='line-num'>");
                 fmt::push_spaces(html, line_num_width);
                 html.push_str(" │ </span>");
@@ -1784,6 +1791,21 @@ mod tests {
             html.matches("spans three lines").count(),
             1,
             "multi-line label repeated:\n{html}"
+        );
+    }
+
+    #[test]
+    fn html_multiline_connector_uses_label_start_column() {
+        let source = "    aaa\n    bbb\n    ccc\n";
+        let diag = Diagnostic::error("multi")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 4, 7))
+            .with_label(Span::new(FileId::DUMMY, 4, 23), "spans three lines")
+            .with_source(source);
+        let html = HtmlRenderer::new().diagnostic_to_html(&diag);
+        assert!(
+            html.contains("<span class='label'>    |</span>"),
+            "middle connector must use the label start column:\n{html}"
         );
     }
 

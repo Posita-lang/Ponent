@@ -679,6 +679,7 @@ impl Drop for JsonContainer<'_> {
 /// positive, so the lowest set lane in the combined mask is a true match.
 /// UTF-8 continuation bytes are all `≥ 0x80`, so no multi-byte character is
 /// mistaken for an escape candidate.
+#[cfg(test)]
 #[inline]
 fn next_json_escape_byte(b: &[u8]) -> Option<usize> {
     // The two structural bytes (`"`, `\`) are found with a SIMD `memchr2`

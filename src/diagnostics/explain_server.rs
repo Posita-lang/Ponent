@@ -66,10 +66,18 @@ impl PendingConn {
 /// (`TcpListener` has no getter for the previous mode, so a caller that
 /// supplied a non-blocking listener gets a blocking one back).
 #[cfg(target_os = "linux")]
-fn epoll_ctl_checked(epfd: i32, op: i32, fd: i32, event: *mut libc::epoll_event) -> i32 {
+fn epoll_ctl_checked(
+    epfd: i32,
+    op: i32,
+    fd: i32,
+    event: *mut libc::epoll_event,
+) -> std::io::Result<()> {
     let rc = unsafe { libc::epoll_ctl(epfd, op, fd, event) };
-    debug_assert_eq!(rc, 0, "epoll_ctl(op={op}, fd={fd}) failed");
-    rc
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Accept one connection already non-blocking.  Linux folds `accept` +
@@ -543,8 +551,18 @@ const MAX_BODY_DRAIN: usize = 8 * 1024 * 1024;
 /// accepting both CRLFCRLF and bare LFLF.  The thread path is deliberately
 /// LF-lenient; the reactor must not reject a request the thread path serves.
 fn header_end(buf: &[u8]) -> Option<usize> {
-    let crlf = memchr::memmem::find(buf, b"\r\n\r\n").map(|pos| pos + 4);
-    let lf = memchr::memmem::find(buf, b"\n\n").map(|pos| pos + 2);
+    static CRLF: std::sync::OnceLock<memchr::memmem::Finder<'static>> =
+        std::sync::OnceLock::new();
+    static LF: std::sync::OnceLock<memchr::memmem::Finder<'static>> =
+        std::sync::OnceLock::new();
+    let crlf = CRLF
+        .get_or_init(|| memchr::memmem::Finder::new(b"\r\n\r\n"))
+        .find(buf)
+        .map(|pos| pos + 4);
+    let lf = LF
+        .get_or_init(|| memchr::memmem::Finder::new(b"\n\n"))
+        .find(buf)
+        .map(|pos| pos + 2);
     match (crlf, lf) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(a), None) => Some(a),
@@ -614,22 +632,7 @@ fn scan_framing(headers: &[u8]) -> HeaderFraming {
     framing
 }
 
-/// Whether the header block names a `Transfer-Encoding`.
-///
-/// Chunked framing is deliberately not parsed; the caller only needs to know
-/// that `Content-Length` is absent/irrelevant so it must not treat the body
-/// as fully drained on a budget cutoff.
-fn has_transfer_encoding(headers: &[u8]) -> bool {
-    headers.split(|&b| b == b'\n').any(|line| {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
-            return false;
-        };
-        line[..colon]
-            .trim_ascii()
-            .eq_ignore_ascii_case(b"transfer-encoding")
-    })
-}
+
 
 /// How completely a request was drained from the socket.
 ///
@@ -690,10 +693,9 @@ fn drain_request_tracked(
     // `MAX_HEADER` below.
     let mut collected: SmallVec<[u8; 4096]> = SmallVec::new();
     collected.extend_from_slice(prefix);
-    static FINDER: std::sync::OnceLock<memchr::memmem::Finder<'static>> =
-        std::sync::OnceLock::new();
-    let finder = FINDER.get_or_init(|| memchr::memmem::Finder::new(b"\r\n\r\n"));
-    let mut header_end = finder.find(&collected).map(|p| p + 4);
+    // One canonical terminator policy: both CRLFCRLF and bare LFLF complete a
+    // header block, matching `header_end` and the reactor.
+    let mut head_end = header_end(&collected);
     let mut scanned = collected.len();
     let mut buf = [0u8; 4096];
     // HTTP has no useful upper bound on header size, but this server only
@@ -702,7 +704,7 @@ fn drain_request_tracked(
     // without bound.
     const MAX_HEADER: usize = 64 * 1024;
 
-    while header_end.is_none() {
+    while head_end.is_none() {
         if Instant::now() >= deadline || collected.len() >= MAX_HEADER {
             break;
         }
@@ -720,8 +722,8 @@ fn drain_request_tracked(
                 // search only the newly appended bytes, replaying the
                 // last 3 bytes so a terminator split across reads is found.
                 let from = scanned.saturating_sub(3);
-                if let Some(p) = finder.find(&collected[from..]) {
-                    header_end = Some(from + p + 4);
+                if let Some(end) = header_end(&collected[from..]) {
+                    head_end = Some(from + end);
                 }
                 scanned = collected.len();
             }
@@ -736,7 +738,7 @@ fn drain_request_tracked(
         }
     }
 
-    let Some(header_end) = header_end.filter(|&end| end <= MAX_HEADER) else {
+    let Some(head_end) = head_end.filter(|&end| end <= MAX_HEADER) else {
         // Absent, incomplete, or oversized: close without a response.  The
         // caller cannot distinguish these, but none is a servable request.
         return DrainOutcome::NoRequest;
@@ -744,9 +746,9 @@ fn drain_request_tracked(
 
     // Bytes past the terminator arrived in the same read as the headers and
     // count toward the body, then toward a pipelined request.
-    let framing = scan_framing(&collected[..header_end]);
+    let framing = scan_framing(&collected[..head_end]);
     *wants_close = framing.connection_close;
-    let already_read = collected.len() - header_end;
+    let already_read = collected.len() - head_end;
     if framing.has_transfer_encoding || framing.ambiguous || framing.oversized {
         // Chunked/unsupported framing, conflicting or malformed
         // `Content-Length`, or a body over the cap: request framing cannot be
@@ -918,6 +920,7 @@ fn render_head(status: &str, extra_headers: &str, body_len: usize) -> String {
         "HTTP/1.1 {status}\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
          X-Content-Type-Options: nosniff\r\n\
+         Cache-Control: no-store\r\n\
          Referrer-Policy: no-referrer\r\n\
          Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; style-src {}; script-src {}\r\n\
          {extra_headers}\
@@ -925,6 +928,17 @@ fn render_head(status: &str, extra_headers: &str, body_len: usize) -> String {
         csp_style_src(),
         csp_script_src(),
     )
+}
+
+fn write_header_too_large(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(
+        b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
+          Cache-Control: no-store\r\n\
+          Content-Type: text/plain; charset=utf-8\r\n\
+          Content-Length: 0\r\n\
+          Connection: close\r\n\r\n",
+    )?;
+    stream.shutdown(Shutdown::Write)
 }
 
 /// Write an HTTP response header and body with one vectored write.
@@ -1015,16 +1029,6 @@ fn looks_like_http_request(bytes: &[u8]) -> bool {
     METHODS
         .iter()
         .any(|m| bytes.starts_with(m) || (!bytes.is_empty() && m.starts_with(bytes)))
-}
-
-/// Extract the method token from a (possibly partial) request line.
-fn request_method(bytes: &[u8]) -> Option<&str> {
-    let line = bytes.split(|&b| b == b'\n').next()?;
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    std::str::from_utf8(line)
-        .ok()?
-        .split_ascii_whitespace()
-        .next()
 }
 
 /// Extract the request target from a (possibly partial) request line.
@@ -1129,9 +1133,13 @@ fn serve_page_after_prefix(
     // returns the header-prefix leftover, so a partial `"GE"` cannot become a
     // 405 and a long target cannot skip the deferred routing check.
     let (line, leftover) = if expected_path.is_some() {
-        match read_request_line(stream, first, Duration::from_secs(2)) {
+        let mut too_large = false;
+        match read_request_line(stream, first, Duration::from_secs(2), &mut too_large) {
             Some(pair) => pair,
             None => {
+                if too_large {
+                    let _ = write_header_too_large(stream);
+                }
                 let _ = stream.shutdown(Shutdown::Both);
                 return Ok(false);
             }
@@ -1768,46 +1776,6 @@ pub fn serve_explain_persistent(listener: &TcpListener) -> std::io::Result<()> {
     }
 }
 
-/// Whether a complete request head asks for a reused connection.
-#[cfg(target_os = "linux")]
-fn reactor_keep_alive(head: &[u8], status: &str) -> bool {
-    if status != "200 OK" {
-        return false;
-    }
-    let Ok(text) = std::str::from_utf8(head) else {
-        return false;
-    };
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let version = request_line.split_ascii_whitespace().nth(2).unwrap_or("");
-    let mut keep = version == "HTTP/1.1";
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("connection") {
-                keep = !value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("close"));
-            }
-        }
-    }
-    keep
-}
-
-/// A request body is not consumed by the reactor, so such a request must not
-/// reuse the connection (its unread bytes would be parsed as the next head).
-#[cfg(target_os = "linux")]
-fn reactor_has_body(head: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(head) else {
-        return true;
-    };
-    text.split("\r\n").skip(1).any(|line| {
-        line.split_once(':').is_some_and(|(name, value)| {
-            name.eq_ignore_ascii_case("content-length")
-                && !matches!(value.trim().parse::<u64>(), Ok(0))
-        })
-    })
-}
-
 /// Linux epoll reactor for the persistent explain server.
 ///
 /// One non-blocking event loop owns every connection: request accumulation,
@@ -1817,13 +1785,15 @@ fn reactor_has_body(head: &[u8]) -> bool {
 /// cannot delay accepting the browser's other connections.
 #[cfg(target_os = "linux")]
 fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()> {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     const MAX_HEADER: usize = 64 * 1024;
     const MAX_EVENTS: usize = 64;
     const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(2);
     const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Shared post-response drain budget (matches the thread path's bound).
+    const LINGER_BUDGET: Duration = Duration::from_millis(100);
     const READING: u8 = 0;
     const WRITING: u8 = 1;
     const DRAINING: u8 = 2;
@@ -1840,6 +1810,16 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
         keep_alive: bool,
         consumed: usize,
         deadline: Instant,
+        /// Absolute deadline for the request header currently being read.
+        /// `None` until the first byte of a request arrives, so an idle
+        /// keep-alive connection gets a fresh budget per request.
+        header_deadline: Option<Instant>,
+        /// Over-cap connection waiting for a first byte: silent preconnects are
+        /// closed without a response, real requests get the cached 503.
+        overload: bool,
+        /// Unread request-body bytes (`usize::MAX` for ambiguous/chunked
+        /// framing, where only EOF/budget can complete the drain).
+        body_remaining: usize,
     }
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -1853,11 +1833,9 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
         events: libc::EPOLLIN as u32,
         u64: listener_fd as u64,
     };
-    if epoll_ctl_checked(epfd, libc::EPOLL_CTL_ADD, listener_fd, &mut interest) < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    epoll_ctl_checked(epfd, libc::EPOLL_CTL_ADD, listener_fd, &mut interest)?;
 
-    let mut conns: HashMap<i32, Conn> = HashMap::new();
+    let mut conns: FxHashMap<i32, Conn> = FxHashMap::default();
     let mut events: Vec<libc::epoll_event> = (0..MAX_EVENTS)
         .map(|_| libc::epoll_event { events: 0, u64: 0 })
         .collect();
@@ -1886,7 +1864,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
             return Err(error);
         }
 
-        let mut close: Vec<i32> = Vec::new();
+        let mut close: smallvec::SmallVec<[i32; 64]> = smallvec::SmallVec::new();
         for event in &events[..ready as usize] {
             let fd = event.u64 as i32;
             if fd == listener_fd {
@@ -1896,28 +1874,32 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                             consecutive_accept_errors = 0;
                             let _ = stream.set_nodelay(true);
                             let conn_fd = stream.as_raw_fd();
-                            if conns.len() >= MAX_CONCURRENT_CONNECTIONS {
-                                // Backpressure: answer 503 instead of silently
-                                // dropping the socket, then close it.
-                                let page = shed_page();
-                                conns.insert(
-                                    conn_fd,
-                                    Conn {
-                                        stream,
-                                        buf: Vec::new(),
-                                        response: Some(HttpResponse::from_cache(
-                                            "503 Service Unavailable",
-                                            "",
-                                            page,
-                                        )),
-                                        conn_hdr: b"Connection: close\r\n\r\n",
-                                        progress: [0; 3],
-                                        state: WRITING,
-                                        keep_alive: false,
-                                        consumed: 0,
-                                        deadline: Instant::now() + WRITE_TIMEOUT,
-                                    },
-                                );
+                            let normal = conns.values().filter(|c| !c.overload).count();
+                            if normal >= MAX_CONCURRENT_CONNECTIONS {
+                                if conns.len() >= MAX_CONCURRENT_CONNECTIONS * 2 {
+                                    // Bound overload slots too: a preconnect
+                                    // flood cannot grow the map without limit.
+                                    let _ = stream.shutdown(Shutdown::Both);
+                                } else {
+                                    conns.insert(
+                                        conn_fd,
+                                        Conn {
+                                            stream,
+                                            buf: Vec::new(),
+                                            response: None,
+                                            conn_hdr: b"",
+                                            progress: [0; 3],
+                                            state: READING,
+                                            keep_alive: false,
+                                            consumed: 0,
+                                            deadline: Instant::now()
+                                                + FIRST_BYTE_READ_TIMEOUT,
+                                            header_deadline: None,
+                                            overload: true,
+                                            body_remaining: 0,
+                                        },
+                                    );
+                                }
                             } else {
                                 conns.insert(
                                     conn_fd,
@@ -1931,6 +1913,9 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                                         keep_alive: false,
                                         consumed: 0,
                                         deadline: Instant::now() + FIRST_BYTE_READ_TIMEOUT,
+                                        header_deadline: None,
+                                        overload: false,
+                                        body_remaining: 0,
                                     },
                                 );
                             }
@@ -1942,7 +1927,11 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                                 },
                                 u64: conn_fd as u64,
                             };
-                            epoll_ctl_checked(epfd, libc::EPOLL_CTL_ADD, conn_fd, &mut conn_event);
+                            if epoll_ctl_checked(epfd, libc::EPOLL_CTL_ADD, conn_fd, &mut conn_event).is_err() {
+                                if let Some(conn) = conns.remove(&conn_fd) {
+                                    let _ = conn.stream.shutdown(Shutdown::Both);
+                                }
+                            }
                         }
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1996,7 +1985,14 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                             eof = true;
                             break;
                         }
-                        Ok(_) => {}
+                        Ok(read) => {
+                            if conn.body_remaining != usize::MAX {
+                                conn.body_remaining = conn.body_remaining.saturating_sub(read);
+                                if conn.body_remaining == 0 {
+                                    break;
+                                }
+                            }
+                        }
                         Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(_) => {
@@ -2005,7 +2001,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                         }
                     }
                 }
-                if eof {
+                if eof || conn.body_remaining == 0 {
                     close.push(fd);
                 }
                 continue;
@@ -2028,12 +2024,18 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                             break;
                         }
                     }
+                    if header_end(&conn.buf).is_some() {
+                        break;
+                    }
                     if conn.buf.len() > MAX_HEADER {
                         break;
                     }
                 }
-                if conn.buf.len() > MAX_HEADER {
-                    close.push(fd);
+                if header_end(&conn.buf).is_none() && conn.buf.len() > MAX_HEADER {
+                    let _ = write_header_too_large(&mut conn.stream);
+                    conn.state = DRAINING;
+                    conn.body_remaining = usize::MAX;
+                    conn.deadline = Instant::now() + LINGER_BUDGET;
                     continue;
                 }
                 if eof && conn.buf.is_empty() {
@@ -2043,44 +2045,95 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                 let Some(head_end) = header_end(&conn.buf) else {
                     if eof {
                         close.push(fd);
+                    } else if conn.buf.is_empty() {
+                        // Idle keep-alive slot: no request has begun yet.
+                        conn.deadline = Instant::now() + KEEP_ALIVE_IDLE;
                     } else {
-                        conn.deadline = Instant::now() + Duration::from_secs(2);
+                        // First byte seen: the header budget starts now and
+                        // is never extended by later reads.
+                        let header_deadline = *conn
+                            .header_deadline
+                            .get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                        conn.deadline = header_deadline;
                     }
                     continue;
                 };
-                let head = conn.buf[..head_end].to_vec();
-                let line_end = memchr::memchr(b'\n', &head)
-                    .map(|position| {
-                        if position > 0 && head[position - 1] == b'\r' {
-                            position - 1
-                        } else {
-                            position
-                        }
-                    })
-                    .unwrap_or(0);
-                if line_end > 8 * 1024 {
-                    // Parity with the other backends: reject an oversized
-                    // request line instead of buffering it.
-                    close.push(fd);
+                if conn.overload {
+                    let page = shed_page();
+                    conn.response = Some(HttpResponse::from_cache(
+                        "503 Service Unavailable",
+                        "",
+                        page,
+                    ));
+                    conn.conn_hdr = b"Connection: close\r\n\r\n";
+                    conn.keep_alive = false;
+                    conn.consumed = head_end;
+                    conn.progress = [0; 3];
+                    conn.state = WRITING;
+                    conn.header_deadline = None;
+                    conn.deadline = Instant::now() + WRITE_TIMEOUT;
+                    let mut conn_event = libc::epoll_event {
+                        events: libc::EPOLLOUT as u32,
+                        u64: fd as u64,
+                    };
+                    if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event).is_err() {
+                        close.push(fd);
+                    }
                     continue;
                 }
-                let Ok(request_line) = std::str::from_utf8(&head[..line_end]) else {
-                    close.push(fd);
-                    continue;
+                let (response, framing, http11) = {
+                    let head = &conn.buf[..head_end];
+                    let line_end = memchr::memchr(b'\n', head)
+                        .map(|position| {
+                            if position > 0 && head[position - 1] == b'\r' {
+                                position - 1
+                            } else {
+                                position
+                            }
+                        })
+                        .unwrap_or(0);
+                    if line_end > 8 * 1024 {
+                        // Parity with the other backends: 431 instead of a
+                        // bare close, then drain under the shared linger
+                        // budget so the response is not RST away.
+                        let _ = write_header_too_large(&mut conn.stream);
+                        conn.state = DRAINING;
+                        conn.body_remaining = usize::MAX;
+                        conn.deadline = Instant::now() + LINGER_BUDGET;
+                        continue;
+                    }
+                    let Ok(request_line) = std::str::from_utf8(&head[..line_end]) else {
+                        close.push(fd);
+                        continue;
+                    };
+                    (
+                        dispatch_request(request_line),
+                        // One framing policy for all backends: the thread
+                        // path's `scan_framing` decides body/TE/Connection
+                        // semantics here too.
+                        scan_framing(&head[line_end..head_end]),
+                        request_is_http11(request_line),
+                    )
                 };
-                let response = dispatch_request(request_line);
-                // One framing policy for all backends: the thread path's
-                // `scan_framing` decides body/TE/Connection semantics here too,
-                // so chunked or ambiguous requests close instead of desyncing
-                // keep-alive.
-                let framing = scan_framing(&head[line_end..head_end]);
+                let already_read = conn.buf.len().saturating_sub(head_end);
+                conn.body_remaining = if framing.has_transfer_encoding
+                    || framing.ambiguous
+                    || framing.oversized
+                {
+                    usize::MAX
+                } else {
+                    framing
+                        .content_length
+                        .unwrap_or(0)
+                        .saturating_sub(already_read)
+                };
                 let keep = response.status == "200 OK"
                     && !framing.has_transfer_encoding
                     && !framing.ambiguous
                     && !framing.oversized
                     && framing.content_length.map_or(true, |n| n == 0)
                     && !framing.connection_close
-                    && request_is_http11(request_line)
+                    && http11
                     && conn.buf.len() == head_end;
                 conn.keep_alive = keep;
                 conn.consumed = head_end;
@@ -2097,7 +2150,9 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                     events: libc::EPOLLOUT as u32,
                     u64: fd as u64,
                 };
-                epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
+                if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event).is_err() {
+                            close.push(fd);
+                        }
             }
 
             if conn.state == WRITING {
@@ -2151,12 +2206,15 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                         conn.response = None;
                         conn.progress = [0; 3];
                         conn.state = READING;
+                        conn.header_deadline = None;
                         conn.deadline = Instant::now() + KEEP_ALIVE_IDLE;
                         let mut conn_event = libc::epoll_event {
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,
                         };
-                        epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
+                        if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event).is_err() {
+                            close.push(fd);
+                        }
                     } else {
                         // Half-close and drain inbound bytes: closing with
                         // unread request/body bytes makes the kernel emit RST,
@@ -2164,12 +2222,19 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                         // shed 503 path included).
                         let _ = conn.stream.shutdown(Shutdown::Write);
                         conn.state = DRAINING;
-                        conn.deadline = Instant::now() + Duration::from_millis(100);
+                        conn.deadline = Instant::now()
+                            + if conn.body_remaining == 0 {
+                                LINGER_BUDGET
+                            } else {
+                                Duration::from_secs(1)
+                            };
                         let mut conn_event = libc::epoll_event {
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,
                         };
-                        epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event);
+                        if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event).is_err() {
+                            close.push(fd);
+                        }
                     }
                 }
             }
@@ -2185,7 +2250,7 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
         close.dedup();
         for fd in close {
             if let Some(conn) = conns.remove(&fd) {
-                epoll_ctl_checked(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+                let _ = epoll_ctl_checked(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
                 let _ = conn.stream.shutdown(Shutdown::Both);
             }
         }
@@ -2215,7 +2280,13 @@ fn handle_persistent_connection(stream: &mut TcpStream) -> std::io::Result<()> {
         };
         stream.set_read_timeout(Some(budget))?;
         first_request = false;
-        let Some((line, leftover)) = read_request_line(stream, &[], budget) else {
+        let mut too_large = false;
+        let Some((line, leftover)) =
+            read_request_line(stream, &[], budget, &mut too_large)
+        else {
+            if too_large {
+                let _ = write_header_too_large(stream);
+            }
             return Ok(());
         };
         // Drain the rest of this request — header block *and* any body
@@ -2234,11 +2305,12 @@ fn handle_persistent_connection(stream: &mut TcpStream) -> std::io::Result<()> {
         if outcome == DrainOutcome::NoRequest {
             return Ok(());
         }
+        let response = dispatch_request(&line);
         let keep_alive = outcome == DrainOutcome::Complete
+            && response.status == "200 OK"
             && request_is_http11(&line)
             && tail_len == 0
             && !wants_close;
-        let response = dispatch_request(&line);
         // : write the pre-rendered head + body — no per-request formatting.
         write_prepared_conn(
             stream,
@@ -2327,19 +2399,14 @@ fn read_request_line(
     stream: &mut TcpStream,
     prefix: &[u8],
     budget: Duration,
+    too_large: &mut bool,
 ) -> Option<(CompactString, SmallVec<[u8; 512]>)> {
-    // [4]2: enforce the 8 KiB cap *before* the prefix fast path; otherwise a
-    // line completed inside a 64 KiB handoff buffer bypasses the cap while the
-    // persistent path rejects it.
-    if prefix.len() > 8192 {
-        let _ = drain_request(stream, prefix, Duration::from_secs(1));
-        return None;
-    }
-    // /a caller may already hold the line prefix from an earlier probe
+    // A caller may already hold the line prefix from an earlier probe
     // (the 512-byte one-shot read).  Handle a line completed inside it without
     // another syscall, and seed the accumulator otherwise.
     if let Some(nl) = memchr::memchr(b'\n', prefix) {
         if nl > 8192 {
+            *too_large = true;
             let _ = drain_request(stream, &prefix[nl + 1..], Duration::from_millis(100));
             return None;
         }
@@ -2394,6 +2461,7 @@ fn read_request_line(
         match memchr::memchr(b'\n', chunk) {
             Some(nl) => {
                 if line.len() + nl > 8192 {
+                    *too_large = true;
                     // The request line is over the cap.  `chunk[nl + 1..]`
                     // arrived past the newline and the kernel may hold more;
                     // drain both before returning so closing does not reset
@@ -2421,6 +2489,7 @@ fn read_request_line(
             }
             None => {
                 if line.len() + n > 8192 {
+                    *too_large = true;
                     let _ = drain_request(stream, &[], Duration::from_millis(100));
                     return None;
                 }
@@ -3454,5 +3523,202 @@ mod tests {
             scan_framing(b"Content-Length: 999999999999999999999999999999\r\n\r\n").oversized,
             "a Content-Length beyond the body cap must be marked oversized"
         );
+    }
+
+    #[test]
+    fn one_shot_serves_lf_only_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || serve_explain(&listener, "E030"));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"GET /E030 HTTP/1.1\nHost: x\nConnection: close\n\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        server.join().unwrap().unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "one-shot rejected an LF-only request: {:?}",
+            &response[..response.len().min(32)]
+        );
+    }
+
+    #[test]
+    fn thread_path_serves_lf_only_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let server = std::thread::spawn(move || handle_persistent_connection(&mut server));
+        client
+            .write_all(b"GET /E030 HTTP/1.1\nHost: x\nConnection: close\n\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        server.join().unwrap().unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "thread path rejected an LF-only request: {:?}",
+            &response[..response.len().min(32)]
+        );
+    }
+
+    #[test]
+    fn oversized_request_line_gets_431() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = serve_explain_persistent(&listener);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = b"GET /".to_vec();
+        request.extend(std::iter::repeat(b'a').take(9 * 1024));
+        request.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
+        let _ = client.write_all(&request);
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        assert!(
+            response.starts_with(b"HTTP/1.1 431"),
+            "oversized request line must get 431, got {:?}",
+            &response[..response.len().min(32)]
+        );
+    }
+
+    #[test]
+    fn short_request_line_with_large_header_is_served() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let server = std::thread::spawn(move || handle_persistent_connection(&mut server));
+        let mut request = b"GET /E030 HTTP/1.1\r\nHost: x\r\nCookie: ".to_vec();
+        request.extend(std::iter::repeat(b'a').take(12 * 1024));
+        request.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+        client.write_all(&request).unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        server.join().unwrap().unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "large header with short request line must be served: {:?}",
+            &response[..response.len().min(32)]
+        );
+    }
+
+    #[test]
+    fn silent_overload_connection_gets_no_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = serve_explain_persistent(&listener);
+        });
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let mut silent = TcpStream::connect(addr).unwrap();
+        silent
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let read = silent.read(&mut byte);
+        assert!(
+            read.is_err() || matches!(read, Ok(0)),
+            "silent overload connection must not receive a response"
+        );
+        drop(idle);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backends_agree_on_request_lifecycle() {
+        fn thread_exchange(request: &[u8]) -> Vec<u8> {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            let server = std::thread::spawn(move || handle_persistent_connection(&mut server));
+            client.write_all(request).unwrap();
+            let mut response = Vec::new();
+            let _ = client.read_to_end(&mut response);
+            server.join().unwrap().unwrap();
+            response
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reactor_addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = serve_explain_persistent(&listener);
+        });
+
+        let mut large_header = b"GET /E030 HTTP/1.1\r\nHost: x\r\nCookie: ".to_vec();
+        large_header.extend(std::iter::repeat(b'a').take(12 * 1024));
+        large_header.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+
+        let mut oversized = b"GET /".to_vec();
+        oversized.extend(std::iter::repeat(b'a').take(9 * 1024));
+        oversized.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        let cases: [(&[u8], &[u8]); 5] = [
+            (
+                b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                b"200",
+            ),
+            (
+                b"GET /E030 HTTP/1.1\nHost: x\nConnection: close\n\n",
+                b"200",
+            ),
+            (
+                b"GET /NO_SUCH_CODE HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                b"404",
+            ),
+            (&oversized, b"431"),
+            (&large_header, b"200"),
+        ];
+
+        for (request, status) in cases {
+            let mut reactor = TcpStream::connect(reactor_addr).unwrap();
+            reactor
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            reactor.write_all(request).unwrap();
+            let mut reactor_response = Vec::new();
+            let _ = reactor.read_to_end(&mut reactor_response);
+
+            let thread_response = thread_exchange(request);
+            assert!(
+                reactor_response.starts_with(b"HTTP/1.1 ") && thread_response.starts_with(b"HTTP/1.1 "),
+                "backend produced no HTTP status"
+            );
+            let reactor_status = &reactor_response[9..12];
+            let thread_status = &thread_response[9..12];
+            assert_eq!(
+                reactor_status, thread_status,
+                "backends disagree for request: {:?}",
+                String::from_utf8_lossy(&request[..request.len().min(32)])
+            );
+            assert_eq!(
+                reactor_status, status,
+                "unexpected status for case: {:?}",
+                String::from_utf8_lossy(&request[..request.len().min(32)])
+            );
+        }
     }
 }

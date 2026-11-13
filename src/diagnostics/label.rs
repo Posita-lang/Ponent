@@ -144,11 +144,11 @@ impl<'a> Snippet<'a> {
     }
 
     pub fn with_line_start(mut self, line_start: usize) -> Self {
-        assert!(
+        debug_assert!(
             line_start >= 1,
             "Snippet::with_line_start is 1-based; got {line_start}"
         );
-        self.line_start = line_start;
+        self.line_start = line_start.max(1);
         self
     }
 

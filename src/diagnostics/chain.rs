@@ -476,6 +476,7 @@ fn scan(&self) -> (bool, usize) {
         // `file_name` — so compute it once here instead of once per
         // recursion level (an N-level chain used to rescan the name N×).
         let file_cols = visible_width(&sanitized);
+        let capped = std::cell::Cell::new(false);
         self.render_entries(
             &RenderEnv {
                 use_color,
@@ -490,10 +491,17 @@ fn scan(&self) -> (bool, usize) {
             },
             0,
             out,
+            &capped,
         );
     }
 
-    fn render_entries(&self, env: &RenderEnv<'_>, depth: usize, out: &mut String) {
+    fn render_entries(
+        &self,
+        env: &RenderEnv<'_>,
+        depth: usize,
+        out: &mut String,
+        capped: &std::cell::Cell<bool>,
+    ) {
         let RenderEnv {
             use_color,
             source,
@@ -508,8 +516,12 @@ fn scan(&self) -> (bool, usize) {
         // Bound the recursion: a pathological/fuzzer-generated chain thousands
         // of levels deep must not overflow the stack.  Real chains are shallow.
         if depth > MAX_CHAIN_DEPTH {
-            super::renderers::fmt::push_spaces(out, 4 + depth * 4);
-            out.push_str("...\n");
+            // One marker per render, not one per truncated branch: a
+            // branching hostile chain must not grow output with its fanout.
+            if !capped.replace(true) {
+                super::renderers::fmt::push_spaces(out, 4 + depth * 4);
+                out.push_str("...\n");
+            }
             return;
         }
         // Indent width only — the spaces are pushed straight into `out` per
@@ -624,7 +636,7 @@ fn scan(&self) -> (bool, usize) {
             }
             if let Some(children) = &entry.children {
                 for child in children.iter() {
-                    child.render_entries(env, depth + 1, out);
+                    child.render_entries(env, depth + 1, out, capped);
                 }
             }
         }
@@ -813,6 +825,41 @@ mod tests {
         // The counting traversal must not under-reserve past the cap either:
         // `flattened_entry_count` stops at the same depth as the renderer.
         assert!(inner.flattened_entry_count() >= MAX_CHAIN_DEPTH);
+    }
+
+    #[test]
+    fn branching_deep_chain_emits_one_marker() {
+        let span = Span::new(FileId::DUMMY, 0, 3);
+        let leaf = || CallChain {
+            entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")],
+        };
+        // Two identical linear branches that both cross the cap.  The old
+        // recursion emitted one `...` per branch; the contract is one marker
+        // per render.
+        let deep = || {
+            let mut chain = leaf();
+            for _ in 0..=MAX_CHAIN_DEPTH {
+                chain = CallChain {
+                    entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")
+                        .with_children(vec![chain])],
+                };
+            }
+            chain
+        };
+        let branch = CallChain {
+            entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "root")
+                .with_children(vec![deep(), deep()])],
+        };
+        let out = branch.render(false, Some("def main() {}"), "f.ps");
+        assert_eq!(
+            out.matches("...").count(),
+            1,
+            "branching cap must emit exactly one marker: {out}"
+        );
+        assert!(
+            out.lines().count() <= 2 * MAX_CHAIN_DEPTH + 8,
+            "branching cap grew output: {out}"
+        );
     }
 
     #[test]

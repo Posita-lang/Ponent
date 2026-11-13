@@ -70,6 +70,13 @@ impl FilesSeen {
     }
 
     fn insert(&mut self, name: &str, id: Option<crate::ast::FileId>) {
+        // Grouped batches repeat the same file: check the last key before
+        // constructing `FileKey::Name`, which would allocate for long paths.
+        match (self.last.as_ref(), id) {
+            (Some(FileKey::Id(prev)), Some(id)) if *prev == id => return,
+            (Some(FileKey::Name(prev)), None) if prev.as_str() == name => return,
+            _ => {}
+        }
         let key = match id {
             Some(id) => FileKey::Id(id),
             None => FileKey::Name(CompactString::from(name)),
@@ -487,16 +494,15 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
         let mut bins: Vec<Vec<usize>> = (0..num_threads).map(|_| Vec::new()).collect();
-        let mut loads = vec![0usize; num_threads];
+        let mut heap = std::collections::BinaryHeap::new();
+        for bin in 0..num_threads {
+            heap.push(std::cmp::Reverse((0usize, bin)));
+        }
         for i in order {
-            let bin = loads
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, &load)| load)
-                .map(|(b, _)| b)
-                .unwrap_or(0);
-            loads[bin] += weights[i];
+            let std::cmp::Reverse((load, bin)) = heap.pop().expect("non-empty bin heap");
+            let next = load + weights[i];
             bins[bin].push(i);
+            heap.push(std::cmp::Reverse((next, bin)));
         }
         let mut bin_of = vec![0usize; n];
         let mut bin_lens: Vec<usize> = Vec::with_capacity(num_threads);

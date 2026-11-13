@@ -10,12 +10,12 @@ expression: out
 |  | ~~~~~~~~ ^^^^^^^^^^^^^^^^^^^^
 |  | declared to return Int<32>
 |2 |    set j = x;
-|  | |
+|  |          |
 |3 |    set i = j + 1; // 中
 |  |    ^^^^^^^^^^^^^^^^^^^^
 |  |    ~~~~~~~~~~~~~
 |  | duplicate definition of `i` [E019]
-|  | |
+|  |          |
 |4 |    return i;
 |  | ^^^^^     ^
 |  | ^^^^^^

@@ -275,8 +275,11 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
 /// auto-vectorizes on aarch64.
 ///
 /// Every kernel processes only full chunks and defers its `< 32`-byte tail to
-/// the public scalar entry, so the chunk/lane proofs of the SWAR code remain
-/// the single source of truth for the tail.
+/// the public SWAR entry, so the chunk/lane proofs of the SWAR code remain
+/// the single source of truth for the tail.  The tail deliberately avoids a
+/// masked AVX2 load: the fallback is one cached feature branch plus at most
+/// 31 bytes of SWAR, while masked tails add unsafe edge cases for no measured
+/// gain on diagnostic-sized inputs.
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use std::arch::x86_64::*;

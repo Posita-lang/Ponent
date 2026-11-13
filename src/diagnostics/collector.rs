@@ -313,6 +313,9 @@ impl<'src> DiagCtxt<'src> {
     /// (Fatal/Error vs Warning), so the `else if` is exact.  Note `check`
     /// still uses `has_errors`, which short-circuits on the first error and
     /// is therefore strictly cheaper than this full pass.
+    ///
+    /// In debug builds this additionally performs an O(n) tally/invariant
+    /// cross-check; release builds are the O(1) accessor implied above.
     pub fn summary(&self) -> (usize, usize) {
         // Debug-only invariant check: every mutator that adds/removes/changes
         // a diagnostic must keep the tally exact.  Release pays nothing.

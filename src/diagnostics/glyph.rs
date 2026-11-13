@@ -2031,8 +2031,18 @@ impl GlyphRenderer {
                         continue;
                     }
                     let span_start = all_labels[i].span.start_as_usize();
-                    let off = span_start.clamp(line_start, line_end) - line_start;
-                    let col = byte_offset_to_display(line, off, self.tab_width);
+                    // A middle row's `line` is not the label's start line;
+                    // clamping the span into it would always yield column 0.
+                    // Measure from the label's start line so the connector
+                    // sits under the opening caret.
+                    let start_line_idx = label_line_ranges[i + 1].0;
+                    let start_line = idx.line(start_line_idx);
+                    let start_line_start =
+                        starts.get(start_line_idx).map_or(0, |&s| s as usize);
+                    let start_off = span_start
+                        .saturating_sub(start_line_start)
+                        .min(start_line.len());
+                    let col = byte_offset_to_display(start_line, start_off, self.tab_width);
                     multiline_flags.push((col, "middle"));
                 }
             }
@@ -7587,6 +7597,39 @@ mod tests {
         }
         // The message itself is still rendered exactly once.
         assert_eq!(out.matches("spans two lines").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn multiline_label_connector_uses_label_start_column() {
+        let src = "    aaa\n    bbb\n    ccc\n";
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 4, 7))
+            .with_label(Span::new(FileId::DUMMY, 4, 23), "spans three lines")
+            .with_source(src);
+        let out = GlyphRenderer::new(false).render_diagnostic(&diag);
+        let lines: Vec<&str> = out.lines().collect();
+        let caret_col = lines
+            .iter()
+            .find(|l| l.contains('^'))
+            .and_then(|l| l.find('^'))
+            .expect("caret row missing");
+        let bbb_row = lines
+            .iter()
+            .position(|l| l.contains("bbb"))
+            .expect("middle source row missing");
+        let connector = lines[bbb_row + 1..]
+            .iter()
+            .find(|l| {
+                l.trim_end().ends_with('|')
+                    && !l.chars().any(|c| c.is_alphabetic())
+            })
+            .expect("middle connector row missing");
+        assert_eq!(
+            connector.rfind('|').unwrap(),
+            caret_col,
+            "connector must sit under the label's opening caret:\n{out}"
+        );
     }
 
     /// F3: wrapped structural-suggestion continuations align under the

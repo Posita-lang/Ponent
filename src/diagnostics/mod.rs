@@ -832,6 +832,27 @@ impl<'src> StyledString<'src> {
 /// that read these fields directly must call `humanize()` themselves.
 /// `kind` is retained (never dropped) as the structured source of
 /// truth so `humanize()` can re-run if the kind is replaced.
+/// Restores a temporarily-taken `Diagnostic::kind` if `humanize_into` panics.
+/// `disarm` on the success path returns the kind without restoring twice.
+struct RestoreKindOnDrop<'a, 'src> {
+    slot: &'a mut Option<std::sync::Arc<DiagnosticKind<'src>>>,
+    restore: Option<std::sync::Arc<DiagnosticKind<'src>>>,
+}
+
+impl Drop for RestoreKindOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(kind) = self.restore.take() {
+            *self.slot = Some(kind);
+        }
+    }
+}
+
+impl<'a, 'src> RestoreKindOnDrop<'a, 'src> {
+    fn disarm(mut self) -> std::sync::Arc<DiagnosticKind<'src>> {
+        self.restore.take().expect("guard armed")
+    }
+}
+
 #[derive(Debug)]
 pub struct Diagnostic<'src> {
     level: DiagnosticLevel,
@@ -1042,18 +1063,21 @@ impl<'src> Diagnostic<'src> {
     }
 
     /// A deterministic identifier derived from `(code, first primary span,
-    /// message)`, for tools to deduplicate / track diagnostics across runs.
-    ///
-    /// Computed once with FNV-1a and cached in an [`AtomicU64`]; when the
-    /// inputs are unchanged, a second call is just a relaxed load. Every
-    /// entry point that can mutate the fields above
-    /// ([`with_code`](Self::with_code), [`with_code_str`](Self::with_code_str),
-    /// [`with_span`](Self::with_span), [`with_additional_span`](Self::with_additional_span),
-    /// [`augment`](Self::augment), [`humanize`](Self::humanize), and
-    /// [`adorn_with_span`]) clears the cache via
-    /// [`invalidate_stable_id`](Self::invalidate_stable_id), so callers
-    /// always see a value consistent with the current triple.
-    pub fn stable_id(&self) -> u64 {
+        /// message, file_name)`, for tools to deduplicate / track diagnostics
+        /// across runs.  `file_name` participates so identical code/spans/messages
+        /// in different files do not collide.
+        ///
+        /// Computed once with FNV-1a and cached in an [`AtomicU64`]; when the
+        /// inputs are unchanged, a second call is just a relaxed load. Every
+        /// entry point that can mutate the fields above
+        /// ([`with_code`](Self::with_code), [`with_code_str`](Self::with_code_str),
+        /// [`with_span`](Self::with_span), [`with_additional_span`](Self::with_additional_span),
+        /// [`augment`](Self::augment), [`humanize`](Self::humanize),
+        /// [`set_file_name`](Self::set_file_name), and
+        /// [`adorn_with_span`](Self::adorn_with_span)) clears the cache via
+        /// [`invalidate_stable_id`](Self::invalidate_stable_id), so callers
+        /// always see a value consistent with the current inputs.
+        pub fn stable_id(&self) -> u64 {
         let cached = self.stable_id_cache.load(Ordering::Relaxed);
         if cached != 0 {
             return cached;
@@ -1586,18 +1610,21 @@ impl<'src> Diagnostic<'src> {
             }
         }
         self.invalidate_stable_id();
-        // Panic-safety: `self.kind` is *taken* (temporarily `None`) while the
-        // kind is humanized.  If `humanize_into` panics, the diagnostic keeps
-        // its constructor message and empty derived fields — an acceptable
-        // degraded state for a renderer, so no rollback guard is paid for.
         let kind_box = std::mem::take(&mut self.kind);
-        let Some(kind) = kind_box.as_deref() else {
+        let Some(kind_arc) = kind_box else {
             // No kind: message/labels were set manually.  Latch so later
             // calls skip the `kind` lookup entirely.
-            self.kind = kind_box;
             self.humanized = true;
             self.humanized_lang = lang;
             return;
+        };
+        // Keep `kind` alive across the derive, and put it back even if
+        // `humanize_into` panics: a retried render must not see `kind = None`
+        // and emit an empty message.
+        let kind_for_call = std::sync::Arc::clone(&kind_arc);
+        let restore = RestoreKindOnDrop {
+            slot: &mut self.kind,
+            restore: Some(kind_arc),
         };
         // `kind` is retained: humanize a *clone* so `kind()` keeps serving
         // the structured data and a later `Lang::set` can re-derive the
@@ -1615,8 +1642,8 @@ impl<'src> Diagnostic<'src> {
         // overwhelmingly common kind) a clone is a handful of pointer copies.
         // Only kinds with large *owned* side fields (`Comptime.traceback`, a
         // long `reason`) pay a deep copy, once per language switch.
-        let (message, labels, help, suggestions) = (*kind).clone().humanize_into();
-        self.kind = kind_box;
+        let (message, labels, help, suggestions) = (*kind_for_call).clone().humanize_into();
+        self.kind = Some(restore.disarm());
         // Static messages move straight into `message`: a borrowed static
         // stays borrowed (zero allocation), an owned one is moved — only
         // the Fluent-slug path needs the render buffer.
@@ -2810,7 +2837,7 @@ pub(crate) fn is_real_file_name(name: &str) -> bool {
 /// to a single space, so a tab never reaches the one-line output verbatim.
 pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
     let bytes = s.as_bytes();
-    let (has_high, dirty) = scan_terminal_control_flags_flatten(bytes);
+    let (has_high, dirty, has_c1) = scan_terminal_control_flags_flatten(bytes);
     if !has_high && !dirty {
         return Cow::Borrowed(s);
     }
@@ -2819,7 +2846,7 @@ pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
     // controls nor visible, so the byte-level scan cannot see them — they are
     // probed separately (see [`sanitize_for_terminal`] for the spoofing
     // rationale) and must reach the owned path for removal.
-    if has_high && !dirty && !has_c1_sequence(bytes) && !has_bidi_override_bytes(bytes) {
+    if has_high && !dirty && !has_c1 && !has_bidi_override_bytes(bytes) {
         return Cow::Borrowed(s);
     }
     // Bidi overrides/isolates are *removed* (not U+FFFD'd), matching
@@ -2881,7 +2908,7 @@ pub(crate) fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
     // byte < 0x20, so the control probe re-scanned what the first pass had
     // just cleared.
     let bytes = s.as_bytes();
-    let (has_high, dirty) = scan_terminal_control_flags(bytes);
+    let (has_high, dirty, has_c1) = scan_terminal_control_flags(bytes);
     if !has_high && !dirty {
         // Every byte in 0x20..=0x7E: printable ASCII, control-free.
         return Cow::Borrowed(s);
@@ -2897,7 +2924,7 @@ pub(crate) fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
     // [`sanitize_filename`] — direction-only characters have no content, and
     // U+FFFD would just inject noise.
     let bidi = has_high && has_bidi_override_bytes(bytes);
-    if has_high && !dirty && !has_c1_sequence(bytes) && !bidi {
+    if has_high && !dirty && !has_c1 && !bidi {
         return Cow::Borrowed(s);
     }
     if bidi {
@@ -2931,7 +2958,7 @@ pub(crate) fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
 /// in — it needs a positional two-byte check, and it is only possible when
 /// `has_high` is set, so callers probe it separately via
 /// [`has_c1_sequence`].
-fn scan_terminal_control_flags(s: &[u8]) -> (bool, bool) {
+fn scan_terminal_control_flags(s: &[u8]) -> (bool, bool, bool) {
     const HI: u64 = 0x8080_8080_8080_8080;
     const SP: u64 = 0x2020_2020_2020_2020;
     const DEL: u64 = 0x7F7F_7F7F_7F7F_7F7F;
@@ -2939,10 +2966,12 @@ fn scan_terminal_control_flags(s: &[u8]) -> (bool, bool) {
 
     let mut has_high = false;
     let mut dirty = false;
+    let mut has_c1 = false;
     let mut i = 0;
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
         has_high |= x & HI != 0;
+        has_c1 |= c1_in_chunk(s, i, x);
         // C0: any byte < 0x20 (existentially exact).
         dirty |= x.wrapping_sub(SP) & !x & HI != 0;
         // DEL: any byte == 0x7F (exact — any flag implies a real lane).
@@ -2950,11 +2979,34 @@ fn scan_terminal_control_flags(s: &[u8]) -> (bool, bool) {
         dirty |= q.wrapping_sub(ONES) & !q & HI != 0;
         i += 8;
     }
-    for &b in &s[i..] {
+    for j in i..s.len() {
+        let b = s[j];
         has_high |= b >= 0x80;
         dirty |= b < 0x20 || b == 0x7F;
+        has_c1 |= b == 0xC2 && s.get(j + 1).is_some_and(|b| (0x80..=0x9F).contains(b));
     }
-    (has_high, dirty)
+    (has_high, dirty, has_c1)
+}
+
+/// Whether one 8-byte chunk contains a C1 sequence start (`0xC2` followed by
+/// `0x80..=0x9F`).  The follow byte may live in the next chunk, so `s` and
+/// `base` are used for the positional check rather than the chunk alone.
+#[inline]
+fn c1_in_chunk(s: &[u8], base: usize, x: u64) -> bool {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const C2: u64 = 0x0202_0202_0202_0202;
+    let q = x ^ C2;
+    let mut mask = q.wrapping_sub(ONES) & !q & HI;
+    while mask != 0 {
+        let lane = (mask.trailing_zeros() / 8) as usize;
+        let k = base + lane;
+        if s.get(k + 1).is_some_and(|b| (0x80..=0x9F).contains(b)) {
+            return true;
+        }
+        mask &= mask - 1;
+    }
+    false
 }
 
 /// Whether `s` contains a C1 control sequence (`0xC2` followed by
@@ -2983,7 +3035,7 @@ fn has_c1_sequence(s: &[u8]) -> bool {
 /// multiline message whose every chunk contains `\t`/`\n` stays near full
 /// SWAR speed.  C1 is probed separately via [`has_c1_sequence`], only when
 /// `has_high`.
-pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool) {
+pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool, bool) {
     const HI: u64 = 0x8080_8080_8080_8080;
     const SP: u64 = 0x2020_2020_2020_2020;
     const DEL: u64 = 0x7F7F_7F7F_7F7F_7F7F;
@@ -2993,10 +3045,12 @@ pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool) {
 
     let mut has_high = false;
     let mut dirty = false;
+    let mut has_c1 = false;
     let mut i = 0;
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
         has_high |= x & HI != 0;
+        has_c1 |= c1_in_chunk(s, i, x);
         // DEL: exact — any flag implies a genuine 0x7F lane.
         let q = x ^ DEL;
         if q.wrapping_sub(ONES) & !q & HI != 0 {
@@ -3019,11 +3073,13 @@ pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool) {
         }
         i += 8;
     }
-    for &b in &s[i..] {
+    for j in i..s.len() {
+        let b = s[j];
         has_high |= b >= 0x80;
         dirty |= (b < 0x20 && b != b'\t' && b != b'\n') || b == 0x7F;
+        has_c1 |= b == 0xC2 && s.get(j + 1).is_some_and(|b| (0x80..=0x9F).contains(b));
     }
-    (has_high, dirty)
+    (has_high, dirty, has_c1)
 }
 
 /// [`scan_terminal_control_flags_multiline`] variant for
@@ -3032,7 +3088,7 @@ pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool) {
 /// keeps or consumes (`push_flattened`).  A multi-line message with no other
 /// controls therefore stays `Cow::Borrowed`, and flagged-lane resolution (not
 /// whole-chunk rescans) keeps tab/newline/CR-dense text at SWAR speed.
-fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool) {
+fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool) {
     const HI: u64 = 0x8080_8080_8080_8080;
     const SP: u64 = 0x2020_2020_2020_2020;
     const DEL: u64 = 0x7F7F_7F7F_7F7F_7F7F;
@@ -3043,10 +3099,12 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool) {
 
     let mut has_high = false;
     let mut dirty = false;
+    let mut has_c1 = false;
     let mut i = 0;
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
         has_high |= x & HI != 0;
+        has_c1 |= c1_in_chunk(s, i, x);
         let q = x ^ DEL;
         if q.wrapping_sub(ONES) & !q & HI != 0 {
             dirty = true;
@@ -3064,11 +3122,13 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool) {
         }
         i += 8;
     }
-    for &b in &s[i..] {
+    for j in i..s.len() {
+        let b = s[j];
         has_high |= b >= 0x80;
         dirty |= (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F;
+        has_c1 |= b == 0xC2 && s.get(j + 1).is_some_and(|b| (0x80..=0x9F).contains(b));
     }
-    (has_high, dirty)
+    (has_high, dirty, has_c1)
 }
 
 /// Unicode bidirectional formatting characters: the U+202A–U+202E
@@ -3132,7 +3192,7 @@ pub(crate) fn sanitize_for_terminal_multiline(s: &str) -> Cow<'_, str> {
     // already rejects every byte < 0x20, so the control probe re-scanned the
     // same clean bytes a second time.
     let bytes = s.as_bytes();
-    let (has_high, dirty) = scan_terminal_control_flags_multiline(bytes);
+    let (has_high, dirty, has_c1) = scan_terminal_control_flags_multiline(bytes);
     if !has_high && !dirty {
         // Printable ASCII plus `\t`/`\n` layout controls: borrow verbatim.
         return Cow::Borrowed(s);
@@ -3145,7 +3205,7 @@ pub(crate) fn sanitize_for_terminal_multiline(s: &str) -> Cow<'_, str> {
     // control scan and force the owned path, where they are removed (same
     // convention as [`sanitize_filename`]).
     let bidi = has_high && has_bidi_override_bytes(bytes);
-    if has_high && !dirty && !has_c1_sequence(bytes) && !bidi {
+    if has_high && !dirty && !has_c1 && !bidi {
         return Cow::Borrowed(s);
     }
     let needs_replace = |c: char| c.is_control() && c != '\n' && c != '\t';
@@ -5051,7 +5111,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let (has_high, dirty) = scan_terminal_control_flags_flatten(&bytes);
+            let (has_high, dirty, _has_c1) = scan_terminal_control_flags_flatten(&bytes);
             let _ = has_high;
             assert_eq!(dirty, reference(&bytes), "{bytes:?}");
         }

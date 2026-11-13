@@ -135,6 +135,13 @@ pub(crate) fn wrap_optimal<'a>(
     // bounds every `Word` offset (`push_words` indexes into one paragraph).
     // A 4 GiB diagnostic message is not a real input; a debug build catches
     // it long before the `u32` casts below would silently wrap.
+    // `Word` offsets are `u32`.  A >4 GiB input is not a real diagnostic, but
+    // silently truncating its ranges in release would be corruption, not
+    // degradation: emit its hard-newline segments verbatim instead.  Keep the
+    // debug assertion as the loud signal for fuzzed/测试 inputs.
+    if text.len() > u32::MAX as usize {
+        return text.split_terminator('\n').map(Cow::Borrowed).collect();
+    }
     debug_assert!(
         text.len() <= u32::MAX as usize,
         "wrap_optimal: text exceeds u32 byte offsets ({} bytes)",
@@ -244,12 +251,20 @@ pub(crate) fn wrap_optimal<'a>(
     // a local scratch in that impossible-by-design case; the normal path stays
     // allocation-free.
     // #7: batch memo.  Identical static help/label strings recur across a batch;
-// hash them once and reuse the DP's segment ranges.  Hits are exact: the
-// stored content is compared byte-for-byte before ranges are applied, so a
-// hash collision can only miss, never mis-render.  Bounded, and a hit still
-// borrows the *current* text (no allocation).
-    let key = (wrap_text_hash(text), max_width, tab_width);
-    if let Some(hit) = wrap_memo_get(key, text) {
+    // hash them once and reuse the DP's segment ranges.  Hits are exact: the
+    // stored content is compared byte-for-byte before ranges are applied, so a
+    // hash collision can only miss, never mis-render.  Bounded, and a hit still
+    // borrows the *current* text (no allocation).
+    //
+    // Size gate: the memo is for short recurring labels, not long prose.  A
+    // long message pays the full-text hash on every miss and, on a miss, an
+    // `Arc<str>` copy of the whole input; skipping it keeps the memo bounded
+    // by `MEMO_MAX_TEXT * 256` bytes (128 KiB) instead of unbounded-by-bytes.
+    let memo_key = (text.len() <= MEMO_MAX_TEXT)
+        .then(|| (wrap_text_hash(text), max_width, tab_width));
+    if let Some(key) = memo_key
+        && let Some(hit) = wrap_memo_get(key, text)
+    {
         return hit;
     }
     let result = if WRAP_IN_USE.get() {
@@ -268,9 +283,15 @@ pub(crate) fn wrap_optimal<'a>(
             wrap_optimal_with(text, max_width, tab_width, tables.as_deref(), scratch)
         })
     };
-    wrap_memo_put(key, text, &result);
+    if let Some(key) = memo_key {
+        wrap_memo_put(key, text, &result);
+    }
     result
 }
+
+/// Memo admission bound: short recurring labels only.  Keeps worst-case
+/// retained text at `MEMO_MAX_TEXT * 256` bytes even on a diverse batch.
+const MEMO_MAX_TEXT: usize = 512;
 
 /// Hash used only as a memo bucket; exact content comparison disambiguates.
 fn wrap_text_hash(s: &str) -> u64 {
@@ -380,8 +401,7 @@ fn wrap_optimal_with<'a>(
         let fits_and_clean = if ascii {
             trimmed.len() <= max_width
         } else {
-            memchr::memchr(b'\t', trimmed.as_bytes()).is_none()
-                && measure_width(trimmed, tab_width) <= max_width
+            measure_width_unless_tab(trimmed, tab_width).is_some_and(|w| w <= max_width)
         };
         if !trimmed.is_empty() && !edges_have_whitespace(trimmed) && fits_and_clean {
             out.push(Cow::Borrowed(trimmed));
@@ -888,6 +908,30 @@ fn measure_width(s: &str, tab_width: usize) -> usize {
         }
     });
     w
+}
+
+/// `measure_width`, but returns `None` as soon as a tab is seen.
+///
+/// The fast-path admission test needs both facts; computing them separately
+/// walked the grapheme stream twice (one `memchr` for the tab, then
+/// `measure_width`).  Printable ASCII keeps the byte-length shortcut.
+fn measure_width_unless_tab(s: &str, tab_width: usize) -> Option<usize> {
+    if is_printable_ascii(s.as_bytes()) {
+        return Some(s.len());
+    }
+    let mut width = 0;
+    let mut saw_tab = false;
+    WIDTH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        for g in s.graphemes(true) {
+            if g == "\t" {
+                saw_tab = true;
+                break;
+            }
+            width += grapheme_width_cached(g, width, tab_width, &mut cache);
+        }
+    });
+    (!saw_tab).then_some(width)
 }
 
 /// `s.trim_end_matches(char::is_whitespace).len()` without touching the
