@@ -99,6 +99,42 @@ fn accept_nonblocking(listener: &TcpListener) -> std::io::Result<TcpStream> {
     }
 }
 
+/// Restores a listener's original non-blocking mode on scope exit.
+///
+/// std exposes only `set_nonblocking(bool)`, no getter; `socket2::SockRef`
+/// fills that gap on every platform.  A guard makes the restore unconditional:
+/// normal return, `?`, and panic unwinding all restore the caller's mode.
+struct RestoreNonblocking<'a> {
+    listener: &'a TcpListener,
+    was_nonblocking: bool,
+}
+
+impl<'a> RestoreNonblocking<'a> {
+    fn new(listener: &'a TcpListener, nonblocking: bool) -> std::io::Result<Self> {
+        // Query first: if the query fails the listener is untouched.  Winsock
+        // has no way to read the non-blocking bit, so non-Unix falls back to
+        // the documented blocking-listener contract.
+        #[cfg(unix)]
+        let was_nonblocking = socket2::SockRef::from(listener).nonblocking()?;
+        #[cfg(not(unix))]
+        let was_nonblocking = false;
+        listener.set_nonblocking(nonblocking)?;
+        Ok(Self {
+            listener,
+            was_nonblocking,
+        })
+    }
+}
+
+impl Drop for RestoreNonblocking<'_> {
+    fn drop(&mut self) {
+        // Drop must not panic; a failed restore in release is best-effort.
+        if self.listener.set_nonblocking(self.was_nonblocking).is_err() {
+            debug_assert!(false, "failed to restore listener non-blocking mode");
+        }
+    }
+}
+
 pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> {
     // `ErrCode::new` carries a `debug_assert!` that aborts on unknown codes;
     // `code` here comes from the CLI (`ponent explain <CODE>`), so a typo
@@ -126,7 +162,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
         ));
     }
 
-    listener.set_nonblocking(true)?;
+    let _nonblocking_guard = RestoreNonblocking::new(listener, true)?;
 
     let html = build_explain_page(&ec);
     // only a request for this code's page consumes the one-shot server.
@@ -477,11 +513,8 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             "explain server: no client connected within ~10s",
         ))
     };
-    // The nonblocking flag must not leak into the caller's listener.  A
-    // failed restore is surfaced only when the main result is Ok, so the
-    // original error keeps priority.
-    let restored = listener.set_nonblocking(false);
-    result.and(restored)
+    // `_nonblocking_guard` restores the caller's original mode on drop.
+    result
 }
 
 /// Parse a `Content-Length` header out of a raw header block.
@@ -3200,6 +3233,32 @@ mod tests {
             "thread path response: {:?}",
             &response[..response.len().min(40)]
         );
+    }
+
+    #[test]
+    fn one_shot_restores_caller_nonblocking_mode() {
+        for initial_nonblocking in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(initial_nonblocking).unwrap();
+            let probe = listener.try_clone().unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || serve_explain(&listener, "E030"));
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            client
+                .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut response = Vec::new();
+            let _ = client.read_to_end(&mut response);
+            server.join().unwrap().unwrap();
+            assert_eq!(
+                socket2::SockRef::from(&probe).nonblocking().unwrap(),
+                initial_nonblocking,
+                "one-shot server must restore the caller's mode"
+            );
+        }
     }
 
     #[test]

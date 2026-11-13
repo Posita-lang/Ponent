@@ -60,6 +60,10 @@ supports-hyperlinks = "3"
 num-traits = "0.2"
 sexp = "1.1.4"
 parking_lot = "0.12"
+# Query/restore a socket's non-blocking mode (std has `set_nonblocking` but
+# no getter).  Used by the one-shot explain server so a caller-supplied
+# non-blocking listener is restored, not guessed away.
+socket2 = { version = "0.6", features = ["all"] }
 arc-swap = "1.9.2"
 boxcar = "0.2.14"
 unicode-width = "0.2"

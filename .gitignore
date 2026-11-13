@@ -22,3 +22,5 @@ agent/
 skills-lock.json
 CLAUDE.md
 .lake/
+formal/_*.lean
+formal/*.log
