@@ -26,5 +26,7 @@ jobs:
       - name: Apply labels
         uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13
         with:
-          sync-labels: true
+          # Only add/remove labels managed by this config. A full label sync can
+          # race with the independent Size Labeler and restore stale size labels.
+          sync-labels: false
           dot: true
