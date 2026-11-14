@@ -42,10 +42,6 @@ impl PendingConn {
                 Duration::from_secs(2)
             }
     }
-
-    fn header_complete(&self) -> bool {
-        matches!(self.scan.scan(&self.buf), HeaderProgress::Complete(_))
-    }
 }
 
 /// Serve the explanation for `code` on an already-bound `listener`.

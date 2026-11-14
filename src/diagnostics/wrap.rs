@@ -311,26 +311,82 @@ fn wrap_text_hash(s: &str) -> u64 {
     hasher.finish()
 }
 
+/// Process-wide memo used while `render_parallel` is active.
+static SHARED_WRAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII scope that switches wrap caches to shared mode for a parallel batch.
+pub(crate) struct SharedWrapGuard;
+
+impl Drop for SharedWrapGuard {
+    fn drop(&mut self) {
+        SHARED_WRAP.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn enter_shared_wrap() -> SharedWrapGuard {
+    SHARED_WRAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SharedWrapGuard
+}
+
+fn wrap_shared() -> bool {
+    SHARED_WRAP.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+type WrapMemoMap =
+    rustc_hash::FxHashMap<(u64, usize, usize), Vec<(std::sync::Arc<str>, SmallVec<[Range<usize>; 4]>)>>;
+
 thread_local! {
-    static WRAP_MEMO: std::cell::RefCell<
-        rustc_hash::FxHashMap<(u64, usize, usize), Vec<(std::sync::Arc<str>, SmallVec<[Range<usize>; 4]>)>>,
-    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    static WRAP_MEMO: std::cell::RefCell<WrapMemoMap> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+static SHARED_MEMO: std::sync::OnceLock<std::sync::RwLock<WrapMemoMap>> =
+    std::sync::OnceLock::new();
+
+fn memo_lookup<'a>(
+    memo: &WrapMemoMap,
+    key: (u64, usize, usize),
+    text: &'a str,
+) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
+    let entries = memo.get(&key)?;
+    let (_, ranges) = entries.iter().find(|(content, _)| &**content == text)?;
+    Some(
+        ranges
+            .iter()
+            .map(|r| Cow::Borrowed(&text[r.clone()]))
+            .collect(),
+    )
 }
 
 fn wrap_memo_get<'a>(
     key: (u64, usize, usize),
     text: &'a str,
 ) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
-    WRAP_MEMO.with_borrow(|memo| {
-        let entries = memo.get(&key)?;
-        let (_, ranges) = entries.iter().find(|(content, _)| &**content == text)?;
-        Some(
-            ranges
-                .iter()
-                .map(|r| Cow::Borrowed(&text[r.clone()]))
-                .collect(),
-        )
-    })
+    if wrap_shared() {
+        let memo = SHARED_MEMO
+            .get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashMap::default()))
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        memo_lookup(&memo, key, text)
+    } else {
+        WRAP_MEMO.with_borrow(|memo| memo_lookup(memo, key, text))
+    }
+}
+
+fn memo_insert(
+    memo: &mut WrapMemoMap,
+    key: (u64, usize, usize),
+    text: &str,
+    ranges: SmallVec<[Range<usize>; 4]>,
+) {
+    if memo.len() >= 256 {
+        memo.clear();
+    }
+    let entries = memo.entry(key).or_default();
+    if !entries.iter().any(|(content, _)| &**content == text) {
+        entries.push((std::sync::Arc::from(text), ranges));
+    }
 }
 
 fn wrap_memo_put(key: (u64, usize, usize), text: &str, result: &[Cow<'_, str>]) {
@@ -353,15 +409,15 @@ fn wrap_memo_put(key: (u64, usize, usize), text: &str, result: &[Cow<'_, str>]) 
             off..off + s.len()
         })
         .collect();
-    WRAP_MEMO.with_borrow_mut(|memo| {
-        if memo.len() >= 256 {
-            memo.clear();
-        }
-        let entries = memo.entry(key).or_default();
-        if !entries.iter().any(|(content, _)| &**content == text) {
-            entries.push((std::sync::Arc::from(text), ranges));
-        }
-    });
+    if wrap_shared() {
+        let mut memo = SHARED_MEMO
+            .get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashMap::default()))
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        memo_insert(&mut memo, key, text, ranges);
+    } else {
+        WRAP_MEMO.with_borrow_mut(|memo| memo_insert(memo, key, text, ranges));
+    }
 }
 
 /// Shared body of [`wrap_optimal`] over a caller-supplied scratch buffer.
@@ -1025,6 +1081,8 @@ struct WrapTables {
     class: [u8; MAX_TABLE_WIDTH + 1],
     badness: [f64; MAX_TABLE_WIDTH + 1],
 }
+type WrapTableSlot = SmallVec<[std::sync::Arc<WrapTables>; 8]>;
+
 thread_local! {
     /// A small per-thread cache of badness/class tables, keyed by `max_width`.
     /// Eight slots (≈56 KB TLS worst case): the *actual* key churn is
@@ -1032,7 +1090,7 @@ thread_local! {
     /// help and diff block at 5–6 distinct widths — so a two-slot cache
     /// evicted and rebuilt the ~11 KB table several times per diagnostic.
     /// Eviction is LRU-by-last-use.
-    static WRAP_TABLES: std::cell::RefCell<SmallVec<[std::rc::Rc<WrapTables>; 8]>> =
+    static WRAP_TABLES: std::cell::RefCell<WrapTableSlot> =
         std::cell::RefCell::new(SmallVec::new());
     /// Reentrancy flag for the scratch borrow (see `wrap_optimal`).
     static WRAP_IN_USE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1044,41 +1102,56 @@ thread_local! {
         std::cell::RefCell::new(WrapScratch::new());
 }
 
+/// Shared table cache used while a parallel render batch is active.
+static SHARED_TABLES: std::sync::OnceLock<std::sync::RwLock<WrapTableSlot>> =
+    std::sync::OnceLock::new();
+
+fn table_from_slot(
+    slot: &mut WrapTableSlot,
+    max_width: usize,
+) -> std::sync::Arc<WrapTables> {
+    // LRU-by-last-use: move a hit to the back so the widths that recur
+    // within one render are the ones that survive eviction.
+    if let Some(pos) = slot.iter().position(|t| t.max_width == max_width) {
+        let t = slot.remove(pos);
+        slot.push(std::sync::Arc::clone(&t));
+        return t;
+    }
+    let inv_measure = 1.0 / (max_width.max(1) as f64);
+    let mut t = WrapTables {
+        max_width,
+        class: [0; MAX_TABLE_WIDTH + 1],
+        badness: [0.0; MAX_TABLE_WIDTH + 1],
+    };
+    for lw in 0..=max_width {
+        t.class[lw] = fitness_class(lw, max_width);
+        t.badness[lw] = intrinsic_badness(lw, max_width, inv_measure, false);
+    }
+    let arc = std::sync::Arc::new(t);
+    if slot.len() >= 8 {
+        slot.remove(0);
+    }
+    slot.push(std::sync::Arc::clone(&arc));
+    arc
+}
+
 /// The badness/class tables for `max_width`, or `None` when the width
 /// exceeds the tabulation bound (the DP then computes inline).
-fn wrap_tables(max_width: usize) -> Option<std::rc::Rc<WrapTables>> {
+fn wrap_tables(max_width: usize) -> Option<std::sync::Arc<WrapTables>> {
     if max_width > MAX_TABLE_WIDTH {
         return None;
     }
-    Some(WRAP_TABLES.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        // LRU-by-last-use: move a hit to the back so the widths that recur
-        // within one render are the ones that survive eviction.
-        if let Some(pos) = slot.iter().position(|t| t.max_width == max_width) {
-            let t = slot.remove(pos);
-            slot.push(std::rc::Rc::clone(&t));
-            return t;
-        }
-        let inv_measure = 1.0 / (max_width.max(1) as f64);
-        // Built on the stack and moved into the `Rc` once: the old
-        // `Rc::from(Box::new(..))` allocated the heap box and then a
-        // second `Rc` cell, copying the ~4.6 KB table between them.
-        let mut t = WrapTables {
-            max_width,
-            class: [0; MAX_TABLE_WIDTH + 1],
-            badness: [0.0; MAX_TABLE_WIDTH + 1],
-        };
-        for lw in 0..=max_width {
-            t.class[lw] = fitness_class(lw, max_width);
-            t.badness[lw] = intrinsic_badness(lw, max_width, inv_measure, false);
-        }
-        let rc = std::rc::Rc::new(t);
-        if slot.len() >= 8 {
-            slot.remove(0);
-        }
-        slot.push(std::rc::Rc::clone(&rc));
-        rc
-    }))
+    if wrap_shared() {
+        let mut slot = SHARED_TABLES
+            .get_or_init(|| std::sync::RwLock::new(SmallVec::new()))
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(table_from_slot(&mut slot, max_width))
+    } else {
+        Some(WRAP_TABLES.with(|cell| {
+            table_from_slot(&mut cell.borrow_mut(), max_width)
+        }))
+    }
 }
 
 /// Scratch buffers shared by every `wrap_dp` call of one `wrap_optimal`:

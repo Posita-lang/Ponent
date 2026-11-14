@@ -41,16 +41,51 @@ type FileUrlMap = Arc<
     >,
 >;
 
+/// One cached per-line sparse table plus its last-access timestamp.
+///
+/// The timestamp lives behind an atomic so a cache *hit* can refresh LRU
+/// recency while holding only the map's read lock.  Eviction (which needs a
+/// write lock) scans for the smallest timestamp; this happens only when the
+/// soft cap is reached, so the hot path stays a single atomic load/store.
+#[derive(Debug)]
+pub(crate) struct CharPrefixEntry {
+    pub table: Option<(Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>,
+    last_used: std::sync::atomic::AtomicU64,
+}
+
+impl CharPrefixEntry {
+    pub(crate) fn new(
+        table: Option<(Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>,
+    ) -> Self {
+        Self {
+            table,
+            last_used: std::sync::atomic::AtomicU64::new(next_char_prefix_tick()),
+        }
+    }
+
+    pub(crate) fn touch(&self) {
+        self.last_used
+            .store(next_char_prefix_tick(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn last_used(&self) -> u64 {
+        self.last_used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+static CHAR_PREFIX_TICK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_char_prefix_tick() -> u64 {
+    CHAR_PREFIX_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Shared sparse non-ASCII char-extra cache (see
 /// [`LineIndex::char_prefixes_arc`]): per-line tables behind an atomic hint,
 /// so a racy store can only cost a re-anchor, never a wrong answer.
 /// `Send + Sync`, so the parallel path shares one map across workers.
-pub(crate) type CharPrefixMap = std::sync::RwLock<
-    FxHashMap<
-        usize,
-        Option<(Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>,
-    >,
->;
+pub(crate) type CharPrefixMap =
+    std::sync::RwLock<FxHashMap<usize, CharPrefixEntry>>;
 
 /// One cached line index, keyed by source identity `(ptr, len)`.
 struct CachedSourceIndex {

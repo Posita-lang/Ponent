@@ -67,6 +67,15 @@ impl FixHints {
     }
 }
 
+/// Static objective for overlap resolution.
+fn applicability_weight(app: Applicability) -> u64 {
+    match app {
+        Applicability::MachineApplicable => 4,
+        Applicability::MaybeIncorrect => 2,
+        Applicability::HasPlaceholders | Applicability::Unspecified => 1,
+    }
+}
+
 /// A single edit collected from a diagnostic's suggestions.
 ///
 /// `replacement` keeps the suggestion's own `Cow`: a compiler-authored fix
@@ -83,10 +92,9 @@ pub struct FixEdit<'src> {
 
 /// Non-overlapping edits for one source buffer.
 ///
-/// Sorted by `(file, start, end)`.  Overlapping candidates are discarded
-/// after the first (lowest-offset wins) so applying the set produces a
-/// consistent result — a conservative union would double-write overlapping
-/// regions.  This matches rustc's behaviour on conflicting suggestions.
+/// Sorted by `(file, start, end)`.  Overlapping candidates are resolved by
+/// maximum total applicability weight (weighted interval scheduling), with a
+/// deterministic lower-offset tie-break.
 #[derive(Debug, Default, Clone)]
 pub struct FixSet<'src> {
     edits: Vec<FixEdit<'src>>,
@@ -108,11 +116,9 @@ impl<'src> FixSet<'src> {
     /// output never mentioned.  (A future `--fix-hidden` flag could opt in
     /// by widening this filter.)
     ///
-    /// **Conflict resolution is by position, never by applicability.**  When
-    /// two edits overlap, the one that sorts first wins (a wide
-    /// `MaybeIncorrect` edit can therefore shadow a narrower
-    /// `MachineApplicable` one) — matching rustc; *not* "the safest edit
-    /// wins".
+    /// **Conflict resolution maximises applicability weight.**  A set of
+    /// pairwise-disjoint edits is chosen by weighted interval scheduling;
+    /// equal-weight ties retain the lower-offset edit.
     pub fn collect(diags: &[Diagnostic<'src>], hints: FixHints) -> Self {
         let mut candidates: Vec<FixEdit<'src>> = Vec::new();
         for diag in diags {
@@ -151,43 +157,111 @@ impl<'src> FixSet<'src> {
                 (e.span.file, e.span.start_as_usize(), e.span.end_as_usize())
             });
         }
-        // Drop overlapping candidates: first-wins.  Zero-length edits count
-        // as overlapping too: two insertions at one point (or an insertion at
-        // the edge of a replacement) would both run and compose into an
-        // order-dependent result, so the later one is dropped.  Edits that
-        // merely *touch* at a boundary (a replacement ending where a
-        // non-zero-length edit starts) are disjoint and both kept.
-        //
-        // Compact in place with a write cursor instead of allocating a second
-        // `Vec`: `FixEdit` carries a `Cow`, so a move is cheap, and a batch
-        // with many overlapping suggestions would otherwise pay a full second
-        // allocation + copy.
-        let mut last: Option<(FileId, usize, usize)> = None;
-        let mut write = 0usize;
-        for read in 0..candidates.len() {
-            let (file, start, end) = {
-                let edit = &candidates[read];
-                (
-                    edit.span.file,
-                    edit.span.start_as_usize(),
-                    edit.span.end_as_usize(),
-                )
-            };
-            if let Some((prev_file, prev_start, prev_end)) = last
-                && prev_file == file
-                && (start < prev_end
-                    || (start == prev_end && (start == end || prev_start == prev_end)))
-            {
-                continue;
-            }
-            last = Some((file, start, end));
-            if write != read {
-                candidates.swap(write, read);
-            }
-            write += 1;
+        // Drop overlapping candidates by maximum total applicability weight.
+        FixSet {
+            edits: Self::resolve_overlaps(candidates),
         }
-        candidates.truncate(write);
-        FixSet { edits: candidates }
+    }
+
+    /// Maximum-weight independent set on the per-file interval graph.
+    ///
+    /// Intervals are half-open `[start, end)`.  Zero-length edits are points:
+    /// duplicate insertions at one point collapse to the highest-weight one,
+    /// but an insertion at a replacement's boundary is disjoint and survives.
+    fn resolve_overlaps(candidates: Vec<FixEdit<'src>>) -> Vec<FixEdit<'src>> {
+        // Candidates arrive sorted by `(file, start, end)`, so duplicate
+        // zero-length runs are adjacent.
+        let mut deduped = Vec::with_capacity(candidates.len());
+        let mut i = 0;
+        while i < candidates.len() {
+            let edit = &candidates[i];
+            let file = edit.span.file;
+            let start = edit.span.start_as_usize();
+            let end = edit.span.end_as_usize();
+            if start == end {
+                let mut best = i;
+                let mut j = i + 1;
+                while j < candidates.len() {
+                    let other = &candidates[j];
+                    if other.span.file != file
+                        || other.span.start_as_usize() != start
+                        || other.span.end_as_usize() != start
+                    {
+                        break;
+                    }
+                    if applicability_weight(other.applicability)
+                        > applicability_weight(candidates[best].applicability)
+                    {
+                        best = j;
+                    }
+                    j += 1;
+                }
+                deduped.push(candidates[best].clone());
+                i = j;
+            } else {
+                deduped.push(edit.clone());
+                i += 1;
+            }
+        }
+
+        let mut result = Vec::with_capacity(deduped.len());
+        let mut file_start = 0;
+        while file_start < deduped.len() {
+            let file = deduped[file_start].span.file;
+            let mut file_end = file_start + 1;
+            while file_end < deduped.len() && deduped[file_end].span.file == file {
+                file_end += 1;
+            }
+            Self::resolve_file(&deduped[file_start..file_end], &mut result);
+            file_start = file_end;
+        }
+        result.sort_by_key(|e| {
+            (e.span.file, e.span.start_as_usize(), e.span.end_as_usize())
+        });
+        result
+    }
+
+    fn resolve_file(edits: &[FixEdit<'src>], out: &mut Vec<FixEdit<'src>>) {
+        let mut group = edits.to_vec();
+        group.sort_by_key(|e| (e.span.end_as_usize(), e.span.start_as_usize()));
+        let n = group.len();
+        if n == 0 {
+            return;
+        }
+        // p[i] = number of earlier edits compatible with i.
+        let mut p = vec![0usize; n];
+        for (i, edit) in group.iter().enumerate() {
+            p[i] = group[..i]
+                .partition_point(|earlier| earlier.span.end_as_usize() <= edit.span.start_as_usize());
+        }
+        // W[i] = best weight over the first i edits.  On equal weight we
+        // exclude the current edit; because `group` is end-sorted, this
+        // preserves the old "lowest offset wins" tie-break.
+        let mut w = vec![0u64; n + 1];
+        let mut take = vec![false; n + 1];
+        for i in 1..=n {
+            let weight = applicability_weight(group[i - 1].applicability);
+            let include = weight + w[p[i - 1]];
+            let exclude = w[i - 1];
+            if include > exclude {
+                w[i] = include;
+                take[i] = true;
+            } else {
+                w[i] = exclude;
+            }
+        }
+        let mut selected = Vec::new();
+        let mut i = n;
+        while i > 0 {
+            if take[i] {
+                selected.push(group[i - 1].clone());
+                i = p[i - 1];
+            } else {
+                i -= 1;
+            }
+        }
+        selected.reverse();
+        out.extend(selected);
     }
 
     /// Whether there is nothing to apply.
@@ -435,6 +509,29 @@ mod tests {
     }
 
     #[test]
+    fn weighted_resolution_prefers_two_machine_edits_over_one_wide_maybe() {
+        let src = "abcdef";
+        let a = diag_with_fix(
+            Span::new(FileId::DUMMY, 0, 2),
+            "XX",
+            Applicability::MachineApplicable,
+        );
+        let b = diag_with_fix(
+            Span::new(FileId::DUMMY, 3, 5),
+            "YY",
+            Applicability::MachineApplicable,
+        );
+        let wide = diag_with_fix(
+            Span::new(FileId::DUMMY, 0, 5),
+            "ZZ",
+            Applicability::MaybeIncorrect,
+        );
+        let set = FixSet::collect(&[wide, a, b], FixHints::Review);
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.apply(src), "XXcYYf");
+    }
+
+    #[test]
     fn malformed_span_is_rejected_at_collect() {
         let src = "abcdef";
         // Simulate a producer that got the ends backwards (Span::new would
@@ -479,8 +576,8 @@ mod tests {
         assert_eq!(set.len(), 1);
         assert_eq!(set.apply(src), "abc1def");
 
-        // An insertion at the start edge of a replacement with the same
-        // start sorts first (end 0 < 3) and wins; the replacement is dropped.
+        // A zero-length insertion at a replacement boundary is a disjoint
+        // half-open interval; both edits survive and compose in offset order.
         let ins = diag_with_fix(
             Span::new(FileId::DUMMY, 0, 0),
             "!",
@@ -492,12 +589,9 @@ mod tests {
             Applicability::MachineApplicable,
         );
         let set = FixSet::collect(&[repl, ins], FixHints::Auto);
-        assert_eq!(set.len(), 1);
-        assert_eq!(set.apply(src), "!abcdef");
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.apply(src), "!XXXdef");
 
-        // A zero-length edit at the *end* boundary of a previous replacement
-        // is a conflict (inside-vs-outside is ambiguous), but a non-zero
-        // edit starting exactly at the previous end is disjoint and kept.
         let repl = diag_with_fix(
             Span::new(FileId::DUMMY, 0, 3),
             "XXX",
@@ -509,8 +603,8 @@ mod tests {
             Applicability::MachineApplicable,
         );
         let set = FixSet::collect(&[repl, ins_at_end], FixHints::Auto);
-        assert_eq!(set.len(), 1);
-        assert_eq!(set.apply(src), "XXXdef");
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.apply(src), "XXX!def");
 
         let repl = diag_with_fix(
             Span::new(FileId::DUMMY, 0, 3),

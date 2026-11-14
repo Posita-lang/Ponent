@@ -1645,28 +1645,20 @@ impl<'src> Diagnostic<'src> {
         // Keep `kind` alive across the derive, and put it back even if
         // `humanize_into` panics: a retried render must not see `kind = None`
         // and emit an empty message.
+        // `kind` is retained: derive from a cheap `Arc` clone.  The
+        // `Humanizer` methods clone only the fields that become the output
+        // (`Cow::Borrowed` stays a pointer copy); the consuming
+        // `humanize_into` path had to clone the entire kind first, including
+        // large non-shared payloads such as `Comptime.traceback`.
         let kind_for_call = std::sync::Arc::clone(&kind_arc);
         let restore = RestoreKindOnDrop {
             slot: &mut self.kind,
             restore: Some(kind_arc),
         };
-        // `kind` is retained: humanize a *clone* so `kind()` keeps serving
-        // the structured data and a later `Lang::set` can re-derive the
-        // rendered fields.  `humanize_into` still consumes its argument, so
-        // the shared fields move into one output within that pass — exactly
-        // one deep clone of the kind per humanize.
-        //
-        // A borrowing `humanize_into_ref(&self)` cannot replace this: the
-        // returned `DiagMessage<'src>` / `Label<'src>` must borrow for the
-        // kind's own `'src`, but a `&self` borrow only proves the shorter
-        // lifetime of the `&self`, and the values are stored back into `self`
-        // (an immutable borrow of `self.kind` cannot overlap the assignments
-        // to `self.message`/`self.labels`).  Keeping the clone is therefore
-        // structural, not laziness — and for `Cow::Borrowed` fields (the
-        // overwhelmingly common kind) a clone is a handful of pointer copies.
-        // Only kinds with large *owned* side fields (`Comptime.traceback`, a
-        // long `reason`) pay a deep copy, once per language switch.
-        let (message, labels, help, suggestions) = (*kind_for_call).clone().humanize_into();
+        let message = kind_for_call.message();
+        let labels = kind_for_call.labels();
+        let help = kind_for_call.help();
+        let suggestions = kind_for_call.suggestions();
         self.kind = Some(restore.disarm());
         // Static messages move straight into `message`: a borrowed static
         // stays borrowed (zero allocation), an owned one is moved — only
@@ -3465,17 +3457,17 @@ thread_local! {
 }
 
 fn cap_char_prefixes(
-    cache: &mut FxHashMap<
-        usize,
-        Option<(std::sync::Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>,
-    >,
+    cache: &mut FxHashMap<usize, crate::diagnostics::render::CharPrefixEntry>,
 ) {
     if cache.len() >= CHAR_PREFIXES_CAP
-        && let Some(key) = cache.keys().next().copied()
+        && let Some(key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used())
+            .map(|(key, _)| *key)
     {
-        // Evict one line instead of clearing every worker's sparse column
-        // table.  A full clear forces an O(line_len) rebuild storm; one
-        // per-line entry is cheap to recompute and the map stays bounded.
+        // Exact least-recently-used eviction.  This scan runs only when the
+        // soft cap is reached; the hit path refreshes recency with one atomic
+        // store and never takes the write lock.
         cache.remove(&key);
     }
 }
@@ -3661,7 +3653,8 @@ impl<'a> LineIndex<'a> {
         {
             let cache = self.char_prefixes.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(entry) = cache.get(&line_idx) {
-                let answer = match entry {
+                entry.touch();
+                let answer = match entry.table.as_ref() {
                     Some((table, hint)) => {
                         let a = char_col_from_sparse_hinted(table, hint, b);
                         LAST_CHAR_COL.with(|cell| {
@@ -3741,7 +3734,10 @@ impl<'a> LineIndex<'a> {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             cap_char_prefixes(&mut cache);
-            cache.insert(line_idx, None);
+            cache.insert(
+                line_idx,
+                crate::diagnostics::render::CharPrefixEntry::new(None),
+            );
             drop(cache);
             LAST_CHAR_COL.with(|cell| {
                 *cell.borrow_mut() =
@@ -3761,7 +3757,13 @@ impl<'a> LineIndex<'a> {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cap_char_prefixes(&mut cache);
-        cache.insert(line_idx, Some((std::sync::Arc::clone(&table), hint)));
+        cache.insert(
+            line_idx,
+            crate::diagnostics::render::CharPrefixEntry::new(Some((
+                std::sync::Arc::clone(&table),
+                hint,
+            ))),
+        );
         drop(cache);
         LAST_CHAR_COL.with(|cell| {
             *cell.borrow_mut() = Some((
@@ -4526,6 +4528,28 @@ mod tests {
         assert_eq!(idx.line(0), "中文");
         let pos = idx.to_linecol("中文".len());
         assert_eq!((pos.line, pos.col), (0, "中文".len()));
+    }
+
+    #[test]
+    fn char_prefix_lru_evicts_least_recently_used() {
+        let mut cache: FxHashMap<
+            usize,
+            crate::diagnostics::render::CharPrefixEntry,
+        > = FxHashMap::default();
+        for i in 0..CHAR_PREFIXES_CAP {
+            cache.insert(
+                i,
+                crate::diagnostics::render::CharPrefixEntry::new(None),
+            );
+        }
+        cache
+            .get(&1)
+            .expect("entry 1 present")
+            .touch();
+        cap_char_prefixes(&mut cache);
+        assert!(!cache.contains_key(&0), "oldest entry must be evicted");
+        assert!(cache.contains_key(&1), "touched entry must survive");
+        assert_eq!(cache.len(), CHAR_PREFIXES_CAP - 1);
     }
 
     /// `linecol_display` returns *character* columns on non-ASCII sources,

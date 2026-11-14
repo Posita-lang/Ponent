@@ -950,6 +950,8 @@ mod humanizer_differential_tests {
     /// a corpus covering every variant and the main option combinations.
     #[test]
     fn humanizer_and_humanize_into_agree() {
+        let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
         for (i, k) in corpus().into_iter().enumerate() {
             let lazy_msg = render(k.message());
             let lazy_labels: Vec<_> = k.labels().iter().map(label_key).collect();

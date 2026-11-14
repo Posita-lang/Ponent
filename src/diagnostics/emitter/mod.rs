@@ -670,6 +670,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             .collect();
         items.sort_by_key(|(i, _)| (bin_of[*i], *i));
 
+        let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(bin_lens.len());
             let mut rest_items: &mut [(usize, &mut Diagnostic<'_>)] = &mut items;
@@ -691,32 +692,57 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                         shared_urls,
                         &prebuilt[..prebuilt.len().min(PRELOAD_SLOTS)],
                     );
-                    // LPT bins are out of order, so return (original index,
-                    // rendered piece) and let the stitch sort.  An empty
-                    // render is dropped here (it contributes no separator).
-                    let mut pieces: Vec<(usize, String)> = Vec::with_capacity(chunk.len());
-                    for (orig, diag) in chunk.iter_mut() {
-                        let orig = *orig;
-                        // One malformed diagnostic must not abort the whole
-                        // batch: contain the panic and emit a placeholder for
-                        // that slot, keeping every other worker's output.
-                        let rendered = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| {
+                    // One malformed diagnostic must not abort the whole batch.  Catch
+                    // at the chunk granularity first (one unwind frame per
+                    // chunk instead of per diagnostic); on a panic, redo the
+                    // chunk per-diagnostic so the placeholder lands only in
+                    // the failing slot and the other renders are preserved.
+                    let chunk_result = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            let mut pieces: Vec<(usize, String)> =
+                                Vec::with_capacity(chunk.len());
+                            for (orig, diag) in chunk.iter_mut() {
+                                let orig = *orig;
                                 diag.humanize();
                                 let mut buf = String::new();
                                 renderer.render_into(*diag, &cx, &mut buf);
-                                buf
-                            }),
-                        );
-                        match rendered {
-                            Ok(buf) if !buf.is_empty() => pieces.push((orig, buf)),
-                            Ok(_) => {}
-                            Err(_) => pieces.push((
-                                orig,
-                                "<ponent: diagnostic rendering panicked>\n".to_string(),
-                            )),
+                                if !buf.is_empty() {
+                                    pieces.push((orig, buf));
+                                }
+                            }
+                            pieces
+                        }),
+                    );
+                    let pieces = match chunk_result {
+                        Ok(pieces) => pieces,
+                        Err(_) => {
+                            let mut pieces: Vec<(usize, String)> =
+                                Vec::with_capacity(chunk.len());
+                            for (orig, diag) in chunk.iter_mut() {
+                                let orig = *orig;
+                                let rendered = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| {
+                                        diag.humanize();
+                                        let mut buf = String::new();
+                                        renderer.render_into(*diag, &cx, &mut buf);
+                                        buf
+                                    }),
+                                );
+                                match rendered {
+                                    Ok(buf) if !buf.is_empty() => {
+                                        pieces.push((orig, buf));
+                                    }
+                                    Ok(_) => {}
+                                    Err(_) => pieces.push((
+                                        orig,
+                                        "<ponent: diagnostic rendering panicked>\n"
+                                            .to_string(),
+                                    )),
+                                }
+                            }
+                            pieces
                         }
-                    }
+                    };
                     pieces
                 }));
             }

@@ -1269,14 +1269,30 @@ impl ShardLog {
     /// whole write path — no shard write lock.
     #[inline]
     fn push(&self, op: EdgeOp) {
+        self.push_batch(std::iter::once(op));
+    }
+
+    /// Append a batch of ops with ONE mutex acquisition.  Order within the
+    /// batch is preserved; the mirror/threshold are updated once after the
+    /// whole group, so a wide query no longer pays one lock + two atomics per
+    /// dependency.
+    fn push_batch<I>(&self, ops: I)
+    where
+        I: IntoIterator<Item = EdgeOp>,
+    {
         let _tw_rev_log =
-            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.push");
+            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.push_batch");
         let mut log = self.log.lock();
-        log.push(op);
+        let before = log.ops.len();
+        for op in ops {
+            log.push(op);
+        }
         let len = log.ops.len();
-        self.ops_len.store(len, Ordering::Release);
-        if len >= SHARD_LOG_COMPACT_THRESHOLD {
-            self.compact_needed.store(true, Ordering::Release);
+        if len != before {
+            self.ops_len.store(len, Ordering::Release);
+            if len >= SHARD_LOG_COMPACT_THRESHOLD {
+                self.compact_needed.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -1476,7 +1492,10 @@ fn reconcile_forward_edges(
     list: &mut SmallVec<[DepNodeIndex; 4]>,
     reads: &[DepNodeIndex],
     reads_index: &ReadsIndex,
-) -> SmallVec<[DepNodeIndex; 4]> {
+) -> (
+    SmallVec<[DepNodeIndex; 4]>,
+    SmallVec<[DepNodeIndex; 8]>,
+) {
     // NO dedup pass: `reads` arrives ALREADY deduplicated, in first-read
     // order — `TaskDeps::read` guarantees it (linear `contains` up to
     // `LINEAR_DEDUP_MAX`, a `HashSet` past it).  The first version of this
@@ -1493,7 +1512,7 @@ fn reconcile_forward_edges(
     // clear-and-extend write).  One memcmp instead of the O(|list| × k)
     // containment scan below.
     if list.as_slice() == reads {
-        return SmallVec::new();
+        return (SmallVec::new(), SmallVec::new());
     }
     // Stale edges: entries of the previous list the current read set no
     // longer contains.  The membership test probes the read set's OWN
@@ -1509,6 +1528,20 @@ fn reconcile_forward_edges(
             removed.push(old);
         }
     }
+    // Additions are only needed when the set actually changed.  The linear
+    // membership scan runs on the changed path, not on every recompute; the
+    // unchanged-set case is already covered by the memcmp fast path above,
+    // and equal-length/no-removal means the two sets are identical.
+    let added: SmallVec<[DepNodeIndex; 8]> =
+        if removed.is_empty() && list.len() == reads.len() {
+            SmallVec::new()
+        } else {
+            reads
+                .iter()
+                .copied()
+                .filter(|read| !list.contains(read))
+                .collect()
+        };
     // Reuse the old list's allocation instead of replacing it: when the
     // read set is larger than the four inline slots the SmallVec is on
     // the heap, and copying into its existing capacity allocates
@@ -1516,7 +1549,7 @@ fn reconcile_forward_edges(
     // site, never `list` itself, so clearing first cannot lose input.
     list.clear();
     list.extend_from_slice(reads);
-    removed
+    (removed, added)
 }
 
 /// Grow a shard's five slot vectors so `slot` is a valid index in all of
@@ -3784,7 +3817,7 @@ impl<S: Scheduler> DepGraph<S> {
 
         // This node's shard: forward edges, RECONCILED to the current
         // read set (stale edges removed — see `reconcile_forward_edges`).
-        let removed = {
+        let (removed, mut added) = {
             let tslot = slot_of(task_node);
             let (r, _t) = self.with_shard_w(shard_of(task_node), self.ticket(), |shard| {
                 ensure_shard_len(shard, tslot);
@@ -3793,9 +3826,11 @@ impl<S: Scheduler> DepGraph<S> {
             r
         };
 
-        // The reads' shards: reverse edges, one lock per shard.
+        // The reads' shards: reverse edges only for dependencies this
+        // recomputation actually added, one lock per shard.
         sort_reads_by_shard(&mut reads, None);
-        self.flush_rev_edges(task_node, &mut reads);
+        sort_reads_by_shard(&mut added, None);
+        self.flush_rev_edges(task_node, &mut added);
         // Drop the reverse edges of reads we no longer depend on.
         self.prune_rev_edges(task_node, removed);
     }
@@ -3824,9 +3859,7 @@ impl<S: Scheduler> DepGraph<S> {
             }
             let group = &removed[start..i];
             let log = &self.rev_logs[s];
-            for &r in group {
-                log.push(EdgeOp::Tombstone(r, task_node));
-            }
+            log.push_batch(group.iter().map(|&r| EdgeOp::Tombstone(r, task_node)));
         }
     }
 
@@ -3863,9 +3896,7 @@ impl<S: Scheduler> DepGraph<S> {
             }
             let group = &reads[start..i];
             let log = &self.rev_logs[s];
-            for &r in group {
-                log.push(EdgeOp::Insert(r, task_node));
-            }
+            log.push_batch(group.iter().map(|&r| EdgeOp::Insert(r, task_node)));
         }
     }
 
@@ -4103,7 +4134,11 @@ impl<S: Scheduler> DepGraph<S> {
         // re-checks after its flush, hence after the bump, and restores
         // itself.  This also skips the collect entirely for unchanged
         // republishes.
-        let (changed_in_section, removed): (bool, SmallVec<[DepNodeIndex; 4]>) = {
+        let (changed_in_section, removed, mut added): (
+            bool,
+            SmallVec<[DepNodeIndex; 4]>,
+            SmallVec<[DepNodeIndex; 8]>,
+        ) = {
             let (out, _t) = self.with_shard_w(shard_of(node), self.ticket(), |shard| {
                 let slot = slot_of(node);
                 ensure_shard_len(shard, slot);
@@ -4114,12 +4149,12 @@ impl<S: Scheduler> DepGraph<S> {
                 // edges are pruned AFTER this critical section releases
                 // (the removed deps may live in OTHER shards — never two
                 // shard locks at once).
-                let removed = if let Some(tn) = task_node {
+                let (removed, added) = if let Some(tn) = task_node {
                     let tslot = slot_of(tn);
                     ensure_shard_len(shard, tslot);
                     reconcile_forward_edges(&mut shard.edges[tslot], &reads, &reads_index)
                 } else {
-                    SmallVec::new()
+                    (SmallVec::new(), SmallVec::new())
                 };
 
                 // ---- publish part ----
@@ -4307,7 +4342,7 @@ impl<S: Scheduler> DepGraph<S> {
                     // is driven by `read_epochs`, not by `changed`.
                     false
                 };
-                (changed, removed)
+                (changed, removed, added)
             });
             out
         };
@@ -4347,10 +4382,9 @@ impl<S: Scheduler> DepGraph<S> {
             // FinishWindow`'s doc in scheduler.rs — §0 mandate.)
             self.sched
                 .suspend(SchedulePoint::FinishWindow { node: tn.0 });
-            // `reads`/`read_epochs` were already sorted together before
-            // the aggregation/write section, so the flush needs no second
-            // permutation.
-            self.flush_rev_edges(tn, &mut reads);
+            // `added` is in the same shard-sorted order as `reads`; only genuinely
+            // new dependencies need a reverse-edge insert.
+            self.flush_rev_edges(tn, &mut added);
             // Drop the reverse edges of reads this recomputation no
             // longer has (see `reconcile_forward_edges` / g3).
             self.prune_rev_edges(tn, removed);
@@ -6583,7 +6617,7 @@ mod tests {
             [5u32, 7, 9].into_iter().map(DepNodeIndex).collect();
         let reads = [7u32, 5, 11].map(DepNodeIndex);
         let index = super::ReadsIndex::build(&reads);
-        let removed = super::reconcile_forward_edges(&mut list, &reads, &index);
+        let (removed, added) = super::reconcile_forward_edges(&mut list, &reads, &index);
         assert_eq!(
             list.to_vec(),
             reads.to_vec(),
@@ -6594,12 +6628,23 @@ mod tests {
             vec![DepNodeIndex(9)],
             "only the edge the read set no longer has is stale"
         );
+        assert_eq!(
+            added.to_vec(),
+            vec![DepNodeIndex(11)],
+            "only the genuinely new dependency is added"
+        );
         // Idempotent: reconciling the same read set again is a no-op.
-        let removed2 = super::reconcile_forward_edges(&mut list, &reads, &index);
+        let (removed2, added2) =
+            super::reconcile_forward_edges(&mut list, &reads, &index);
         assert_eq!(
             removed2.to_vec(),
             vec![],
-            "second reconciliation is a no-op"
+            "second reconciliation has no stale edge"
+        );
+        assert_eq!(
+            added2.to_vec(),
+            vec![],
+            "second reconciliation has no added edge"
         );
     }
 

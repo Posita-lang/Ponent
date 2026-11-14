@@ -205,6 +205,7 @@ pub struct CallChain<'src> {
 struct ChainFacts {
     any_spanned: bool,
     entry_count: usize,
+    message_bytes: usize,
 }
 
 /// Read-only per-chain invariants threaded through the recursive entry walk.
@@ -261,9 +262,10 @@ impl<'src> CallChain<'src> {
     /// One traversal for both facts: whether any reachable entry has a span (the
 /// hyperlink gate) and how many entries the renderer will emit (the reserve
 /// estimate).  Two identical DFS walks previously paid the tree twice.
-fn scan(&self) -> (bool, usize) {
+fn scan(&self) -> ChainFacts {
     let mut any_spanned = false;
     let mut total = 0usize;
+    let mut message_bytes = 0usize;
     let mut stack: SmallVec<[(&CallChain<'src>, usize); 8]> = SmallVec::new();
     stack.push((self, 0));
     while let Some((chain, depth)) = stack.pop() {
@@ -273,6 +275,7 @@ fn scan(&self) -> (bool, usize) {
         total += chain.entries.len();
         for entry in &chain.entries {
             any_spanned |= entry.span.is_some();
+            message_bytes += entry.message.len();
             if let Some(children) = &entry.children {
                 for child in children {
                     stack.push((child, depth + 1));
@@ -280,7 +283,11 @@ fn scan(&self) -> (bool, usize) {
             }
         }
     }
-    (any_spanned, total)
+    ChainFacts {
+        any_spanned,
+        entry_count: total,
+        message_bytes,
+    }
 }
 
 /// Flattened entry count (all depths), capped like the renderer.  Used to
@@ -289,7 +296,7 @@ fn scan(&self) -> (bool, usize) {
     /// `ChainFacts` directly.
     #[cfg(test)]
     fn flattened_entry_count(&self) -> usize {
-        self.scan().1
+        self.scan().entry_count
     }
 
     /// Render the call chain into a multi-line string.
@@ -331,7 +338,7 @@ fn scan(&self) -> (bool, usize) {
         // #3: one scan for both the reserve estimate and the hyperlink gate;
         // the renderer used to walk the tree twice per render.
         let facts = self.scan();
-        let mut out = String::with_capacity(64 + facts.1 * 64);
+        let mut out = String::with_capacity(64 + facts.message_bytes + facts.entry_count * 32);
         self.render_into_with_facts(
             use_color,
             source,
@@ -342,8 +349,9 @@ fn scan(&self) -> (bool, usize) {
             None,
             None,
             ChainFacts {
-                any_spanned: facts.0,
-                entry_count: facts.1,
+                any_spanned: facts.any_spanned,
+                entry_count: facts.entry_count,
+                message_bytes: facts.message_bytes,
             },
             &mut out,
         );
@@ -395,8 +403,9 @@ fn scan(&self) -> (bool, usize) {
             cx,
             anchor,
             ChainFacts {
-                any_spanned: facts.0,
-                entry_count: facts.1,
+                any_spanned: facts.any_spanned,
+                entry_count: facts.entry_count,
+                message_bytes: facts.message_bytes,
             },
             out,
         );

@@ -1945,10 +1945,17 @@ impl GlyphRenderer {
         gutter_tail.push_str(self.s.reset);
         gutter_tail.push(' ');
 
+        let primary_end_line = idx.to_linecol(primary_span.end_as_usize()).line;
         for line_idx in first_line..=last_line {
             // O(1) slice via the shared index instead of indexing a
             // whole-file `Vec<&str>` that was collected only for this.
             let line = idx.line(line_idx);
+            let context_only = (line_idx < start_pos.line || line_idx > primary_end_line)
+                && label_window.is_idle_for(line_idx)
+                && !suggestion_lines
+                    .iter()
+                    .flatten()
+                    .any(|&(a, b)| line_idx >= a && line_idx <= b);
             // One grapheme walk converts this row's byte ranges to display
             // columns, measures the line's width, and emits the highlighted
             // source text — replacing the three separate passes over the
@@ -1959,31 +1966,51 @@ impl GlyphRenderer {
             out.push_str(&gutter_head);
             push_uint_padded(out, (line_idx + 1) as u64, line_num_width);
             out.push_str(&gutter_tail);
-            let display_width = compute_line_underlines_and_render(
-                primary_span,
-                &all_labels,
-                &mut label_window,
-                source,
-                line,
-                line_idx,
-                starts,
-                &mut underlines_buf,
-                out,
-                highlight_on,
-                highlight_off,
-                ranges_buf,
-                &mut meta_buf,
-                display_buf,
-                order_buf,
-                done_buf,
-                active_buf,
-                self.tab_width,
-                // Gutter width: `│ <num> │ ` — the terminal column the
-                // source text starts at, so tab stops advance from the
-                // absolute cursor column.
-                BOX_VERT_WIDTH + line_num_width + 1 + BOX_VERT_WIDTH + 1,
-                true,
-            );
+            let display_width = if context_only {
+                render_line_merged_with(
+                    line,
+                    &[],
+                    &[],
+                    &mut underlines_buf,
+                    out,
+                    highlight_on,
+                    highlight_off,
+                    display_buf,
+                    order_buf,
+                    done_buf,
+                    active_buf,
+                    self.tab_width,
+                    BOX_VERT_WIDTH + line_num_width + 1 + BOX_VERT_WIDTH + 1,
+                    true,
+                    |out, s| out.push_str(s),
+                )
+            } else {
+                compute_line_underlines_and_render(
+                    primary_span,
+                    &all_labels,
+                    &mut label_window,
+                    source,
+                    line,
+                    line_idx,
+                    starts,
+                    &mut underlines_buf,
+                    out,
+                    highlight_on,
+                    highlight_off,
+                    ranges_buf,
+                    &mut meta_buf,
+                    display_buf,
+                    order_buf,
+                    done_buf,
+                    active_buf,
+                    self.tab_width,
+                    // Gutter width: `│ <num> │ ` — the terminal column the
+                    // source text starts at, so tab stops advance from the
+                    // absolute cursor column.
+                    BOX_VERT_WIDTH + line_num_width + 1 + BOX_VERT_WIDTH + 1,
+                    true,
+                )
+            };
             let underlines = &underlines_buf;
 
             // Line number + source
@@ -3231,6 +3258,18 @@ impl<'a> LabelWindow<'a> {
     /// Label indices covering the current row, in original order.
     pub(crate) fn active(&self) -> &[usize] {
         &self.scratch.active
+    }
+
+    /// True when no label is active and the next label starts after
+    /// `line_idx`; advancing the window would be a no-op.
+    pub(crate) fn is_idle_for(&self, line_idx: usize) -> bool {
+        if !self.scratch.active.is_empty() {
+            return false;
+        }
+        self.scratch
+            .order
+            .get(self.cursor)
+            .is_none_or(|&i| self.label_lines[i].0 > line_idx)
     }
 }
 
@@ -4918,8 +4957,12 @@ pub(crate) fn visible_width_with_tab(s: &str, tab_width: usize) -> usize {
         while let Some(esc) = memchr::memchr(0x1b, rest.as_bytes()) {
             // Plain-text prefix before the escape: measure grapheme by grapheme.
             let (text, tail) = rest.split_at(esc);
-            for g in text.graphemes(true) {
-                w += grapheme_width_cached(g, w, tab_width, &mut cache);
+            if crate::diagnostics::ascii::is_printable_ascii(text.as_bytes()) {
+                w += text.len();
+            } else {
+                for g in text.graphemes(true) {
+                    w += grapheme_width_cached(g, w, tab_width, &mut cache);
+                }
             }
             let skip = escape_len(tail.as_bytes());
             if skip == 1 {
@@ -4929,8 +4972,12 @@ pub(crate) fn visible_width_with_tab(s: &str, tab_width: usize) -> usize {
             }
             rest = &tail[skip..];
         }
-        for g in rest.graphemes(true) {
-            w += grapheme_width_cached(g, w, tab_width, &mut cache);
+        if crate::diagnostics::ascii::is_printable_ascii(rest.as_bytes()) {
+            w += rest.len();
+        } else {
+            for g in rest.graphemes(true) {
+                w += grapheme_width_cached(g, w, tab_width, &mut cache);
+            }
         }
     });
     w
@@ -5357,6 +5404,23 @@ const NONASCII: u8 = 6;
 
 const CLASS: [u8; 256] = build_class();
 
+/// `[A-Za-z0-9_]` continuation table for the IDENT scanner: one load per
+/// byte instead of `is_ascii_alphanumeric() || == b'_'`.
+const IDENT_CONT: [bool; 256] = build_ident_cont();
+
+const fn build_ident_cont() -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        table[b] = (b >= b'0' as usize && b <= b'9' as usize)
+            || (b >= b'A' as usize && b <= b'Z' as usize)
+            || (b >= b'a' as usize && b <= b'z' as usize)
+            || b == b'_' as usize;
+        b += 1;
+    }
+    table
+}
+
 /// Bitmap of the `PASS` class over `0..0x80`, built from [`CLASS`] so the
 /// two can never drift.  Bytes ≥ 0x80 are always `NONASCII`, never `PASS`,
 /// so a single `u128` covers the whole PASS set.
@@ -5633,7 +5697,7 @@ fn highlight_code_impl_into(
             IDENT => {
                 let start = i;
                 i += 1;
-                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                while i < len && IDENT_CONT[bytes[i] as usize] {
                     i += 1;
                 }
                 let word = &line[start..i];
@@ -6575,6 +6639,14 @@ mod tests {
             let table_pass = CLASS[b as usize] == PASS;
             let mask_pass = b < 0x80 && (PASS_MASK >> b) & 1 == 1;
             assert_eq!(table_pass, mask_pass, "byte {b:#04x}");
+        }
+    }
+
+    #[test]
+    fn ident_continuation_table_matches_predicate() {
+        for b in 0..=255u8 {
+            let expected = b.is_ascii_alphanumeric() || b == b'_';
+            assert_eq!(IDENT_CONT[b as usize], expected, "byte {b:#04x}");
         }
     }
 

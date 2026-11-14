@@ -30,6 +30,24 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-features --locked
 
+  cross-platform:
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - run: cargo check --workspace --locked
+      - run: >-
+          cargo test --bin ponent --locked --
+          --skip test_loop_vars_collected_from_assign_bodies
+
   msrv:
     name: MSRV (rust-version)
     runs-on: ubuntu-latest
