@@ -4244,6 +4244,9 @@ pub(crate) struct UnderlineLanes {
     lanes: Vec<SmallVec<[usize; 4]>>,
     /// Min-heap of `(end_col, lane)` driving the greedy sweep.
     active: BinaryHeap<Reverse<(usize, usize)>>,
+    /// Linear active set for rows with ≤4 underlines; a heap's sift cost
+    /// dominates at that size.
+    small_active: SmallVec<[(usize, usize); 4]>,
     /// Start-sorted index scratch.
     order: Vec<usize>,
     /// Lanes used by the last `assign`.
@@ -4255,6 +4258,7 @@ impl UnderlineLanes {
         Self {
             lanes: Vec::new(),
             active: BinaryHeap::new(),
+            small_active: SmallVec::new(),
             order: Vec::new(),
             count: 0,
         }
@@ -4274,10 +4278,12 @@ impl UnderlineLanes {
         let Self {
             lanes,
             active,
+            small_active,
             order,
             count,
         } = self;
         active.clear();
+        small_active.clear();
         for lane in lanes.iter_mut() {
             lane.clear();
         }
@@ -4317,6 +4323,7 @@ impl UnderlineLanes {
         }
 
         let mut n = 0usize;
+        let small = underlines.len() <= 4;
         // Collapse duplicate annotations to a single lane entry: a later
         // `(start, ulen, ch)` twin would only stack an identical underline
         // row.  `order` is sorted by `(start, end)`, and `(start, end)`
@@ -4357,24 +4364,47 @@ impl UnderlineLanes {
                 continue;
             }
             chars_seen |= bit;
-            let lane = match active.peek() {
-                // Earliest-ending lane already past `start` → reuse it.
-                Some(&Reverse((lane_end, lane_idx))) if lane_end <= start => {
-                    active.pop();
-                    lane_idx
+            let lane = if small {
+                let earliest = small_active
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, pair)| (pair.0, pair.1))
+                    .map(|(pos, pair)| (pos, pair.0, pair.1));
+                match earliest {
+                    Some((pos, end, lane)) if end <= start => {
+                        small_active.swap_remove(pos);
+                        lane
+                    }
+                    _ => {
+                        let idx = n;
+                        n += 1;
+                        idx
+                    }
                 }
-                // Every lane still covers `start` → open a new one.
-                _ => {
-                    let idx = n;
-                    n += 1;
-                    idx
+            } else {
+                match active.peek() {
+                    // Earliest-ending lane already past `start` → reuse it.
+                    Some(&Reverse((lane_end, lane_idx))) if lane_end <= start => {
+                        active.pop();
+                        lane_idx
+                    }
+                    // Every lane still covers `start` → open a new one.
+                    _ => {
+                        let idx = n;
+                        n += 1;
+                        idx
+                    }
                 }
             };
             if lane >= lanes.len() {
                 lanes.push(SmallVec::new());
             }
             lanes[lane].push(i);
-            active.push(Reverse((end, lane)));
+            if small {
+                small_active.push((end, lane));
+            } else {
+                active.push(Reverse((end, lane)));
+            }
         }
 
         // ── Why only relabel, not search all optimal colourings ─────

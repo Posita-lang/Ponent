@@ -794,24 +794,19 @@ fn run_explain(code: Option<String>, color: ColorChoice, serve: bool) {
                 let _ = open_browser(&url_bg);
             });
 
-            // Spin a one-line ASCII spinner on stderr while the server waits
-            // for the browser to connect.  The wait is bounded by
-            // `explain_server`'s `ACCEPT_BUDGET` (10 s) plus its short drain
-            // tails, so the spinner cannot run indefinitely even in a headless
-            // CI run where no browser ever connects.  Only when stderr is a
-            // real terminal: a pipe or log file must never receive
-            // cursor-movement control bytes.
-            let spinner = if std::io::stderr().is_terminal() {
-                Some(spawn_explain_spinner(&url, &explain_code))
-            } else {
-                None
-            };
+            eprintln!(
+                "Serving error explanations at {url} \
+                 (Ctrl+C to stop; exits after 10s idle)"
+            );
 
-            // Serve the explain page using the already-bound listener.
-            let served = diagnostics::explain_server::serve_explain(&listener, &explain_code);
-            if let Some((handle, stop)) = spinner {
-                stop_explain_spinner(handle, &stop);
-            }
+            // Bounded persistent server: every registered code (including the
+            // page's "See also" links) is served, then the process returns
+            // after an idle window instead of exiting as soon as E007 is
+            // written.
+            let served = diagnostics::explain_server::serve_explain_persistent_bounded(
+                &listener,
+                std::time::Duration::from_secs(10),
+            );
             served.unwrap_or_else(|e| {
                 eprintln!("warning: explain server error: {e}");
             });
