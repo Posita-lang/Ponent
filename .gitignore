@@ -1,7 +1,8 @@
 /target
 **/*.rs.bk
 Cargo.lock
-.cargo/
+.cargo/*
+!.cargo/config.toml
 *.tmp
 schedule*.txt
 src/.vscode/
