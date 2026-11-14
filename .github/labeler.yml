@@ -1,0 +1,9 @@
+# Labels are inferred only where the changed paths provide reliable evidence.
+# Do not infer issue type (bug/enhancement) from source paths: that requires triage.
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - "docs/**"
+          - ".github/ISSUE_TEMPLATE/**"
+          - ".github/PULL_REQUEST_TEMPLATE/**"

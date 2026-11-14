@@ -1,0 +1,30 @@
+name: Pull Request Labeler
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-labeler-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: Apply path-based labels
+    runs-on: ubuntu-latest
+    steps:
+      # This workflow deliberately does not check out or execute pull-request code.
+      # The action reads the trusted configuration from the base repository.
+      - name: Apply labels
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13
+        with:
+          sync-labels: true
+          dot: true
