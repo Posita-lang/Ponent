@@ -75,6 +75,23 @@ jobs:
               return;
             }
 
+            const contributionKind = isPullRequest ? "pull-request" : "issue";
+            const greetingMarker = `<!-- ponent-first-${contributionKind}-greeting:${currentNumber} -->`;
+            const existingComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: currentNumber,
+                per_page: 100,
+              },
+            );
+
+            if (existingComments.some((comment) => comment.body?.includes(greetingMarker))) {
+              core.info("Skipping greeting: the first-contribution greeting is already present.");
+              return;
+            }
+
             const message = isPullRequest
               ? [
                   "Thank you for opening your first pull request to Ponent!",
@@ -91,7 +108,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: currentNumber,
-              body: message,
+              body: `${greetingMarker}\n\n${message}`,
             });
 
             core.info(`Posted first-${isPullRequest ? "PR" : "issue"} greeting for ${author}.`);
