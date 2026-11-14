@@ -5,7 +5,8 @@ edition = "2024"
 # MSRV surface actually used by this tree, with the version each feature
 # stabilized — the FLOOR is the max of these, so adding one of these to a
 # file must be reflected here:
-#   - AVX-512 intrinsics                 1.89  ← the current floor
+#   - covariant-vec 0.1.2 dep           1.92  ← the current floor
+#   - AVX-512 intrinsics                 1.89
 #   - let-chains (`if let ... && ...`)  1.88
 #   - `Option::is_none_or`              1.82
 #   - inline `const` array init
@@ -16,7 +17,7 @@ edition = "2024"
 # instead of a confusing cascade of syntax errors.  Enforced by the `msrv`
 # job in .github/workflows/ci.yml.  Not probed on every release — it is
 # the floor the features demand, not a claim about the newest one.
-rust-version = "1.89"
+rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 
 # The root package is implicitly a member.  `tools/codegen` is the build

@@ -40,7 +40,7 @@ jobs:
       # NOT try to run the whole suite: `slow-tests` needs ~17 min and
       # `shuttle` needs a scheduler-aware build.  `cargo check` is enough
       # to prove the syntax/library floor.
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: dtolnay/rust-toolchain@1.92
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
