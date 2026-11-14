@@ -77,12 +77,12 @@ jobs:
                   "Thank you for opening your first pull request to Ponent!",
                   "",
                   "We appreciate the contribution. Please ensure the PR explains its motivation, relevant design decisions, and verification performed. For changes affecting correctness, ownership, concurrency, or safety guarantees, include the invariants considered and the evidence supporting the change.",
-                ].join("\\n")
+                ].join("\n")
               : [
                   "Thank you for opening your first issue in Ponent!",
                   "",
                   "We appreciate your interest. Please include the relevant context, expected behavior, actual behavior, and a minimal reproduction when applicable. For correctness or safety-sensitive reports, please also identify the affected invariant or guarantee if known.",
-                ].join("\\n");
+                ].join("\n");
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
