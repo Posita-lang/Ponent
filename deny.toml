@@ -25,9 +25,15 @@ feature-depth = 1
 # Advisory checks — vulnerability auditing
 # ─────────────────────────────────────────────────────────────────────────────
 [advisories]
+# Two unmaintained-crate advisories are dev-only transitive deps with no
+# upstream fix available (upstream explicitly says "No safe upgrade").
+# Default unused-ignored-advisory = "warn": when the upstream chain no
+# longer pulls them in, an unused-ignore warning prompts us to delete.
 ignore = [
-    #"RUSTSEC-0000-0000",
-    #{ id = "RUSTSEC-0000-0000", reason = "known false positive for our usage" },
+    # flowlog-runtime -> timely -> bincode
+    { id = "RUSTSEC-2025-0141", reason = "bincode permanently unmaintained; dev-only transitive dep (timely), no fix version upstream" },
+    # flowlog-runtime -> differential-dataflow -> columnation -> paste
+    { id = "RUSTSEC-2024-0436", reason = "paste archived; dev-only transitive dep (columnation/differential-dataflow), no fix version upstream" },
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -38,13 +44,15 @@ allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "Zlib",
-    "0BSD",
+    # xxhash-rust (direct dep, content fingerprints): Boost license, very permissive.
+    "BSL-1.0",
+    # as_variant (direct dep, SmallBox storage): file-level weak copyleft, OSI/FSF approved.
+    "MPL-2.0",
+    # webpki-roots (reqwest/rustls TLS chain): license of root CA cert data.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 exceptions = [
@@ -81,7 +89,18 @@ deny = [
     { crate = "openssl-src", reason = "prefer rustls for TLS — smaller, safer, no C dependency" },
 ]
 
-skip = []
+# Skip the stale transitive duplicate copies (keep the new/direct one);
+# these come from third-party version matrices we don't control.
+skip = [
+    # reqwest's old path pulls 0.22; direct dep is 0.23.
+    { name = "base64", version = "0.22" },
+    # small-map pulls 0.16; indexmap pulls 0.17.
+    { name = "hashbrown", version = "0.16" },
+    # legacy derive ecosystem still on syn 2; wait for upstream to migrate.
+    { name = "syn", version = "2.0" },
+    # ring pins 0.52.
+    { name = "windows-sys", version = "0.52" },
+]
 skip-tree = []
 
 # ─────────────────────────────────────────────────────────────────────────────

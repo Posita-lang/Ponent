@@ -147,7 +147,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # generated table (and `list_error_codes` output) stable.
 # default-features=false drops the site renderer (pulldown-cmark) from the
 # build-script dependency graph.
-ponent-codegen = { path = "tools/codegen", default-features = false }
+ponent-codegen = { path = "tools/codegen", version = "0.0.0", default-features = false }
 
 [profile.release]
 # Whole-program optimisation + a single codegen unit: better inlining
