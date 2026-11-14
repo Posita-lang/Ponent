@@ -49,6 +49,9 @@ struct FilesSeen {
     /// Previous key — the grouped-batch fast path skips the scan on a repeat.
     last: Option<FileKey>,
     seen: FilesSeenInner,
+    /// Display names of `FileKey::Id` entries, so a later span-less
+    /// diagnostic (`FileKey::Name`) for the same file does not double-count.
+    id_names: SmallVec<[(crate::ast::FileId, CompactString); INLINE_FILES]>,
 }
 
 /// Inline capacity of [`FilesSeenInner::Small`].  Used in both the array type
@@ -66,6 +69,7 @@ impl FilesSeen {
         FilesSeen {
             last: None,
             seen: FilesSeenInner::Small(SmallVec::new()),
+            id_names: SmallVec::new(),
         }
     }
 
@@ -75,13 +79,24 @@ impl FilesSeen {
         match (self.last.as_ref(), id) {
             (Some(FileKey::Id(prev)), Some(id)) if *prev == id => return,
             (Some(FileKey::Name(prev)), None) if prev.as_str() == name => return,
+            (Some(FileKey::Id(prev)), None)
+                if self
+                    .id_names
+                    .iter()
+                    .any(|(known_id, known_name)| known_id == prev && known_name == name) =>
+            {
+                return;
+            }
             _ => {}
         }
         let key = match id {
             Some(id) => FileKey::Id(id),
             None => FileKey::Name(CompactString::from(name)),
         };
-        if self.last.as_ref() == Some(&key) {
+        // A span-less diagnostic falls back to the display name; if a
+        // spanned diagnostic already registered that name, this is the same
+        // file for summary purposes.
+        if id.is_none() && self.name_seen(name) {
             return;
         }
         let (last, seen) = (&mut self.last, &mut self.seen);
@@ -101,7 +116,26 @@ impl FilesSeen {
                 s.insert(key.clone());
             }
         }
+        if let Some(id) = id
+            && !self.id_names.iter().any(|(known, _)| *known == id)
+        {
+            self.id_names.push((id, CompactString::from(name)));
+        }
         *last = Some(key);
+    }
+
+    fn name_seen(&self, name: &str) -> bool {
+        if self.id_names.iter().any(|(_, known)| known == name) {
+            return true;
+        }
+        match &self.seen {
+            FilesSeenInner::Small(v) => v
+                .iter()
+                .any(|key| matches!(key, FileKey::Name(known) if known == name)),
+            FilesSeenInner::Large(s) => s
+                .iter()
+                .any(|key| matches!(key, FileKey::Name(known) if known == name)),
+        }
     }
 
     fn len(&self) -> usize {
@@ -343,8 +377,11 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             if is_warning && !promoted {
                 warnings += 1;
             }
-            let weight =
-                1 + diag.labels.len() + diag.suggestions.len() + diag.spans.primary_ref().len();
+            let weight = 1
+                + diag.labels.len()
+                + diag.suggestions.len()
+                + diag.spans.primary_ref().len()
+                + usize::from(diag.kind().is_some()) * 4;
             total_weight += weight;
             weights.push(weight);
             filtered.push(diag);
@@ -493,7 +530,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let n = filtered.len();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
-        let mut bins: Vec<Vec<usize>> = (0..num_threads).map(|_| Vec::new()).collect();
+        let mut bins: Vec<SmallVec<[usize; 16]>> = (0..num_threads).map(|_| SmallVec::new()).collect();
         let mut heap = std::collections::BinaryHeap::new();
         for bin in 0..num_threads {
             heap.push(std::cmp::Reverse((0usize, bin)));
@@ -551,6 +588,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             bool,
             std::sync::Arc<CharPrefixMap>,
             u64,
+            u64,
         )> = {
             // The prebuild is *not* a batched render: a `RenderCtx` here would
             // grow its `source_index` LRU cache only for it to be dropped at
@@ -571,6 +609,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                             idx.ascii(),
                             std::sync::Arc::clone(idx.char_prefixes_arc()),
                             idx.generation(),
+                            crate::diagnostics::render::source_fingerprint(src),
                         ));
                     }
                 }
@@ -587,8 +626,15 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let shared_urls = std::sync::Arc::clone(&self.shared.file_urls);
         // A slice reference (Copy) so each `move` closure shares the prebuilt
         // tables instead of the first `spawn` moving the `Vec` itself.
-        let prebuilt: &[(usize, usize, std::sync::Arc<[u32]>, bool, std::sync::Arc<CharPrefixMap>, u64)] =
-            &prebuilt;
+        let prebuilt: &[(
+            usize,
+            usize,
+            std::sync::Arc<[u32]>,
+            bool,
+            std::sync::Arc<CharPrefixMap>,
+            u64,
+            u64,
+        )] = &prebuilt;
 
         // LPT bins are non-contiguous, so materialise each bin as a contiguous run
         // for `split_at_mut`, tagging every piece with its original index; the

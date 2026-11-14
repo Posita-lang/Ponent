@@ -5,13 +5,35 @@
 //! parsing, no grapheme segmentation. The renderers use these as fast-path
 //! gates; a `true` answer lets them skip the Unicode tables entirely.
 
+/// The control bytes a fast-path predicate admits.
+///
+/// The three public predicates differ only by this set; encoding it as a type
+/// keeps their scalar tails and their documentation in lockstep.
+#[derive(Clone, Copy)]
+enum AllowedControls {
+    None,
+    Tab,
+    TabAndNewline,
+}
+
+impl AllowedControls {
+    #[inline]
+    const fn allows(self, b: u8) -> bool {
+        match self {
+            Self::None => matches!(b, 0x20..=0x7E),
+            Self::Tab => b == b'\t' || matches!(b, 0x20..=0x7E),
+            Self::TabAndNewline => b == b'\t' || b == b'\n' || matches!(b, 0x20..=0x7E),
+        }
+    }
+}
+
 /// `true` when every byte is printable ASCII (`0x20..=0x7E`).
 ///
-/// SWAR over `u128` chunks: two masks per sixteen bytes instead of two
-/// compares per byte.  The lane proof is width-independent — the exact-mask
-/// forms have no inter-lane borrow, and the `hasless` form's top-lane
-/// borrow-out implies that lane already flagged — so the scalar tail is only
-/// the final ≤15 bytes.
+/// The widest available SIMD path handles full chunks; the `u128` SWAR body
+/// below is the fallback for short tails.  The SWAR lane proof is
+/// width-independent — the exact-mask forms have no inter-lane borrow, and the
+/// `hasless` form's top-lane borrow-out implies that lane already flagged — so
+/// the scalar tail is only the final bytes below the selected vector width.
 ///
 /// # Chunk independence
 ///
@@ -23,10 +45,23 @@
 #[inline]
 pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe { x86_64::is_printable_ascii_avx512(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
     if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: AVX2 support was just checked at runtime; the kernel only
         // reads full chunks and defers its tail back to this function.
         return unsafe { x86_64::is_printable_ascii(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 16 {
+        // SSE2 is baseline on x86_64; no runtime probe is needed.
+        return unsafe { x86_64::is_printable_ascii_sse2(s) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if s.len() >= 16 {
+        return unsafe { neon::is_printable_ascii(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
@@ -52,7 +87,7 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
         }
         i += 16;
     }
-    s[i..].iter().all(|&b| matches!(b, 0x20..=0x7E))
+    s[i..].iter().all(|&b| AllowedControls::None.allows(b))
 }
 
 /// `true` when every byte is printable ASCII **or** the two layout controls
@@ -60,10 +95,12 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 /// `sanitize_for_terminal_multiline` needs: it preserves tab and newline as
 /// layout intent, replaces every other control (CR, C1, DEL) with U+FFFD.
 ///
-/// SWAR with **exact** control masks: setting every byte's high bit before the
-/// subtraction (`x | HI`) makes each minuend byte ≥ 0x80, so no inter-lane
-/// borrow can occur and the word subtraction is exactly per-lane.  There are
-/// therefore no borrow false positives to resolve, and no per-lane loop:
+/// The SIMD kernels above implement this same [`AllowedControls`] set.  The
+/// SWAR body below is the fallback for the final short tail: it uses **exact**
+/// control masks, setting every byte's high bit before the subtraction
+/// (`x | HI`) so each minuend byte ≥ 0x80 and no inter-lane borrow can occur;
+/// the word subtraction is therefore exactly per-lane, with no borrow
+/// resolution loop.
 ///
 /// * `lt20 = !((x|HI) - SP) & HI` — high bit clear iff `b + 0x60 < 0x80` iff
 ///   `b < 0x20`, exactly.
@@ -78,9 +115,21 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 #[inline]
 pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe { x86_64::is_printable_ascii_multiline_avx512(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
     if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::is_printable_ascii_multiline(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 16 {
+        return unsafe { x86_64::is_printable_ascii_multiline_sse2(s) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if s.len() >= 16 {
+        return unsafe { neon::is_printable_ascii_multiline(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
@@ -115,7 +164,7 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     }
     s[i..]
         .iter()
-        .all(|&b| b == 0x09 || b == 0x0A || matches!(b, 0x20..=0x7E))
+        .all(|&b| AllowedControls::TabAndNewline.allows(b))
 }
 
 /// `true` when every byte is printable ASCII **or** the tab (`0x09`).
@@ -123,15 +172,26 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
 /// The gate for `render_line_merged_with`'s tab-aware byte-level fast path:
 /// source code is routinely tab-indented, and the pure-printable gate
 /// rejected tab (`0x09 < 0x20`), pushing every tab-indented row into the
-/// grapheme walk.  SWAR shape identical to
-/// [`is_printable_ascii_multiline`]'s exact-mask form: `tab` is an exact lane
-/// mask, so there is no borrow resolution loop to run.
+/// grapheme walk.  [`AllowedControls::Tab`] is the exact set; the SIMD kernels
+/// and the SWAR fallback both implement it.
 #[inline]
 pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe { x86_64::is_printable_ascii_or_tab_avx512(s) };
+    }
     #[cfg(target_arch = "x86_64")]
     if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::is_printable_ascii_or_tab(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 16 {
+        return unsafe { x86_64::is_printable_ascii_or_tab_sse2(s) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if s.len() >= 16 {
+        return unsafe { neon::is_printable_ascii_or_tab(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
@@ -162,13 +222,13 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
         }
         i += 16;
     }
-    s[i..].iter().all(|&b| b == b'\t' || matches!(b, 0x20..=0x7E))
+    s[i..].iter().all(|&b| AllowedControls::Tab.allows(b))
 }
 
 /// Tri-state classification of one row, so callers that need both the
 /// printable and printable-or-tab predicates (the glyph fast path tested them
 /// sequentially) pay one SWAR pass instead of two.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AsciiClass {
     /// Every byte is printable ASCII (`0x20..=0x7E`).
     Printable,
@@ -178,17 +238,30 @@ pub(crate) enum AsciiClass {
     Other,
 }
 
-/// Classify `s` in one `u64`-chunk pass with the exact control masks.
+/// Classify `s` in one pass at the widest available vector width, with the
+/// SWAR fallback for the tail.
 ///
-/// Exactness relies on rejecting high bytes first (as
+/// The SWAR fallback rejects high bytes first (as
 /// [`is_printable_ascii_multiline`] does): the `(x | HI) - SP` form is only
 /// exact when every lane is ≤ `0x7F`.
 #[inline]
 pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe { x86_64::classify_ascii_avx512(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
     if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::classify_ascii(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 16 {
+        return unsafe { x86_64::classify_ascii_sse2(s) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if s.len() >= 16 {
+        return unsafe { neon::classify_ascii(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
@@ -220,7 +293,7 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     for &b in &s[i..] {
         if b == b'\t' {
             saw_tab = true;
-        } else if !matches!(b, 0x20..=0x7E) {
+        } else if !AllowedControls::None.allows(b) {
             return AsciiClass::Other;
         }
     }
@@ -233,9 +306,10 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 
 /// Byte offset of the first byte ≥ 0x80 in `s`, or `None` if `s` is pure ASCII.
 ///
-/// SWAR over `u128` chunks: every non-ASCII UTF-8 byte (lead or continuation)
-/// has its high bit set, so one AND per 16-byte chunk decides whether the
-/// chunk holds a candidate; a `trailing_zeros` on the flagged lanes locates it.
+/// SIMD kernels scan the widest available chunk; the SWAR fallback uses
+/// `u128` chunks: every non-ASCII UTF-8 byte (lead or continuation) has its
+/// high bit set, so one AND per 16-byte chunk decides whether the chunk holds
+/// a candidate; a `trailing_zeros` on the flagged lanes locates it.
 /// Used by `char_col`'s sparse-table build to jump the ASCII runs of a mixed
 /// line without decoding every character — `O(chunk)` per non-ASCII char
 /// instead of `O(line_len)` char decodes.
@@ -246,9 +320,21 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 #[inline]
 pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe { x86_64::next_non_ascii_byte_avx512(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
     if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::next_non_ascii_byte(s) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 16 {
+        return unsafe { x86_64::next_non_ascii_byte_sse2(s) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if s.len() >= 16 {
+        return unsafe { neon::next_non_ascii_byte(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
 
@@ -265,21 +351,17 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
     s[i..].iter().position(|&b| b >= 0x80).map(|off| i + off)
 }
 
-/// Runtime-dispatched AVX2 kernels.
+/// Runtime-dispatched SIMD kernels.
 ///
-/// The public predicates below keep their branch-light SWAR body as the
-/// fallback; when the CPU reports AVX2 they hand full 32-byte chunks to these
-/// kernels (one `movemask` decides 32 lanes at once instead of two `u128`
-/// masks).  SSE2 is baseline on `x86_64`, but AVX2 is not, hence the runtime
-/// check at every entry.  Non-x86 targets stay on SWAR, which LLVM already
-/// auto-vectorizes on aarch64.
+/// `x86_64` uses AVX-512BW for 64-byte chunks, AVX2 for 32-byte chunks, and
+/// SSE2 for 16-byte chunks; `aarch64` uses NEON for 16-byte chunks.  The
+/// scalar SWAR body remains the tail for every kernel, so the lane proofs in
+/// this module stay the single source of truth below the vector width.
 ///
-/// Every kernel processes only full chunks and defers its `< 32`-byte tail to
-/// the public SWAR entry, so the chunk/lane proofs of the SWAR code remain
-/// the single source of truth for the tail.  The tail deliberately avoids a
-/// masked AVX2 load: the fallback is one cached feature branch plus at most
-/// 31 bytes of SWAR, while masked tails add unsafe edge cases for no measured
-/// gain on diagnostic-sized inputs.
+/// Every kernel processes only full chunks.  The tail deliberately avoids a
+/// masked load: the fallback is one cached feature branch plus at most
+/// `width - 1` bytes of SWAR, while masked tails add unsafe edge cases for no
+/// measured gain on diagnostic-sized inputs.
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use std::arch::x86_64::*;
@@ -315,22 +397,15 @@ mod x86_64 {
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
-            if unsafe { _mm256_movemask_epi8(eq) } != 0 {
-                return false;
-            }
-            // High bytes are negative i8, so `sp > v` flags them; tab/newline
-            // exclusions cannot rescue a high byte.
             let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
-            if unsafe { _mm256_movemask_epi8(lt) } != 0 {
-                let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
-                let nl = unsafe { _mm256_cmpeq_epi8(v, nl_v) };
-                let off = unsafe {
-                    _mm256_andnot_si256(nl, _mm256_andnot_si256(tab, lt))
-                };
-                if unsafe { _mm256_movemask_epi8(off) } != 0 {
-                    return false;
-                }
+            let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
+            let nl = unsafe { _mm256_cmpeq_epi8(v, nl_v) };
+            let allowed = unsafe { _mm256_or_si256(tab, nl) };
+            let off = unsafe { _mm256_andnot_si256(allowed, lt) };
+            let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
+            let bad = unsafe { _mm256_or_si256(eq, off) };
+            if unsafe { _mm256_movemask_epi8(bad) } != 0 {
+                return false;
             }
             i += 32;
         }
@@ -346,18 +421,13 @@ mod x86_64 {
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
-            if unsafe { _mm256_movemask_epi8(eq) } != 0 {
-                return false;
-            }
-            // High bytes are negative i8 and therefore flagged by `lt`.
             let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
-            if unsafe { _mm256_movemask_epi8(lt) } != 0 {
-                let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
-                let off = unsafe { _mm256_andnot_si256(tab, lt) };
-                if unsafe { _mm256_movemask_epi8(off) } != 0 {
-                    return false;
-                }
+            let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
+            let off = unsafe { _mm256_andnot_si256(tab, lt) };
+            let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
+            let bad = unsafe { _mm256_or_si256(eq, off) };
+            if unsafe { _mm256_movemask_epi8(bad) } != 0 {
+                return false;
             }
             i += 32;
         }
@@ -374,21 +444,15 @@ mod x86_64 {
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
+            let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
+            let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
+            let off = unsafe { _mm256_andnot_si256(tab, lt) };
             let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
-            if unsafe { _mm256_movemask_epi8(eq) } != 0 {
+            let bad = unsafe { _mm256_or_si256(eq, off) };
+            if unsafe { _mm256_movemask_epi8(bad) } != 0 {
                 return super::AsciiClass::Other;
             }
-            // High bytes are negative i8, so `lt` flags them; tab is the only
-            // excluded control and can never be a high byte.
-            let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
-            if unsafe { _mm256_movemask_epi8(lt) } != 0 {
-                let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
-                let off = unsafe { _mm256_andnot_si256(tab, lt) };
-                if unsafe { _mm256_movemask_epi8(off) } != 0 {
-                    return super::AsciiClass::Other;
-                }
-                saw_tab = true;
-            }
+            saw_tab |= unsafe { _mm256_movemask_epi8(tab) } != 0;
             i += 32;
         }
         match super::classify_ascii(&s[i..]) {
@@ -410,6 +474,333 @@ mod x86_64 {
                 return Some(i + mask.trailing_zeros() as usize);
             }
             i += 32;
+        }
+        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn is_printable_ascii_avx512(s: &[u8]) -> bool {
+        let sp = _mm512_set1_epi8(0x20);
+        let del = _mm512_set1_epi8(0x7F);
+        let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
+            let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
+            let eq = unsafe { _mm512_cmpeq_epi8_mask(v, del) };
+            if lt | eq != 0 {
+                return false;
+            }
+            i += 64;
+        }
+        super::is_printable_ascii(&s[i..])
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn is_printable_ascii_multiline_avx512(s: &[u8]) -> bool {
+        let sp = _mm512_set1_epi8(0x20);
+        let del = _mm512_set1_epi8(0x7F);
+        let tab_v = _mm512_set1_epi8(0x09);
+        let nl_v = _mm512_set1_epi8(0x0A);
+        let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
+            let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
+            let tab = unsafe { _mm512_cmpeq_epi8_mask(v, tab_v) };
+            let nl = unsafe { _mm512_cmpeq_epi8_mask(v, nl_v) };
+            let off = lt & !(tab | nl);
+            let eq = unsafe { _mm512_cmpeq_epi8_mask(v, del) };
+            if eq | off != 0 {
+                return false;
+            }
+            i += 64;
+        }
+        super::is_printable_ascii_multiline(&s[i..])
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn is_printable_ascii_or_tab_avx512(s: &[u8]) -> bool {
+        let sp = _mm512_set1_epi8(0x20);
+        let del = _mm512_set1_epi8(0x7F);
+        let tab_v = _mm512_set1_epi8(0x09);
+        let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
+            let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
+            let tab = unsafe { _mm512_cmpeq_epi8_mask(v, tab_v) };
+            let off = lt & !tab;
+            let eq = unsafe { _mm512_cmpeq_epi8_mask(v, del) };
+            if eq | off != 0 {
+                return false;
+            }
+            i += 64;
+        }
+        super::is_printable_ascii_or_tab(&s[i..])
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn classify_ascii_avx512(s: &[u8]) -> super::AsciiClass {
+        let sp = _mm512_set1_epi8(0x20);
+        let del = _mm512_set1_epi8(0x7F);
+        let tab_v = _mm512_set1_epi8(0x09);
+        let mut saw_tab = false;
+        let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
+            let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
+            let tab = unsafe { _mm512_cmpeq_epi8_mask(v, tab_v) };
+            let off = lt & !tab;
+            let eq = unsafe { _mm512_cmpeq_epi8_mask(v, del) };
+            if eq | off != 0 {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= tab != 0;
+            i += 64;
+        }
+        match super::classify_ascii(&s[i..]) {
+            super::AsciiClass::Other => super::AsciiClass::Other,
+            super::AsciiClass::PrintableOrTab => super::AsciiClass::PrintableOrTab,
+            super::AsciiClass::Printable if saw_tab => super::AsciiClass::PrintableOrTab,
+            super::AsciiClass::Printable => super::AsciiClass::Printable,
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn next_non_ascii_byte_avx512(s: &[u8]) -> Option<usize> {
+        let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
+            let mask = unsafe { _mm512_movepi8_mask(v) };
+            if mask != 0 {
+                return Some(i + mask.trailing_zeros() as usize);
+            }
+            i += 64;
+        }
+        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn is_printable_ascii_sse2(s: &[u8]) -> bool {
+        let sp = _mm_set1_epi8(0x20);
+        let del = _mm_set1_epi8(0x7F);
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
+            let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
+            let eq = unsafe { _mm_cmpeq_epi8(v, del) };
+            if unsafe { _mm_movemask_epi8(_mm_or_si128(lt, eq)) } != 0 {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii(&s[i..])
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn is_printable_ascii_multiline_sse2(s: &[u8]) -> bool {
+        let sp = _mm_set1_epi8(0x20);
+        let del = _mm_set1_epi8(0x7F);
+        let tab_v = _mm_set1_epi8(0x09);
+        let nl_v = _mm_set1_epi8(0x0A);
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
+            let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
+            let tab = unsafe { _mm_cmpeq_epi8(v, tab_v) };
+            let nl = unsafe { _mm_cmpeq_epi8(v, nl_v) };
+            let allowed = unsafe { _mm_or_si128(tab, nl) };
+            let off = unsafe { _mm_andnot_si128(allowed, lt) };
+            let eq = unsafe { _mm_cmpeq_epi8(v, del) };
+            let bad = unsafe { _mm_or_si128(eq, off) };
+            if unsafe { _mm_movemask_epi8(bad) } != 0 {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii_multiline(&s[i..])
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn is_printable_ascii_or_tab_sse2(s: &[u8]) -> bool {
+        let sp = _mm_set1_epi8(0x20);
+        let del = _mm_set1_epi8(0x7F);
+        let tab_v = _mm_set1_epi8(0x09);
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
+            let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
+            let tab = unsafe { _mm_cmpeq_epi8(v, tab_v) };
+            let off = unsafe { _mm_andnot_si128(tab, lt) };
+            let eq = unsafe { _mm_cmpeq_epi8(v, del) };
+            let bad = unsafe { _mm_or_si128(eq, off) };
+            if unsafe { _mm_movemask_epi8(bad) } != 0 {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii_or_tab(&s[i..])
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn classify_ascii_sse2(s: &[u8]) -> super::AsciiClass {
+        let sp = _mm_set1_epi8(0x20);
+        let del = _mm_set1_epi8(0x7F);
+        let tab_v = _mm_set1_epi8(0x09);
+        let mut saw_tab = false;
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
+            let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
+            let tab = unsafe { _mm_cmpeq_epi8(v, tab_v) };
+            let off = unsafe { _mm_andnot_si128(tab, lt) };
+            let eq = unsafe { _mm_cmpeq_epi8(v, del) };
+            let bad = unsafe { _mm_or_si128(eq, off) };
+            if unsafe { _mm_movemask_epi8(bad) } != 0 {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= unsafe { _mm_movemask_epi8(tab) } != 0;
+            i += 16;
+        }
+        match super::classify_ascii(&s[i..]) {
+            super::AsciiClass::Other => super::AsciiClass::Other,
+            super::AsciiClass::PrintableOrTab => super::AsciiClass::PrintableOrTab,
+            super::AsciiClass::Printable if saw_tab => super::AsciiClass::PrintableOrTab,
+            super::AsciiClass::Printable => super::AsciiClass::Printable,
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn next_non_ascii_byte_sse2(s: &[u8]) -> Option<usize> {
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
+            let mask = unsafe { _mm_movemask_epi8(v) };
+            if mask != 0 {
+                return Some(i + mask.trailing_zeros() as usize);
+            }
+            i += 16;
+        }
+        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    #[inline]
+    unsafe fn any_nonzero(v: uint8x16_t) -> bool {
+        unsafe { vmaxvq_u8(v) != 0 }
+    }
+
+    #[inline]
+    unsafe fn first_high_lane(v: uint8x16_t) -> Option<usize> {
+        let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
+        let packed = unsafe { vshrn_n_u16(vreinterpretq_u16_u8(high), 4) };
+        let bits = unsafe { vget_lane_u64(vreinterpret_u64_u8(packed), 0) };
+        (bits != 0).then_some((bits.trailing_zeros() / 4) as usize)
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn is_printable_ascii(s: &[u8]) -> bool {
+        let sp = unsafe { vdupq_n_u8(0x20) };
+        let del = unsafe { vdupq_n_u8(0x7F) };
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            let lt = unsafe { vcltq_u8(v, sp) };
+            let eq = unsafe { vceqq_u8(v, del) };
+            let bad = unsafe { vorrq_u8(lt, eq) };
+            let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
+            if unsafe { any_nonzero(vorrq_u8(bad, high)) } {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii(&s[i..])
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn is_printable_ascii_multiline(s: &[u8]) -> bool {
+        let sp = unsafe { vdupq_n_u8(0x20) };
+        let del = unsafe { vdupq_n_u8(0x7F) };
+        let tab_v = unsafe { vdupq_n_u8(0x09) };
+        let nl_v = unsafe { vdupq_n_u8(0x0A) };
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            let lt = unsafe { vcltq_u8(v, sp) };
+            let tab = unsafe { vceqq_u8(v, tab_v) };
+            let nl = unsafe { vceqq_u8(v, nl_v) };
+            let allowed = unsafe { vorrq_u8(tab, nl) };
+            let off = unsafe { vbicq_u8(lt, allowed) };
+            let eq = unsafe { vceqq_u8(v, del) };
+            let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
+            if unsafe { any_nonzero(vorrq_u8(vorrq_u8(eq, off), high)) } {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii_multiline(&s[i..])
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
+        let sp = unsafe { vdupq_n_u8(0x20) };
+        let del = unsafe { vdupq_n_u8(0x7F) };
+        let tab_v = unsafe { vdupq_n_u8(0x09) };
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            let lt = unsafe { vcltq_u8(v, sp) };
+            let tab = unsafe { vceqq_u8(v, tab_v) };
+            let off = unsafe { vbicq_u8(lt, tab) };
+            let eq = unsafe { vceqq_u8(v, del) };
+            let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
+            if unsafe { any_nonzero(vorrq_u8(vorrq_u8(eq, off), high)) } {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii_or_tab(&s[i..])
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
+        let sp = unsafe { vdupq_n_u8(0x20) };
+        let del = unsafe { vdupq_n_u8(0x7F) };
+        let tab_v = unsafe { vdupq_n_u8(0x09) };
+        let mut saw_tab = false;
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            let lt = unsafe { vcltq_u8(v, sp) };
+            let tab = unsafe { vceqq_u8(v, tab_v) };
+            let off = unsafe { vbicq_u8(lt, tab) };
+            let eq = unsafe { vceqq_u8(v, del) };
+            let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
+            if unsafe { any_nonzero(vorrq_u8(vorrq_u8(eq, off), high)) } {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= unsafe { any_nonzero(tab) };
+            i += 16;
+        }
+        match super::classify_ascii(&s[i..]) {
+            super::AsciiClass::Other => super::AsciiClass::Other,
+            super::AsciiClass::PrintableOrTab => super::AsciiClass::PrintableOrTab,
+            super::AsciiClass::Printable if saw_tab => super::AsciiClass::PrintableOrTab,
+            super::AsciiClass::Printable => super::AsciiClass::Printable,
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
+        let mut i = 0usize;
+        while i + 16 <= s.len() {
+            let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            if let Some(lane) = unsafe { first_high_lane(v) } {
+                return Some(i + lane);
+            }
+            i += 16;
         }
         super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
     }
@@ -506,8 +897,15 @@ mod tests {
         };
         // Aligned and misaligned tab/newline-heavy inputs, plus tails.
         for s in [
-            &b""[..], b"\t", b"\n", b"\t\n\t\n\t\n", b"\n\n\n\n\n\n\n\n", b"\t\n\r\t\n\r",
-            b"a\tb\nc\rd", b"\x01\t\n\x0B", b"\t\t\t\t\t\t\t\t",
+            &b""[..],
+            b"\t",
+            b"\n",
+            b"\t\n\t\n\t\n",
+            b"\n\n\n\n\n\n\n\n",
+            b"\t\n\r\t\n\r",
+            b"a\tb\nc\rd",
+            b"\x01\t\n\x0B",
+            b"\t\t\t\t\t\t\t\t",
         ] {
             assert_eq!(is_printable_ascii_multiline(s), !reference(s), "{s:?}");
         }
@@ -658,6 +1056,70 @@ mod tests {
             buf2[8] = 0x07;
             buf2[9] = b;
             assert!(!is_printable_ascii(&buf2));
+        }
+    }
+
+    /// Long inputs cross the SSE2 (16B), AVX2 (32B), and AVX-512BW (64B)
+    /// dispatch thresholds.  Every predicate is checked against its scalar
+    /// reference at each width and at the ±1 tail boundaries.
+    #[test]
+    fn long_simd_paths_match_scalar_reference() {
+        for len in [64, 65, 95, 96, 127, 128, 129, 191, 192, 255, 256, 257, 1024] {
+            let printable = vec![b'~'; len];
+            assert!(is_printable_ascii(&printable), "len {len}");
+            assert!(is_printable_ascii_or_tab(&printable), "len {len}");
+            assert!(is_printable_ascii_multiline(&printable), "len {len}");
+            assert_eq!(
+                classify_ascii(&printable),
+                AsciiClass::Printable,
+                "len {len}"
+            );
+
+            let mut tabbed = printable.clone();
+            tabbed[len / 2] = b'\t';
+            assert!(!is_printable_ascii(&tabbed), "len {len}");
+            assert!(is_printable_ascii_or_tab(&tabbed), "len {len}");
+            assert!(is_printable_ascii_multiline(&tabbed), "len {len}");
+            assert_eq!(
+                classify_ascii(&tabbed),
+                AsciiClass::PrintableOrTab,
+                "len {len}"
+            );
+
+            let mut multiline = tabbed.clone();
+            multiline[len - 1] = b'\n';
+            assert!(is_printable_ascii_multiline(&multiline), "len {len}");
+            assert!(!is_printable_ascii_or_tab(&multiline), "len {len}");
+
+            for offender in [b'\r', b'\x7F', 0x80, 0xFF] {
+                let mut bad = printable.clone();
+                bad[len / 3] = offender;
+                assert!(!is_printable_ascii(&bad), "len {len}, byte {offender:#04x}");
+                assert!(
+                    !is_printable_ascii_or_tab(&bad),
+                    "len {len}, byte {offender:#04x}"
+                );
+                assert!(
+                    !is_printable_ascii_multiline(&bad),
+                    "len {len}, byte {offender:#04x}"
+                );
+                assert_eq!(
+                    classify_ascii(&bad),
+                    AsciiClass::Other,
+                    "len {len}, byte {offender:#04x}"
+                );
+            }
+        }
+    }
+
+    /// `next_non_ascii_byte` must locate a high byte in every 64-bit AVX-512
+    /// lane, including the second half of a 128-byte scan.
+    #[test]
+    fn next_non_ascii_covers_avx512_lanes() {
+        for lane in 0..128 {
+            let mut v = vec![b'a'; 256];
+            v[lane] = 0x80;
+            assert_eq!(next_non_ascii_byte(&v), Some(lane), "lane {lane}");
         }
     }
 }

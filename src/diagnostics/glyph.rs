@@ -285,9 +285,16 @@ pub(crate) struct SectionScratch {
     // `row_buf` is used by the HTML renderer; the glyph path appends rows
     // directly to its output (P4) and no longer copies through it.
     pub row_buf: String,
+    /// Pre-built per-row gutter fragments (`│ <num> ` head/tail), cleared and
+    /// refilled once per section instead of allocating twice per section.
+    pub gutter_head: String,
+    pub gutter_tail: String,
     pub connector: String,
     pub lanes: UnderlineLanes,
     pub multiline_flags: SmallVec<[(usize, &'static str); 4]>,
+    /// Display column of each label's start row, captured from the start-row
+    /// underline record so middle connector rows do not re-walk the line.
+    pub label_start_cols: SmallVec<[Option<usize>; 8]>,
     pub ranges_buf: Vec<(usize, usize)>,
     pub display_buf: Vec<(usize, usize)>,
     pub order_buf: Vec<usize>,
@@ -342,9 +349,12 @@ impl SectionScratch {
             extra_lines: SmallVec::new(),
             all_label_lines: SmallVec::new(),
             row_buf: String::new(),
+            gutter_head: String::new(),
+            gutter_tail: String::new(),
             connector: String::new(),
             lanes: UnderlineLanes::new(),
             multiline_flags: SmallVec::new(),
+            label_start_cols: SmallVec::new(),
             ranges_buf: Vec::new(),
             display_buf: Vec::new(),
             order_buf: Vec::new(),
@@ -1152,7 +1162,11 @@ impl GlyphRenderer {
                 // it stays identifiable.  `write_note_line_with` owns the
                 // gutter, wrapping, note color, and continuation padding.
                 let suffix = match pos {
-                    Some(pos) => format!("{}:{}", pos.line + 1, pos.col + 1),
+                    Some(pos) => {
+                        let display_col =
+                            byte_offset_to_display(idx.line(pos.line), pos.col, self.tab_width);
+                        format!("{}:{}", pos.line + 1, display_col + 1)
+                    }
                     None => lbl.span.to_string(),
                 };
                 self.write_note_line_with(out, lbl.message.as_ref(), Some(&suffix));
@@ -1371,7 +1385,7 @@ impl GlyphRenderer {
         // wrap it in an OSC 8 hyperlink when the terminal supports one.
         // The `None` fallback owns an `ErrCode::unknown("?")` (borrowed via the
         // `?` literal), since a codeless diagnostic still shows `[]`.
-        let fallback_code = crate::diagnostics::ErrCode::unknown("?");
+        let fallback_code = std::sync::OnceLock::new();
         // `SmallVec<[&ErrCode; 2]>`: the overwhelmingly common case has a
         // single code (or none → the `?` fallback), so it stays inline and
         // avoids a heap allocation per rendered diagnostic.  The related-error
@@ -1380,7 +1394,8 @@ impl GlyphRenderer {
             if diag.related_errors.is_empty() {
                 match diag.code.as_ref() {
                     Some(c) => smallvec![c],
-                    None => smallvec![&fallback_code],
+                    None => smallvec![fallback_code
+                        .get_or_init(|| crate::diagnostics::ErrCode::unknown("?"))],
                 }
             } else {
                 let mut codes: SmallVec<[&crate::diagnostics::ErrCode; 2]> = SmallVec::new();
@@ -1422,7 +1437,10 @@ impl GlyphRenderer {
                     }
                 }
                 if codes.is_empty() {
-                    codes.push(&fallback_code);
+                    codes.push(
+                        fallback_code
+                            .get_or_init(|| crate::diagnostics::ErrCode::unknown("?")),
+                    );
                 }
                 codes
             };
@@ -1819,9 +1837,14 @@ impl GlyphRenderer {
             out.push_str(filename_display);
             out.push(':');
         }
+        let header_display_col = byte_offset_to_display(
+            idx.line(start_pos.line),
+            start_pos.col,
+            self.tab_width,
+        );
         push_uint(out, start_pos.line as u64 + 1);
         out.push(':');
-        push_uint(out, start_pos.col as u64 + 1);
+        push_uint(out, header_display_col as u64 + 1);
         if hyperlink {
             out.push_str("\x1b]8;;\x1b\\");
         }
@@ -1852,6 +1875,9 @@ impl GlyphRenderer {
         scratch.ranges.push(idx.span_lines(primary_span));
         scratch.ranges.extend_from_slice(all_label_lines);
         let label_line_ranges: &[(usize, usize)] = &scratch.ranges;
+        let label_start_cols = &mut scratch.label_start_cols;
+        label_start_cols.clear();
+        label_start_cols.resize(all_labels.len(), None);
 
         // Display-column-aware source line rendering loop.  The `String`
         // scratch buffers are `mem::take`-n into owned locals so format macros
@@ -1902,6 +1928,20 @@ impl GlyphRenderer {
         // SGR 7 (reverse video) — the 16-colour `highlight_bg` pairs with
         // `\x1b[27m` (see `Styles::highlight_reset`).
         let highlight_off = if self.s.use_color { self.s.highlight_reset } else { "" };
+        let mut gutter_head = std::mem::take(&mut scratch.gutter_head);
+        gutter_head.clear();
+        gutter_head.push_str(self.s.dim);
+        gutter_head.push_str(self.bc.v);
+        gutter_head.push_str(self.s.reset);
+        gutter_head.push_str(self.s.dim);
+        let mut gutter_tail = std::mem::take(&mut scratch.gutter_tail);
+        gutter_tail.clear();
+        gutter_tail.push_str(self.s.reset);
+        gutter_tail.push(' ');
+        gutter_tail.push_str(self.s.dim);
+        gutter_tail.push_str(self.bc.sub_v);
+        gutter_tail.push_str(self.s.reset);
+        gutter_tail.push(' ');
 
         for line_idx in first_line..=last_line {
             // O(1) slice via the shared index instead of indexing a
@@ -1914,17 +1954,9 @@ impl GlyphRenderer {
             // first and the render writes *straight into* `out`, so a plain
             // row is no longer copied twice (render scratch → out).
             // Gutter: `│ <num> │ `
-            out.push_str(self.s.dim);
-            out.push_str(self.bc.v);
-            out.push_str(self.s.reset);
-            out.push_str(self.s.dim);
+            out.push_str(&gutter_head);
             push_uint_padded(out, (line_idx + 1) as u64, line_num_width);
-            out.push_str(self.s.reset);
-            out.push(' ');
-            out.push_str(self.s.dim);
-            out.push_str(self.bc.sub_v);
-            out.push_str(self.s.reset);
-            out.push(' ');
+            out.push_str(&gutter_tail);
             let display_width = compute_line_underlines_and_render(
                 primary_span,
                 &all_labels,
@@ -1990,6 +2022,9 @@ impl GlyphRenderer {
                 {
                     *flag = true;
                 }
+                if line_idx == start {
+                    label_start_cols[i] = Some(col);
+                }
                 if msg_empty {
                     continue;
                 }
@@ -2042,7 +2077,9 @@ impl GlyphRenderer {
                     let start_off = span_start
                         .saturating_sub(start_line_start)
                         .min(start_line.len());
-                    let col = byte_offset_to_display(start_line, start_off, self.tab_width);
+                    let col = label_start_cols[i].unwrap_or_else(|| {
+                        byte_offset_to_display(start_line, start_off, self.tab_width)
+                    });
                     multiline_flags.push((col, "middle"));
                 }
             }
@@ -2592,6 +2629,8 @@ impl GlyphRenderer {
         // Restore the `mem::take`-n `String` scratch buffers so the next
         // section reuses their capacity.
         scratch.connector = connector;
+        scratch.gutter_head = gutter_head;
+        scratch.gutter_tail = gutter_tail;
         scratch.label_window = label_window.into_scratch();
         scratch.underlines_buf = underlines_buf;
         scratch.hl_buf = hl_buf;
@@ -3273,7 +3312,13 @@ pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
         // `[line_start, line_end]` range contains the point — including
         // both ends of an empty line.
         let intersects = if span_start == span_end {
-            span_start >= line_start && span_start <= line_end
+            // Include this line's terminator bytes (CRLF included) but not
+            // the first byte of the next line.
+            let zero_end = line_starts
+                .get(line_idx + 1)
+                .map_or(source.len().saturating_sub(1), |&s| (s as usize).saturating_sub(1))
+                .max(line_end);
+            span_start >= line_start && span_start <= zero_end
         } else {
             span_end > line_start && span_start < line_end
         };
@@ -3417,19 +3462,9 @@ fn line_needs_sanitize(line: &str) -> bool {
 
     // 1) C0 (excluding tab/newline) and DEL: reuse the shared scanner rather
     // than maintaining a second, drift-prone copy of the same SWAR masks.
-    if super::scan_terminal_control_flags_multiline(bytes).1 {
+    let (_, dirty, has_c1) = super::scan_terminal_control_flags_multiline(bytes);
+    if dirty || has_c1 {
         return true;
-    }
-
-    // 3) C1 controls (U+0080..U+009F): `0xC2` is the *only* lead byte for
-    // the block, so a lead + continuation-range follow check is exact.
-    let mut j = 0;
-    while let Some(off) = memchr::memchr(0xC2, &bytes[j..]) {
-        let k = j + off;
-        if k + 1 < bytes.len() && (0x80..=0x9F).contains(&bytes[k + 1]) {
-            return true;
-        }
-        j = k + 1;
     }
 
     // 4) Bidi overrides / isolates — exact byte predicate from `mod.rs`.
@@ -3618,14 +3653,12 @@ pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
         let mut tab_w: SmallVec<[usize; 8]> = SmallVec::new();
         let mut tab_extra: SmallVec<[usize; 8]> = SmallVec::new(); // extra *after* each tab
         let mut extra = 0usize; // extra_before of the tab being scanned
-        for (i, &b) in line.as_bytes().iter().enumerate() {
-            if b == b'\t' {
-                let w = tab_width - (content_start_col + i + extra) % tab_width;
-                extra += w - 1;
-                tab_pos.push(i);
-                tab_w.push(w);
-                tab_extra.push(extra);
-            }
+        for i in memchr::memchr_iter(b'\t', line.as_bytes()) {
+            let w = tab_width - (content_start_col + i + extra) % tab_width;
+            extra += w - 1;
+            tab_pos.push(i);
+            tab_w.push(w);
+            tab_extra.push(extra);
         }
         // Display column of byte offset `b` (≤ len): byte index plus the
         // cumulative expansion of every tab strictly before `b`.

@@ -513,7 +513,7 @@ impl<'a> std::fmt::Display for DiagMessage<'a> {
 /// locations.  Analogous to rustc's `MultiSpan`.  When there is a single
 /// primary span, `primary` contains one element; for multiple (e.g. a
 /// duplicate definition + the previous definition), both are primary.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct MultiSpan {
     // Invariant: when `!dirty`, sorted by `(file, start, end)` ascending
     // (`Span`'s `Ord`), no duplicates. All mutation goes through `push`,
@@ -534,6 +534,19 @@ pub struct MultiSpan {
     /// is `Sync`).
     /// Invalidated by every `push`/`clear`.
     sorted_cache: std::sync::OnceLock<Box<[Span]>>,
+}
+
+impl Clone for MultiSpan {
+    fn clone(&self) -> Self {
+        // `sorted_cache` is a pure function of `primary`; copying its boxed
+        // slice makes cloning a diagnostic O(spans) and defeats the cache.
+        // Recompute lazily if the clone is ever read in the dirty state.
+        MultiSpan {
+            primary: self.primary.clone(),
+            dirty: self.dirty,
+            sorted_cache: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 impl MultiSpan {
@@ -560,10 +573,10 @@ impl MultiSpan {
     /// [`first`](Self::first) read, so a fully reverse-sorted push stream
     /// costs `O(n log n)` total instead of `O(n²)` memmoves.
     pub fn push(&mut self, span: Span) {
-        // The sorted view cache is dropped on every push: `OnceCell::take`
-        // is a single `Option` swap, no allocation, and re-population only
-        // happens on the next dirty read.
-        self.sorted_cache.take();
+        // Drop the sorted view cache on every push by replacing the lock (the
+        // old `OnceLock::take` requires Rust 1.90; MSRV is 1.88).  Re-population
+        // only happens on the next dirty read.
+        self.sorted_cache = std::sync::OnceLock::new();
         match self.primary.last() {
             Some(last) if *last == span => {}
             Some(last) if *last > span => {
@@ -593,7 +606,7 @@ impl MultiSpan {
     pub fn clear(&mut self) {
         self.primary.clear();
         self.dirty = false;
-        self.sorted_cache.take();
+        self.sorted_cache = std::sync::OnceLock::new();
     }
 
     /// Return the spans in sorted order.  When `dirty`, sorts + dedups once
@@ -644,7 +657,7 @@ impl MultiSpan {
             // it with an unsynchronized cell would make the read racy.
             debug_assert!(
                 self.sorted_cache.get().is_some(),
-                "sorted cache set immediately before this read"
+                "sorted cache holds the winner's value when `set` loses the race"
             );
             Cow::Borrowed(self.sorted_cache.get().expect("just set"))
         }
@@ -899,7 +912,7 @@ pub struct Diagnostic<'src> {
     /// new language, the user block is preserved.  Labels are kind-derived
     /// first, then user-added — the same order the builders establish, since
     /// user builders only ever append.
-    kind_derived_labels: u8,
+    kind_derived_labels: u32,
     /// Whether [`humanize`](Self::humanize) has already populated `message`
     /// and `labels` from `kind`. Guards against redundant re-rendering on a
     /// second call (the operation is idempotent, but not free).
@@ -1693,10 +1706,10 @@ impl<'src> Diagnostic<'src> {
             self.labels.push(lbl);
         }
         debug_assert!(
-            self.labels.len() <= u8::MAX as usize,
-            "kind derives >255 labels; widen kind_derived_labels"
+            self.labels.len() <= u32::MAX as usize,
+            "kind derives more labels than u32 can represent"
         );
-        self.kind_derived_labels = self.labels.len().min(u8::MAX as usize) as u8;
+        self.kind_derived_labels = self.labels.len().min(u32::MAX as usize) as u32;
         for lbl in user.drain(..) {
             self.labels.push(lbl);
         }
@@ -2059,7 +2072,8 @@ pub fn explain_error_code_with_depth(
     const RESET: &str = "\x1b[0m";
 
     for line in explain.lines() {
-        if line.starts_with("  ") && !line.trim().is_empty() {
+        let trimmed = line.trim();
+        if line.starts_with("  ") && !trimmed.is_empty() {
             // Code/example line — apply syntax highlighting + background
             if !in_code_block {
                 let _ = writeln!(out);
@@ -2071,7 +2085,7 @@ pub fn explain_error_code_with_depth(
             } else {
                 let _ = writeln!(out, "  {highlighted}");
             }
-        } else if line.trim().is_empty() {
+        } else if trimmed.is_empty() {
             if in_code_block {
                 in_code_block = false;
             }
@@ -2263,22 +2277,20 @@ fn known_code_ranges() -> &'static str {
 /// [`known_code_ranges`]).  Split out so the ordering can be tested with
 /// synthetic codes the current table does not contain.
 fn format_code_ranges(codes: &[&str]) -> String {
-    let mut codes: Vec<&str> = codes.to_vec();
-    // Sort by (prefix, numeric value, raw string): within a prefix,
-    // lexicographic order only matches numeric order while codes are
-    // equal-width — a future 4-digit `E1000` would sort before `E999`
-    // lexicographically.  `sort_unstable_by_key` avoids the Vec allocation
-    // of `sort_by_cached_key`; the key is `Copy` and cheap to compute, and
-    // the slice is small (typically 1–5 codes).
-    codes.sort_unstable_by_key(|c| {
-        (
-            c.as_bytes().first().copied().unwrap_or(b'?'),
-            c.get(1..)
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(u32::MAX),
-            *c,
-        )
-    });
+    let mut keyed: Vec<(u8, u32, &str)> = codes
+        .iter()
+        .map(|&c| {
+            (
+                c.as_bytes().first().copied().unwrap_or(b'?'),
+                c.get(1..)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(u32::MAX),
+                c,
+            )
+        })
+        .collect();
+    keyed.sort_unstable();
+    let codes: Vec<&str> = keyed.into_iter().map(|(_, _, c)| c).collect();
     let numeric = |c: &str| c.get(1..).and_then(|s| s.parse::<u32>().ok());
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
@@ -2445,7 +2457,6 @@ fn suggest_top3_scan(
     // Top-3 by (dist asc, prefix desc, code asc) via fixed-size insertion
     // sort — avoids the `Vec` + `O(n log n)` sort for a 3-element result.
     let mut top: ArrayVec<(usize, usize, &str), 3> = ArrayVec::new();
-    let needle_len = needle.chars().count();
     let nb = needle.as_bytes();
 
     // ── First-char bucketing ─────────────────────────────────────
@@ -2807,6 +2818,21 @@ fn char_col_from_sparse_hinted(
     b - if k > 0 { s[k - 1].1 as usize } else { 0 }
 }
 
+/// Same lookup as [`char_col_from_sparse_hinted`] for a caller that owns its
+/// hint exclusively (the per-line memo), so no atomic read-modify-write is
+/// needed on the dominant repeated-query path.
+fn char_col_from_sparse_hint_mut(s: &[(u32, u32)], hint: &mut usize, b: usize) -> usize {
+    let mut k = (*hint).min(s.len());
+    while k < s.len() && (s[k].0 as usize) < b {
+        k += 1;
+    }
+    if k > 0 && (s[k - 1].0 as usize) >= b {
+        k = s.partition_point(|&(p, _)| (p as usize) < b);
+    }
+    *hint = k;
+    b - if k > 0 { s[k - 1].1 as usize } else { 0 }
+}
+
 /// Convert a byte-offset span into a 0-based (line, col) pair.
 /// Single source of truth — previously duplicated verbatim in
 /// `glyph::byte_to_linecol` and `label::byte_to_linecol`.
@@ -2849,6 +2875,9 @@ pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
     if has_high && !dirty && !has_c1 && !has_bidi_override_bytes(bytes) {
         return Cow::Borrowed(s);
     }
+    // Layout-only ASCII (`\n`/`\r`/`\t` are the only controls) is already
+    // covered by the first branch: the scanner excludes those bytes from
+    // `dirty`, so `!has_high && !dirty` is exactly the layout-only case.
     // Bidi overrides/isolates are *removed* (not U+FFFD'd), matching
     // [`sanitize_filename`] and the source-row renderer: they carry no
     // content, only rendering direction, so replacement would just inject
@@ -3001,7 +3030,9 @@ fn c1_in_chunk(s: &[u8], base: usize, x: u64) -> bool {
     while mask != 0 {
         let lane = (mask.trailing_zeros() / 8) as usize;
         let k = base + lane;
-        if s.get(k + 1).is_some_and(|b| (0x80..=0x9F).contains(b)) {
+        if s.get(k) == Some(&0xC2)
+            && s.get(k + 1).is_some_and(|b| (0x80..=0x9F).contains(b))
+        {
             return true;
         }
         mask &= mask - 1;
@@ -3335,7 +3366,7 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool) {
     // typical small sources from over-reserving.
     const LARGE_SOURCE_THRESHOLD: usize = 1 << 20;
     let capacity = if bytes.len() >= LARGE_SOURCE_THRESHOLD {
-        bytes.len() / 32 + 16
+        (bytes.len() / 32 + 16).min(1 << 20)
     } else {
         16
     };
@@ -3589,16 +3620,7 @@ impl<'a> LineIndex<'a> {
                 match table {
                     // ASCII line: char col == byte col.
                     None => Some(b),
-                    Some(t) => {
-                        // The shared map's hint cannot be updated through the
-                        // memo (it is a snapshot), but the hint is a heuristic
-                        // — carry the advanced position inside the memo so a
-                        // same-line run stays O(1) per step.
-                        let hint_cell = std::sync::atomic::AtomicUsize::new(*hint);
-                        let answer = char_col_from_sparse_hinted(t, &hint_cell, b);
-                        *hint = hint_cell.load(_AtomicOrdering::Relaxed);
-                        Some(answer)
-                    }
+                    Some(t) => Some(char_col_from_sparse_hint_mut(t, hint, b)),
                 },
                 _ => None,
             }
@@ -4937,12 +4959,12 @@ mod tests {
         let kind_a = DiagnosticKind::NameNotFound {
             name: std::borrow::Cow::Borrowed("a"),
             span: Span::new(FileId::DUMMY, 0, 1),
-            suggestions: Vec::new(),
+            suggestions: smallvec![],
         };
         let kind_b = DiagnosticKind::NameNotFound {
             name: std::borrow::Cow::Borrowed("b"),
             span: Span::new(FileId::DUMMY, 0, 1),
-            suggestions: Vec::new(),
+            suggestions: smallvec![],
         };
         let mut d = base.clone().with_kind(kind_a);
         d.humanize();

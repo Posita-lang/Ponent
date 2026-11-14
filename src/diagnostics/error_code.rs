@@ -813,7 +813,7 @@ pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4
     // lowercase `e030` used to return an empty sibling list).  From here on
     // `code` is the CANONICAL table code, so the cache key can't fragment
     // across case spellings of the same code.
-    let Some(entry) = lookup_uppercased(code) else {
+    let Some(entry) = resolve(code) else {
         return SmallVec::new();
     };
     // `lookup_uppercased` only ever returns table entries, and every table
@@ -822,6 +822,7 @@ pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4
     // `build_siblings`' filtering.
     let slot = code_slot(entry.code)
         .expect("every CODE_TABLE entry has a direct-address slot") as u16;
+    
     // Codes grouped by category, built once. CODE_TABLE is static so the
     // grouping is invariant; caching it turns the per-call O(table) scan into
     // O(category) — a real win on the terminal renderer's per-diagnostic
@@ -838,6 +839,23 @@ pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4
         }
         map
     });
+    // Production callers ask for 4; a per-slot `OnceLock` array makes the
+    // hit path a single atomic load, with no `RwLock` or `LiteMap` search.
+    // Other `max` values keep the general keyed cache below.
+    if max == 4 {
+        static SIBLING4: std::sync::OnceLock<
+            Box<[std::sync::OnceLock<SmallVec<[&'static str; 4]>>]>,
+        > = std::sync::OnceLock::new();
+        let cells = SIBLING4.get_or_init(|| {
+            (0..DIRECT_ADDRESS_SLOTS)
+                .map(|_| std::sync::OnceLock::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        return cells[slot as usize]
+            .get_or_init(|| build_siblings(by_category, entry, max))
+            .clone();
+    }
     // The per-code *answer* is memoised per `(slot, max)`: `max` is a
     // call-site constant in the renderers today, but the function is `pub`
     // and nothing enforces a single `max` — keying the cache by the slot

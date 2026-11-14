@@ -2,7 +2,7 @@ use crate::ast::Span;
 use crate::diagnostics::DiagMessage;
 use crate::diagnostics::i18n::LiftCow;
 use crate::diagnostics::label::{AnnotationKind, Label};
-use crate::smallvec::smallvec;
+use crate::smallvec::{SmallVec, smallvec};
 use covariant_vec::CovariantVec;
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -111,7 +111,7 @@ pub enum DiagnosticKind<'src> {
     NameNotFound {
         name: Cow<'src, str>,
         span: Span,
-        suggestions: Vec<String>,
+        suggestions: SmallVec<[Cow<'static, str>; 2]>,
     },
     /// A duplicate definition (variable, function, type).
     DuplicateDefinition {
@@ -199,6 +199,14 @@ impl ComptimeReason {
 
 /// Specific kinds of comptime evaluation errors.
 #[derive(Debug, Clone)]
+/// Payload text for comptime diagnostics.
+///
+/// `Arc<str>` rather than `Cow<'src, str>`: every producer in
+/// `hir::comptime` constructs these from an owned `ComptimeError` string, so
+/// there is no borrowed source text to preserve.  Threading `'src` here would
+/// only add a lifetime parameter that leaks into the query cache
+/// (`FnBodyCheck`/`VfsError` diagnostics are `'input`) without eliminating a
+/// single allocation, while `Arc` makes the repeated `humanize` clones O(1).
 pub enum ComptimeErrorKind {
     /// Step limit exceeded (possible infinite loop).
     StepLimitExceeded,
@@ -207,21 +215,21 @@ pub enum ComptimeErrorKind {
     /// Integer overflow (trap policy).
     Overflow,
     /// Type mismatch in a comptime operation.
-    TypeError(String),
+    TypeError(std::sync::Arc<str>),
     /// Assertion failed at compile time.
-    AssertionFailed(String),
+    AssertionFailed(std::sync::Arc<str>),
     /// Unknown identifier in comptime context.
-    UnknownIdentifier(String),
+    UnknownIdentifier(std::sync::Arc<str>),
     /// A runtime-only construct encountered in comptime context.
-    NotComptimeAllowed(String),
+    NotComptimeAllowed(std::sync::Arc<str>),
     /// The expression cannot be evaluated at compile time.
     Deferred,
     /// A comptime sandbox violation.
-    SandboxViolation(String),
+    SandboxViolation(std::sync::Arc<str>),
     /// Memory limit exceeded during comptime evaluation.
-    MemoryLimitExceeded(String),
+    MemoryLimitExceeded(std::sync::Arc<str>),
     /// An internal comptime error.
-    Internal(String),
+    Internal(std::sync::Arc<str>),
 }
 
 /// Map a frame span to the traceback's `Option<Span>`: the abandoned
@@ -293,19 +301,19 @@ fn comptime_message<'a>(kind: &ComptimeErrorKind) -> DiagMessage<'a> {
         },
         ComptimeErrorKind::TypeError(e) => DiagMessage::Slug {
             slug: "comptime-type-error",
-            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+            pairs: smallvec![("e", Cow::Owned(e.to_string()))],
         },
         ComptimeErrorKind::AssertionFailed(e) => DiagMessage::Slug {
             slug: "comptime-assertion-failed",
-            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+            pairs: smallvec![("e", Cow::Owned(e.to_string()))],
         },
         ComptimeErrorKind::UnknownIdentifier(e) => DiagMessage::Slug {
             slug: "comptime-unknown-identifier",
-            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+            pairs: smallvec![("e", Cow::Owned(e.to_string()))],
         },
         ComptimeErrorKind::NotComptimeAllowed(e) => DiagMessage::Slug {
             slug: "comptime-not-allowed",
-            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+            pairs: smallvec![("e", Cow::Owned(e.to_string()))],
         },
         ComptimeErrorKind::Deferred => DiagMessage::Slug {
             slug: "comptime-deferred",
@@ -313,15 +321,15 @@ fn comptime_message<'a>(kind: &ComptimeErrorKind) -> DiagMessage<'a> {
         },
         ComptimeErrorKind::SandboxViolation(e) => DiagMessage::Slug {
             slug: "comptime-sandbox-violation",
-            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+            pairs: smallvec![("e", Cow::Owned(e.to_string()))],
         },
         ComptimeErrorKind::MemoryLimitExceeded(e) => DiagMessage::Slug {
             slug: "comptime-memory-limit",
-            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+            pairs: smallvec![("e", Cow::Owned(e.to_string()))],
         },
         ComptimeErrorKind::Internal(e) => DiagMessage::Slug {
             slug: "comptime-internal",
-            pairs: smallvec![("e", Cow::Owned(e.clone()))],
+            pairs: smallvec![("e", Cow::Owned(e.to_string()))],
         },
     }
 }
@@ -893,12 +901,12 @@ mod humanizer_differential_tests {
             DiagnosticKind::NameNotFound {
                 name: Cow::Borrowed("n"),
                 span: span(0, 1),
-                suggestions: vec!["m".to_string()],
+                suggestions: smallvec![Cow::Borrowed("m")],
             },
             DiagnosticKind::NameNotFound {
                 name: Cow::Borrowed("n"),
                 span: span(0, 1),
-                suggestions: Vec::new(),
+                suggestions: SmallVec::new(),
             },
             DiagnosticKind::DuplicateDefinition {
                 name: Cow::Borrowed("d"),

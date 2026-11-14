@@ -236,6 +236,16 @@ pub(crate) fn wrap_optimal<'a>(
     // whole message: one TLS access + one `Rc` clone and at most five
     // allocations per *message*, instead of one set per paragraph.
     let tables = wrap_tables(max_width);
+    // State indices are `u32`; every word is at least one byte, so rejecting
+    // a paragraph above `u32::MAX / N_FITNESS` bytes keeps `n * N_FITNESS`
+    // representable.  The fallback is the same always-valid line preserving
+    // layout the DP uses on a backtrack failure.
+    if text.len() > u32::MAX as usize / N_FITNESS {
+        return text
+            .split_terminator('\n')
+            .map(Cow::Borrowed)
+            .collect();
+    }
     // The DP scratch lives in a per-thread `thread_local!` (mirroring
     // `WRAP_TABLES`): a diagnostic wraps a *dozen* labels/help/child
     // messages, and each used to pay `WrapScratch::new()` — up to five
@@ -1078,6 +1088,9 @@ struct WrapScratch {
     dp: SmallVec<[f64; 32]>,
     prev: SmallVec<[u32; 32]>,
     reachable: SmallVec<[bool; 32]>,
+    /// One bit per fitness class; lets the min-plus precompute skip the 4×4
+    /// scan when only one class at `j` is reachable (the common case).
+    reachable_mask: SmallVec<[u8; 32]>,
     best_cost: SmallVec<[[f64; N_FITNESS]; 8]>,
     best_src: SmallVec<[[u32; N_FITNESS]; 8]>,
     /// Word buffer for one paragraph, reused across paragraphs.
@@ -1091,13 +1104,18 @@ struct WrapScratch {
 
 impl WrapScratch {
     fn new() -> Self {
+        // Pre-reserve the common short-label size.  A first paragraph would
+        // otherwise grow each buffer from zero inline capacity several times
+        // in an LSP re-emit loop; 32 entries covers the dominant `n <= 32`
+        // diagnostic and costs only a few KiB per thread.
         WrapScratch {
-            pws: SmallVec::new(),
-            dp: SmallVec::new(),
-            prev: SmallVec::new(),
-            reachable: SmallVec::new(),
-            best_cost: SmallVec::new(),
-            best_src: SmallVec::new(),
+            pws: SmallVec::with_capacity(32),
+            dp: SmallVec::with_capacity(32),
+            prev: SmallVec::with_capacity(32),
+            reachable: SmallVec::with_capacity(32),
+            reachable_mask: SmallVec::with_capacity(32),
+            best_cost: SmallVec::with_capacity(32),
+            best_src: SmallVec::with_capacity(32),
             words: SmallVec::new(),
             breaks: SmallVec::new(),
         }
@@ -1119,6 +1137,20 @@ fn wrap_dp(
         // bookkeeping.
         return smallvec![words[0].range()];
     }
+    // State indices are `u32` (`j * N_FITNESS + class`).  The public entry
+    // rejects paragraphs above `u32::MAX / N_FITNESS` bytes; this release
+    // guard covers any internal caller whose word count somehow exceeds that
+    // (each word is at least one byte, so it normally cannot).
+    if n > u32::MAX as usize / N_FITNESS {
+        return words
+            .iter()
+            .map(|w| w.start as usize..w.end as usize)
+            .collect();
+    }
+    debug_assert!(
+        n <= u32::MAX as usize / N_FITNESS,
+        "wrap_dp state index would overflow u32"
+    );
 
     // One fused prefix array: `pws[m] = Σ_{k<m} (width_k + trailing_space_k)`.
     // The line covering `words[i..j)` then measures `base_j - pws[i]` where
@@ -1130,6 +1162,7 @@ fn wrap_dp(
         dp,
         prev,
         reachable,
+        reachable_mask,
         best_cost,
         best_src,
         words: _,
@@ -1179,12 +1212,15 @@ fn wrap_dp(
     prev.resize(n_states, u32::MAX);
     reachable.clear();
     reachable.resize(n_states, false);
+    reachable_mask.clear();
+    reachable_mask.resize(n + 1, 0);
     // `j == 0` is the empty prefix: nothing sits above the first line, so all
     // entry classes are free.
     for c in 0..N_FITNESS {
         dp[c] = 0.0;
         reachable[c] = true;
     }
+    reachable_mask[0] = (1u8 << N_FITNESS) - 1;
 
     // Min-plus precomputation over fitness classes.  For each prefix end `i`
     // and each class `class` of the *next* line, `best_cost[i][class]` is
@@ -1250,6 +1286,7 @@ fn wrap_dp(
                 dp[s] = cost;
                 prev[s] = best_src[i_lo][class];
                 reachable[s] = true;
+                reachable_mask[j] |= 1u8 << class;
             }
         }
         for i in (i_lo + 1)..j {
@@ -1282,6 +1319,7 @@ fn wrap_dp(
                 dp[s] = cost;
                 prev[s] = best_src[i][class];
                 reachable[s] = true;
+                reachable_mask[j] |= 1u8 << class;
             }
         }
         // `dp[j]` is now final — no future iteration writes it.  Precompute
@@ -1295,14 +1333,35 @@ fn wrap_dp(
         // initial value).  Checking all four fitness classes at `j` is
         // required: different classes can have different reachability.
         // Reads the one-byte `reachable` mirror instead of four `f64`s.
-        if j < n
-            && (reachable[j0]
-                || reachable[j0 + 1]
-                || reachable[j0 + 2]
-                || reachable[j0 + 3])
-        {
-            // The full 4×4 `pc` scan is load-bearing — restricting the
-            // argmin to `pc ∈ {class-1, class, class+1}` is unsound.
+        let mask = reachable_mask[j];
+        if j < n && mask != 0 {
+            if mask.count_ones() == 1 {
+                // The common case: exactly one class at this prefix is
+                // reachable.  The min-plus scan then has a single candidate,
+                // so copy the JUMP row directly.
+                let pc = mask.trailing_zeros() as usize;
+                let pi = j0 + pc;
+                for class in 0..N_FITNESS {
+                    best_cost[j][class] = dp[pi] + JUMP[class][pc];
+                    best_src[j][class] = pi as u32;
+                }
+            } else {
+            for class in 0..N_FITNESS {
+                let mut bc = f64::INFINITY;
+                let mut bp = 0u32;
+                for pc in 0..N_FITNESS {
+                    let pi = j0 + pc;
+                    let cost = dp[pi] + JUMP[class][pc];
+                    if cost < bc {
+                        bc = cost;
+                        bp = pi as u32;
+                    }
+                }
+                best_cost[j][class] = bc;
+                best_src[j][class] = bp;
+            }
+            }
+        }
             //
             // The argument for pruning only bounds the *jump* term:
             // `JUMP[class][pc]` is zero for `|class - pc| ≤ 1` and
@@ -1383,21 +1442,6 @@ fn wrap_dp(
             // lexicographic block order is Monge only for an additively
             // separable `J`), so a future attempt must keep the 4 classes
             // as 4 independent per-class recurrences.
-            for class in 0..N_FITNESS {
-                let mut bc = f64::INFINITY;
-                let mut bp = 0u32;
-                for pc in 0..N_FITNESS {
-                    let pi = j0 + pc;
-                    let cost = dp[pi] + JUMP[class][pc];
-                    if cost < bc {
-                        bc = cost;
-                        bp = pi as u32;
-                    }
-                }
-                best_cost[j][class] = bc;
-                best_src[j][class] = bp;
-            }
-        }
     }
 
     // Cheapest terminal state, then walk the `prev` links back to the

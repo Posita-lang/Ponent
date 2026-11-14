@@ -5,6 +5,7 @@ use super::glyph::visible_width;
 use super::renderers::fmt::{dec_digits, push_uint};
 
 use crate::ast::{FileId, Span};
+use crate::smallvec::SmallVec;
 use crate::diagnostics::i18n::{cached_label_static, fluent};
 
 use super::LineIndex;
@@ -263,7 +264,8 @@ impl<'src> CallChain<'src> {
 fn scan(&self) -> (bool, usize) {
     let mut any_spanned = false;
     let mut total = 0usize;
-    let mut stack: Vec<(&CallChain<'src>, usize)> = vec![(self, 0)];
+    let mut stack: SmallVec<[(&CallChain<'src>, usize); 8]> = SmallVec::new();
+    stack.push((self, 0));
     while let Some((chain, depth)) = stack.pop() {
         if depth > MAX_CHAIN_DEPTH {
             continue;

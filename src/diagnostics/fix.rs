@@ -144,7 +144,13 @@ impl<'src> FixSet<'src> {
                 });
             }
         }
-        candidates.sort_by_key(|e| (e.span.file, e.span.start_as_usize(), e.span.end_as_usize()));
+        if !candidates.is_sorted_by_key(|e| {
+            (e.span.file, e.span.start_as_usize(), e.span.end_as_usize())
+        }) {
+            candidates.sort_by_key(|e| {
+                (e.span.file, e.span.start_as_usize(), e.span.end_as_usize())
+            });
+        }
         // Drop overlapping candidates: first-wins.  Zero-length edits count
         // as overlapping too: two insertions at one point (or an insertion at
         // the edge of a replacement) would both run and compose into an
@@ -259,6 +265,18 @@ impl<'src> FixSet<'src> {
         source: &'s str,
         pred: impl Fn(&FixEdit<'src>) -> bool,
     ) -> Cow<'s, str> {
+        self.apply_filtered_count(source, pred).0
+    }
+
+    /// Same one-pass apply, additionally returning the number of edits that
+    /// actually spliced.  Malformed spans are skipped, so this can be smaller
+    /// than `filter(pred).count()`.
+    fn apply_filtered_count<'s>(
+        &self,
+        source: &'s str,
+        pred: impl Fn(&FixEdit<'src>) -> bool,
+    ) -> (Cow<'s, str>, usize) {
+        let mut applied = 0usize;
         // One pass: allocate only when the first applicable edit is seen, and
         // return the borrowed source when none applies.  The old shape walked
         // `edits` three times (any-check, size sum, write); the write pass is
@@ -299,14 +317,16 @@ impl<'src> FixSet<'src> {
             buf.push_str(&source[last..start]);
             buf.push_str(&edit.replacement);
             last = end;
+            applied += 1;
         }
-        match out {
+        let rewritten = match out {
             Some(mut buf) => {
                 buf.push_str(&source[last..]);
                 Cow::Owned(buf)
             }
             None => Cow::Borrowed(source),
-        }
+        };
+        (rewritten, applied)
     }
 }
 
@@ -324,12 +344,7 @@ pub fn apply_fixes<'src, 's>(
 ) -> (Cow<'s, str>, usize) {
     let set = FixSet::collect(diags, hints);
     let anchor = set.edits.first().map(|e| e.span.file);
-    let n = set
-        .edits
-        .iter()
-        .filter(|e| anchor.is_none_or(|f| e.span.file == f))
-        .count();
-    (set.apply(source), n)
+    set.apply_filtered_count(source, |e| anchor.is_none_or(|f| e.span.file == f))
 }
 
 /// Like [`apply_fixes`] but for an explicit file: apply and count only the
@@ -342,8 +357,7 @@ pub fn apply_fixes_for_file<'src, 's>(
     hints: FixHints,
 ) -> (Cow<'s, str>, usize) {
     let set = FixSet::collect(diags, hints);
-    let n = set.edits.iter().filter(|e| e.span.file == file).count();
-    (set.apply_for_file(source, file), n)
+    set.apply_filtered_count(source, |e| e.span.file == file)
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]

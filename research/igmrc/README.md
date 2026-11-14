@@ -197,7 +197,34 @@ general problem unless P = NP.
 
 ---
 
-## 5. What to use
+## 5. Connectivity does not restore tractability
+
+Requiring the interval graph to be connected does **not** remove the hardness.
+The disjoint padding clique can be replaced by a pendant `p`-clique attached
+through a single staggered bridge:
+
+- place the hard core `H` (all maximal cliques of size `< p`) to the left;
+- let `K_p = {x_1,…,x_p}` share a Helly point `t`, with staggered left
+  endpoints `l_1 < … < l_p ≤ t`;
+- extend the rightmost interval `u` of `H` to end at `r` with
+  `l_1 < r < l_2`.
+
+Then `u` overlaps only `x_1`, so the bridge has size 2, every core clique
+keeps its original size, and only the single `K_p` clique at the far right has
+size `p`. The graph is connected and has `ω = χ = p`, but it is **not
+saturated**. Give `K_p` a constant total rank-1 cost (all vertices the same
+weight, or weight 0), fix `x_1` to the spare colour `p`, and every optimal
+colouring of `H` extends without constraint because `H` only uses colours
+`1..h`, `h < p`. Hence `OPT(G) = OPT(H) + const`, and the reduction goes
+through.
+
+The real tractability boundary is **`ω`-saturation of the entire clique
+path**, not connectivity. A lone `p`-clique at the end of the path is enough
+to force exact-`χ` while preserving the unsaturated slack where NP-hardness
+lives. In particular, the fully saturated flow/LP algorithm from §2 cannot be
+applied to this connected gadget.
+
+## 6. What to use
 
 - General instances: exact engine is the `O(n · k! · k)` sweep DP; for
   `n ≤ 50`, `k ≤ 5` it is already linear in `n` with ≤ 120 states.

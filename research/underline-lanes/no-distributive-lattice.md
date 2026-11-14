@@ -477,11 +477,6 @@ gauge, so the natural object is closer to a torsor than to a lattice.
   (ii) reciprocity `(-1)^n χ_G(-t) = Σ_{D acyclic} Ω_{P_D}(t)` (weak order
   polynomial), whose strict-order companion
   `χ_G(t) = Σ_D Ω°_{P_D}(t)` is the decomposition invoked in §7.
-  An earlier draft cited **5**(3), 281–290 and
-  `(-1)^n χ_G(-t) = Σ_D t^{#sources(D)}`; both are wrong (on `K₂` the two
-  sides are `t² + t` vs `2t`, on `K₃` `t³ + 3t² + 2t` vs `6t`). The DOI
-  attached to that draft could not be verified against the publisher record
-  and has been dropped; the volume/issue/pages above are the verified ones.
 - J. Propp, *Acyclic orientations with a fixed sink form a disjoint union
   of distributive lattices* (unpublished note; original source not
   formally published or online-findable). The published proof carrier is

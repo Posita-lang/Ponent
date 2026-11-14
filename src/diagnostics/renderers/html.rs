@@ -94,6 +94,9 @@ impl Renderer for HtmlRenderer {
              .diag.message { color: var(--fg); }\n\
              .diag .span { color: var(--muted); }\n\
              .diag .suggestion { color: var(--suggestion); }\n\
+             .diag .suggestion-diff { margin: 4px 0 4px 20px; white-space: pre-wrap; font-size: 0.9em; }\n\
+             .diag .suggestion-diff .diff-del { display: block; color: var(--error-border); }\n\
+             .diag .suggestion-diff .diff-add { display: block; color: var(--help-border); }\n\
              .diag .help-text { color: var(--help-text); }\n\
              .chain { margin-left: 20px; color: var(--muted); font-size: 0.9em; }\n\
              .chain .entry { margin: 2px 0; }\n\
@@ -552,6 +555,43 @@ impl HtmlRenderer {
             html.push_str("<div class='suggestion'>suggestion: ");
             html.push_str(&self.escape(&suggestion.to_string()));
             html.push_str("</div>\n");
+
+            let (Some(idx), Some(span), Some(replacement)) = (
+                idx_opt.as_ref(),
+                suggestion.span,
+                suggestion.replacement.as_deref(),
+            ) else {
+                continue;
+            };
+            let anchor_file = diag.spans().first().map(|s| s.file);
+            if anchor_file != Some(span.file)
+                || replacement.contains('\n')
+                || replacement.contains('\r')
+            {
+                continue;
+            }
+            let start_pos = idx.to_linecol(span.start_as_usize());
+            let end_pos = idx.to_linecol(span.end_as_usize());
+            let (line, col) = (start_pos.line, start_pos.col);
+            let (end_line, end_col) = (end_pos.line, end_pos.col);
+            if line != end_line {
+                continue;
+            }
+            let old_line = idx.line(line);
+            if !old_line.is_char_boundary(col) || !old_line.is_char_boundary(end_col) {
+                continue;
+            }
+            let new_line = format!(
+                "{}{}{}",
+                &old_line[..col],
+                replacement,
+                &old_line[end_col..]
+            );
+            html.push_str("<div class='suggestion-diff'><span class='diff-del'>- ");
+            html.push_str(&self.escape(old_line));
+            html.push_str("</span>\n<span class='diff-add'>+ ");
+            html.push_str(&self.escape(&new_line));
+            html.push_str("</span></div>\n");
         }
 
         // Help

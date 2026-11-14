@@ -155,9 +155,10 @@ pub fn push_fold_marker(out: &mut String, gap: usize) {
         out.push_str(" (");
         // Format into a stack buffer and borrow it for the duration of the
         // call: `render_into` only reads the `Cow`, so a fold-marker-dense
-        // diff no longer pays one heap allocation per marker.  20 bytes hold
-        // every `u64`/`usize` decimal (20 digits on 64-bit).
-        let mut buf = arrayvec::ArrayString::<20>::new();
+        // diff no longer pays one heap allocation per marker.  39 bytes cover
+        // every `u128`/128-bit `usize` decimal, so a future 128-bit target
+        // cannot silently truncate the marker.
+        let mut buf = arrayvec::ArrayString::<39>::new();
         use std::fmt::Write as _;
         let _ = write!(buf, "{gap}");
         crate::diagnostics::i18n::render_into(

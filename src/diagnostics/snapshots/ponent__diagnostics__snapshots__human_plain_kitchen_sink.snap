@@ -4,7 +4,7 @@ expression: out
 ---
 +- error[E030,E019]: 1. return type mismatch
 |                    2. duplicate definition of `i`
-|  +- example.ps:3:2
+|  +- example.ps:3:5
 |  |
 |1 | def foo(x: Bool) -> Int<32> {
 |  | ~~~~~~~~ ^^^^^^^^^^^^^^^^^^^^

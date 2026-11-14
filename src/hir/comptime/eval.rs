@@ -1,4 +1,5 @@
 use crate::ast::FileId;
+use std::borrow::Cow;
 use crate::ast::IntLit;
 use crate::diagnostics::DiagCtxt;
 use crate::diagnostics::kind::{ComptimeErrorKind, ComptimeReason, DiagnosticKind, maybe_span};
@@ -408,18 +409,24 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
             ComptimeError::StepLimitExceeded => ComptimeErrorKind::StepLimitExceeded,
             ComptimeError::DivisionByZero => ComptimeErrorKind::DivisionByZero,
             ComptimeError::Overflow => ComptimeErrorKind::Overflow,
-            ComptimeError::TypeError(s) => ComptimeErrorKind::TypeError(s.clone()),
-            ComptimeError::AssertionFailed(s) => ComptimeErrorKind::AssertionFailed(s.clone()),
-            ComptimeError::UnknownIdentifier(s) => ComptimeErrorKind::UnknownIdentifier(s.clone()),
+            ComptimeError::TypeError(s) => ComptimeErrorKind::TypeError(std::sync::Arc::from(s.as_str())),
+            ComptimeError::AssertionFailed(s) => {
+                ComptimeErrorKind::AssertionFailed(std::sync::Arc::from(s.as_str()))
+            }
+            ComptimeError::UnknownIdentifier(s) => {
+                ComptimeErrorKind::UnknownIdentifier(std::sync::Arc::from(s.as_str()))
+            }
             ComptimeError::NotComptimeAllowed(s) => {
-                ComptimeErrorKind::NotComptimeAllowed(s.clone())
+                ComptimeErrorKind::NotComptimeAllowed(std::sync::Arc::from(s.as_str()))
             }
             ComptimeError::Deferred => ComptimeErrorKind::Deferred,
-            ComptimeError::SandboxViolation(s) => ComptimeErrorKind::SandboxViolation(s.clone()),
-            ComptimeError::MemoryLimitExceeded(s) => {
-                ComptimeErrorKind::MemoryLimitExceeded(s.clone())
+            ComptimeError::SandboxViolation(s) => {
+                ComptimeErrorKind::SandboxViolation(std::sync::Arc::from(s.as_str()))
             }
-            ComptimeError::Internal(s) => ComptimeErrorKind::Internal(s.clone()),
+            ComptimeError::MemoryLimitExceeded(s) => {
+                ComptimeErrorKind::MemoryLimitExceeded(std::sync::Arc::from(s.as_str()))
+            }
+            ComptimeError::Internal(s) => ComptimeErrorKind::Internal(std::sync::Arc::from(s.as_str())),
         };
         // Merge outer traceback (from checker's region_tree) with inner call stack.
         let mut traceback = self.outer_traceback.clone();

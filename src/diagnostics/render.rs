@@ -82,8 +82,7 @@ struct CachedSourceIndex {
 /// allocation, which this does with overwhelming probability.  Identical
 /// content (merged literals) produces the same fingerprint — correct, since
 /// the tables would be identical anyway.
-#[cfg(debug_assertions)]
-fn source_fingerprint(s: &str) -> u64 {
+pub(crate) fn source_fingerprint(s: &str) -> u64 {
     let b = s.as_bytes();
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut feed = |x: u8| {
@@ -135,10 +134,11 @@ impl SharedSources {
             bool,
             Arc<CharPrefixMap>,
             u64,
+            u64,
         )],
     ) -> Arc<Self> {
         let mut map = FxHashMap::default();
-        for &(ptr, len, ref starts, ascii, ref prefixes, generation) in entries {
+        for &(ptr, len, ref starts, ascii, ref prefixes, generation, _fingerprint) in entries {
             map.insert(
                 (ptr, len),
                 SharedSourceIndex {
@@ -390,7 +390,7 @@ impl<'a> RenderCtx<'a> {
         uri: Option<&'a str>,
         shared_sources: Arc<SharedSources>,
         file_urls: FileUrlMap,
-        preload: &[(usize, usize, Arc<[u32]>, bool, Arc<CharPrefixMap>, u64)],
+        preload: &[(usize, usize, Arc<[u32]>, bool, Arc<CharPrefixMap>, u64, u64)],
     ) -> Self {
         let mut cx = Self::new(opts, uri);
         cx.set_shared_sources(shared_sources);
@@ -430,10 +430,10 @@ impl<'a> RenderCtx<'a> {
     /// evict warm tables.
     pub(crate) fn preload_line_index(
         &mut self,
-        entries: &[(usize, usize, Arc<[u32]>, bool, Arc<CharPrefixMap>, u64)],
+        entries: &[(usize, usize, Arc<[u32]>, bool, Arc<CharPrefixMap>, u64, u64)],
     ) {
         let mut cache = self.source_index.borrow_mut();
-        for &(ptr, len, ref starts, ascii, ref prefixes, generation) in entries.iter().rev() {
+        for &(ptr, len, ref starts, ascii, ref prefixes, generation, fingerprint) in entries.iter().rev() {
             if cache.len() >= CACHE_SLOTS {
                 cache.pop();
             }
@@ -446,10 +446,8 @@ impl<'a> RenderCtx<'a> {
                     ascii,
                     char_prefixes: Arc::clone(prefixes),
                     generation,
-                    // Prebuilt entries carry no source text, so the ABA
-                    // tripwire is disabled for them (see `line_index`).
                     #[cfg(debug_assertions)]
-                    fingerprint: 0,
+                    fingerprint,
                 },
             );
         }
