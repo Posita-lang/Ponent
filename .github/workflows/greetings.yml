@@ -1,0 +1,114 @@
+name: Greetings
+
+on:
+  pull_request_target:
+    types:
+      - opened
+  issues:
+    types:
+      - opened
+
+permissions:
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: first-interaction-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  greet:
+    name: Welcome first-time contributors
+    runs-on: ubuntu-latest
+    steps:
+      # This workflow uses only event metadata and the GitHub API. It never
+      # checks out or executes code from the triggering contribution.
+      - name: Greet first-time contributor
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const isPullRequest = context.eventName === "pull_request_target";
+            const contribution = isPullRequest
+              ? context.payload.pull_request
+              : context.payload.issue;
+
+            if (!contribution || !contribution.user?.login) {
+              throw new Error("The opened contribution is missing its author.");
+            }
+
+            const author = contribution.user.login;
+            const currentNumber = contribution.number;
+
+            if (!Number.isSafeInteger(currentNumber) || currentNumber <= 0) {
+              throw new Error(`Invalid contribution number: ${currentNumber}`);
+            }
+
+            // The issues endpoint includes both issues and pull requests.
+            // Filter by creator, then distinguish the contribution type using
+            // the presence of the pull_request property. GitHub issue numbers
+            // are monotonically assigned across issues and PRs, so only a
+            // lower-numbered item can be an earlier contribution. Ignoring
+            // equal and higher numbers also makes concurrent first submissions
+            // deterministic: the lowest-numbered one gets the greeting.
+            const authoredContributions = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                creator: author,
+                state: "all",
+                per_page: 100,
+              },
+            );
+
+            const hasPreviousContribution = authoredContributions.some((item) => {
+              if (item.number >= currentNumber) return false;
+              return isPullRequest
+                ? Boolean(item.pull_request)
+                : !item.pull_request;
+            });
+
+            if (hasPreviousContribution) {
+              core.info(
+                `Skipping greeting: ${author} has already opened a ${isPullRequest ? "pull request" : "issue"}.`,
+              );
+              return;
+            }
+
+            const contributionKind = isPullRequest ? "pull-request" : "issue";
+            const greetingMarker = `<!-- ponent-first-${contributionKind}-greeting:${currentNumber} -->`;
+            const existingComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: currentNumber,
+                per_page: 100,
+              },
+            );
+
+            if (existingComments.some((comment) => comment.body?.includes(greetingMarker))) {
+              core.info("Skipping greeting: the first-contribution greeting is already present.");
+              return;
+            }
+
+            const message = isPullRequest
+              ? [
+                  "Thank you for opening your first pull request to Ponent!",
+                  "",
+                  "We appreciate the contribution. Please ensure the PR explains its motivation, relevant design decisions, and verification performed. For changes affecting correctness, ownership, concurrency, or safety guarantees, include the invariants considered and the evidence supporting the change.",
+                ].join("\n")
+              : [
+                  "Thank you for opening your first issue in Ponent!",
+                  "",
+                  "We appreciate your interest. Please include the relevant context, expected behavior, actual behavior, and a minimal reproduction when applicable. For correctness or safety-sensitive reports, please also identify the affected invariant or guarantee if known.",
+                ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: currentNumber,
+              body: `${greetingMarker}\n\n${message}`,
+            });
+
+            core.info(`Posted first-${isPullRequest ? "PR" : "issue"} greeting for ${author}.`);
