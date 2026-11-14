@@ -15,7 +15,8 @@ permissions:
 
 concurrency:
   group: pr-size-labeler-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  # Serialize this PR's size-label writes; each run reads the latest PR metadata.
+  cancel-in-progress: false
 
 jobs:
   label:
