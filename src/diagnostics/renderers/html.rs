@@ -9,7 +9,7 @@ use crate::diagnostics::DiagnosticLevel;
 use crate::diagnostics::LineIndex;
 use crate::diagnostics::glyph::{
     LabelWindow, SectionScratch, byte_offset_to_display, compute_line_annotation_ranges,
-    render_line_merged_with,
+    expand_tabs_from_col, render_line_merged_with,
 };
 use crate::diagnostics::label::Label;
 use crate::diagnostics::render::{RenderCtx, Renderer};
@@ -98,6 +98,7 @@ impl Renderer for HtmlRenderer {
              .diag .suggestion-diff .diff-del { display: block; color: var(--error-border); }\n\
              .diag .suggestion-diff .diff-add { display: block; color: var(--help-border); }\n\
              .diag .help-text { color: var(--help-text); }\n\
+             .diag .highlight { color: var(--accent); font-weight: bold; }\n\
              .chain { margin-left: 20px; color: var(--muted); font-size: 0.9em; }\n\
              .chain .entry { margin: 2px 0; }\n\
              .chain .entry .label { color: var(--accent); }\n\
@@ -295,7 +296,7 @@ impl HtmlRenderer {
                         // sanitized like every other renderer; a raw
                         // control/bidi filename could forge terminal state in
                         // the HTML body even though the attribute is clean.
-                        html.push_str(&self.escape(file));
+                        html.push_str(&self.escape_filename(file));
                         html.push(':');
                     }
                     let (line, col) =
@@ -539,6 +540,35 @@ impl HtmlRenderer {
             html.push_str("</ul>\n");
         }
 
+        // Child diagnostics (notes/help) are part of the diagnostic model;
+        // machine and HTML renderers must not silently drop them.
+        for child in &diag.children {
+            html.push_str("<div class='label'>");
+            html.push_str(child.level.label());
+            html.push_str(": ");
+            if let Some(styled) = &child.styled_message {
+                for part in &styled.0 {
+                    match part.style {
+                        crate::diagnostics::StringPartStyle::Highlighted => {
+                            html.push_str("<span class='highlight'>");
+                            html.push_str(&self.escape(part.content.as_ref()));
+                            html.push_str("</span>");
+                        }
+                        crate::diagnostics::StringPartStyle::Normal => {
+                            html.push_str(&self.escape(part.content.as_ref()));
+                        }
+                    }
+                }
+            } else {
+                html.push_str(&self.escape(child.plain_message().as_ref()));
+            }
+            if let Some(span) = child.span {
+                html.push_str(" at ");
+                html.push_str(&self.escape(&span.to_string()));
+            }
+            html.push_str("</div>\n");
+        }
+
         // Suggestions.  Mirror the human renderer's visibility policy: a
         // `HideCodeAlways` / `CompletelyHidden` suggestion is internal and must
         // not become user-facing HTML.  `Suggestion`'s `Display` also carries
@@ -587,10 +617,19 @@ impl HtmlRenderer {
                 replacement,
                 &old_line[end_col..]
             );
+            let tab_width = cx.map_or(self.fallback_tab_width, |c| c.opts.tab_width.max(1));
+            let line_num_width = (idx.text_line_count().saturating_sub(1))
+                .checked_ilog10()
+                .unwrap_or(0) as usize
+                + 1;
+            // Gutter: line number + space + separator + space + `- `/`+ `.
+            let diff_text_col = line_num_width + 5;
+            let old_display = expand_tabs_from_col(old_line, tab_width, diff_text_col);
+            let new_display = expand_tabs_from_col(&new_line, tab_width, diff_text_col);
             html.push_str("<div class='suggestion-diff'><span class='diff-del'>- ");
-            html.push_str(&self.escape(old_line));
+            html.push_str(&self.escape(old_display.as_ref()));
             html.push_str("</span>\n<span class='diff-add'>+ ");
-            html.push_str(&self.escape(&new_line));
+            html.push_str(&self.escape(new_display.as_ref()));
             html.push_str("</span></div>\n");
         }
 
@@ -627,7 +666,7 @@ impl HtmlRenderer {
                     let (line, col) = idx.linecol_display(span.start_as_usize().min(limit));
                     html.push_str(" at ");
                     if !file_name.is_empty() {
-                        html.push_str(&self.escape(file_name));
+                        html.push_str(&self.escape_filename(file_name));
                         html.push(':');
                     }
                     fmt::push_uint(html, (line + 1) as u64);
@@ -639,7 +678,7 @@ impl HtmlRenderer {
                     // No index for a foreign file: name it without inventing a
                     // line/column rather than silently dropping the location.
                     html.push_str(" at ");
-                    html.push_str(&self.escape(name));
+                    html.push_str(&self.escape_filename(name));
                 }
                 html.push_str("</div>\n");
             }
@@ -870,7 +909,7 @@ impl HtmlRenderer {
         // here and reuse the (borrowed, allocation-free) result per row instead
         // of `format!`-ing a fresh `file:line:col` string only to escape and
         // discard it on each iteration.
-        let escaped_file = self.escape(file_name);
+        let escaped_file = self.escape_filename(file_name);
         // The `file:` prefix of the `data-location` attribute is also constant
         // per row; building it once keeps the row loop to pointer copies.
         // Built from parts — a clean path (the overwhelmingly common shape)
@@ -1212,6 +1251,19 @@ impl HtmlRenderer {
         // sanitizer borrows when the input is already clean; when it owns, the
         // escaped result must be owned too (it cannot borrow the temporary).
         match crate::diagnostics::sanitize_for_terminal_multiline(s) {
+            Cow::Borrowed(clean) => self.escape_clean(clean),
+            Cow::Owned(clean) => match self.escape_clean(&clean) {
+                Cow::Borrowed(_) => Cow::Owned(clean),
+                Cow::Owned(escaped) => Cow::Owned(escaped),
+            },
+        }
+    }
+
+    /// Filenames are a single-line field: unlike messages/source text, they
+    /// must not retain `\n`/`\t`, or a `data-location` attribute and the
+    /// visible location header could be split across lines.
+    fn escape_filename<'a>(&self, s: &'a str) -> Cow<'a, str> {
+        match crate::diagnostics::sanitize_for_terminal(s) {
             Cow::Borrowed(clean) => self.escape_clean(clean),
             Cow::Owned(clean) => match self.escape_clean(&clean) {
                 Cow::Borrowed(_) => Cow::Owned(clean),
@@ -1877,5 +1929,31 @@ mod tests {
             let html = HtmlRenderer::new().diagnostic_to_html(&diag);
             assert!(html.contains("at eof"), "EOF label dropped: {html}");
         }
+    }
+
+    #[test]
+    fn child_diagnostics_render_with_highlight() {
+        let diag = Diagnostic::error("parent").with_highlighted_note(
+            crate::diagnostics::StyledString::new(vec![crate::diagnostics::StringPart {
+                content: "child".into(),
+                style: crate::diagnostics::StringPartStyle::Highlighted,
+            }]),
+        );
+        let html = HtmlRenderer::new().diagnostic_to_html(&diag);
+        assert!(html.contains("note: "), "child label missing: {html}");
+        assert!(
+            html.contains("<span class='highlight'>child</span>"),
+            "child highlight missing: {html}"
+        );
+    }
+
+    #[test]
+    fn filename_newlines_are_sanitized() {
+        let diag = Diagnostic::error("x")
+            .with_span(Span::new(FileId::DUMMY, 0, 1))
+            .with_source("x")
+            .with_file_name("a\nb.rs");
+        let html = HtmlRenderer::new().diagnostic_to_html(&diag);
+        assert!(!html.contains("a\nb.rs"), "raw newline in filename: {html}");
     }
 }

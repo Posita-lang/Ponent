@@ -22,6 +22,9 @@ expression: out
   "relatedErrors": [
     {"file": "example.ps", "code": "E019", "message": "duplicate definition of `i`", "span": {"start": 43, "end": 56, "line": 3, "column": 2}}
   ],
+  "children": [
+    {"level": "note", "message": "expected Int<32>", "styledMessage": [{"text": "expected ", "highlighted": false},{"text": "Int<32>", "highlighted": true}]}
+  ],
   "help": "change the return type",
   "suggestions": [
     {"message": "cast with `as`", "applicability": "Unspecified", "style": "ShowAlways"}

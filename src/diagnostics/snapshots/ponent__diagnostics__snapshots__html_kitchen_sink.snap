@@ -24,6 +24,7 @@ expression: out
 <ul class='related'>
 <li class='related-entry'><span class='code'>E019</span> <span class='message'>duplicate definition of `i`</span> <span class='span'>at 43..56</span></li>
 </ul>
+<div class='label'>note: expected <span class='highlight'>Int&lt;32&gt;</span></div>
 <div class='suggestion'>suggestion: cast with `as`</div>
 <div class='help-text'>help: change the return type</div>
 <div class='chain'>referenced by:

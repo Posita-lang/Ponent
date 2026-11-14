@@ -373,6 +373,93 @@ impl JsonRenderer {
             arr.close();
         }
 
+        // Child diagnostics carry user-visible notes/help (including styled
+        // type/name highlights); machine consumers must see them too.
+        if !diag.children().is_empty() {
+            obj.key("children");
+            let mut arr = JsonContainer::array(&mut *obj.out, &ind1, &ind, self.pretty);
+            for child in diag.children() {
+                arr.element();
+                let o = &mut *arr.out;
+                o.push('{');
+                flat_key0(o, "level");
+                Self::push_json_str(o, child.level.as_str());
+                flat_key(o, "message");
+                let plain = child.plain_message();
+                Self::push_json_str(o, plain.as_ref());
+                if let Some(styled) = &child.styled_message {
+                    flat_key(o, "styledMessage");
+                    o.push('[');
+                    for (i, part) in styled.0.iter().enumerate() {
+                        if i > 0 {
+                            o.push(',');
+                        }
+                        o.push('{');
+                        flat_key0(o, "text");
+                        Self::push_json_str(o, part.content.as_ref());
+                        flat_key(
+                            o,
+                            "highlighted",
+                        );
+                        o.push_str(if matches!(
+                            part.style,
+                            crate::diagnostics::StringPartStyle::Highlighted
+                        ) {
+                            "true"
+                        } else {
+                            "false"
+                        });
+                        o.push('}');
+                    }
+                    o.push(']');
+                }
+                if let Some(sp) = child.span {
+                    flat_key(o, "span");
+                    o.push('{');
+                    flat_key0(o, "start");
+                    super::fmt::push_uint(o, sp.start as u64);
+                    flat_key(o, "end");
+                    super::fmt::push_uint(o, sp.end as u64);
+                    match diag.file_name_for(sp.file) {
+                        Some(name) => {
+                            flat_key(o, "file");
+                            Self::push_json_str(o, name);
+                        }
+                        None => {
+                            flat_key(o, "fileId");
+                            super::fmt::push_uint(o, sp.file.as_u32() as u64);
+                        }
+                    }
+                    o.push('}');
+                }
+                if !child.labels.is_empty() {
+                    flat_key(o, "labels");
+                    o.push('[');
+                    for (i, lbl) in child.labels.iter().enumerate() {
+                        if i > 0 {
+                            o.push(',');
+                        }
+                        o.push('{');
+                        flat_key0(o, "start");
+                        super::fmt::push_uint(o, lbl.span.start as u64);
+                        flat_key(o, "end");
+                        super::fmt::push_uint(o, lbl.span.end as u64);
+                        flat_key(o, "message");
+                        Self::push_json_str(o, &lbl.message);
+                        flat_key(o, "kind");
+                        Self::push_json_str(
+                            o,
+                            crate::diagnostics::annotation_kind_name(lbl.kind),
+                        );
+                        o.push('}');
+                    }
+                    o.push(']');
+                }
+                o.push('}');
+            }
+            arr.close();
+        }
+
         // help
         if let Some(help) = diag.help() {
             obj.key("help");
@@ -1049,5 +1136,23 @@ mod tests {
         check(long_clean, "long clean");
         let long_dirty = format!("{}{}", "a".repeat(200), "\\");
         check(&long_dirty, "long dirty");
+    }
+
+    #[test]
+    fn child_diagnostics_are_serialized() {
+        let diag = Diagnostic::error("parent").with_highlighted_note(
+            crate::diagnostics::StyledString::new(vec![crate::diagnostics::StringPart {
+                content: "child".into(),
+                style: crate::diagnostics::StringPartStyle::Highlighted,
+            }]),
+        );
+        let out = json_of(&diag, false);
+        assert!(out.contains("\"children\""), "children missing: {out}");
+        assert!(out.contains("\"styledMessage\""), "styled missing: {out}");
+        assert!(
+            out.contains("\"highlighted\": true"),
+            "highlight missing: {out}"
+        );
+        assert!(out.contains("child"), "child text missing: {out}");
     }
 }

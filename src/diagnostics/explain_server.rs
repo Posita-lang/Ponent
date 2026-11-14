@@ -340,24 +340,24 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                     remove.push((i, PendingAction::Close));
                     continue;
                 }
-                let mut action = PendingAction::Close;
+                let mut action = None;
                 loop {
                     let mut tmp = [0u8; 4096];
                     match pending[i].stream.read(&mut tmp) {
                         Ok(0) => {
-                            action = PendingAction::Close;
+                            action = Some(PendingAction::Close);
                             break;
                         }
                         Ok(n) => {
                             pending[i].buf.extend_from_slice(&tmp[..n]);
                             match pending[i].scan.scan(&pending[i].buf) {
                                 HeaderProgress::Complete(_) => {
-                                    action = PendingAction::Serve;
+                                    action = Some(PendingAction::Serve);
                                     break;
                                 }
                                 HeaderProgress::TooLargeHeader
                                 | HeaderProgress::TooLargeLine => {
-                                    action = PendingAction::TooLarge;
+                                    action = Some(PendingAction::TooLarge);
                                     break;
                                 }
                                 HeaderProgress::Incomplete => {}
@@ -368,15 +368,14 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(_) => {
-                            action = PendingAction::Close;
+                            action = Some(PendingAction::Close);
                             break;
                         }
                     }
                 }
-                if action == PendingAction::Close && Instant::now() >= pending[i].expiry() {
-                    action = PendingAction::Close;
+                if let Some(action) = action {
+                    remove.push((i, action));
                 }
-                remove.push((i, action));
             }
 
             let mut handoff: SmallVec<[(TcpStream, SmallVec<[u8; 512]>, PendingAction); 8]> =
@@ -565,6 +564,9 @@ const MAX_REQUEST_LINE: usize = 8 * 1024;
 /// Bound one reactor wakeup's accept work so a sustained connect flood cannot
 /// starve established reads/writes/deadlines; level-triggered epoll resumes.
 const ACCEPT_BATCH: usize = 64;
+/// Consecutive non-transient `accept` failures before the persistent server
+/// reports the listener as dead instead of spinning forever.
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: usize = 100;
 
 /// Incremental header scanner shared by PendingConn, `drain_request_tracked`
 /// and the epoll reactor.  Only the newly appended suffix (plus the 3-byte
@@ -784,8 +786,10 @@ fn arm_read_timeout_until(stream: &mut TcpStream, deadline: Instant) -> std::io:
 /// wall-clock budget expires.  Shared by [`serve_page`], the persistent
 /// handler, and the speculative-connection drain in [`serve_explain`].
 ///
-/// Only CRLF (`\r\n\r\n`) terminators are recognised: browsers always send
-/// CRLF, and the persistent request-line reader is the only LF-lenient path.
+/// Only HTTP header framing is recognised.  The request line and the blank
+/// line after the headers are LF-lenient (`\n\n` and a lone `\n` are accepted,
+/// matching the tests and the incremental scanner); CRLF remains the canonical
+/// browser form.
 ///
 /// Accumulating the chunks makes a terminator split across *any* number of
 /// reads correct.  The scan itself is incremental : only bytes appended by
@@ -822,16 +826,22 @@ fn drain_request_tracked(
         HeaderProgress::Complete(end) => Some(end),
         _ => None,
     };
+    let mut hit_cap = false;
     let mut buf = [0u8; 4096];
 
     while head_end.is_none() {
-        if Instant::now() >= deadline || collected.len() >= MAX_HEADER {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if collected.len() >= MAX_HEADER {
+            hit_cap = true;
             break;
         }
         // Finding 8: never read past the header cap; a terminator arriving
         // beyond it must not be accepted as a valid header block.
         let want = (MAX_HEADER - collected.len()).min(buf.len());
         if want == 0 {
+            hit_cap = true;
             break;
         }
         if arm_read_timeout_until(stream, deadline).is_err() {
@@ -861,9 +871,13 @@ fn drain_request_tracked(
     }
 
     let Some(head_end) = head_end.filter(|&end| end <= MAX_HEADER) else {
-        // Absent, incomplete, or oversized: close without a response.  The
-        // caller cannot distinguish these, but none is a servable request.
-        return DrainOutcome::NoRequest;
+        // Absent and incomplete are silent; hitting the size cap is a
+        // protocol-visible 431, matching the reactor's `TooLargeHeader`.
+        return if hit_cap {
+            DrainOutcome::TooLarge
+        } else {
+            DrainOutcome::NoRequest
+        };
     };
 
     // Bytes past the terminator arrived in the same read as the headers and
@@ -1376,33 +1390,46 @@ fn serve_page_after_prefix(
         // Finding 6: validate the full three-token grammar and version before
         // any routing decision, exactly like the persistent dispatcher.
         let Some(req) = parse_request_line(line.as_ref()) else {
-            let _ = drain_request(stream, prefix, Duration::from_secs(1));
-            let _ = write_prepared(stream, bad_request_head(), "");
-            linger_after_half_close(stream);
-            return Ok(false);
+            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            return finish_head(
+                stream,
+                drain,
+                |stream| write_prepared(stream, bad_request_head(), ""),
+                false,
+            );
         };
+        let head_only = req.method == "HEAD";
         if !matches!(req.version, "HTTP/1.0" | "HTTP/1.1") {
-            let _ = drain_request(stream, prefix, Duration::from_secs(1));
-            let _ = write_prepared(stream, bad_request_head(), "");
-            linger_after_half_close(stream);
-            return Ok(false);
+            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            return finish_head(
+                stream,
+                drain,
+                |stream| write_prepared(stream, bad_request_head(), ""),
+                false,
+            );
         }
         // [4]2: origin-form is required; `GET E030 HTTP/1.1` must not be
         // served by the one-shot while the persistent router rejects it.
         if !req.target.starts_with('/') {
-            let _ = drain_request(stream, prefix, Duration::from_secs(1));
-            let _ = write_prepared(stream, bad_request_head(), "");
-            linger_after_half_close(stream);
-            return Ok(false);
+            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            return finish_head(
+                stream,
+                drain,
+                |stream| write_prepared(stream, bad_request_head(), ""),
+                false,
+            );
         }
         // A non-GET/HEAD must not receive a full body (protocol violation); answer
         // 405 with `Allow: GET, HEAD` and keep waiting for the real page request.
         if req.method != "GET" && req.method != "HEAD" {
             stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-            let _ = drain_request(stream, prefix, Duration::from_secs(1));
-            let _ = write_prepared(stream, method_not_allowed_head(), "");
-            linger_after_half_close(stream);
-            return Ok(false);
+            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            return finish_head(
+                stream,
+                drain,
+                |stream| write_prepared(stream, method_not_allowed_head(), ""),
+                false,
+            );
         }
         if let Some(expected) = expected_path {
             let target = req.target;
@@ -1422,7 +1449,16 @@ fn serve_page_after_prefix(
                 let key = decoded.strip_prefix('/').unwrap_or(decoded.as_str());
                 let key = if key.is_empty() { "/" } else { key };
                 let page = not_found_page_cached(key);
-                match drain_request(stream, prefix, Duration::from_secs(1)) {
+                let drain = drain_request(stream, prefix, Duration::from_secs(1));
+                if head_only {
+                    return finish_head(
+                        stream,
+                        drain,
+                        |stream| write_prepared_parts(stream, page.head_parts(), ""),
+                        false,
+                    );
+                }
+                match drain {
                     DrainOutcome::NoRequest => {
                         let _ = stream.shutdown(Shutdown::Both);
                     }
@@ -1444,13 +1480,16 @@ fn serve_page_after_prefix(
             }
         }
         // HEAD gets the identical GET head (including Content-Length) and no body.
-        if req.method == "HEAD" {
+        if head_only {
             stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-            let _ = drain_request(stream, prefix, Duration::from_secs(1));
+            let drain = drain_request(stream, prefix, Duration::from_secs(1));
             let head = render_head("200 OK", "", body.len());
-            let _ = write_prepared(stream, &head, "");
-            linger_after_half_close(stream);
-            return Ok(false);
+            return finish_head(
+                stream,
+                drain,
+                |stream| write_prepared(stream, &head, ""),
+                true,
+            );
         }
     }
 
@@ -1519,6 +1558,42 @@ fn canonical_path_code(target: &str) -> Option<CompactString> {
 fn method_not_allowed_head() -> &'static str {
     static HEAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HEAD.get_or_init(|| render_head("405 Method Not Allowed", "Allow: GET, HEAD\r\n", 0))
+}
+
+/// Write a head-only response after the request drain, choosing the same
+/// half-close/linger policy as the GET path.  `delivered` distinguishes the
+/// expected page (which completes the one-shot server) from a 404/431.
+fn finish_head<F>(
+    stream: &mut TcpStream,
+    drain: DrainOutcome,
+    write_head: F,
+    delivered: bool,
+) -> std::io::Result<bool>
+where
+    F: FnOnce(&mut TcpStream) -> std::io::Result<()>,
+{
+    match drain {
+        DrainOutcome::NoRequest => {
+            let _ = stream.shutdown(Shutdown::Both);
+            Ok(false)
+        }
+        DrainOutcome::HeadersOnly => {
+            write_head(stream)?;
+            linger_after_half_close(stream);
+            Ok(delivered)
+        }
+        DrainOutcome::Complete => {
+            write_head(stream)?;
+            drain_residual(stream);
+            let _ = stream.shutdown(Shutdown::Both);
+            Ok(delivered)
+        }
+        DrainOutcome::TooLarge => {
+            write_header_too_large(stream)?;
+            linger_after_half_close(stream);
+            Ok(false)
+        }
+    }
 }
 
 /// Half-close, then consume inbound bytes until EOF or a short budget.
@@ -1867,7 +1942,6 @@ pub fn serve_explain_persistent(listener: &TcpListener) -> std::io::Result<()> {
     // no diagnostic.  A *transient* error (EMFILE, ENFILE) is followed by
     // success, which resets the counter, so only a genuinely stuck listener
     // reaches the cap.
-    const MAX_CONSECUTIVE_ACCEPT_ERRORS: usize = 100;
     let mut consecutive_accept_errors = 0usize;
     // H5: exponential backoff for transient fd/memory exhaustion, capped at
     // 1 s and excluded from the give-up counter.
@@ -2244,7 +2318,20 @@ fn serve_explain_persistent_epoll(listener: &TcpListener) -> std::io::Result<()>
                             std::thread::sleep(Duration::from_millis(50));
                             break;
                         }
-                        Err(_) => {
+                        Err(ref error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(libc::ECONNABORTED | libc::EPROTO)
+                            ) =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                            break;
+                        }
+                        Err(error) => {
+                            consecutive_accept_errors += 1;
+                            if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                                return Err(error);
+                            }
                             std::thread::sleep(Duration::from_millis(10));
                             break;
                         }
@@ -2758,13 +2845,12 @@ fn bad_request_head() -> &'static str {
 /// must be handed to [`drain_request`] as its `prefix` — otherwise the next
 /// `read` would skip them and the drain could miss the `\r\n\r\n` terminator.
 ///
-/// Reads in 512-byte chunks (one `read` syscall per chunk) instead of one
-/// byte at a time, so a typical ~20–80 byte request line is one syscall.
-/// `line` is a `SmallVec<[u8; 512]>` so it stays on the stack for the common
-/// request-line length, and `leftover` is bounded by the chunk size so its
-/// `SmallVec<[u8; 512]>` is inline too.  The returned `CompactString` is
-/// built from the validated `&str`, so a short request line also inlines
-/// (≤24 bytes) and the common path makes zero heap allocations.
+/// Reads in 1 KiB chunks (one `read` syscall per chunk) instead of one
+/// byte at a time, so a typical ~20–80 byte request line is one syscall and a
+/// long query string needs half as many reads.  `line` is a
+/// `SmallVec<[u8; 512]>` so it stays on the stack for the common request-line
+/// length; `leftover` is bounded by the chunk size and spills only when a
+/// single read crosses the inline capacity.
 fn read_request_line(
     stream: &mut TcpStream,
     prefix: &[u8],
@@ -2799,7 +2885,7 @@ fn read_request_line(
     let deadline = Instant::now() + budget;
     let mut line: SmallVec<[u8; 512]> = SmallVec::new();
     line.extend_from_slice(prefix);
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 1024];
     loop {
         if Instant::now() >= deadline {
             // A partial request line may still have bytes queued in the
@@ -3083,15 +3169,15 @@ fn method_not_allowed_response() -> HttpResponse {
     static PAGE: std::sync::OnceLock<CachedPage> = std::sync::OnceLock::new();
     HttpResponse::from_cache(
         "405 Method Not Allowed",
-        "Allow: GET\r\n",
+        "Allow: GET, HEAD\r\n",
         PAGE.get_or_init(|| {
             CachedPage::build(
                 "405 Method Not Allowed",
-                "Allow: GET\r\n",
+                "Allow: GET, HEAD\r\n",
                 simple_page(
                     "405 — method not allowed",
                     "405 — method not allowed",
-                    "This server only accepts <code>GET</code> requests.",
+                    "This server only accepts <code>GET</code> and <code>HEAD</code> requests.",
                 ),
             )
         }),
@@ -3103,8 +3189,8 @@ fn method_not_allowed_response() -> HttpResponse {
 /// The request line must have exactly three whitespace-separated fields
 /// (`method SP request-target SP HTTP-version`); anything else is a `400`
 /// rather than being silently routed to the index as the old
-/// `nth(1).unwrap_or("/")` did.  Only `GET` is served; other methods get a
-/// `405` with an `Allow` header.
+/// `nth(1).unwrap_or("/")` did.  `GET` and `HEAD` are served; other methods
+/// get a `405` with an `Allow` header.
 fn dispatch_request(request_line: &str) -> HttpResponse {
     dispatch_request_meta(request_line).0
 }
@@ -3117,7 +3203,15 @@ fn dispatch_request_meta(request_line: &str) -> (HttpResponse, bool) {
     let http11 = req.version == "HTTP/1.1";
     let head_only = req.method == "HEAD";
     if !req.target.starts_with('/') || !matches!(req.version, "HTTP/1.0" | "HTTP/1.1") {
-        return (bad_request_response(), http11);
+        let response = bad_request_response();
+        return (
+            if head_only {
+                response.as_head()
+            } else {
+                response
+            },
+            http11,
+        );
     }
     if req.method != "GET" && !head_only {
         return (method_not_allowed_response(), http11);
@@ -3460,8 +3554,23 @@ mod tests {
     fn dispatch_rejects_non_get_with_allow_header() {
         let response = dispatch_request("POST /E030 HTTP/1.1");
         assert_eq!(response.status, "405 Method Not Allowed");
-        assert_eq!(response.extra_headers, "Allow: GET\r\n");
+        assert_eq!(response.extra_headers, "Allow: GET, HEAD\r\n");
         assert!(response.body().contains("only accepts"));
+    }
+
+    #[test]
+    fn head_error_responses_are_bodyless() {
+        for line in [
+            "HEAD /E030 HTTP/2",
+            "HEAD E030 HTTP/1.1",
+        ] {
+            let response = dispatch_request(line);
+            assert_eq!(response.status, "400 Bad Request", "line {line:?}");
+            assert!(
+                response.body().is_empty(),
+                "HEAD 400 must not carry a body: {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -3573,8 +3682,8 @@ mod tests {
         );
         assert!(
             response
-                .windows(b"Allow: GET".len())
-                .any(|w| w == b"Allow: GET"),
+                .windows(b"Allow: GET, HEAD".len())
+                .any(|w| w == b"Allow: GET, HEAD"),
             "response: {}",
             String::from_utf8_lossy(&response)
         );
@@ -3973,6 +4082,62 @@ mod tests {
         assert!(
             scan_framing(b"Content-Length: 999999999999999999999999999999\r\n\r\n").oversized,
             "a Content-Length beyond the body cap must be marked oversized"
+        );
+    }
+
+    #[test]
+    fn one_shot_keeps_fragmented_request_pending() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || serve_explain(&listener, "E030"));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\n")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        client
+            .write_all(b"Connection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        server.join().unwrap().unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "fragmented one-shot request was closed: {:?}",
+            &response[..response.len().min(32)]
+        );
+    }
+
+    #[test]
+    fn one_shot_head_completes_without_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || serve_explain(&listener, "E030"));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(b"HEAD /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        server.join().unwrap().unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "one-shot HEAD failed: {:?}",
+            &response[..response.len().min(32)]
+        );
+        let split = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("complete response head");
+        assert!(
+            response[split + 4..].is_empty(),
+            "HEAD response carried a body"
         );
     }
 

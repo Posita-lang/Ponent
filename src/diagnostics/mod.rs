@@ -3311,6 +3311,13 @@ pub(crate) struct LineIndex<'a> {
     /// inner `Arc`: the map is shared by reference, so the inner refcount was
     /// always 1 and only bought a heap allocation per non-ASCII line.
     ///
+    /// Succinct rank/select (Jacobson 1989; Munro–Paterson) gives this
+    /// bitvector `O(1)` rank in `n/8 + o(n)` bits, which is the asymptotic
+    /// optimum.  Here K is typically a handful of non-ASCII chars per line,
+    /// so `partition_point`'s two or three compares beat the succinct
+    /// structure's constants; revisit only if a renderer ever ranks on
+    /// multi-KB CJK lines with thousands of distinct offsets.
+    ///
     /// CAVEAT: the `AtomicUsize` hint is shared through the map.  A racy
     /// `store` can only make a later query re-anchor via `partition_point`
     /// (the hint is a heuristic, never the answer), so the shared map is

@@ -929,7 +929,7 @@ impl GlyphRenderer {
                     .checked_sub(1)
                     .and_then(|prev_i| merged.get(prev_i))
                     .map(|prev| merged[i].0.0.saturating_sub(prev.0.1).saturating_sub(1));
-                self.write_source_section(
+                let anchor_outcome = self.write_source_section(
                     out,
                     source,
                     idx,
@@ -952,10 +952,12 @@ impl GlyphRenderer {
                     &anchor_suggestion_lines,
                     &mut suggestion_rendered,
                 );
-                // The return value is deliberately ignored for the anchor
-                // file: unlike a foreign file, the anchor never registers in
-                // `foreign_rendered_files`, and an empty anchor source still
-                // falls through to the label-fallback loop below.
+                // An empty anchor source returns before drawing the
+                // `file:line:col` header.  Keep the primary location visible
+                // with the no-source fallback instead of dropping it.
+                if i == 0 && !anchor_outcome.drew_primary {
+                    self.write_note_line(out, &format!("at {}", group[0]));
+                }
             }
 
             // ── Pre-group foreign-file data ───────────────────────
@@ -1409,14 +1411,14 @@ impl GlyphRenderer {
                 // hash set — O(R) total instead of O(R²) string compares.
                 let mut seen: SmallVec<[&str; 4]> = SmallVec::new();
                 if let Some(c) = diag.code.as_ref() {
-                    seen.push(c.code());
+                    seen.push(c.canonical());
                 }
                 let mut spill: Option<rustc_hash::FxHashSet<&str>> = None;
                 for rel in &diag.related_errors {
                     let Some(c) = rel.code.as_ref() else {
                         continue;
                     };
-                    let code = c.code();
+                    let code = c.canonical();
                     let dup = match &mut spill {
                         Some(s) => !s.insert(code),
                         None => seen.iter().any(|k| *k == code),
@@ -2567,7 +2569,7 @@ impl GlyphRenderer {
                 // glyph: the first line emits `glyph label: message`, so the
                 // continuations skip the same `label: ` gutter (one cell for
                 // the glyph pad + `label` + ": ").
-                push_spaces(out, label.len() + 2);
+                push_spaces(out, visible_width(label) + 2);
                 out.push_str(line.as_ref());
                 out.push('\n');
             }

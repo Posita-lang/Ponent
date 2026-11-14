@@ -99,6 +99,18 @@ impl FilesSeen {
         if id.is_none() && self.name_seen(name) {
             return;
         }
+        // The reverse order: a span-less name was seen first, then a spanned
+        // diagnostic with the same display name arrives.  Keep one summary
+        // file and record the id→name link without inserting a second key.
+        if let Some(id) = id
+            && self.name_seen(name)
+        {
+            if !self.id_names.iter().any(|(known, _)| *known == id) {
+                self.id_names.push((id, CompactString::from(name)));
+            }
+            self.last = Some(FileKey::Id(id));
+            return;
+        }
         let (last, seen) = (&mut self.last, &mut self.seen);
         match seen {
             FilesSeenInner::Small(v) => {
@@ -918,5 +930,13 @@ mod tests {
             2,
             "plain warnings must not consume the error budget:\n{out}"
         );
+    }
+
+    #[test]
+    fn files_seen_name_then_id_counts_one_file() {
+        let mut seen = FilesSeen::new();
+        seen.insert("a.rs", None);
+        seen.insert("a.rs", Some(FileId::DUMMY));
+        assert_eq!(seen.len(), 1, "logical file was counted twice");
     }
 }
