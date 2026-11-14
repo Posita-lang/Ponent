@@ -171,8 +171,8 @@ mod tests {
         // Top-level `let` is rejected (E003), so the two `let` statements
         // live inside a top-level `comptime` block.
         let source = "/// doc\ncomptime {\nlet x = 1;\n  // trivia\nlet y = 2;\n}";
-        let bump = bumpalo::Bump::new();
-        let arena = crate::arena::SyncArena::new(&bump);
+        let mut bump = bumpalo::Bump::new();
+        let arena = crate::arena::SyncArena::new(&mut bump);
         let program = crate::parser::Parser::new(source, FileId::DUMMY, &arena)
             .parse_program()
             .expect("parse must succeed");

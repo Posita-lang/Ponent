@@ -120,7 +120,7 @@ pub fn load_and_parse(
     // as in the checker tests; `LoadedFile` tracks both for the session
     // to release).
     let text: &'static str = Box::leak(text_owned.into_boxed_str());
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
 
@@ -796,7 +796,7 @@ mod tests {
             )
             .expect("register");
         let text: &'static str = Box::leak(raw.into_boxed_str());
-        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
         let mut parser = Parser::new(text, id, arena);

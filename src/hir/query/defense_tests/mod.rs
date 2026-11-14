@@ -710,7 +710,7 @@ static C11_ARENA: std::sync::OnceLock<&'static crate::arena::SyncArena<'static>>
 /// thread — `SyncArena` serializes allocation.
 fn c11_arena() -> &'static crate::arena::SyncArena<'static> {
     *C11_ARENA.get_or_init(|| {
-        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)))
     })
 }
@@ -4536,8 +4536,8 @@ fn d8b_lexer_semantic_stream_invariance() {
     /// The semantic stream through the TWO-CHANNEL entry point
     /// (Parser's upfront lex): trivia skipped, docs diverted.
     fn semantic_tokens(src: &str) -> Vec<Token<'_>> {
-        let bump = bumpalo::Bump::new();
-        let arena = crate::arena::SyncArena::new(&bump);
+        let mut bump = bumpalo::Bump::new();
+        let arena = crate::arena::SyncArena::new(&mut bump);
         crate::parser::Parser::new(src, FileId::DUMMY, &arena)
             .semantic_tokens()
             .cloned()
@@ -4564,8 +4564,8 @@ fn d8b_lexer_semantic_stream_invariance() {
     // Second channel must CAPTURE what the semantic stream excludes:
     // the doc text lands in the doc channel, trivia runs in the trivia
     // channel — nothing is lost, only re-channelled.
-    let bump = bumpalo::Bump::new();
-    let arena = crate::arena::SyncArena::new(&bump);
+    let mut bump = bumpalo::Bump::new();
+    let arena = crate::arena::SyncArena::new(&mut bump);
     let parser = crate::parser::Parser::new(docced, FileId::DUMMY, &arena);
     assert_eq!(
         parser
@@ -4577,8 +4577,8 @@ fn d8b_lexer_semantic_stream_invariance() {
         vec!["@spec A spec"],
         "doc comment must be captured into the doc channel"
     );
-    let bump2 = bumpalo::Bump::new();
-    let arena2 = crate::arena::SyncArena::new(&bump2);
+    let mut bump2 = bumpalo::Bump::new();
+    let arena2 = crate::arena::SyncArena::new(&mut bump2);
     let parser2 = crate::parser::Parser::new(noisy, FileId::DUMMY, &arena2);
     assert!(
         parser2
@@ -4615,7 +4615,7 @@ fn doctokens_query_returns_item_docs_via_doc_map() {
     use crate::session::SessionQueryProvider;
 
     let src = "//! module doc must not leak\n/// @spec adds\n/// second line\ndef add(x, y) { return x; }\ndef bare(x) { return x; }";
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
     let program = Box::leak(Box::new(

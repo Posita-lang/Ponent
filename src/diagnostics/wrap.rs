@@ -240,7 +240,7 @@ pub(crate) fn wrap_optimal<'a>(
     // a paragraph above `u32::MAX / N_FITNESS` bytes keeps `n * N_FITNESS`
     // representable.  The fallback is the same always-valid line preserving
     // layout the DP uses on a backtrack failure.
-    if text.len() > u32::MAX as usize / N_FITNESS {
+    if text.len() >= u32::MAX as usize / N_FITNESS {
         return text
             .split_terminator('\n')
             .map(Cow::Borrowed)
@@ -435,7 +435,10 @@ fn wrap_optimal_with<'a>(
             // callers indexing the last segment (`chain.rs`) never see an
             // empty result for non-empty input.
             scratch.words = words;
-            out.push(Cow::Borrowed(""));
+            // A non-empty paragraph with no words is whitespace-only.
+            // ASCII spaces/tabs are layout noise; non-ASCII whitespace such
+            // as NBSP/U+3000 is content and must survive verbatim.
+            out.push(Cow::Borrowed(if para.is_ascii() { "" } else { para }));
             continue;
         }
         for range in wrap_dp(&words, max_width, tables, scratch) {
@@ -1087,7 +1090,6 @@ struct WrapScratch {
     pws: SmallVec<[usize; 8]>,
     dp: SmallVec<[f64; 32]>,
     prev: SmallVec<[u32; 32]>,
-    reachable: SmallVec<[bool; 32]>,
     /// One bit per fitness class; lets the min-plus precompute skip the 4×4
     /// scan when only one class at `j` is reachable (the common case).
     reachable_mask: SmallVec<[u8; 32]>,
@@ -1112,7 +1114,6 @@ impl WrapScratch {
             pws: SmallVec::with_capacity(32),
             dp: SmallVec::with_capacity(32),
             prev: SmallVec::with_capacity(32),
-            reachable: SmallVec::with_capacity(32),
             reachable_mask: SmallVec::with_capacity(32),
             best_cost: SmallVec::with_capacity(32),
             best_src: SmallVec::with_capacity(32),
@@ -1137,15 +1138,23 @@ fn wrap_dp(
         // bookkeeping.
         return smallvec![words[0].range()];
     }
-    // State indices are `u32` (`j * N_FITNESS + class`).  The public entry
-    // rejects paragraphs above `u32::MAX / N_FITNESS` bytes; this release
-    // guard covers any internal caller whose word count somehow exceeds that
-    // (each word is at least one byte, so it normally cannot).
-    if n > u32::MAX as usize / N_FITNESS {
-        return words
+    // State indices are `u32` (`j * N_FITNESS + class`).  Use checked
+    // arithmetic here as well as the public guard: on 32-bit `(n+1)*4` can
+    // wrap even when `n` alone looks representable.
+    let per_word = || {
+        words
             .iter()
             .map(|w| w.start as usize..w.end as usize)
-            .collect();
+            .collect()
+    };
+    let Some(n_states) = n
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(N_FITNESS))
+    else {
+        return per_word();
+    };
+    if n_states - 1 > u32::MAX as usize {
+        return per_word();
     }
     debug_assert!(
         n <= u32::MAX as usize / N_FITNESS,
@@ -1161,7 +1170,6 @@ fn wrap_dp(
         pws,
         dp,
         prev,
-        reachable,
         reachable_mask,
         best_cost,
         best_src,
@@ -1171,7 +1179,13 @@ fn wrap_dp(
     pws.clear();
     pws.resize(n + 1, 0);
     for (i, w) in words.iter().enumerate() {
-        pws[i + 1] = pws[i] + w.width as usize + w.trailing_space as usize;
+        let Some(next) = pws[i]
+            .checked_add(w.width as usize)
+            .and_then(|v| v.checked_add(w.trailing_space as usize))
+        else {
+            return per_word();
+        };
+        pws[i + 1] = next;
     }
 
     // Hoisted once for the whole DP: `intrinsic_badness` would otherwise
@@ -1200,25 +1214,20 @@ fn wrap_dp(
         None => (&[], &[]),
     };
 
-    let n_states = (n + 1) * N_FITNESS;
     // All five buffers come from the shared `WrapScratch`: `clear` +
     // `resize` keeps their capacity (and any heap allocation) across the
     // paragraphs of one `wrap_optimal` call.  `dp`/`prev` are fully
-    // overwritten via resize-with-init below, so stale contents are
-    // harmless; `reachable` is reset to all-false the same way.
+    // overwritten via resize-with-init below, so stale contents are harmless.
     dp.clear();
     dp.resize(n_states, f64::INFINITY);
     prev.clear();
     prev.resize(n_states, u32::MAX);
-    reachable.clear();
-    reachable.resize(n_states, false);
     reachable_mask.clear();
     reachable_mask.resize(n + 1, 0);
     // `j == 0` is the empty prefix: nothing sits above the first line, so all
     // entry classes are free.
     for c in 0..N_FITNESS {
         dp[c] = 0.0;
-        reachable[c] = true;
     }
     reachable_mask[0] = (1u8 << N_FITNESS) - 1;
 
@@ -1285,7 +1294,6 @@ fn wrap_dp(
             if cost < dp[s] {
                 dp[s] = cost;
                 prev[s] = best_src[i_lo][class];
-                reachable[s] = true;
                 reachable_mask[j] |= 1u8 << class;
             }
         }
@@ -1318,7 +1326,6 @@ fn wrap_dp(
             if cost < dp[s] {
                 dp[s] = cost;
                 prev[s] = best_src[i][class];
-                reachable[s] = true;
                 reachable_mask[j] |= 1u8 << class;
             }
         }
@@ -1332,7 +1339,7 @@ fn wrap_dp(
         // comparisons only to leave `best_cost[j]` at `INFINITY` (its
         // initial value).  Checking all four fitness classes at `j` is
         // required: different classes can have different reachability.
-        // Reads the one-byte `reachable` mirror instead of four `f64`s.
+        // Reads the one-byte reachability mask instead of four `f64`s.
         let mask = reachable_mask[j];
         if j < n && mask != 0 {
             if mask.count_ones() == 1 {
@@ -1625,6 +1632,15 @@ mod tests {
         let second = wrap_optimal(" \n", 80, 4);
         assert!(first.iter().all(|segment| segment.is_empty()));
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn non_ascii_whitespace_only_paragraph_survives() {
+        let nbsp = "\u{00A0}";
+        assert_eq!(
+            wrap_optimal(nbsp, 80, 4).as_slice(),
+            [Cow::Borrowed(nbsp)].as_slice()
+        );
     }
 
     #[test]

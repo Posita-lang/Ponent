@@ -280,7 +280,7 @@ impl DiagFilter {
         let canon = |pat: &str| -> String {
             crate::diagnostics::error_code::lookup_uppercased(pat)
                 .map(|e| e.code.to_string())
-                .unwrap_or_else(|| pat.to_string())
+                .unwrap_or_else(|| pat.to_ascii_uppercase())
         };
         let allow_codes: rustc_hash::FxHashSet<String> =
             opts.allow_codes.iter().map(|s| canon(s)).collect();
@@ -300,6 +300,17 @@ impl DiagFilter {
         }
     }
 
+    fn code_matches(
+        set: &rustc_hash::FxHashSet<String>,
+        code: &crate::diagnostics::error_code::ErrCode,
+    ) -> bool {
+        let canonical = code.canonical();
+        set.contains(canonical)
+            || set
+                .iter()
+                .any(|pattern| pattern.eq_ignore_ascii_case(canonical))
+    }
+
     /// Whether `diag` passes the filter — mirrors the original
     /// [`Diagnostic::matches_filter`] exactly, with hash lookups for the
     /// exact-match fields.
@@ -312,13 +323,13 @@ impl DiagFilter {
         // *dropped*.  Pinned by `allow_codes_suppresses_matching_diagnostics`.
         if !self.allow_codes.is_empty()
             && let Some(c) = code
-            && self.allow_codes.contains(c.canonical())
+            && Self::code_matches(&self.allow_codes, c)
         {
             return false;
         }
         if !self.only_codes.is_empty() {
             match code {
-                Some(c) if self.only_codes.contains(c.canonical()) => {}
+                Some(c) if Self::code_matches(&self.only_codes, c) => {}
                 _ => return false,
             }
         }
@@ -3459,8 +3470,13 @@ fn cap_char_prefixes(
         Option<(std::sync::Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>,
     >,
 ) {
-    if cache.len() >= CHAR_PREFIXES_CAP {
-        cache.clear();
+    if cache.len() >= CHAR_PREFIXES_CAP
+        && let Some(key) = cache.keys().next().copied()
+    {
+        // Evict one line instead of clearing every worker's sparse column
+        // table.  A full clear forces an O(line_len) rebuild storm; one
+        // per-line entry is cheap to recompute and the map stays bounded.
+        cache.remove(&key);
     }
 }
 

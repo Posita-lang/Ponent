@@ -1816,7 +1816,7 @@ mod tests {
         let arena: &'static crate::arena::SyncArena<'static> = Box::leak(Box::new(
             crate::arena::SyncArena::new(Box::leak(Box::new(bumpalo::Bump::new()))),
         ));
-        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let vars = vec![Symbol::intern("i"), Symbol::intern("j")];
         // i = 0; j = 0; while i < 100 { i := i + 1; j := j + 1 } — a two-
         // variable monotone chain whose bound-raising needs several

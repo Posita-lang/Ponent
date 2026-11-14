@@ -11,7 +11,7 @@ use crate::parser::Parser;
 /// equivalence tests inspect the bodies of REJECTED programs (the error
 /// direction).
 pub(crate) fn check_source_keep_hir(source: &'static str) -> (HirProgram<'static>, Vec<String>) {
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
     let mut parser = Parser::new(source, FileId::DUMMY, arena);
@@ -100,7 +100,7 @@ fn check_source_with(
     // increments.  Parallel tests get their own TraitEnv instances, so
     // there is no cross-test DefId collision.
 
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
     let mut parser = Parser::new(source, FileId::DUMMY, arena);
@@ -167,7 +167,7 @@ fn check_source_with(
 /// classifies by cycle variance.
 #[test]
 fn b5a_recursive_enum_expansion_via_resolver() {
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
     // Multi-field variant payloads are TUPLES in Posita: `Node((Tree, Tree))`.
@@ -214,7 +214,7 @@ fn b5a_recursive_enum_expansion_via_resolver() {
 /// boundary: "κ diagnostics are NOT gated").
 #[test]
 fn stage4_dyn_trait_closes_parametricity_gate() {
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
     let source = "def f(x: dyn Foo) -> Int<32> { return 0; }\ndef main() -> Int<32> { return 0; }";
@@ -251,7 +251,7 @@ fn stage4_dyn_trait_closes_parametricity_gate() {
 /// diagnostics become compile-time errors).  Mirrors `check_source` with
 /// `strict_mode = true` on the checker.
 pub(crate) fn check_strict(source: &'static str) -> Result<HirProgram<'static>, Vec<String>> {
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
     let mut parser = Parser::new(source, FileId::DUMMY, arena);
@@ -4083,7 +4083,7 @@ mod test_regex {
         );
         // Exercise the parser directly, skipping type-check (100KB would
         // trigger other paths).
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let sync_arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
         let mut parser = crate::parser::Parser::new(&source, FileId::DUMMY, sync_arena);
@@ -4137,7 +4137,7 @@ mod test_regex {
         let source = "@trusted
          def unsafe_fn() -> Int<32> { return 42; }
          def main() -> Int<32> { return 0; }";
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let sync_arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
         let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -4172,7 +4172,7 @@ mod test_regex {
     fn test_m3_dyn_trait_rejected_in_strict() {
         let source = "def f(x: dyn Foo) -> Int<32> { return 0; }
          def main() -> Int<32> { return 0; }";
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let sync_arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
         let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -4234,7 +4234,7 @@ mod test_regex {
         let source = "@trusted
          def unsafe_fn() -> Int<32> { return 42; }
          def main() -> Int<32> { return 0; }";
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let sync_arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
         let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -4443,7 +4443,7 @@ mod test_regex {
         // @experimental should be accepted when --enable-experimental is set.
         let source = "@experimental
          def main() -> Int<32> { return 0; }";
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let sync_arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
         let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -4478,7 +4478,7 @@ mod test_regex {
         let source = "@cfg(all(target_os == \"linux\", target_os == \"windows\"))
          def f() -> Int<32> { return 0; }
          def main() -> Int<32> { return 0; }";
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let sync_arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
         let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -4511,7 +4511,7 @@ mod test_regex {
         let source = "@cfg(debug)
          def f() -> Int<32> { return 0; }
          def main() -> Int<32> { return 0; }";
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let sync_arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
         let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -4547,7 +4547,7 @@ mod test_regex {
          def main() -> Int<32> {
              comptime { return unsafe_fn(); }
          }";
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let sync_arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
         let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -6464,7 +6464,7 @@ def main() -> Int<32> { return 0; }",
         // codes (the probe's `operation` body has an unrelated E031 noise
         // error, so we assert on codes rather than on success).
         let run = |strict: bool| -> Vec<String> {
-            let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+            let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
             let sync_arena: &'static crate::arena::SyncArena<'static> =
                 Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
             let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -9460,7 +9460,7 @@ fn test_strict_mode_rejects_unsafe_block() {
     let source = "def main() -> Int<32> {
          unsafe { return 0; }
      }";
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let sync_arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
     let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -9491,7 +9491,7 @@ fn test_strict_mode_rejects_unsafe_block() {
 fn test_strict_mode_rejects_runtime_check() {
     let source = "@runtime_check
      def main() -> Int<32> { return 0; }";
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let sync_arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
     let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -11094,7 +11094,7 @@ fn test_set_in_loop_body_is_assignment() {
 /// running `check_program`).
 fn with_live_checker(f: impl for<'a, 's, 'i, 'r> FnOnce(&'r mut TypeChecker<'a, 's, 'i>)) {
     let source = "def main() -> Int<32> { return 0; }";
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let sync_arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
     let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -11327,7 +11327,7 @@ fn test_lookup_method_generic_match_probe() {
              def grab(&self) -> Int<32> { return 1; }
          }
          def main() -> Int<32> { return 0; }";
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let sync_arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(arena)));
     let mut parser = Parser::new(source, FileId::DUMMY, sync_arena);
@@ -11811,7 +11811,7 @@ fn test_gadt_scrut_field_access_method() {
 fn test_digest_gate_recomputes_only_changed_function() {
     use crate::hir::query::queries::{fn_body_compute_count_for, fn_body_compute_mark};
 
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
 
@@ -11921,7 +11921,7 @@ fn test_check_fn_body_mismatched_key_folds_to_error_value() {
     use crate::hir::hir::HirStmt;
     use crate::hir::query::queries::{CheckFnBody, FnId};
 
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
 

@@ -223,8 +223,8 @@ fn main() {
     // plain local lifetime rather than `'static`.  Every allocation goes
     // through the `SyncArena` (never the bare `&Bump`), so the arena's
     // allocation lock is always respected.
-    let bump = bumpalo::Bump::new();
-    let session_sync_arena = crate::arena::SyncArena::new(&bump);
+    let mut bump = bumpalo::Bump::new();
+    let session_sync_arena = crate::arena::SyncArena::new(&mut bump);
 
     let cli = cli::Cli::parse();
     // `--fix` is only meaningful for the `check` subcommand; silently ignoring

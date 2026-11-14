@@ -4247,6 +4247,8 @@ pub(crate) struct UnderlineLanes {
     /// Linear active set for rows with ≤4 underlines; a heap's sift cost
     /// dominates at that size.
     small_active: SmallVec<[(usize, usize); 4]>,
+    /// Reused weight-sort scratch for `assign`.
+    weights: SmallVec<[(usize, usize); 8]>,
     /// Start-sorted index scratch.
     order: Vec<usize>,
     /// Lanes used by the last `assign`.
@@ -4259,6 +4261,7 @@ impl UnderlineLanes {
             lanes: Vec::new(),
             active: BinaryHeap::new(),
             small_active: SmallVec::new(),
+            weights: SmallVec::new(),
             order: Vec::new(),
             count: 0,
         }
@@ -4279,11 +4282,13 @@ impl UnderlineLanes {
             lanes,
             active,
             small_active,
+            weights,
             order,
             count,
         } = self;
         active.clear();
         small_active.clear();
+        weights.clear();
         for lane in lanes.iter_mut() {
             lane.clear();
         }
@@ -4431,7 +4436,7 @@ impl UnderlineLanes {
         // reduces the weighted depth sum whenever a later-opened lane ends
         // up heavier than an earlier one.
         if n > 1 {
-            let mut weights: SmallVec<[(usize, usize); 8]> = (0..n)
+            weights.extend((0..n)
                 .map(|l| {
                     let w: usize = lanes[l]
                         .iter()
@@ -4444,8 +4449,7 @@ impl UnderlineLanes {
                         })
                         .sum();
                     (w, l)
-                })
-                .collect();
+                }));
             // Descending weight → heaviest first.  Tie-break on the original
             // lane index for deterministic output.
             weights.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -4540,9 +4544,7 @@ impl UnderlineLanes {
             let color = color_for(ch);
             out.push_str(color);
             push_spaces(out, start - cursor);
-            for _ in start..end {
-                out.push(ch);
-            }
+            out.extend(std::iter::repeat_n(ch, end - start));
             out.push_str(reset);
             if ch != ' ' {
                 visible = true;

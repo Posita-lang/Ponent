@@ -100,10 +100,11 @@ impl FilesSeen {
             return;
         }
         // The reverse order: a span-less name was seen first, then a spanned
-        // diagnostic with the same display name arrives.  Keep one summary
-        // file and record the id→name link without inserting a second key.
+        // diagnostic with the same display name arrives.  Merge only with an
+        // *anonymous* name entry; two distinct FileIds may legitimately share
+        // a display name and must remain two summary files.
         if let Some(id) = id
-            && self.name_seen(name)
+            && self.anonymous_name_seen(name)
         {
             if !self.id_names.iter().any(|(known, _)| *known == id) {
                 self.id_names.push((id, CompactString::from(name)));
@@ -134,6 +135,17 @@ impl FilesSeen {
             self.id_names.push((id, CompactString::from(name)));
         }
         *last = Some(key);
+    }
+
+    fn anonymous_name_seen(&self, name: &str) -> bool {
+        match &self.seen {
+            FilesSeenInner::Small(v) => v
+                .iter()
+                .any(|key| matches!(key, FileKey::Name(known) if known == name)),
+            FilesSeenInner::Large(s) => s
+                .iter()
+                .any(|key| matches!(key, FileKey::Name(known) if known == name)),
+        }
     }
 
     fn name_seen(&self, name: &str) -> bool {
@@ -938,5 +950,13 @@ mod tests {
         seen.insert("a.rs", None);
         seen.insert("a.rs", Some(FileId::DUMMY));
         assert_eq!(seen.len(), 1, "logical file was counted twice");
+    }
+
+    #[test]
+    fn files_seen_distinct_ids_with_same_name_stay_distinct() {
+        let mut seen = FilesSeen::new();
+        seen.insert("module.rs", Some(FileId::from_raw(1)));
+        seen.insert("module.rs", Some(FileId::from_raw(2)));
+        assert_eq!(seen.len(), 2, "distinct FileIds were merged by name");
     }
 }

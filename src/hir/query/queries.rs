@@ -3107,8 +3107,8 @@ mod tests {
 
     #[test]
     fn type_def_shape_reads_a_real_resolved_struct() {
-        let arena = Bump::new();
-        let sync_arena = crate::arena::SyncArena::new(&arena);
+        let mut arena = Bump::new();
+        let sync_arena = crate::arena::SyncArena::new(&mut arena);
         let (_ctx, symbols, trait_env, resolution_map, program) = resolved(
             "type Point = struct { x: Int<32>, y: Int<32> }\n",
             &sync_arena,
@@ -3149,8 +3149,8 @@ mod tests {
 
     #[test]
     fn type_def_shape_is_total_for_unknown_def_ids() {
-        let arena = Bump::new();
-        let sync_arena = crate::arena::SyncArena::new(&arena);
+        let mut arena = Bump::new();
+        let sync_arena = crate::arena::SyncArena::new(&mut arena);
         let (_ctx, symbols, trait_env, resolution_map, program) = resolved("", &sync_arena);
 
         let system = QuerySystem::new();
@@ -3177,8 +3177,8 @@ mod tests {
     /// `par_get` hands the provider to rayon.
     #[test]
     fn type_def_shape_runs_under_par_get() {
-        let arena = Bump::new();
-        let sync_arena = crate::arena::SyncArena::new(&arena);
+        let mut arena = Bump::new();
+        let sync_arena = crate::arena::SyncArena::new(&mut arena);
         let (_ctx, symbols, trait_env, resolution_map, program) = resolved(
             "type A = struct { v: Int<32> }\ntype B = struct { w: Int<32> }\n",
             &sync_arena,
@@ -3222,8 +3222,8 @@ mod tests {
     /// cross-function freeze at every call site.
     #[test]
     fn check_fn_signature_reads_a_real_function() {
-        let arena = Bump::new();
-        let sync_arena = crate::arena::SyncArena::new(&arena);
+        let mut arena = Bump::new();
+        let sync_arena = crate::arena::SyncArena::new(&mut arena);
         let (_ctx, symbols, trait_env, resolution_map, program) = resolved(
             "def get(x: &mut Int<32>) -> &mut Int<32> { return x; }\n",
             &sync_arena,
@@ -3275,8 +3275,8 @@ mod tests {
     /// not by name — two impl blocks may both define `get`.
     #[test]
     fn check_fn_signature_addresses_impl_methods_by_index() {
-        let arena = Bump::new();
-        let sync_arena = crate::arena::SyncArena::new(&arena);
+        let mut arena = Bump::new();
+        let sync_arena = crate::arena::SyncArena::new(&mut arena);
         let source = concat!(
             "type Box = struct { v: Int<32> }\n",
             "impl for Box {\n",
@@ -3334,8 +3334,8 @@ mod tests {
     /// `compute` poisons the latch and surfaces as a bogus cycle error.
     #[test]
     fn check_fn_signature_is_total_for_out_of_range_keys() {
-        let arena = Bump::new();
-        let sync_arena = crate::arena::SyncArena::new(&arena);
+        let mut arena = Bump::new();
+        let sync_arena = crate::arena::SyncArena::new(&mut arena);
         let (_ctx, symbols, trait_env, resolution_map, program) = resolved(
             "def get(x: &mut Int<32>) -> &mut Int<32> { return x; }\n",
             &sync_arena,

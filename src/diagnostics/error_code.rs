@@ -799,12 +799,23 @@ pub fn related_codes_of(code: &str) -> &'static [&'static str] {
     let Some(entry) = resolve(code) else {
         return &[];
     };
-    for (src, rel) in RELATED_CODES {
-        if *src == entry.code {
-            return rel;
-        }
-    }
-    &[]
+    let slot = code_slot(entry.code)
+        .expect("every CODE_TABLE entry has a direct-address slot") as usize;
+    static RELATED_CACHE: std::sync::OnceLock<
+        Box<[std::sync::OnceLock<&'static [&'static str]>]>,
+    > = std::sync::OnceLock::new();
+    let cells = RELATED_CACHE.get_or_init(|| {
+        (0..DIRECT_ADDRESS_SLOTS)
+            .map(|_| std::sync::OnceLock::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    });
+    cells[slot].get_or_init(|| {
+        RELATED_CODES
+            .iter()
+            .find_map(|(src, rel)| (*src == entry.code).then_some(*rel))
+            .unwrap_or(&[])
+    })
 }
 
 pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4]> {
@@ -1138,14 +1149,40 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Skip a char literal starting at the opening `'`, honouring `'\''` and
     /// `'\u{…}'`, returning the index just past the closing quote (or `len`).
     fn skip_char_literal(bytes: &[u8], i: usize) -> usize {
+        let len = bytes.len();
         let mut j = i + 1;
-        while j < bytes.len() && bytes[j] != b'\'' {
-            if bytes[j] == b'\\' {
+        if j >= len {
+            return len;
+        }
+        if bytes[j] == b'\\' {
+            j += 1;
+            if j >= len {
+                return len;
+            }
+            if bytes[j] == b'u' && j + 1 < len && bytes[j + 1] == b'{' {
+                j += 2;
+                while j < len && bytes[j] != b'}' {
+                    j += 1;
+                }
+                if j < len {
+                    j += 1;
+                }
+            } else {
                 j += 1;
             }
-            j += 1;
+        } else {
+            let ch = std::str::from_utf8(&bytes[j..])
+                .ok()
+                .and_then(|s| s.chars().next());
+            j += ch.map_or(1, char::len_utf8);
         }
-        (j + 1).min(bytes.len())
+        if j < len && bytes[j] == b'\'' {
+            (j + 1).min(len)
+        } else {
+            // A lifetime such as `'static` is not a char literal: skip only
+            // the quote so the following identifier is scanned normally.
+            i + 1
+        }
     }
 
     fn argument_span(source: &str, open_idx: usize) -> Option<&str> {
@@ -1515,6 +1552,18 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // mis-delimits the following literal as empty.
         let arg = r#""E0\"30" + "E030""#;
         assert_eq!(code_literals(arg), vec!["E030"]);
+    }
+
+    #[test]
+    fn code_literals_skip_lifetimes() {
+        assert_eq!(
+            code_literals("ErrCode::new(foo::<&'static str>(\"E030\"))"),
+            vec!["E030"]
+        );
+        assert_eq!(
+            code_literals("if x == '&' { \"E031\" } else { \"E032\" }"),
+            vec!["E031", "E032"]
+        );
     }
 
     #[test]

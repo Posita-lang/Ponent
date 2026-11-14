@@ -546,7 +546,9 @@ impl HtmlRenderer {
             html.push_str("<div class='label'>");
             html.push_str(child.level.label());
             html.push_str(": ");
-            if let Some(styled) = &child.styled_message {
+            if let Some(styled) = &child.styled_message
+                && !styled.0.is_empty()
+            {
                 for part in &styled.0 {
                     match part.style {
                         crate::diagnostics::StringPartStyle::Highlighted => {

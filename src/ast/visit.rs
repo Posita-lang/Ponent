@@ -2098,7 +2098,7 @@ mod tests {
         Program<'static, 'static>,
         &'static crate::arena::SyncArena<'static>,
     ) {
-        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
         let mut parser = Parser::new(source, FileId::DUMMY, arena);

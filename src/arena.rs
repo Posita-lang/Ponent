@@ -136,10 +136,10 @@ impl fmt::Debug for SyncArena<'_> {
 }
 
 impl<'a> SyncArena<'a> {
-    /// Wrap a borrow of a `Bump`.  The caller must not use the original
-    /// borrow to allocate while this wrapper is alive — doing so would
-    /// bypass the lock and break invariant (2).
-    pub fn new(bump: &'a Bump) -> Self {
+    /// Wrap an exclusive borrow of a `Bump`.  Requiring `&mut Bump` makes the
+    /// soundness invariant structural: while the arena is alive, safe code
+    /// cannot retain a shared `&Bump` and allocate through it unsynchronized.
+    pub fn new(bump: &'a mut Bump) -> Self {
         SyncArena {
             bump,
             fast: Padded(AtomicPtr::new(ptr::null_mut())),
@@ -446,7 +446,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn leaked_arena() -> &'static SyncArena<'static> {
-        let bump: &'static Bump = Box::leak(Box::new(Bump::new()));
+        let bump: &'static mut Bump = Box::leak(Box::new(Bump::new()));
         Box::leak(Box::new(SyncArena::new(bump)))
     }
 

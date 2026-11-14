@@ -656,8 +656,8 @@ mod tests {
         backend.insert_file("/src/main.ps", "def main() -> Int<32> { return 42; }");
 
         // The arena is owned HERE, by the caller, and outlives the tree.
-        let bump = bumpalo::Bump::new();
-        let arena = crate::arena::SyncArena::new(&bump);
+        let mut bump = bumpalo::Bump::new();
+        let arena = crate::arena::SyncArena::new(&mut bump);
         let mut id_counter = 0;
         let mut root =
             VfsNode::scan(&backend, "/src", &mut id_counter, &arena).expect("scan should succeed");

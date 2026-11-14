@@ -2846,7 +2846,7 @@ mod tests {
         ),
         Vec<String>,
     > {
-        let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let arena: &'static crate::arena::SyncArena<'static> =
             Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
         let mut ctx = TypeContext::new();

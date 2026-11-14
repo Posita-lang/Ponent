@@ -356,9 +356,9 @@ impl JsonRenderer {
                         if let Some(idx) = idx.as_ref()
                             && let Some(source) = diag.source()
                             && anchor_file == Some(sp.file)
-                            && sp.end_as_usize() <= source.len()
                         {
-                            let (line, col) = idx.linecol_display(sp.start_as_usize());
+                            let (line, col) =
+                                idx.linecol_display(sp.start_as_usize().min(source.len()));
                             flat_key(o, "line");
                             super::fmt::push_uint(o, (line + 1) as u64);
                             flat_key(o, "column");

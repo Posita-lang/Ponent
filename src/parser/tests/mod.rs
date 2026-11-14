@@ -2,7 +2,7 @@ use super::*;
 
 /// Leak a fresh `'static` arena for tests that return `'static` ASTs.
 fn leaked_arena() -> &'static crate::arena::SyncArena<'static> {
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     Box::leak(Box::new(crate::arena::SyncArena::new(bump)))
 }
 
@@ -1383,7 +1383,7 @@ fn test_replace_ident_renames_into_nested_stmt() {
         panic!("expected a function def");
     };
     let if_stmt = &body.as_ref().unwrap()[0];
-    let bump: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+    let bump: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
     let arena: &'static crate::arena::SyncArena<'static> =
         Box::leak(Box::new(crate::arena::SyncArena::new(bump)));
     let renamed = crate::ast::visit::replace_ident_in_stmt(

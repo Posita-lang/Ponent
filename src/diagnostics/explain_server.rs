@@ -620,7 +620,7 @@ impl HeaderScan {
     /// Scan a buffer that begins at the request line.
     fn scan(&self, buf: &[u8]) -> HeaderProgress {
         match self.line_nl.get() {
-            Some(position) if position > MAX_REQUEST_LINE => {
+            Some(position) if position >= MAX_REQUEST_LINE => {
                 return HeaderProgress::TooLargeLine;
             }
             Some(_) => {}
@@ -631,7 +631,7 @@ impl HeaderScan {
                         let position = from + offset;
                         self.line_nl.set(Some(position));
                         self.line_scanned.set(buf.len());
-                        if position > MAX_REQUEST_LINE {
+                        if position >= MAX_REQUEST_LINE {
                             return HeaderProgress::TooLargeLine;
                         }
                     }
@@ -2052,9 +2052,17 @@ fn serve_explain_persistent_impl(
     let first_deadline = Instant::now() + Duration::from_secs(10);
     let mut served_any = false;
     let mut last_activity = Instant::now();
+    let served_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let mut seen_served = 0usize;
     std::thread::scope(|scope| {
         loop {
             let now = Instant::now();
+            let written = served_count.load(Ordering::Relaxed);
+            if written != seen_served {
+                seen_served = written;
+                served_any = true;
+                last_activity = now;
+            }
             if let Some(idle) = idle {
                 if !served_any && now >= first_deadline {
                     terminal_error = Some(std::io::Error::new(
@@ -2073,8 +2081,6 @@ fn serve_explain_persistent_impl(
             let incoming = listener.accept();
             match incoming {
                 Ok((mut stream, _)) => {
-                    served_any = true;
-                    last_activity = Instant::now();
                     consecutive_accept_errors = 0;
                     accept_backoff_ms = 50;
                     // Per-connection errors must not kill the server.
@@ -2128,6 +2134,7 @@ fn serve_explain_persistent_impl(
                     // footprint honest and still leaves room for debug-build
                     // frames.  If spawn itself fails, dropping the closure
                     // drops the guard, so the counter never leaks.
+                    let served_thread = std::sync::Arc::clone(&served_count);
                     let spawned = std::thread::Builder::new()
                         .name("ponent-explain".into())
                         .stack_size(64 * 1024)
@@ -2139,7 +2146,7 @@ fn serve_explain_persistent_impl(
                             // request instead; the guard still drops on
                             // unwind.
                             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                let _ = handle_persistent_connection(&mut stream);
+                                let _ = handle_persistent_connection(&mut stream, &served_thread);
                             }))
                             .is_err()
                             {
@@ -2850,7 +2857,10 @@ fn serve_explain_persistent_epoll(
     }
 }
 
-fn handle_persistent_connection(stream: &mut TcpStream) -> std::io::Result<()> {
+fn handle_persistent_connection(
+    stream: &mut TcpStream,
+    served: &AtomicUsize,
+) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     // A client that stops reading must not wedge `write_all` on a full
     // socket buffer; the response is a few KB, well under one write, but a
@@ -2920,6 +2930,7 @@ fn handle_persistent_connection(stream: &mut TcpStream) -> std::io::Result<()> {
             response.body(),
             keep_alive,
         )?;
+        served.fetch_add(1, Ordering::Relaxed);
         if keep_alive {
             // Do NOT `drain_residual`: bytes arriving after this response
             // belong to the next request on the same connection (browsers do
@@ -3001,7 +3012,7 @@ fn read_request_line(
     // (the 512-byte one-shot read).  Handle a line completed inside it without
     // another syscall, and seed the accumulator otherwise.
     if let Some(nl) = memchr::memchr(b'\n', prefix) {
-        if nl > 8192 {
+        if nl >= 8192 {
             *too_large = true;
             let _ = drain_request(stream, &prefix[nl + 1..], Duration::from_millis(100));
             return None;
@@ -3988,7 +3999,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let server = std::thread::spawn(move || handle_persistent_connection(&mut server));
+        let server = std::thread::spawn(move || handle_persistent_connection(&mut server, &AtomicUsize::new(0)));
         client
             .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
@@ -4368,7 +4379,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let server = std::thread::spawn(move || handle_persistent_connection(&mut server));
+        let server = std::thread::spawn(move || handle_persistent_connection(&mut server, &AtomicUsize::new(0)));
         client
             .write_all(b"GET /E030 HTTP/1.1\nHost: x\nConnection: close\n\n")
             .unwrap();
@@ -4415,7 +4426,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let server = std::thread::spawn(move || handle_persistent_connection(&mut server));
+        let server = std::thread::spawn(move || handle_persistent_connection(&mut server, &AtomicUsize::new(0)));
         let mut request = b"GET /E030 HTTP/1.1\r\nHost: x\r\nCookie: ".to_vec();
         request.extend(std::iter::repeat(b'a').take(12 * 1024));
         request.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
@@ -4466,7 +4477,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             let (mut server, _) = listener.accept().unwrap();
-            let server = std::thread::spawn(move || handle_persistent_connection(&mut server));
+            let server = std::thread::spawn(move || handle_persistent_connection(&mut server, &AtomicUsize::new(0)));
             client.write_all(request).unwrap();
             let mut response = Vec::new();
             let _ = client.read_to_end(&mut response);

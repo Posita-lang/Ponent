@@ -1518,7 +1518,7 @@ mod tests {
     /// The expression translator produces SMT-LIB2 terms.
     #[test]
     fn test_expr_to_smt() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let e = bin(&arena, BinOp::Ge, ident(&arena, "i"), lit(&arena, 0));
         let mut s = String::new();
         assert!(expr_to_smt(e, &mut s));
@@ -1543,7 +1543,7 @@ mod tests {
             eprintln!("z3 unavailable — skipping test_check_hints");
             return;
         }
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let ge0 = bin(&arena, BinOp::Ge, ident(&arena, "i"), lit(&arena, 0));
         assert!(solver.check_hints(&[ge0]), "i ≥ 0 is consistent");
         let contradictory = bin(
@@ -1563,7 +1563,7 @@ mod tests {
     /// decision that sends an obligation to bit-vector discharge.
     #[test]
     fn test_expr_uses_wrap() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = ident(&arena, "x");
         let one = lit(&arena, 1);
         let wrap = bin(&arena, BinOp::AddWrap, x, one);
@@ -1650,7 +1650,7 @@ mod tests {
     /// negatives via `bvneg`) at the variable's own width.
     #[test]
     fn test_expr_to_smt_bv_wrap_and_literals() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = ident(&arena, "x");
         let wrap = bin(&arena, BinOp::AddWrap, x, lit(&arena, 1));
         let mut s = String::new();
@@ -1688,7 +1688,7 @@ mod tests {
     /// while an in-range bound translates normally.
     #[test]
     fn test_expr_to_smt_bv_diff_in_bounds_guard() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = ident(&arena, "x");
         let y = ident(&arena, "y");
         // |128| = 2^(8-1): at/above the boundary → out of range → fail.
@@ -1741,7 +1741,7 @@ mod tests {
             eprintln!("z3 unavailable — skipping test_discharge_bv_wrap_obligation_accepted");
             return;
         }
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         // hints: x ≥ 0 ∧ x ≤ 255 (the invariant candidates)
         let x = ident(&arena, "x");
         let ge0 = bin(&arena, BinOp::Ge, x, lit(&arena, 0));
@@ -1774,7 +1774,7 @@ mod tests {
     /// also be accepted by Z3.
     #[test]
     fn test_expr_to_smt_bv_signed_comparator_standard_name() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = ident(&arena, "x");
         let le = bin(&arena, BinOp::Le, x, lit(&arena, 127));
         let mut s = String::new();
@@ -1820,7 +1820,7 @@ mod tests {
     /// checks that should fail (or vice versa for `x ≤ -5`).
     #[test]
     fn test_expr_to_smt_bv_negative_bound_signed_vs_unsigned() {
-        let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+        let arena: &'static mut bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
         let x = ident(&arena, "x");
         // x ≥ -5  →  in signed 8-bit terms: x ∈ [-5, 127].
         let ge = bin(&arena, BinOp::Ge, x, lit(&arena, -5));
