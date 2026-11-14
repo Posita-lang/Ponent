@@ -45,8 +45,11 @@ jobs:
 
             // The issues endpoint includes both issues and pull requests.
             // Filter by creator, then distinguish the contribution type using
-            // the presence of the pull_request property. Exclude the current
-            // item so this check does not depend on API indexing timing.
+            // the presence of the pull_request property. GitHub issue numbers
+            // are monotonically assigned across issues and PRs, so only a
+            // lower-numbered item can be an earlier contribution. Ignoring
+            // equal and higher numbers also makes concurrent first submissions
+            // deterministic: the lowest-numbered one gets the greeting.
             const authoredContributions = await github.paginate(
               github.rest.issues.listForRepo,
               {
@@ -59,7 +62,7 @@ jobs:
             );
 
             const hasPreviousContribution = authoredContributions.some((item) => {
-              if (item.number === currentNumber) return false;
+              if (item.number >= currentNumber) return false;
               return isPullRequest
                 ? Boolean(item.pull_request)
                 : !item.pull_request;
