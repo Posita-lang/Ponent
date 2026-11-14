@@ -68,25 +68,32 @@ jobs:
               throw new Error(`No size bucket matched ${changedLines} changed lines.`);
             }
 
-            // Ensure the selected label exists. Handle a concurrent workflow
-            // creating the same label by accepting 422 only if it now exists.
-            try {
-              await github.rest.issues.createLabel({
-                owner,
-                repo,
-                name: selected.name,
-                color: selected.color,
-                description: selected.description,
-              });
-            } catch (error) {
-              if (error.status !== 422) throw error;
+            // Ensure the selected label exists. Read first to avoid generating
+            // expected 422 responses on every run; re-check after a concurrent
+            // create to distinguish that race from a real validation failure.
+            let repositoryLabels = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              { owner, repo, per_page: 100 },
+            );
+            if (!repositoryLabels.some(({ name }) => name === selected.name)) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: selected.name,
+                  color: selected.color,
+                  description: selected.description,
+                });
+              } catch (error) {
+                if (error.status !== 422) throw error;
 
-              const repositoryLabels = await github.paginate(
-                github.rest.issues.listLabelsForRepo,
-                { owner, repo, per_page: 100 },
-              );
-              if (!repositoryLabels.some(({ name }) => name === selected.name)) {
-                throw error;
+                repositoryLabels = await github.paginate(
+                  github.rest.issues.listLabelsForRepo,
+                  { owner, repo, per_page: 100 },
+                );
+                if (!repositoryLabels.some(({ name }) => name === selected.name)) {
+                  throw error;
+                }
               }
             }
 
