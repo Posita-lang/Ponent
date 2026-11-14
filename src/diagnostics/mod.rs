@@ -2865,10 +2865,14 @@ pub(crate) fn is_real_file_name(name: &str) -> bool {
 /// flattening).  The short renderer's `push_flattened` collapses all three
 /// to a single space, so a tab never reaches the one-line output verbatim.
 pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
+    sanitize_for_terminal_flatten_with_break(s).0
+}
+
+pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>, bool) {
     let bytes = s.as_bytes();
-    let (has_high, dirty, has_c1) = scan_terminal_control_flags_flatten(bytes);
+    let (has_high, dirty, has_c1, has_break) = scan_terminal_control_flags_flatten(bytes);
     if !has_high && !dirty {
-        return Cow::Borrowed(s);
+        return (Cow::Borrowed(s), has_break);
     }
     // Non-ASCII with no C0/C1/DEL *and* no bidi override/isolate: borrow.
     // Bidi formatting characters (U+202A–U+202E, U+2066–U+2069) are neither
@@ -2876,7 +2880,7 @@ pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
     // probed separately (see [`sanitize_for_terminal`] for the spoofing
     // rationale) and must reach the owned path for removal.
     if has_high && !dirty && !has_c1 && !has_bidi_override_bytes(bytes) {
-        return Cow::Borrowed(s);
+        return (Cow::Borrowed(s), has_break);
     }
     // Layout-only ASCII (`\n`/`\r`/`\t` are the only controls) is already
     // covered by the first branch: the scanner excludes those bytes from
@@ -2886,7 +2890,7 @@ pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
     // content, only rendering direction, so replacement would just inject
     // noise while `\n`/`\r`/`\t` survive for the flattening caller.
     if has_bidi_override_bytes(bytes) {
-        return Cow::Owned(s.chars()
+        return (Cow::Owned(s.chars()
             .filter(|c| !is_bidi_override(*c))
             .map(|c| {
                 if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
@@ -2895,9 +2899,9 @@ pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
                     c
                 }
             })
-            .collect());
+            .collect()), has_break);
     }
-    Cow::Owned(s.chars()
+    (Cow::Owned(s.chars()
         .map(|c| {
             if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
                 '\u{FFFD}'
@@ -2905,7 +2909,7 @@ pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
                 c
             }
         })
-        .collect())
+        .collect()), has_break)
 }
 
 /// Replace control characters with U+FFFD so external text cannot inject
@@ -2977,12 +2981,13 @@ pub(crate) fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
 
 /// One SWAR pass classifying a byte slice for the terminal sanitizers.
 ///
-/// Returns `(has_high, dirty)`:
+/// Returns `(has_high, dirty, has_c1)`:
 ///
 /// * `has_high` — any byte ≥ 0x80 (non-ASCII UTF-8 byte, lead or
 ///   continuation);
 /// * `dirty` — any byte that a sanitizer must replace: byte < 0x20 (C0) or
-///   `0x7F` (DEL).
+///   `0x7F` (DEL);
+/// * `has_c1` — a `0xC2 0x80..=0x9F` C1 control sequence.
 ///
 /// Three masks per 8-byte chunk (`hasless(0x20)`, `has_zero(0x7F)`, the
 /// high-bit OR) instead of the two full scans the previous two-gate
@@ -3027,7 +3032,7 @@ fn scan_terminal_control_flags(s: &[u8]) -> (bool, bool, bool) {
 fn c1_in_chunk(s: &[u8], base: usize, x: u64) -> bool {
     const HI: u64 = 0x8080_8080_8080_8080;
     const ONES: u64 = 0x0101_0101_0101_0101;
-    const C2: u64 = 0x0202_0202_0202_0202;
+    const C2: u64 = 0xC2C2_C2C2_C2C2_C2C2;
     let q = x ^ C2;
     let mut mask = q.wrapping_sub(ONES) & !q & HI;
     while mask != 0 {
@@ -3059,9 +3064,10 @@ fn has_c1_sequence(s: &[u8]) -> bool {
 }
 
 /// One fused SWAR pass classifying a byte slice for
-/// [`sanitize_for_terminal_multiline`]: returns `(has_high, dirty)` where
-/// `has_high` is any byte ≥ 0x80 and `dirty` is any byte the multiline
-/// sanitizer must replace — a C0 byte other than `\t`/`\n`, or DEL.  The
+/// [`sanitize_for_terminal_multiline`]: returns `(has_high, dirty, has_c1)`
+/// where `has_high` is any byte ≥ 0x80, `dirty` is any byte the multiline
+/// sanitizer must replace — a C0 byte other than `\t`/`\n`, or DEL — and
+/// `has_c1` is a `0xC2 0x80..=0x9F` sequence.  The
 /// `\t`/`\n` exclusion keeps the old dirty-chunk discipline: the `< 0x20`
 /// mask is only existentially exact (it cannot be masked per-lane), so a
 /// chunk that trips it gets its *flagged lanes* resolved by exact byte
@@ -3119,10 +3125,11 @@ pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool, bo
 /// [`scan_terminal_control_flags_multiline`] variant for
 /// [`sanitize_for_terminal_flatten`]: `\t`, `\n` *and* `\r` are excluded from
 /// the dirty set, because those are exactly the layout bytes the flatten path
-/// keeps or consumes (`push_flattened`).  A multi-line message with no other
-/// controls therefore stays `Cow::Borrowed`, and flagged-lane resolution (not
-/// whole-chunk rescans) keeps tab/newline/CR-dense text at SWAR speed.
-fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool) {
+/// keeps or consumes (`push_flattened`).  Returns `(has_high, dirty, has_c1)`;
+/// `has_c1` flags a `0xC2 0x80..=0x9F` sequence.  A multi-line message with no
+/// other controls therefore stays `Cow::Borrowed`, and flagged-lane resolution
+/// (not whole-chunk rescans) keeps tab/newline/CR-dense text at SWAR speed.
+fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, bool) {
     const HI: u64 = 0x8080_8080_8080_8080;
     const SP: u64 = 0x2020_2020_2020_2020;
     const DEL: u64 = 0x7F7F_7F7F_7F7F_7F7F;
@@ -3134,6 +3141,7 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool) {
     let mut has_high = false;
     let mut dirty = false;
     let mut has_c1 = false;
+    let mut has_break = false;
     let mut i = 0;
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
@@ -3150,6 +3158,7 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool) {
             let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI;
             let nl = !(((x ^ NL) | HI).wrapping_sub(ONES)) & HI;
             let cr = !(((x ^ CR) | HI).wrapping_sub(ONES)) & HI;
+            has_break |= tab | nl | cr != 0;
             if lt20 & !tab & !nl & !cr != 0 {
                 dirty = true;
             }
@@ -3159,10 +3168,11 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool) {
     for j in i..s.len() {
         let b = s[j];
         has_high |= b >= 0x80;
+        has_break |= matches!(b, b'\t' | b'\n' | b'\r');
         dirty |= (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F;
         has_c1 |= b == 0xC2 && s.get(j + 1).is_some_and(|b| (0x80..=0x9F).contains(b));
     }
-    (has_high, dirty, has_c1)
+    (has_high, dirty, has_c1, has_break)
 }
 
 /// Unicode bidirectional formatting characters: the U+202A–U+202E
@@ -5159,6 +5169,19 @@ mod tests {
                 Cow::Owned(_)
             ));
         }
+        // Regression: C1 in the SIMD/SWAR body (not just the scalar tail).
+        // The u64 kernel previously XORed with 0x02 instead of 0xC2, so a
+        // long string whose only control was C1 borrowed unsanitized.
+        for pad in 0..32 {
+            let s = format!("{}a\u{0085}bcdefghijklmnopqrstuvwxyz", "x".repeat(pad));
+            assert!(has_c1_sequence(s.as_bytes()), "pad {pad}");
+            assert!(scan_terminal_control_flags(s.as_bytes()).2, "pad {pad}");
+            assert!(matches!(sanitize_for_terminal(&s), Cow::Owned(_)));
+        }
+        // Non-ASCII without C1 must not falsely report C1.
+        let clean = format!("{}é", "x".repeat(64));
+        assert!(!scan_terminal_control_flags(clean.as_bytes()).2);
+        assert!(matches!(sanitize_for_terminal(&clean), Cow::Borrowed(_)));
         let reference = |s: &[u8]| {
             s.iter()
                 .any(|&b| (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F)
@@ -5180,7 +5203,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let (has_high, dirty, _has_c1) = scan_terminal_control_flags_flatten(&bytes);
+            let (has_high, dirty, _has_c1, _has_break) = scan_terminal_control_flags_flatten(&bytes);
             let _ = has_high;
             assert_eq!(dirty, reference(&bytes), "{bytes:?}");
         }

@@ -620,12 +620,10 @@ impl HtmlRenderer {
                 &old_line[end_col..]
             );
             let tab_width = cx.map_or(self.fallback_tab_width, |c| c.opts.tab_width.max(1));
-            let line_num_width = (idx.text_line_count().saturating_sub(1))
-                .checked_ilog10()
-                .unwrap_or(0) as usize
-                + 1;
-            // Gutter: line number + space + separator + space + `- `/`+ `.
-            let diff_text_col = line_num_width + 5;
+            // HTML's diff block has no line-number/`│` gutter: the `- `/`+ `
+            // payload starts at the block's left edge, so tab stops advance
+            // from column 0 (the CSS margin is a pixel offset, not a cell).
+            let diff_text_col = 0;
             let old_display = expand_tabs_from_col(old_line, tab_width, diff_text_col);
             let new_display = expand_tabs_from_col(&new_line, tab_width, diff_text_col);
             html.push_str("<div class='suggestion-diff'><span class='diff-del'>- ");
@@ -1227,7 +1225,9 @@ impl HtmlRenderer {
             return;
         }
         let escaped = self.escape(s);
-        if escaped.len() > 4096 {
+        if escaped.len() > 4096
+            || matches!(escaped, std::borrow::Cow::Borrowed(_))
+        {
             out.push_str(escaped.as_ref());
             return;
         }

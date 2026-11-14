@@ -85,6 +85,10 @@ impl JsonRenderer {
     /// because a diagnostic's whole JSON is now assembled in one buffer, so
     /// values that exceed the 24-byte `CompactString` inline limit touch the
     /// heap exactly once instead of twice.
+    ///
+    /// U+2028/U+2029 are valid JSON string characters and are intentionally
+    /// emitted raw; this renderer's output is not safe to embed verbatim in an
+    /// HTML `<script>` context (escape them at that boundary if needed).
     fn push_json_str(out: &mut impl Write, s: &str) {
         // Escaping is decided and applied by [`push_json_escaped_str`]: a
         // single SWAR scan per 8-byte chunk finds each escape site, and the
@@ -155,7 +159,16 @@ impl JsonRenderer {
         // line/column values are resolved against — a span from any *other*
         // file must not be mapped through this index.
         let anchor_file = diag.spans.first().map(|s| s.file);
-        let idx = diag.source().map(|s| cx.line_index(s));
+        let needs_index = anchor_file.is_some()
+            || !diag.related_errors.is_empty()
+            || !diag.suggestions.is_empty()
+            || diag.call_chain.as_ref().is_some_and(|c| !c.is_empty())
+            || !diag.labels().is_empty();
+        let idx = if needs_index {
+            diag.source().map(|s| cx.line_index(s))
+        } else {
+            None
+        };
 
         // Stable identifier: computed from `(code, primary span, message)`
         // via FNV-1a so tools can dedupe/suppress across runs. Emitted
@@ -185,6 +198,9 @@ impl JsonRenderer {
                 obj.key("category");
                 obj.string(entry.category.key());
             } else {
+                // Stable schema: `title`/`category` are always present for a
+                // coded diagnostic; an unregistered code yields `null` rather
+                // than key absence, so consumers do not need two code paths.
                 obj.key("title");
                 obj.raw("null");
                 obj.key("category");

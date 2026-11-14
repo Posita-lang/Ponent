@@ -87,6 +87,21 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
         }
         i += 16;
     }
+    const HI64: u64 = 0x8080_8080_8080_8080;
+    const SP64: u64 = 0x2020_2020_2020_2020;
+    const DEL64: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const ONES64: u64 = 0x0101_0101_0101_0101;
+    while i + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        if (x | x.wrapping_sub(SP64)) & HI64 != 0 {
+            return false;
+        }
+        let v = x ^ DEL64;
+        if v.wrapping_sub(ONES64) & !v & HI64 != 0 {
+            return false;
+        }
+        i += 8;
+    }
     s[i..].iter().all(|&b| AllowedControls::None.allows(b))
 }
 
@@ -162,6 +177,31 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
         }
         i += 16;
     }
+    const HI64: u64 = 0x8080_8080_8080_8080;
+    const SP64: u64 = 0x2020_2020_2020_2020;
+    const TAB64: u64 = 0x0909_0909_0909_0909;
+    const NL64: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+    const DEL64: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const ONES64: u64 = 0x0101_0101_0101_0101;
+    while i + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        if x & HI64 != 0 {
+            return false;
+        }
+        let q = x ^ DEL64;
+        if q.wrapping_sub(ONES64) & !q & HI64 != 0 {
+            return false;
+        }
+        let lt20 = !((x | HI64).wrapping_sub(SP64)) & HI64;
+        if lt20 != 0 {
+            let tab = !(((x ^ TAB64) | HI64).wrapping_sub(ONES64)) & HI64;
+            let nl = !(((x ^ NL64) | HI64).wrapping_sub(ONES64)) & HI64;
+            if (lt20 & !tab & !nl) != 0 {
+                return false;
+            }
+        }
+        i += 8;
+    }
     s[i..]
         .iter()
         .all(|&b| AllowedControls::TabAndNewline.allows(b))
@@ -221,6 +261,29 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
             }
         }
         i += 16;
+    }
+    const HI64: u64 = 0x8080_8080_8080_8080;
+    const SP64: u64 = 0x2020_2020_2020_2020;
+    const TAB64: u64 = 0x0909_0909_0909_0909;
+    const DEL64: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const ONES64: u64 = 0x0101_0101_0101_0101;
+    while i + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        if x & HI64 != 0 {
+            return false;
+        }
+        let v = x ^ DEL64;
+        if v.wrapping_sub(ONES64) & !v & HI64 != 0 {
+            return false;
+        }
+        let lt20 = !((x | HI64).wrapping_sub(SP64)) & HI64;
+        if lt20 != 0 {
+            let tab = !(((x ^ TAB64) | HI64).wrapping_sub(ONES64)) & HI64;
+            if (lt20 & !tab) != 0 {
+                return false;
+            }
+        }
+        i += 8;
     }
     s[i..].iter().all(|&b| AllowedControls::Tab.allows(b))
 }

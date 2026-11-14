@@ -18,6 +18,12 @@ use super::term::path_to_file_url;
 /// actual cap) must agree, or a drift silently disables links for the
 /// rendered tail or under-reserves.
 const MAX_CHAIN_DEPTH: usize = 64;
+/// Upper bounds for the reserve-estimate walk.  Rendering itself is still
+/// bounded by `MAX_CHAIN_DEPTH`/the caller, but a hostile *wide* chain (many
+/// entries at shallow depth) must not make `String::with_capacity` reserve
+/// megabytes before emitting a truncated `...`.
+const MAX_RESERVE_ENTRIES: usize = 64 * 1024;
+const MAX_RESERVE_MESSAGE_BYTES: usize = 1 << 20;
 
 /// Suffix for one chain entry, stored as pieces so the display width is
 /// computable from parts (no `visible_width` scan over the OSC-8-escaped
@@ -272,10 +278,14 @@ fn scan(&self) -> ChainFacts {
         if depth > MAX_CHAIN_DEPTH {
             continue;
         }
-        total += chain.entries.len();
+        total = total
+            .saturating_add(chain.entries.len())
+            .min(MAX_RESERVE_ENTRIES);
         for entry in &chain.entries {
             any_spanned |= entry.span.is_some();
-            message_bytes += entry.message.len();
+            message_bytes = message_bytes
+                .saturating_add(entry.message.len())
+                .min(MAX_RESERVE_MESSAGE_BYTES);
             if let Some(children) = &entry.children {
                 for child in children {
                     stack.push((child, depth + 1));
@@ -590,9 +600,7 @@ fn scan(&self) -> ChainFacts {
                 && !message.is_empty()
                 // The `is_printable_ascii` gate above proves the message has
                 // no tab/newline and no byte outside 0x20..=0x7E, so the only
-                // possible whitespace is `' '`.  A byte scan is exact and
-                // avoids `trim()`'s Unicode-whitespace decode.
-                && message.bytes().any(|b| b != b' ')
+                // possible whitespace is `' '`.
                 // #1: the slow `wrap_optimal` trims edge spaces; a short
                 // `"  foo  "` must render identically, so the fast path
                 // declines when an edge space is present (byte checks are

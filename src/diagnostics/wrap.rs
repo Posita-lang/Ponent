@@ -67,7 +67,7 @@
 //! [`explain_error_code`]: crate::diagnostics::explain_error_code
 
 use super::ascii::is_printable_ascii;
-use super::glyph::{grapheme_width_cached, WIDTH_CACHE};
+use super::glyph::{grapheme_width_cached, WidthCache, WIDTH_CACHE};
 use crate::smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::ops::Range;
@@ -589,7 +589,10 @@ fn collect_words_into(
         push_words_ascii(text, breaks, max_width, words);
     } else {
         uax_break_opportunities_into(text, breaks);
-        push_words(text, breaks, max_width, tab_width, words);
+        WIDTH_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            push_words(text, breaks, max_width, tab_width, words, &mut cache);
+        });
     }
 }
 
@@ -791,6 +794,7 @@ fn push_words(
     max_width: usize,
     tab_width: usize,
     words: &mut SmallVec<[Word; 16]>,
+    cache: &mut WidthCache,
 ) {
     for w in breaks.windows(2) {
         let chunk_start = w[0];
@@ -808,19 +812,27 @@ fn push_words(
             if let Some(prev) = words.last_mut() {
                 // A realistic whitespace run is a handful of cells; the
                 // `u32` field only wraps on a multi-gigabyte run.
-                prev.trailing_space += measure_width(chunk, tab_width) as u32;
+                prev.trailing_space += measure_width_cached(chunk, tab_width, cache) as u32;
             }
             continue;
         }
 
         let content = &text[chunk_start..content_end];
-        let w_content = measure_width(content, tab_width);
-        let space = measure_width(&text[content_end..chunk_end], tab_width);
+        let w_content = measure_width_cached(content, tab_width, cache);
+        let space = measure_width_cached(&text[content_end..chunk_end], tab_width, cache);
 
         if w_content > max_width {
             // Unavoidably wider than the target: split at grapheme boundaries
             // so combining marks / emoji stay intact.
-            push_split_oversized(words, content, chunk_start, max_width, tab_width, space);
+            push_split_oversized(
+                words,
+                content,
+                chunk_start,
+                max_width,
+                tab_width,
+                space,
+                cache,
+            );
         } else {
             words.push(Word {
                 start: chunk_start as u32,
@@ -928,26 +940,24 @@ fn push_split_oversized(
     max_width: usize,
     tab_width: usize,
     trailing: usize,
+    cache: &mut WidthCache,
 ) {
     let mut sub_start = 0usize;
     let mut sub_width = 0usize;
-    WIDTH_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        for (i, g) in text.grapheme_indices(true) {
-            let gw = grapheme_width_cached(g, sub_width, tab_width, &mut cache);
-            if sub_width > 0 && sub_width + gw > max_width {
-                words.push(Word {
-                    start: (offset + sub_start) as u32,
-                    end: (offset + i) as u32,
-                    width: sub_width as u32,
-                    trailing_space: 0,
-                });
-                sub_start = i;
-                sub_width = 0;
-            }
-            sub_width += gw;
+    for (i, g) in text.grapheme_indices(true) {
+        let gw = grapheme_width_cached(g, sub_width, tab_width, cache);
+        if sub_width > 0 && sub_width + gw > max_width {
+            words.push(Word {
+                start: (offset + sub_start) as u32,
+                end: (offset + i) as u32,
+                width: sub_width as u32,
+                trailing_space: 0,
+            });
+            sub_start = i;
+            sub_width = 0;
         }
-    });
+        sub_width += gw;
+    }
     if sub_start < text.len() {
         words.push(Word {
             start: (offset + sub_start) as u32,
@@ -963,6 +973,10 @@ fn push_split_oversized(
 /// Display width of `s` in terminal cells.
 #[inline]
 fn measure_width(s: &str, tab_width: usize) -> usize {
+    WIDTH_CACHE.with(|cell| measure_width_cached(s, tab_width, &mut cell.borrow_mut()))
+}
+
+fn measure_width_cached(s: &str, tab_width: usize, cache: &mut WidthCache) -> usize {
     // Fast path: printable ASCII is one cell per byte, found without ever
     // building a grapheme iterator.  Mirrors the fast paths in
     // `line_display_width` / `visible_width`.
@@ -970,12 +984,9 @@ fn measure_width(s: &str, tab_width: usize) -> usize {
         return s.len();
     }
     let mut w = 0;
-    WIDTH_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        for g in s.graphemes(true) {
-            w += grapheme_width_cached(g, w, tab_width, &mut cache);
-        }
-    });
+    for g in s.graphemes(true) {
+        w += grapheme_width_cached(g, w, tab_width, cache);
+    }
     w
 }
 

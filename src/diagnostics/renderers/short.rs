@@ -119,7 +119,11 @@ impl Renderer for ShortRenderer {
         // Borrow the code string directly; the `[E030]` framing and the
         // coloured tag are written straight into the output below, so no
         // intermediate `CompactString` is built.
-        let code: Option<&str> = diag.code().map(|c| c.code());
+        let code_display: Option<Cow<'_, str>> = diag
+            .code()
+            .map(|c| c.code())
+            .filter(|c| !c.is_empty())
+            .map(super::super::sanitize_for_terminal);
 
         // Resolve the location *before* allocating: the 1-based line/col
         // digit widths feed the capacity computation, and every accessor
@@ -141,13 +145,8 @@ impl Renderer for ShortRenderer {
         // scalar growth pre-scan and no possibility of under-booking.  Unused
         // in release?  No: both are written below.
         let raw_msg = diag.message();
-        let sanitized = super::super::sanitize_for_terminal_flatten(raw_msg);
-        // `code` is untrusted input (`with_code_str` accepts arbitrary
-        // strings): route it through the terminal sanitizer like every other
-        // renderer, so an ESC/BEL in a code cannot inject terminal escapes.
-        let code_display: Option<Cow<'_, str>> = code
-            .filter(|c| !c.is_empty())
-            .map(super::super::sanitize_for_terminal);
+        let (sanitized, has_break) =
+            super::super::sanitize_for_terminal_flatten_with_break(raw_msg);
 
         // ---- Size the reservation to the exact bytes ---------------------
         //   location + tag + ": " + message + "\n"
@@ -168,7 +167,11 @@ impl Renderer for ShortRenderer {
                 }
                 len += 48; // "start..end: " upper bound
             }
-            (None, None) => {}
+            (None, None) => {
+                if diag.source().is_some() && !file.is_empty() {
+                    len += file.len() + 2; // "file: "
+                }
+            }
         }
         if self.use_color {
             len += 4 + level.len() + 4; // "\x1b[1m" level "\x1b[0m"
@@ -206,7 +209,12 @@ impl Renderer for ShortRenderer {
                 fmt::push_uint(out, span.end_as_usize() as u64);
                 out.push_str(": ");
             }
-            (None, None) => {}
+            (None, None) => {
+                if diag.source().is_some() && !file.is_empty() {
+                    out.push_str(file);
+                    out.push_str(": ");
+                }
+            }
         }
 
         // ---- level[code] tag ---------------------------------------------
@@ -237,7 +245,11 @@ impl Renderer for ShortRenderer {
         // A multi-line message would break the one-line format, and a stray
         // `\r` would make a terminal redraw the line.  `push_flattened`
         // consumes the break runs the sanitizer preserved as layout bytes.
-        push_flattened(out, &sanitized);
+        if has_break {
+            push_flattened(out, &sanitized);
+        } else {
+            out.push_str(&sanitized);
+        }
         out.push('\n');
     }
 

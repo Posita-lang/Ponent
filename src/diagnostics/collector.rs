@@ -57,6 +57,9 @@ pub struct DiagCtxt<'src> {
     /// change severity must update it; `summary` cross-checks it in debug.
     errors: usize,
     warnings: usize,
+    /// Errors in the unreported suffix; kept in lockstep with `errors` so
+    /// `has_unreported_errors` is O(1) on the per-module path.
+    unreported_errors: usize,
 }
 
 /// The inline `SmallVec<[Diagnostic; 2]>` is what keeps a zero/one-diagnostic
@@ -81,6 +84,7 @@ impl<'src> DiagCtxt<'src> {
             can_emit_warnings: true,
             errors: 0,
             warnings: 0,
+            unreported_errors: 0,
         }
     }
 
@@ -92,6 +96,7 @@ impl<'src> DiagCtxt<'src> {
         }
         if diag.is_error() {
             self.errors += 1;
+            self.unreported_errors += 1;
         } else if diag.is_warning() {
             self.warnings += 1;
         }
@@ -227,6 +232,7 @@ impl<'src> DiagCtxt<'src> {
             for d in &self.diags[keep..] {
                 if d.is_error() {
                     self.errors -= 1;
+                    self.unreported_errors -= 1;
                 } else if d.is_warning() {
                     self.warnings -= 1;
                 }
@@ -240,6 +246,7 @@ impl<'src> DiagCtxt<'src> {
         self.reported_len = 0;
         self.errors = 0;
         self.warnings = 0;
+        self.unreported_errors = 0;
     }
 
     /// Emit all unreported diagnostics via the given emitter.
@@ -257,6 +264,7 @@ impl<'src> DiagCtxt<'src> {
     ) -> io::Result<()> {
         emitter.emit_all(&mut self.diags[self.reported_len..])?;
         self.reported_len = self.diags.len();
+        self.unreported_errors = 0;
         Ok(())
     }
 
@@ -367,7 +375,7 @@ impl<'src> DiagCtxt<'src> {
 
     /// True when there are unreported errors.
     pub fn has_unreported_errors(&self) -> bool {
-        self.diags[self.reported_len..].iter().any(|d| d.is_error())
+        self.unreported_errors > 0
     }
 
     /// Move all unreported diagnostics into the reported list.
@@ -377,6 +385,7 @@ impl<'src> DiagCtxt<'src> {
     /// compilation.
     pub fn mark_all_reported(&mut self) {
         self.reported_len = self.diags.len();
+        self.unreported_errors = 0;
     }
 
     /// Drain the unreported list and return it.
@@ -394,16 +403,19 @@ impl<'src> DiagCtxt<'src> {
         if self.reported_len == 0 {
             self.errors = 0;
             self.warnings = 0;
+            self.unreported_errors = 0;
             return all;
         }
         let unreported = all.split_off(self.reported_len);
         for d in &unreported {
             if d.is_error() {
                 self.errors -= 1;
+                self.unreported_errors -= 1;
             } else if d.is_warning() {
                 self.warnings -= 1;
             }
         }
+        self.unreported_errors = 0;
         // Put the still-reported prefix back: `split_off` left it in `all`.
         self.diags = SmallVec::from_vec(all);
         unreported
@@ -419,6 +431,7 @@ impl<'src> DiagCtxt<'src> {
             self.reported_len = 0;
             self.errors = 0;
             self.warnings = 0;
+            self.unreported_errors = 0;
             return all;
         }
         let unreported = all.split_off(self.reported_len);
@@ -500,6 +513,7 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
             can_emit_warnings: true,
             errors,
             warnings,
+            unreported_errors: errors,
         }
     }
 }
@@ -668,6 +682,16 @@ mod tests {
             !out.borrow().contains("late"),
             "suppressed push must not be emitted: {out:?}"
         );
+    }
+
+    #[test]
+    fn unreported_error_count_tracks_push_truncate_and_report() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("first"));
+        assert!(c.has_unreported_errors());
+        c.truncate_unreported(0);
+        assert!(!c.has_unreported_errors());
+        drop(c);
     }
 
     #[test]

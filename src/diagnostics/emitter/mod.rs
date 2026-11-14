@@ -19,6 +19,9 @@ use std::io;
 #[cfg(test)]
 static PARALLEL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Written for a diagnostic whose render (or worker setup) panicked.
+const RENDER_PANIC_PLACEHOLDER: &str = "<internal: diagnostic rendering panicked>\n";
+
 pub mod stylesheet;
 
 /// Distinct-file set used by the batch summary, shaped for the access
@@ -49,9 +52,12 @@ struct FilesSeen {
     /// Previous key — the grouped-batch fast path skips the scan on a repeat.
     last: Option<FileKey>,
     seen: FilesSeenInner,
-    /// Display names of `FileKey::Id` entries, so a later span-less
-    /// diagnostic (`FileKey::Name`) for the same file does not double-count.
+    /// Display names of `FileKey::Id` entries while `name_index` is `None`
+    /// (inline small set only).
     id_names: SmallVec<[(crate::ast::FileId, CompactString); INLINE_FILES]>,
+    /// Built when `seen` spills to a hash set; all name probes then become
+    /// hash lookups instead of O(n) scans.
+    name_index: Option<NameIndex>,
 }
 
 /// Inline capacity of [`FilesSeenInner::Small`].  Used in both the array type
@@ -64,12 +70,22 @@ enum FilesSeenInner {
     Large(rustc_hash::FxHashSet<FileKey>),
 }
 
+struct NameIndex {
+    /// Names currently present as anonymous `FileKey::Name` entries.
+    anon: rustc_hash::FxHashSet<CompactString>,
+    /// Names claimed by at least one `FileKey::Id`.
+    claimed: rustc_hash::FxHashSet<CompactString>,
+    /// Exact `(FileId, display name)` pairs (aliases included).
+    id_names: rustc_hash::FxHashSet<(crate::ast::FileId, CompactString)>,
+}
+
 impl FilesSeen {
     fn new() -> Self {
         FilesSeen {
             last: None,
             seen: FilesSeenInner::Small(SmallVec::new()),
             id_names: SmallVec::new(),
+            name_index: None,
         }
     }
 
@@ -77,16 +93,12 @@ impl FilesSeen {
         // Grouped batches repeat the same file: check the last key before
         // constructing `FileKey::Name`, which would allocate for long paths.
         match (self.last.as_ref(), id) {
-            (Some(FileKey::Id(prev)), Some(id)) if *prev == id => return,
-            (Some(FileKey::Name(prev)), None) if prev.as_str() == name => return,
-            (Some(FileKey::Id(prev)), None)
-                if self
-                    .id_names
-                    .iter()
-                    .any(|(known_id, known_name)| known_id == prev && known_name == name) =>
-            {
+            (Some(FileKey::Id(prev)), Some(id)) if *prev == id => {
+                self.add_id_name(id, name);
                 return;
             }
+            (Some(FileKey::Name(prev)), None) if prev.as_str() == name => return,
+            (Some(FileKey::Id(prev)), None) if self.id_name_known(*prev, name) => return,
             _ => {}
         }
         let key = match id {
@@ -99,56 +111,111 @@ impl FilesSeen {
         if id.is_none() && self.name_seen(name) {
             return;
         }
-        // The reverse order: a span-less name was seen first, then a spanned
-        // diagnostic with the same display name arrives.  Merge only with an
-        // *anonymous* name entry; two distinct FileIds may legitimately share
-        // a display name and must remain two summary files.
+        // A span-less name was seen first, then a spanned diagnostic with the
+        // same display name arrives: claim the anonymous entry in place.  This
+        // is essential: leaving `Name` in `seen` would make a later, distinct
+        // `FileId` merge into the same anonymous name again.
         if let Some(id) = id
             && self.anonymous_name_seen(name)
         {
-            if !self.id_names.iter().any(|(known, _)| *known == id) {
-                self.id_names.push((id, CompactString::from(name)));
-            }
-            self.last = Some(FileKey::Id(id));
+            self.claim_anonymous(name, id);
             return;
         }
-        let (last, seen) = (&mut self.last, &mut self.seen);
+        self.insert_seen_key(key);
+        if let Some(id) = id {
+            self.add_id_name(id, name);
+        } else if let Some(index) = self.name_index.as_mut() {
+            index.anon.insert(CompactString::from(name));
+        }
+    }
+
+    fn insert_seen_key(&mut self, key: FileKey) {
+        let (seen, id_names, name_index) = (&mut self.seen, &self.id_names, &mut self.name_index);
         match seen {
             FilesSeenInner::Small(v) => {
                 if !v.contains(&key) {
                     if v.len() < INLINE_FILES {
-                        v.push(key.clone());
+                        v.push(key);
                     } else {
                         let mut set: rustc_hash::FxHashSet<FileKey> = v.drain(..).collect();
-                        set.insert(key.clone());
+                        set.insert(key);
+                        *name_index = Some(NameIndex::from_seen(&set, id_names));
                         *seen = FilesSeenInner::Large(set);
                     }
                 }
             }
             FilesSeenInner::Large(s) => {
-                s.insert(key.clone());
+                s.insert(key);
             }
         }
-        if let Some(id) = id
-            && !self.id_names.iter().any(|(known, _)| *known == id)
+    }
+
+    /// Replace an anonymous `Name(name)` entry with `Id(id)` without changing
+    /// the summary length, and update the name indexes.
+    fn claim_anonymous(&mut self, name: &str, id: crate::ast::FileId) {
+        let old = FileKey::Name(CompactString::from(name));
+        match &mut self.seen {
+            FilesSeenInner::Small(v) => {
+                if let Some(pos) = v.iter().position(|key| *key == old) {
+                    v[pos] = FileKey::Id(id);
+                } else {
+                    v.push(FileKey::Id(id));
+                }
+            }
+            FilesSeenInner::Large(s) => {
+                s.remove(&old);
+                s.insert(FileKey::Id(id));
+            }
+        }
+        if let Some(index) = self.name_index.as_mut() {
+            index.anon.remove(name);
+            index.claimed.insert(CompactString::from(name));
+            index.id_names.insert((id, CompactString::from(name)));
+        } else {
+            self.add_id_name(id, name);
+        }
+        self.last = Some(FileKey::Id(id));
+    }
+
+    fn add_id_name(&mut self, id: crate::ast::FileId, name: &str) {
+        if let Some(index) = self.name_index.as_mut() {
+            index.claimed.insert(CompactString::from(name));
+            index.id_names.insert((id, CompactString::from(name)));
+        } else if !self
+            .id_names
+            .iter()
+            .any(|(known, known_name)| *known == id && known_name == name)
         {
             self.id_names.push((id, CompactString::from(name)));
         }
-        *last = Some(key);
+    }
+
+    fn id_name_known(&self, id: crate::ast::FileId, name: &str) -> bool {
+        match &self.name_index {
+            Some(index) => index.id_names.contains(&(id, CompactString::from(name))),
+            None => self
+                .id_names
+                .iter()
+                .any(|(known_id, known_name)| *known_id == id && known_name == name),
+        }
     }
 
     fn anonymous_name_seen(&self, name: &str) -> bool {
-        match &self.seen {
-            FilesSeenInner::Small(v) => v
+        match (&self.seen, &self.name_index) {
+            (_, Some(index)) => index.anon.contains(name),
+            (FilesSeenInner::Small(v), None) => v
                 .iter()
                 .any(|key| matches!(key, FileKey::Name(known) if known == name)),
-            FilesSeenInner::Large(s) => s
+            (FilesSeenInner::Large(s), None) => s
                 .iter()
                 .any(|key| matches!(key, FileKey::Name(known) if known == name)),
         }
     }
 
     fn name_seen(&self, name: &str) -> bool {
+        if let Some(index) = &self.name_index {
+            return index.claimed.contains(name) || index.anon.contains(name);
+        }
         if self.id_names.iter().any(|(_, known)| known == name) {
             return true;
         }
@@ -167,6 +234,29 @@ impl FilesSeen {
             FilesSeenInner::Small(v) => v.len(),
             FilesSeenInner::Large(s) => s.len(),
         }
+    }
+}
+
+impl NameIndex {
+    fn from_seen(
+        seen: &rustc_hash::FxHashSet<FileKey>,
+        id_names: &SmallVec<[(crate::ast::FileId, CompactString); INLINE_FILES]>,
+    ) -> Self {
+        let mut index = NameIndex {
+            anon: rustc_hash::FxHashSet::default(),
+            claimed: rustc_hash::FxHashSet::default(),
+            id_names: rustc_hash::FxHashSet::default(),
+        };
+        for key in seen {
+            if let FileKey::Name(name) = key {
+                index.anon.insert(name.clone());
+            }
+        }
+        for (id, name) in id_names {
+            index.claimed.insert(name.clone());
+            index.id_names.insert((*id, name.clone()));
+        }
+        index
     }
 }
 
@@ -339,7 +429,10 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // `.min(64)` cap keeps a pathological over-estimate from
         // over-allocating.
         let (lo, hi) = iter.size_hint();
-        let cap = if hi == Some(lo) { lo } else { lo.min(64) };
+        // Trust a usable upper bound (Map/Filter often provide one), but keep
+        // a hard cap so a pathological hint cannot over-allocate.
+        const HARD_CAP: usize = 4096;
+        let cap = hi.unwrap_or(lo.min(64)).min(HARD_CAP);
         let mut filtered: SmallVec<[&'r mut Diagnostic<'src>; 16]> =
             SmallVec::with_capacity(cap);
         // Cheap render-cost proxy summed over the batch.  The parallel
@@ -435,7 +528,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             && total_weight >= WEIGHT_THRESHOLD
             && num_threads > 1
         {
-            self.render_parallel(filtered.as_mut_slice(), &weights, total_weight, sink, num_threads)?;
+            self.render_parallel(filtered.as_mut_slice(), &weights, sink, num_threads)?;
         } else {
             // Serial path: one batch ctx, with the URL cache and scratch
             // hoisted onto the emitter so they survive across batches.
@@ -533,15 +626,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         &self,
         filtered: &mut [&mut Diagnostic<'_>],
         weights: &[usize],
-        total_weight: usize,
         sink: &mut S,
         num_threads: usize,
     ) -> io::Result<()> {
-        // The LPT split above uses the per-diagnostic weights directly; the
-        // aggregate is retained in the signature for the caller's gate.
-        let _ = total_weight;
-        #[cfg(test)]
-        PARALLEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // LPT (longest processing time first): assign each diagnostic, heaviest
         // first, to the currently lightest bin.  This is the classic
         // 4/3-approximation makespan heuristic and prevents one monster
@@ -582,6 +669,8 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             let cx = RenderCtx::hoisted(&self.opts, None, &self.shared);
             return self.render_sequential(filtered, sink, &cx);
         }
+        #[cfg(test)]
+        PARALLEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let separator = self.renderer.render_separator();
         let renderer = &self.renderer;
         let opts = &self.opts;
@@ -605,7 +694,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // source's per-line sparse tables are built once per *batch*, not
         // once per thread.  So is the `file://` URL cache: one
         // `canonicalize` per file per batch, not once per worker per file.
-        let prebuilt: Vec<(
+        let mut prebuilt: Vec<(
             usize,
             usize,
             std::sync::Arc<[u32]>,
@@ -626,20 +715,45 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                     let key = (src.as_ptr() as usize, src.len());
                     if seen.insert(key) {
                         let idx = LineIndex::new(src);
-                        out.push((
-                            key.0,
-                            key.1,
-                            std::sync::Arc::clone(idx.starts_arc()),
-                            idx.ascii(),
-                            std::sync::Arc::clone(idx.char_prefixes_arc()),
-                            idx.generation(),
-                            crate::diagnostics::render::source_fingerprint(src),
-                        ));
+                        let fingerprint = {
+                                #[cfg(debug_assertions)]
+                                {
+                                    crate::diagnostics::render::source_fingerprint(src)
+                                }
+                                #[cfg(not(debug_assertions))]
+                                {
+                                    0
+                                }
+                            };
+                            out.push((
+                                key.0,
+                                key.1,
+                                std::sync::Arc::clone(idx.starts_arc()),
+                                idx.ascii(),
+                                std::sync::Arc::clone(idx.char_prefixes_arc()),
+                                idx.generation(),
+                                fingerprint,
+                            ));
                     }
                 }
             }
             out
         };
+        // Sort by aggregate render weight before workers preload their LRU:
+        // first-seen order can put a cold source in a PRELOAD_SLOTS slot while
+        // the hot source falls back to the shared map on every probe.
+        let mut source_weight: rustc_hash::FxHashMap<(usize, usize), usize> =
+            rustc_hash::FxHashMap::default();
+        for (i, diag) in filtered.iter().enumerate() {
+            if let Some(src) = diag.source() {
+                *source_weight
+                    .entry((src.as_ptr() as usize, src.len()))
+                    .or_default() += weights[i];
+            }
+        }
+        prebuilt.sort_by_key(|entry| {
+            std::cmp::Reverse(*source_weight.get(&(entry.0, entry.1)).unwrap_or(&0))
+        });
         let shared_sources = SharedSources::from_entries(&prebuilt);
         // Share the emitter's hoisted URL cache across all workers *and*
         // across batches: cloning the `Arc` (not the map) is legal even though
@@ -681,17 +795,32 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
 
                 let shared_sources = std::sync::Arc::clone(&shared_sources);
                 let shared_urls = std::sync::Arc::clone(&shared_urls);
-                handles.push(s.spawn(move || {
+                let indices: Vec<usize> = chunk.iter().map(|(orig, _)| *orig).collect();
+                handles.push((
+                    indices,
+                    s.spawn(move || {
                     // One-shot worker constructor: shared line tables, shared
                     // URL cache, and the preloaded LRU in a single call, so a
                     // worker cannot silently miss one of the setup steps.
-                    let cx = RenderCtx::for_parallel_worker(
-                        opts,
-                        None,
-                        shared_sources,
-                        shared_urls,
-                        &prebuilt[..prebuilt.len().min(PRELOAD_SLOTS)],
-                    );
+                    let cx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        RenderCtx::for_parallel_worker(
+                            opts,
+                            None,
+                            shared_sources,
+                            shared_urls,
+                            &prebuilt[..prebuilt.len().min(PRELOAD_SLOTS)],
+                        )
+                    })) {
+                        Ok(cx) => cx,
+                        Err(_) => {
+                            return chunk
+                                .iter()
+                                .map(|(orig, _)| {
+                                    (*orig, RENDER_PANIC_PLACEHOLDER.to_string())
+                                })
+                                .collect();
+                        }
+                    };
                     // One malformed diagnostic must not abort the whole batch.  Catch
                     // at the chunk granularity first (one unwind frame per
                     // chunk instead of per diagnostic); on a panic, redo the
@@ -735,8 +864,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                                     Ok(_) => {}
                                     Err(_) => pieces.push((
                                         orig,
-                                        "<ponent: diagnostic rendering panicked>\n"
-                                            .to_string(),
+                                        RENDER_PANIC_PLACEHOLDER.to_string(),
                                     )),
                                 }
                             }
@@ -744,7 +872,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                         }
                     };
                     pieces
-                }));
+                })));
             }
 
             // Gather in bin order, then restore the batch's original order.
@@ -752,8 +880,15 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // memory is the same Σ(rendered) as the old collect-then-stitch
             // shape.
             let mut all: Vec<(usize, String)> = Vec::new();
-            for h in handles {
-                all.extend(h.join().expect("render thread panicked"));
+            for (indices, h) in handles {
+                match h.join() {
+                    Ok(pieces) => all.extend(pieces),
+                    Err(_) => {
+                        for index in indices {
+                            all.push((index, RENDER_PANIC_PLACEHOLDER.to_string()));
+                        }
+                    }
+                }
             }
             all.sort_by_key(|(i, _)| *i);
             let mut first = true;
@@ -984,5 +1119,19 @@ mod tests {
         seen.insert("module.rs", Some(FileId::from_raw(1)));
         seen.insert("module.rs", Some(FileId::from_raw(2)));
         assert_eq!(seen.len(), 2, "distinct FileIds were merged by name");
+    }
+
+    #[test]
+    fn files_seen_anonymous_name_claimed_by_one_id_then_another_counts_two() {
+        let mut seen = FilesSeen::new();
+        seen.insert("module.rs", None);
+        seen.insert("module.rs", Some(FileId::from_raw(1)));
+        assert_eq!(seen.len(), 1, "anonymous name should merge with first id");
+        seen.insert("module.rs", Some(FileId::from_raw(2)));
+        assert_eq!(
+            seen.len(),
+            2,
+            "the anonymous entry was consumed by Id(1); Id(2) is a second file"
+        );
     }
 }

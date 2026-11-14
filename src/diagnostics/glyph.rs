@@ -3866,7 +3866,9 @@ pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
     if !single {
         order_buf.clear();
         order_buf.extend(0..ranges.len());
-        order_buf.sort_by_key(|&i| (ranges[i].0, ranges[i].1));
+        if !order_buf.is_sorted_by_key(|&i| (ranges[i].0, ranges[i].1)) {
+            order_buf.sort_by_key(|&i| (ranges[i].0, ranges[i].1));
+        }
     }
 
     display_buf.resize(ranges.len(), (0, 0));
