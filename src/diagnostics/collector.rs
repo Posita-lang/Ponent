@@ -91,14 +91,18 @@ impl<'src> DiagCtxt<'src> {
     /// Push a diagnostic into `unreported` and return an `EmissionGuarantee`
     /// proving the diagnostic was recorded (inspired by rustc's `ErrorGuaranteed`).
     pub fn push(&mut self, diag: Diagnostic<'src>) -> EmissionGuarantee {
-        if diag.is_warning() && !self.can_emit_warnings {
-            return EmissionGuarantee::suppressed();
-        }
-        if diag.is_error() {
-            self.errors += 1;
-            self.unreported_errors += 1;
-        } else if diag.is_warning() {
-            self.warnings += 1;
+        match diag.level() {
+            super::DiagnosticLevel::Fatal | super::DiagnosticLevel::Error => {
+                self.errors += 1;
+                self.unreported_errors += 1;
+            }
+            super::DiagnosticLevel::Warning => {
+                if !self.can_emit_warnings {
+                    return EmissionGuarantee::suppressed();
+                }
+                self.warnings += 1;
+            }
+            _ => {}
         }
         self.diags.push(diag);
         EmissionGuarantee::emitted()
@@ -166,14 +170,16 @@ impl<'src> DiagCtxt<'src> {
     }
 
     /// Iterate over all diagnostics (reported first, then unreported).
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Diagnostic<'src>> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Diagnostic<'src>> + ExactSizeIterator {
         self.diags.iter()
     }
 
     /// Iterate mutably over all diagnostics (reported first, then
     /// unreported) — the feed for [`Emitter::emit_all_iter`], which
     /// humanizes each diagnostic at its render boundary.
-    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Diagnostic<'src>> {
+    pub(crate) fn iter_mut(
+        &mut self,
+    ) -> impl DoubleEndedIterator<Item = &mut Diagnostic<'src>> + ExactSizeIterator {
         self.diags.iter_mut()
     }
 
@@ -207,34 +213,30 @@ impl<'src> DiagCtxt<'src> {
     /// Number of fresh (unreported) diagnostics.
     #[must_use]
     pub fn unreported_len(&self) -> usize {
-        self.diags.len() - self.reported_len
+        debug_assert!(
+            self.reported_len <= self.diags.len(),
+            "reported_len exceeds diagnostics length"
+        );
+        self.diags.len().saturating_sub(self.reported_len)
     }
 
-    /// Remove the fresh diagnostics pushed since `len` — used to tolerate
-    /// expected failures during recursive type resolution (an ADT payload
-    /// referencing the ADT itself, which is not yet registered).
-    pub fn truncate_unreported(&mut self, len: usize) {
-        // `Vec::truncate` is a no-op when `new_len >= len`, so a stale count
-        // captured before later pushes would silently keep too many
-        // diagnostics.  Callers pass a value from `unreported_len()`; assert
-        // that in debug builds to catch the stale-capture bug class.
+    /// Truncate the unreported list to at most `keep_unreported` items, preserving
+    /// the reported prefix.  `keep_unreported` is a *count*, not an absolute
+    /// diagnostic index; it is normally obtained from [`Self::unreported_len`].
+    pub fn truncate_unreported(&mut self, keep_unreported: usize) {
         debug_assert!(
-            len <= self.unreported_len(),
-            "truncate_unreported: stale count {len} > {}",
+            keep_unreported <= self.unreported_len(),
+            "truncate_unreported: stale count {keep_unreported} > {}",
             self.unreported_len()
         );
-        // `saturating_add`, not `+`: an out-of-contract `len` (producer bug)
-        // must not wrap `reported_len + len` to a small value and truncate the
-        // reported prefix away.  Saturation yields `usize::MAX`, and
-        // `Vec::truncate` is a no-op when `new_len >= len`.
-        let keep = self.reported_len.saturating_add(len);
+        let keep = self.reported_len.saturating_add(keep_unreported);
         if keep < self.diags.len() {
             for d in &self.diags[keep..] {
                 if d.is_error() {
-                    self.errors -= 1;
-                    self.unreported_errors -= 1;
+                    self.errors = self.errors.saturating_sub(1);
+                    self.unreported_errors = self.unreported_errors.saturating_sub(1);
                 } else if d.is_warning() {
-                    self.warnings -= 1;
+                    self.warnings = self.warnings.saturating_sub(1);
                 }
             }
             self.diags.truncate(keep);
@@ -409,10 +411,9 @@ impl<'src> DiagCtxt<'src> {
         let unreported = all.split_off(self.reported_len);
         for d in &unreported {
             if d.is_error() {
-                self.errors -= 1;
-                self.unreported_errors -= 1;
+                self.errors = self.errors.saturating_sub(1);
             } else if d.is_warning() {
-                self.warnings -= 1;
+                self.warnings = self.warnings.saturating_sub(1);
             }
         }
         self.unreported_errors = 0;
@@ -437,9 +438,9 @@ impl<'src> DiagCtxt<'src> {
         let unreported = all.split_off(self.reported_len);
         for d in &all {
             if d.is_error() {
-                self.errors -= 1;
+                self.errors = self.errors.saturating_sub(1);
             } else if d.is_warning() {
-                self.warnings -= 1;
+                self.warnings = self.warnings.saturating_sub(1);
             }
         }
         self.diags = SmallVec::from_vec(unreported);
@@ -461,9 +462,9 @@ impl<'src> DiagCtxt<'src> {
                 moved += 1;
             }
         }
-        self.errors -= moved;
+        self.errors = self.errors.saturating_sub(moved);
         self.warnings += moved;
-        self.unreported_errors -= moved;
+        self.unreported_errors = self.unreported_errors.saturating_sub(moved);
     }
 
     /// Downgrade all **unreported** error-level diagnostics to information.
@@ -475,8 +476,8 @@ impl<'src> DiagCtxt<'src> {
                 moved += 1;
             }
         }
-        self.errors -= moved;
-        self.unreported_errors -= moved;
+        self.errors = self.errors.saturating_sub(moved);
+        self.unreported_errors = self.unreported_errors.saturating_sub(moved);
     }
 
     /// Downgrade all **unreported** warning-level diagnostics to information.
@@ -488,7 +489,7 @@ impl<'src> DiagCtxt<'src> {
                 moved += 1;
             }
         }
-        self.warnings -= moved;
+        self.warnings = self.warnings.saturating_sub(moved);
     }
 }
 
@@ -532,6 +533,21 @@ impl<'src> IntoIterator for DiagCtxt<'src> {
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_vec_initializes_tallies() {
+        let ctx: DiagCtxt<'_> = vec![
+            Diagnostic::error("e1"),
+            Diagnostic::warning("w1"),
+            Diagnostic::note("n1"),
+            Diagnostic::error("e2"),
+        ]
+        .into();
+        assert_eq!(ctx.error_count(), 2);
+        assert_eq!(ctx.warning_count(), 1);
+        assert!(ctx.has_unreported_errors());
+        assert_eq!(ctx.unreported_len(), 4);
+    }
 
     #[test]
     fn errors_to_warnings_updates_is_error_and_is_warning() {

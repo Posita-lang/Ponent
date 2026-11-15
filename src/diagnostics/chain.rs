@@ -282,22 +282,21 @@ impl<'src> CallChain<'src> {
         let mut any_spanned = false;
         let mut total = 0usize;
         let mut message_bytes = 0usize;
+        let mut visited = 0usize;
         let mut stack: SmallVec<[(&CallChain<'src>, usize); 8]> = SmallVec::new();
         stack.push((self, 0));
-        while let Some((chain, depth)) = stack.pop() {
+        'outer: while let Some((chain, depth)) = stack.pop() {
             if depth > MAX_CHAIN_DEPTH {
                 continue;
             }
-            if any_spanned
-                && total >= MAX_RESERVE_ENTRIES
-                && message_bytes >= MAX_RESERVE_MESSAGE_BYTES
-            {
+            if total >= MAX_RESERVE_ENTRIES && message_bytes >= MAX_RESERVE_MESSAGE_BYTES {
                 break;
             }
-            total = total
-                .saturating_add(chain.entries.len())
-                .min(MAX_RESERVE_ENTRIES);
             for entry in &chain.entries {
+                if visited >= MAX_RESERVE_ENTRIES {
+                    break 'outer;
+                }
+                visited += 1;
                 any_spanned = any_spanned || entry.span.is_some();
                 message_bytes = message_bytes
                     .saturating_add(entry.message.len())
@@ -309,6 +308,7 @@ impl<'src> CallChain<'src> {
                 }
             }
         }
+        total = visited;
         ChainFacts {
             any_spanned,
             entry_count: total,
@@ -365,14 +365,13 @@ impl<'src> CallChain<'src> {
         if self.entries.is_empty() {
             return String::new();
         }
-        // Reserve for the frame plus the per-entry text.  Hyperlinked entries also
-// carry an OSC 8 URL (40–150+ bytes) that the old 48-byte estimate ignored,
-// forcing a reallocation on exactly the coloured path that needs the cache
-// most; 64 covers the common spanned entry without over-reserving.
-        // #3: one scan for both the reserve estimate and the hyperlink gate;
-        // the renderer used to walk the tree twice per render.
+        // Reserve for the frame plus the per-entry text.  Hyperlinked entries
+        // also carry an OSC 8 URL (40–150+ bytes); `message_bytes` is a lower
+        // bound (control bytes expand to U+FFFD, tabs to spaces), so 64 per
+        // entry is a deliberate over-estimate to avoid reallocation on the
+        // coloured path.
         let facts = self.scan();
-        let mut out = String::with_capacity(64 + facts.message_bytes + facts.entry_count * 32);
+        let mut out = String::with_capacity(64 + facts.message_bytes + facts.entry_count * 64);
         self.render_into_with_facts(
             use_color, source, file_name, idx, max_width, tab_width, None, None, facts, &mut out,
         );
@@ -496,6 +495,7 @@ impl<'src> CallChain<'src> {
         // recursion level (an N-level chain used to rescan the name N×).
         let file_cols = visible_width(&sanitized);
         let capped = std::cell::Cell::new(false);
+        let rendered = std::cell::Cell::new(0usize);
         self.render_entries(
             &RenderEnv {
                 use_color,
@@ -511,6 +511,7 @@ impl<'src> CallChain<'src> {
             0,
             out,
             &capped,
+            &rendered,
         );
     }
 
@@ -552,6 +553,7 @@ impl<'src> CallChain<'src> {
         depth: usize,
         out: &mut String,
         capped: &std::cell::Cell<bool>,
+        rendered: &std::cell::Cell<usize>,
     ) {
         let RenderEnv {
             use_color,
@@ -587,6 +589,14 @@ impl<'src> CallChain<'src> {
         let color_off = if use_color { "\x1b[0m" } else { "" };
 
         for entry in &self.entries {
+            if rendered.get() >= MAX_RESERVE_ENTRIES {
+                if !capped.replace(true) {
+                    super::renderers::fmt::push_spaces(out, indent_cols);
+                    out.push_str("...\n");
+                }
+                return;
+            }
+            rendered.set(rendered.get() + 1);
             // One ASCII classification serves both sanitizer selection and the
             // fast-path gate: printable/tab-only input is untouched by the
             // multiline sanitizer, so scanning it twice was dead work.
@@ -686,13 +696,20 @@ impl<'src> CallChain<'src> {
                 }
                 let narrow = avail_full.saturating_sub(suffix_cols).max(1);
                 if narrow < avail_full
-                    && let Some(last_seg) = segs.last()
-                    && super::glyph::visible_width_with_tab(last_seg.as_ref(), tab_width) + suffix_cols
-                        > avail_full
+                    && let Some(last_seg) = segs.pop()
                 {
-                    last_text = segs.pop().unwrap().into_owned();
-                    let reparsed = super::wrap::wrap_optimal(&last_text, narrow, tab_width);
-                    segs.extend(reparsed);
+                    let overflow = super::glyph::visible_width_with_tab(
+                        last_seg.as_ref(),
+                        tab_width,
+                    ) + suffix_cols
+                        > avail_full;
+                    if overflow {
+                        last_text = last_seg.into_owned();
+                        let reparsed = super::wrap::wrap_optimal(&last_text, narrow, tab_width);
+                        segs.extend(reparsed);
+                    } else {
+                        segs.push(last_seg);
+                    }
                 }
                 // `wrap_optimal` always yields ≥ 1 segment for non-empty
                 // input, but a message that sanitizes to whitespace yields
@@ -713,7 +730,7 @@ impl<'src> CallChain<'src> {
             }
             if let Some(children) = &entry.children {
                 for child in children.iter() {
-                    child.render_entries(env, depth + 1, out, capped);
+                    child.render_entries(env, depth + 1, out, capped, rendered);
                 }
             }
         }
@@ -919,10 +936,31 @@ mod tests {
         );
         // No single entry line should exceed max_width.
         for line in &lines[1..] {
-            assert!(line.len() <= 50, "line too wide (max_width=40): {line:?}");
+            assert!(
+                crate::diagnostics::glyph::visible_width(line) <= 40,
+                "line exceeds max_width: {line:?}"
+            );
         }
         // The message must wrap into more than one line.
         assert!(lines.len() > 2, "message did not wrap: {out}");
+    }
+
+    #[test]
+    fn multiline_message_preserves_newlines_and_suffixes_last_line() {
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(
+            ChainEntryKind::Call,
+            Some(Span::new(FileId::DUMMY, 0, 3)),
+            "line one\n\tline two",
+        ));
+        let out = chain.render_with_index(false, Some("def main() {}"), "f.ps", None, 40, 4);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.iter().any(|l| l.contains("line one")), "out: {out}");
+        assert!(lines.iter().any(|l| l.contains("line two")), "out: {out}");
+        assert!(
+            lines.last().unwrap().contains(": f.ps:1:1"),
+            "suffix missing from last line: {out}"
+        );
     }
 
     #[test]

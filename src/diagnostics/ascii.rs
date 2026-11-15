@@ -27,6 +27,42 @@ impl AllowedControls {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_level() -> u8 {
+    static LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let cached = LEVEL.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let level = if std::arch::is_x86_feature_detected!("avx512bw") {
+        3
+    } else if std::arch::is_x86_feature_detected!("avx2") {
+        2
+    } else {
+        1
+    };
+    LEVEL.store(level, std::sync::atomic::Ordering::Relaxed);
+    level
+}
+
+#[cfg(test)]
+thread_local! {
+    static SWAR_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline]
+fn swar_forced() -> bool {
+    #[cfg(test)]
+    {
+        SWAR_FORCED.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// `true` when every byte is printable ASCII (`0x20..=0x7E`).
 ///
 /// The widest available SIMD path handles full chunks; the `u128` SWAR body
@@ -45,22 +81,22 @@ impl AllowedControls {
 #[inline]
 pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
         return unsafe { x86_64::is_printable_ascii_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
         // SAFETY: AVX2 support was just checked at runtime; the kernel only
         // reads full chunks and defers its tail back to this function.
         return unsafe { x86_64::is_printable_ascii(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         // SSE2 is baseline on x86_64; no runtime probe is needed.
         return unsafe { x86_64::is_printable_ascii_sse2(s) };
     }
     #[cfg(target_arch = "aarch64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::is_printable_ascii(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
@@ -104,11 +140,13 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 /// layout intent, replaces every other control (CR, C1, DEL) with U+FFFD.
 ///
 /// The SIMD kernels above implement this same [`AllowedControls`] set.  The
-/// SWAR body below is the fallback for the final short tail: it uses **exact**
-/// control masks, setting every byte's high bit before the subtraction
-/// (`x | HI`) so each minuend byte ≥ 0x80 and no inter-lane borrow can occur;
-/// the word subtraction is therefore exactly per-lane, with no borrow
-/// resolution loop.
+/// SWAR body below is the fallback for the final short tail.  Its
+/// `< 0x20`, tab and newline masks are **exact** (each minuend byte has its
+/// high bit forced with `x | HI`, so the word subtraction cannot borrow
+/// between lanes).  The high-byte/DEL rejection is deliberately *not* an
+/// exact mask: it is existential — any high bit in `x` or a DEL lane in
+/// `x ^ 0x7F` is itself the proof, and a borrow chain can only originate at
+/// such a lane within the same chunk.
 ///
 /// * `lt20 = !((x|HI) - SP) & HI` — high bit clear iff `b + 0x60 < 0x80` iff
 ///   `b < 0x20`, exactly.
@@ -123,20 +161,20 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 #[inline]
 pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
         return unsafe { x86_64::is_printable_ascii_multiline_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::is_printable_ascii_multiline(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { x86_64::is_printable_ascii_multiline_sse2(s) };
     }
     #[cfg(target_arch = "aarch64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::is_printable_ascii_multiline(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
@@ -203,20 +241,20 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
 #[inline]
 pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
         return unsafe { x86_64::is_printable_ascii_or_tab_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::is_printable_ascii_or_tab(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { x86_64::is_printable_ascii_or_tab_sse2(s) };
     }
     #[cfg(target_arch = "aarch64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::is_printable_ascii_or_tab(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
@@ -267,6 +305,17 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
     s[i..].iter().all(|&b| AllowedControls::Tab.allows(b))
 }
 
+#[inline]
+fn compose_classify_tail(saw_tab: bool, tail: AsciiClass) -> AsciiClass {
+    if tail == AsciiClass::Other {
+        AsciiClass::Other
+    } else if tail == AsciiClass::PrintableOrTab || saw_tab {
+        AsciiClass::PrintableOrTab
+    } else {
+        AsciiClass::Printable
+    }
+}
+
 /// Tri-state classification of one row, so callers that need both the
 /// printable and printable-or-tab predicates (the glyph fast path tested them
 /// sequentially) pay one SWAR pass instead of two.
@@ -289,20 +338,20 @@ pub(crate) enum AsciiClass {
 #[inline]
 pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
         return unsafe { x86_64::classify_ascii_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::classify_ascii(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { x86_64::classify_ascii_sse2(s) };
     }
     #[cfg(target_arch = "aarch64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::classify_ascii(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
@@ -359,20 +408,20 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 #[inline]
 pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
         return unsafe { x86_64::next_non_ascii_byte_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::next_non_ascii_byte(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { x86_64::next_non_ascii_byte_sse2(s) };
     }
     #[cfg(target_arch = "aarch64")]
-    if s.len() >= 16 {
+    if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::next_non_ascii_byte(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
@@ -494,12 +543,7 @@ mod x86_64 {
             saw_tab |= unsafe { _mm256_movemask_epi8(tab) } != 0;
             i += 32;
         }
-        match super::classify_ascii(&s[i..]) {
-            super::AsciiClass::Other => super::AsciiClass::Other,
-            super::AsciiClass::PrintableOrTab => super::AsciiClass::PrintableOrTab,
-            super::AsciiClass::Printable if saw_tab => super::AsciiClass::PrintableOrTab,
-            super::AsciiClass::Printable => super::AsciiClass::Printable,
-        }
+        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "avx2")]
@@ -595,12 +639,7 @@ mod x86_64 {
             saw_tab |= tab != 0;
             i += 64;
         }
-        match super::classify_ascii(&s[i..]) {
-            super::AsciiClass::Other => super::AsciiClass::Other,
-            super::AsciiClass::PrintableOrTab => super::AsciiClass::PrintableOrTab,
-            super::AsciiClass::Printable if saw_tab => super::AsciiClass::PrintableOrTab,
-            super::AsciiClass::Printable => super::AsciiClass::Printable,
-        }
+        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
@@ -699,12 +738,7 @@ mod x86_64 {
             saw_tab |= unsafe { _mm_movemask_epi8(tab) } != 0;
             i += 16;
         }
-        match super::classify_ascii(&s[i..]) {
-            super::AsciiClass::Other => super::AsciiClass::Other,
-            super::AsciiClass::PrintableOrTab => super::AsciiClass::PrintableOrTab,
-            super::AsciiClass::Printable if saw_tab => super::AsciiClass::PrintableOrTab,
-            super::AsciiClass::Printable => super::AsciiClass::Printable,
-        }
+        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "sse2")]
@@ -823,12 +857,7 @@ mod neon {
             saw_tab |= unsafe { any_nonzero(tab) };
             i += 16;
         }
-        match super::classify_ascii(&s[i..]) {
-            super::AsciiClass::Other => super::AsciiClass::Other,
-            super::AsciiClass::PrintableOrTab => super::AsciiClass::PrintableOrTab,
-            super::AsciiClass::Printable if saw_tab => super::AsciiClass::PrintableOrTab,
-            super::AsciiClass::Printable => super::AsciiClass::Printable,
-        }
+        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "neon")]
@@ -915,6 +944,64 @@ mod tests {
                 "{bytes:?}"
             );
         }
+    }
+
+    #[test]
+    fn forced_swar_matches_scalar_for_all_predicates() {
+        SWAR_FORCED.with(|f| f.set(true));
+        let ref_classify = |s: &[u8]| {
+            let mut tab = false;
+            for &b in s {
+                if b == b'\t' {
+                    tab = true;
+                } else if !(0x20..=0x7E).contains(&b) {
+                    return AsciiClass::Other;
+                }
+            }
+            if tab {
+                AsciiClass::PrintableOrTab
+            } else {
+                AsciiClass::Printable
+            }
+        };
+        let mut seed: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(7);
+            seed
+        };
+        let adversarial = [
+            0x00, 0x01, 0x09, 0x0A, 0x0D, 0x1F, 0x20, 0x41, 0x7E, 0x7F, 0x80, 0xC2, 0xFF,
+        ];
+        for _ in 0..6000 {
+            let len = (next() % 81) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    if next() & 3 == 0 {
+                        adversarial[(next() as usize) % adversarial.len()]
+                    } else {
+                        (next() & 0xFF) as u8
+                    }
+                })
+                .collect();
+            assert_eq!(is_printable_ascii(&bytes), ref_single(&bytes), "{bytes:?}");
+            assert_eq!(
+                is_printable_ascii_multiline(&bytes),
+                ref_multi(&bytes),
+                "{bytes:?}"
+            );
+            assert_eq!(
+                is_printable_ascii_or_tab(&bytes),
+                ref_tab(&bytes),
+                "{bytes:?}"
+            );
+            assert_eq!(classify_ascii(&bytes), ref_classify(&bytes), "{bytes:?}");
+            assert_eq!(
+                next_non_ascii_byte(&bytes),
+                bytes.iter().position(|&b| b >= 0x80),
+                "{bytes:?}"
+            );
+        }
+        SWAR_FORCED.with(|f| f.set(false));
     }
 
     /// The multiline predicate is existentially "no control other than

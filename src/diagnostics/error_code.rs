@@ -258,8 +258,9 @@ impl ErrorCategory {
         }
     }
 
-    /// Stable machine-readable key (JSON `"category"` field).  Never
-    /// localized — consumers depend on a fixed vocabulary.
+    /// Human-readable display string (e.g. `"Parse Error"`).  **Not** the
+    /// machine-readable key — JSON/CLI consumers must use [`key`](Self::key),
+    /// and localized output should use [`label`](Self::label).
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCategory::Parse => "Parse Error",
@@ -334,8 +335,9 @@ impl std::str::FromStr for ErrorCategory {
             }
         }
         Err(format!(
-            "unknown error category `{s}` (valid: parse, resolution, type, \
-             contract, trait, inference, internal, generic)"
+            "unknown error category `{}` (valid: parse, resolution, type, \
+             contract, trait, inference, internal, generic)",
+            super::sanitize_for_terminal(s)
         ))
     }
 }
@@ -843,8 +845,7 @@ pub fn related_codes_of(code: &str) -> &'static [&'static str] {
     let Some(entry) = resolve(code) else {
         return &[];
     };
-    let slot = code_slot(entry.code)
-        .expect("every CODE_TABLE entry has a direct-address slot") as u16;
+    let slot = entry.slot;
     static RELATED_CACHE: std::sync::OnceLock<
         std::sync::RwLock<LiteMap<u16, std::sync::OnceLock<&'static [&'static str]>>>,
     > = std::sync::OnceLock::new();
@@ -888,8 +889,7 @@ pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4
     // entry passed the `^[EW]\d{3}$` build assertion — so a slot exists.  The
     // old `else { … }` fallback here was unreachable dead code duplicating
     // `build_siblings`' filtering.
-    let slot = code_slot(entry.code)
-        .expect("every CODE_TABLE entry has a direct-address slot") as u16;
+    let slot = entry.slot;
     
     // Codes grouped by category, built once. CODE_TABLE is static so the
     // grouping is invariant; caching it turns the per-call O(table) scan into
@@ -917,7 +917,7 @@ pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4
     let cache = SIBLING_CACHE
         .get_or_init(|| std::sync::RwLock::new(LiteMap::new()));
     let slot_hit = || -> Option<SmallVec<[&'static str; 4]>> {
-        let m = cache.read().ok()?;
+        let m = cache.read().unwrap_or_else(|e| e.into_inner());
         m.get(&(slot, max)).and_then(OnceLock::get).cloned()
     };
     if let Some(cached) = slot_hit() {
@@ -973,6 +973,15 @@ mod tests {
     /// sibling list is computed from the canonical entry, not returned empty
     /// because `lookup` demands `^[EW]\d{3}$`.
     #[test]
+    #[test]
+    fn related_codes_accepts_lowercase_code() {
+        assert_eq!(
+            related_codes_of("e030"),
+            related_codes_of("E030"),
+            "lowercase input must resolve through the same path"
+        );
+    }
+
     fn category_siblings_accepts_lowercase_code() {
         let upper = category_siblings_of("E030", 4);
         let lower = category_siblings_of("e030", 4);

@@ -94,7 +94,8 @@ impl Stylesheet {
                 // The pattern has no `..`, so a new `Stylesheet` field is a
                 // compile error here until it is added to this one list.
                 let Stylesheet { $($field,)+ } = *self;
-                // 19 declarations at ~28 chars each; reserve up front.
+                // The macro list below is the single source of truth; reserve enough
+                // for the generated declarations.
                 let mut s = String::with_capacity(640);
                 use std::fmt::Write as _;
                 $(

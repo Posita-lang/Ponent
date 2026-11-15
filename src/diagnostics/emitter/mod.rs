@@ -164,11 +164,10 @@ impl FilesSeen {
         let old = FileKey::Name(CompactString::from(name));
         match &mut self.seen {
             FilesSeenInner::Small { seen, id_names } => {
-                if let Some(pos) = seen.iter().position(|key| *key == old) {
-                    seen[pos] = FileKey::Id(id);
-                } else {
-                    seen.push(FileKey::Id(id));
-                }
+                let Some(pos) = seen.iter().position(|key| *key == old) else {
+                    unreachable!("claim_anonymous called without an anonymous entry")
+                };
+                seen[pos] = FileKey::Id(id);
                 if !id_names.iter().any(|(known_id, known_name)| {
                     *known_id == id && known_name == name
                 }) {
@@ -438,7 +437,14 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // allocation/free in the documented LSP re-emit loop.
         let mut buf = self.shared.render_buf.borrow_mut();
         buf.clear();
-        self.renderer.render_into(diag, &cx, &mut buf);
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            diag.humanize();
+            self.renderer.render_into(diag, &cx, &mut buf);
+        }));
+        if rendered.is_err() {
+            buf.clear();
+            buf.push_str(RENDER_PANIC_PLACEHOLDER);
+        }
         sink.write_str(&buf)?;
         self.renderer.end(&mut sink)?;
         sink.flush()
@@ -672,8 +678,8 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // the spawn/join cost even above the count threshold; require enough
         // total weight that the work actually amortises the threads.
         const WEIGHT_THRESHOLD: usize = 256;
-        // Keep each parallel chunk at least this large so spawn/join
-        // overhead (~50 µs/thread) is amortised by real render work.
+        // Keep the worker count bounded so each worker handles at least this many
+        // diagnostics on average; dynamic claiming eliminates fixed chunks.
         const MIN_CHUNK: usize = 16;
         let num_threads = self.parallelism;
         // Cap the spawn count: at the 64-diagnostic threshold this yields
@@ -740,7 +746,6 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // here, so a filter-skipped diagnostic costs no Fluent lookup
             // and no derived strings.  `humanize` is idempotent, so an
             // already-materialized diagnostic is a free no-op here.
-            diag.humanize();
             // Render *before* deciding on the separator: the separator is
             // inserted between *rendered* diagnostics only, so a diagnostic
             // whose renderer emits nothing contributes no separator either —
@@ -749,7 +754,14 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // just the built-ins).
             let mut buf = self.shared.render_buf.borrow_mut();
             buf.clear();
-            self.renderer.render_into(diag, &cx, &mut buf);
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                diag.humanize();
+                self.renderer.render_into(diag, &cx, &mut buf);
+            }));
+            if rendered.is_err() {
+                buf.clear();
+                buf.push_str(RENDER_PANIC_PLACEHOLDER);
+            }
             if buf.is_empty() {
                 continue;
             }
