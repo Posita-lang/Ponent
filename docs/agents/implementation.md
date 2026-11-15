@@ -56,6 +56,21 @@ Do not blindly implement an incorrect or incomplete review recommendation.
 
 If a finding is invalid, already fixed, or based on an incorrect assumption, document the reason rather than introducing an unnecessary change.
 
+### Epistemic Discipline
+
+Implementation decisions must be grounded in evidence, not confidence expressed through language.
+
+- Distinguish **observed facts**, **logical deductions**, **assumptions**, **hypotheses**, and **unknowns** when evaluating findings and choosing a solution.
+- Independently verify each consequential review claim against the current code. A review finding is an input to investigate, not an instruction to trust.
+- Identify assumptions on which the implementation depends. Resolve them where practical; otherwise document their scope and consequences.
+- Attempt to falsify the proposed solution before accepting it: examine counterexamples, boundary conditions, failure paths, callers, and interactions with architectural invariants.
+- Do not mistake a passing test for proof beyond the behavior that test actually covers. Add targeted regression tests or other verification for the relevant claim.
+- Do not use uncertainty as an excuse to defer investigation that can reasonably be performed.
+- Report exactly what was changed and what was verified. Separate verified outcomes from deductions, expectations, and unresolved risks.
+- Never claim a test, benchmark, or verification step succeeded unless it was actually executed and its result observed.
+
+Use **Verified**, **Derived**, **Suspected**, **Assumed**, and **Unknown** where useful in implementation reports. Explain the supporting evidence; do not use labels as decoration.
+
 ## 4. Implementation Requirements
 
 ### Correctness
