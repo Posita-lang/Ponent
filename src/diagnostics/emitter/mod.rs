@@ -109,6 +109,7 @@ impl FilesSeen {
         // spanned diagnostic already registered that name, this is the same
         // file for summary purposes.
         if id.is_none() && self.name_seen(name) {
+            self.last = Some(key);
             return;
         }
         // A span-less name was seen first, then a spanned diagnostic with the
@@ -121,31 +122,32 @@ impl FilesSeen {
             self.claim_anonymous(name, id);
             return;
         }
-        self.insert_seen_key(key);
+        self.insert_seen_key(&key);
         if let Some(id) = id {
             self.add_id_name(id, name);
         } else if let Some(index) = self.name_index.as_mut() {
             index.anon.insert(CompactString::from(name));
         }
+        self.last = Some(key);
     }
 
-    fn insert_seen_key(&mut self, key: FileKey) {
+    fn insert_seen_key(&mut self, key: &FileKey) {
         let (seen, id_names, name_index) = (&mut self.seen, &self.id_names, &mut self.name_index);
         match seen {
             FilesSeenInner::Small(v) => {
-                if !v.contains(&key) {
+                if !v.contains(key) {
                     if v.len() < INLINE_FILES {
-                        v.push(key);
+                        v.push(key.clone());
                     } else {
                         let mut set: rustc_hash::FxHashSet<FileKey> = v.drain(..).collect();
-                        set.insert(key);
+                        set.insert(key.clone());
                         *name_index = Some(NameIndex::from_seen(&set, id_names));
                         *seen = FilesSeenInner::Large(set);
                     }
                 }
             }
             FilesSeenInner::Large(s) => {
-                s.insert(key);
+                s.insert(key.clone());
             }
         }
     }
@@ -223,9 +225,13 @@ impl FilesSeen {
             FilesSeenInner::Small(v) => v
                 .iter()
                 .any(|key| matches!(key, FileKey::Name(known) if known == name)),
-            FilesSeenInner::Large(s) => s
-                .iter()
-                .any(|key| matches!(key, FileKey::Name(known) if known == name)),
+            FilesSeenInner::Large(_) => {
+                debug_assert!(
+                    self.name_index.is_some(),
+                    "Large FilesSeen always has a name index"
+                );
+                false
+            }
         }
     }
 

@@ -380,8 +380,10 @@ fn memo_insert(
     text: &str,
     ranges: SmallVec<[Range<usize>; 4]>,
 ) {
-    if memo.len() >= 256 {
-        memo.clear();
+    if memo.len() >= 256
+        && let Some(victim) = memo.keys().next().copied()
+    {
+        memo.remove(&victim);
     }
     let entries = memo.entry(key).or_default();
     if !entries.iter().any(|(content, _)| &**content == text) {
@@ -921,6 +923,10 @@ fn push_split_oversized_ascii(
             width: rest as u32,
             trailing_space: trailing as u32,
         });
+    } else if let Some(last) = words.last_mut() {
+        // `max_width == 0` makes every byte its own piece; attach the glue to
+        // the final piece instead of dropping it.
+        last.trailing_space = trailing as u32;
     }
 }
 

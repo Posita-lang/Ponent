@@ -808,22 +808,29 @@ pub fn related_codes_of(code: &str) -> &'static [&'static str] {
         return &[];
     };
     let slot = code_slot(entry.code)
-        .expect("every CODE_TABLE entry has a direct-address slot") as usize;
+        .expect("every CODE_TABLE entry has a direct-address slot") as u16;
     static RELATED_CACHE: std::sync::OnceLock<
-        Box<[std::sync::OnceLock<&'static [&'static str]>]>,
+        std::sync::RwLock<LiteMap<u16, std::sync::OnceLock<&'static [&'static str]>>>,
     > = std::sync::OnceLock::new();
-    let cells = RELATED_CACHE.get_or_init(|| {
-        (0..DIRECT_ADDRESS_SLOTS)
-            .map(|_| std::sync::OnceLock::new())
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
+    let cache = RELATED_CACHE.get_or_init(|| {
+        std::sync::RwLock::new(LiteMap::new())
     });
-    cells[slot].get_or_init(|| {
-        RELATED_CODES
-            .iter()
-            .find_map(|(src, rel)| (*src == entry.code).then_some(*rel))
-            .unwrap_or(&[])
-    })
+    if let Some(cached) = cache
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&slot)
+        .and_then(std::sync::OnceLock::get)
+    {
+        return cached;
+    }
+    let built = RELATED_CODES
+        .iter()
+        .find_map(|(src, rel)| (*src == entry.code).then_some(*rel))
+        .unwrap_or(&[]);
+    if let Ok(mut map) = cache.write() {
+        let _ = map.entry(slot).or_default().set(built);
+    }
+    built
 }
 
 pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4]> {

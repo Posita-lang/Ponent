@@ -309,6 +309,8 @@ pub(crate) struct SectionScratch {
     /// batch.  `Vec` (not `SmallVec`) because it is indexed by suggestion
     /// number and must cover every suggestion even when most are `None`.
     pub suggestion_lines_buf: Vec<Option<(usize, usize)>>,
+    /// Per-section row coverage of suggestion spans, reused across sections.
+    pub sug_covered: Vec<bool>,
     /// Scratch for the highlighter's `_into` entry points where the
     /// highlighted text must be assembled *before* it can be pushed between
     /// gutter pieces (the connector re-colouring pass scans the highlighted
@@ -363,6 +365,7 @@ impl SectionScratch {
             indent: String::new(),
             hl_buf: String::new(),
             suggestion_lines_buf: Vec::new(),
+            sug_covered: Vec::new(),
             section_label_lines: SmallVec::new(),
             section_label_sources: SmallVec::new(),
             section_label_order: SmallVec::new(),
@@ -1955,13 +1958,16 @@ impl GlyphRenderer {
         // A suggestion span contributes context rows; precompute its coverage
         // once so the row loop does an O(1) array lookup instead of scanning
         // every suggestion per row.
-        let mut sug_covered = vec![false; last_line.saturating_sub(first_line) + 1];
+        scratch.sug_covered.clear();
+        scratch
+            .sug_covered
+            .resize(last_line.saturating_sub(first_line) + 1, false);
         for &(a, b) in suggestion_lines.iter().flatten() {
             let lo = a.max(first_line);
             let hi = b.min(last_line);
             if lo <= hi {
                 for line in lo..=hi {
-                    sug_covered[line - first_line] = true;
+                    scratch.sug_covered[line - first_line] = true;
                 }
             }
         }
@@ -1971,7 +1977,7 @@ impl GlyphRenderer {
             let line = idx.line(line_idx);
             let context_only = (line_idx < start_pos.line || line_idx > primary_end_line)
                 && label_window.is_idle_for(line_idx)
-                && !sug_covered[line_idx - first_line];
+                && !scratch.sug_covered[line_idx - first_line];
             // One grapheme walk converts this row's byte ranges to display
             // columns, measures the line's width, and emits the highlighted
             // source text — replacing the three separate passes over the

@@ -305,10 +305,18 @@ impl DiagFilter {
         code: &crate::diagnostics::error_code::ErrCode,
     ) -> bool {
         let canonical = code.canonical();
-        set.contains(canonical)
-            || set
-                .iter()
-                .any(|pattern| pattern.eq_ignore_ascii_case(canonical))
+        if set.contains(canonical) {
+            return true;
+        }
+        // `from_opts` stores every pattern uppercased.  Known and resolved
+        // spellings are already canonical uppercase; only genuinely unknown
+        // mixed-case spellings need one allocation, and unknown codes are
+        // rare.  This replaces an O(filter_size) case-insensitive scan on the
+        // per-diagnostic path.
+        if canonical.bytes().all(|b| !b.is_ascii_lowercase()) {
+            return false;
+        }
+        set.contains(&canonical.to_ascii_uppercase())
     }
 
     /// Whether `diag` passes the filter — mirrors the original
@@ -3433,6 +3441,10 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool) {
 /// regression is bounded and only reaches files that genuinely have thousands
 /// of distinct non-ASCII lines.
 const CHAR_PREFIXES_CAP: usize = 4 * 1024;
+/// Evict a batch rather than one entry: the LRU scan is O(cap), so paying it
+/// once per `CHAR_PREFIXES_EVICT` insertions amortizes to ~O(1) per insert
+/// while keeping the write-lock hold bounded.
+const CHAR_PREFIXES_EVICT: usize = 256;
 
 /// Per-thread memo of the last [`LineIndex::char_col`] lookup, so a run of
 /// span conversions on the same line of the same index skips the
@@ -3472,16 +3484,15 @@ thread_local! {
 fn cap_char_prefixes(
     cache: &mut FxHashMap<usize, crate::diagnostics::render::CharPrefixEntry>,
 ) {
-    if cache.len() >= CHAR_PREFIXES_CAP
-        && let Some(key) = cache
+    if cache.len() >= CHAR_PREFIXES_CAP {
+        let mut victims: Vec<(usize, u64)> = cache
             .iter()
-            .min_by_key(|(_, entry)| entry.last_used())
-            .map(|(key, _)| *key)
-    {
-        // Exact least-recently-used eviction.  This scan runs only when the
-        // soft cap is reached; the hit path refreshes recency with one atomic
-        // store and never takes the write lock.
-        cache.remove(&key);
+            .map(|(key, entry)| (*key, entry.last_used()))
+            .collect();
+        victims.sort_unstable_by_key(|(_, tick)| *tick);
+        for (key, _) in victims.into_iter().take(CHAR_PREFIXES_EVICT) {
+            cache.remove(&key);
+        }
     }
 }
 
@@ -4562,7 +4573,7 @@ mod tests {
         cap_char_prefixes(&mut cache);
         assert!(!cache.contains_key(&0), "oldest entry must be evicted");
         assert!(cache.contains_key(&1), "touched entry must survive");
-        assert_eq!(cache.len(), CHAR_PREFIXES_CAP - 1);
+        assert_eq!(cache.len(), CHAR_PREFIXES_CAP - CHAR_PREFIXES_EVICT);
     }
 
     /// `linecol_display` returns *character* columns on non-ASCII sources,

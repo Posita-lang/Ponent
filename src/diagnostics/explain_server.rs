@@ -55,10 +55,9 @@ impl PendingConn {
 /// was served.  Connections that never send a request — the browser's
 /// speculative preconnects — are closed and the wait continues, so a
 /// preconnect cannot consume the single page this call exists to serve.
-/// The listener must be blocking on entry; this function switches it to
-/// non-blocking for the poll loop and leaves it in blocking mode on return
-/// (`TcpListener` has no getter for the previous mode, so a caller that
-/// supplied a non-blocking listener gets a blocking one back).
+/// The listener may be blocking or non-blocking on entry; the mode is restored
+/// on every return path (queried via `socket2::SockRef` on Unix, with the
+/// blocking fallback contract on non-Unix).
 #[cfg(target_os = "linux")]
 fn epoll_ctl_checked(
     epfd: i32,
@@ -136,6 +135,28 @@ impl Drop for RestoreNonblocking<'_> {
     }
 }
 
+#[cfg(all(target_os = "linux", not(test)))]
+fn enable_tcp_defer_accept(listener: &TcpListener) {
+    use std::os::fd::AsRawFd;
+    let one: libc::c_int = 1;
+    // SAFETY: `listener` owns a live TCP socket fd; `one` is a valid
+    // `c_int` and its size is exactly the optval length.  The call only
+    // changes a socket option; a failure is a portability/backstop issue, and
+    // the userspace first-byte budgets remain authoritative.
+    unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_DEFER_ACCEPT,
+            std::ptr::from_ref(&one).cast(),
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn enable_tcp_defer_accept(_listener: &TcpListener) {}
+
 pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> {
     // `ErrCode::new` carries a `debug_assert!` that aborts on unknown codes;
     // `code` here comes from the CLI (`ponent explain <CODE>`), so a typo
@@ -164,6 +185,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     }
 
     let _nonblocking_guard = RestoreNonblocking::new(listener, true)?;
+    enable_tcp_defer_accept(listener);
 
     let html = build_explain_page(&ec);
     // only a request for this code's page consumes the one-shot server.
@@ -187,6 +209,8 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     let deadline = Instant::now() + ACCEPT_BUDGET;
     let mut idle_deadline: Option<Instant> = None;
     let mut served = false;
+    #[cfg(not(unix))]
+    let mut first_error: Option<std::io::Error> = None;
 
     // A9.2: accept speculative preconnects into a poll-set instead of
     // servicing them serially.  A silent preconnect sends nothing, so `poll`
@@ -428,7 +452,9 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 });
                 if delivered.load(Ordering::Acquire) {
                     served = true;
-                    idle_deadline = Some(Instant::now() + POST_SERVE_IDLE);
+                    if idle_deadline.is_none() {
+                        idle_deadline = Some(Instant::now() + POST_SERVE_IDLE);
+                    }
                 }
             }
         }
@@ -520,6 +546,10 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     let result = if served {
         Ok(())
     } else {
+        #[cfg(not(unix))]
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "explain server: no client connected within ~10s",
@@ -792,7 +822,35 @@ fn arm_read_timeout_until(stream: &mut TcpStream, deadline: Instant) -> std::io:
 fn drain_request(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> DrainOutcome {
     let mut tail_len = 0;
     let mut wants_close = false;
-    drain_request_tracked(stream, prefix, budget, &mut tail_len, &mut wants_close)
+    let mut is_head = false;
+    drain_request_tracked(
+        stream,
+        prefix,
+        budget,
+        &mut tail_len,
+        &mut wants_close,
+        &mut is_head,
+    )
+}
+
+/// [`drain_request`] plus whether the request line named `HEAD`.
+fn drain_request_with_head(
+    stream: &mut TcpStream,
+    prefix: &[u8],
+    budget: Duration,
+) -> (DrainOutcome, bool) {
+    let mut tail_len = 0;
+    let mut wants_close = false;
+    let mut is_head = false;
+    let outcome = drain_request_tracked(
+        stream,
+        prefix,
+        budget,
+        &mut tail_len,
+        &mut wants_close,
+        &mut is_head,
+    );
+    (outcome, is_head)
 }
 
 /// [`drain_request`], additionally reporting how many bytes past this
@@ -805,6 +863,7 @@ fn drain_request_tracked(
     budget: Duration,
     tail_len: &mut usize,
     wants_close: &mut bool,
+    is_head: &mut bool,
 ) -> DrainOutcome {
     let deadline = Instant::now() + budget;
     // 4 KiB covers the common request header block on the stack; larger
@@ -873,6 +932,7 @@ fn drain_request_tracked(
             DrainOutcome::NoRequest
         };
     };
+    *is_head = collected.starts_with(b"HEAD ");
 
     // Bytes past the terminator arrived in the same read as the headers and
     // count toward the body, then toward a pipelined request.
@@ -1592,7 +1652,7 @@ fn serve_page_after_prefix(
 /// percent-decode, exactly one leading slash, reject a second leading slash,
 /// exactly one trailing slash, then canonicalize the code spelling.  `"/"`
 /// (the index) has no code and returns `None`; callers handle the index first.
-fn canonical_path_code(target: &str) -> Option<CompactString> {
+fn canonical_path_code(target: &str) -> Option<&'static str> {
     let raw = target.split('?').next().unwrap_or("/");
     // Slash policy runs on the *encoded* path: `%2F` is an encoded slash and
     // must not be normalised into a path separator (otherwise `/E030%2F`
@@ -1611,7 +1671,7 @@ fn canonical_path_code(target: &str) -> Option<CompactString> {
     }
     ErrCode::try_new(p)
         .ok()
-        .map(|e| CompactString::from(e.canonical()))
+        .and_then(|e| e.entry().map(|entry| entry.code))
 }
 
 /// Pre-rendered 405 head built through the normal `render_head`, so the
@@ -1987,6 +2047,7 @@ fn serve_explain_persistent_impl(
     // Preserve the caller's listener mode: the Linux reactor flips it to
     // nonblocking below, and the guard restores the original on every return.
     let _restore = RestoreNonblocking::new(listener, false)?;
+    enable_tcp_defer_accept(listener);
     // Thread-per-connection: a slow client (its 500 ms read-timeout path, or
     // one that stalls mid-request) must not delay accepting the browser's
     // other connections.  The shared caches (`explain_page_cached`,
@@ -2043,7 +2104,10 @@ fn serve_explain_persistent_impl(
                 last_activity = now;
             }
             if let Some(idle) = idle {
-                if !served_any && now >= first_deadline {
+                if !served_any
+                    && now >= first_deadline
+                    && active.load(Ordering::Relaxed) == 0
+                {
                     terminal_error = Some(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "explain server: no client connected before the first-request deadline",
@@ -2076,7 +2140,8 @@ fn serve_explain_persistent_impl(
                             let _ = stream.shutdown(Shutdown::Both);
                             continue;
                         }
-                        let outcome = drain_request(&mut stream, &[], Duration::from_millis(100));
+                        let (outcome, is_head) =
+                            drain_request_with_head(&mut stream, &[], Duration::from_millis(100));
                         if outcome == DrainOutcome::NoRequest {
                             // H3: a silent preconnect never made a request;
                             // writing a 503 to it is unsolicited and can
@@ -2092,7 +2157,8 @@ fn serve_explain_persistent_impl(
                         // tell the client we are overloaded so a browser
                         // can retry, instead of an empty close.
                         let page = shed_page();
-                        let _ = write_prepared_parts(&mut stream, page.head_parts(), &page.body);
+                        let body: &str = if is_head { "" } else { &page.body };
+                        let _ = write_prepared_parts(&mut stream, page.head_parts(), body);
                         let _ = drain_residual(&mut stream);
                         if outcome == DrainOutcome::Complete {
                             let _ = stream.shutdown(Shutdown::Both);
@@ -2225,7 +2291,8 @@ fn serve_explain_persistent_epoll(
     use rustc_hash::FxHashMap;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    const MAX_HEADER: usize = 64 * 1024;
+    enable_tcp_defer_accept(listener);
+
     const MAX_EVENTS: usize = 64;
     const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(2);
     const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2322,7 +2389,7 @@ fn serve_explain_persistent_epoll(
     loop {
         let now = Instant::now();
         if let Some(idle) = idle {
-            if !served_any && now >= first_deadline {
+            if !served_any && now >= first_deadline && conns.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "explain server: no client connected before the first-request deadline",
@@ -2399,7 +2466,7 @@ fn serve_explain_persistent_epoll(
                                     conn_fd,
                                     Conn {
                                         stream,
-                                        buf: Vec::with_capacity(1024),
+                                        buf: Vec::new(),
                                         response: None,
                                         conn_hdr: b"",
                                         progress: [0; 6],
@@ -2588,6 +2655,7 @@ fn serve_explain_persistent_epoll(
                     continue;
                 };
                 if conn.overload {
+                    let is_head = conn.buf.starts_with(b"HEAD ");
                     let framing = scan_framing(&conn.buf[..head_end]);
                     let already_read = conn.buf.len().saturating_sub(head_end);
                     conn.body_remaining = if framing.has_transfer_encoding
@@ -2601,12 +2669,12 @@ fn serve_explain_persistent_epoll(
                             .unwrap_or(0)
                             .saturating_sub(already_read)
                     };
+                    conn.buf.clear();
+                    conn.buf.shrink_to_fit();
                     let page = shed_page();
-                    conn.response = Some(HttpResponse::from_cache(
-                        "503 Service Unavailable",
-                        "",
-                        page,
-                    ));
+                    let response =
+                        HttpResponse::from_cache("503 Service Unavailable", "", page);
+                    conn.response = Some(if is_head { response.as_head() } else { response });
                     conn.conn_hdr = b"Connection: close\r\n\r\n";
                     conn.keep_alive = false;
                     conn.consumed = head_end;
@@ -2634,7 +2702,7 @@ fn serve_explain_persistent_epoll(
                             }
                         })
                         .unwrap_or(0);
-                    if line_end > 8 * 1024 {
+                    if line_end >= MAX_REQUEST_LINE {
                         // Parity with the other backends: 431 instead of a
                         // bare close, then drain under the shared linger
                         // budget so the response is not RST away.
@@ -2718,60 +2786,69 @@ fn serve_explain_persistent_epoll(
 
             if conn.state == WRITING {
                 let mut finished = false;
-                loop {
-                    let Some(response) = conn.response.as_ref() else {
-                        finished = true;
-                        break;
-                    };
-                    let head = response.head_parts();
-                    let body = response.body().as_bytes();
-                    let date = http_date_header();
-                    let lengths = [
-                        head[0].len(),
-                        head[1].len(),
-                        head[2].len(),
-                        date.len(),
-                        conn.conn_hdr.len(),
-                        body.len(),
-                    ];
-                    if conn.progress[0] >= lengths[0]
-                        && conn.progress[1] >= lengths[1]
-                        && conn.progress[2] >= lengths[2]
-                        && conn.progress[3] >= lengths[3]
-                        && conn.progress[4] >= lengths[4]
-                        && conn.progress[5] >= lengths[5]
-                    {
-                        finished = true;
-                        break;
-                    }
-                    let slices = [
-                        std::io::IoSlice::new(&head[0].as_bytes()[conn.progress[0]..]),
-                        std::io::IoSlice::new(&head[1].as_bytes()[conn.progress[1]..]),
-                        std::io::IoSlice::new(&head[2].as_bytes()[conn.progress[2]..]),
-                        std::io::IoSlice::new(&date.as_bytes()[conn.progress[3]..]),
-                        std::io::IoSlice::new(&conn.conn_hdr[conn.progress[4]..]),
-                        std::io::IoSlice::new(&body[conn.progress[5]..]),
-                    ];
-                    match conn.stream.write_vectored(&slices) {
-                        Ok(0) => {
-                            close.push(fd);
-                            break;
-                        }
-                        Ok(mut written) => {
-                            for (i, len) in lengths.iter().enumerate() {
-                                let take = (len - conn.progress[i]).min(written);
-                                conn.progress[i] += take;
-                                written -= take;
-                                if written == 0 {
+                match conn.response.as_ref() {
+                    None => finished = true,
+                    Some(response) => {
+                        let head = response.head_parts();
+                        let body = response.body().as_bytes();
+                        let date = http_date_header();
+                        let lengths = [
+                            head[0].len(),
+                            head[1].len(),
+                            head[2].len(),
+                            date.len(),
+                            conn.conn_hdr.len(),
+                            body.len(),
+                        ];
+                        loop {
+                            if conn.progress[0] >= lengths[0]
+                                && conn.progress[1] >= lengths[1]
+                                && conn.progress[2] >= lengths[2]
+                                && conn.progress[3] >= lengths[3]
+                                && conn.progress[4] >= lengths[4]
+                                && conn.progress[5] >= lengths[5]
+                            {
+                                finished = true;
+                                break;
+                            }
+                            let slices = [
+                                std::io::IoSlice::new(&head[0].as_bytes()[conn.progress[0]..]),
+                                std::io::IoSlice::new(&head[1].as_bytes()[conn.progress[1]..]),
+                                std::io::IoSlice::new(&head[2].as_bytes()[conn.progress[2]..]),
+                                std::io::IoSlice::new(&date.as_bytes()[conn.progress[3]..]),
+                                std::io::IoSlice::new(&conn.conn_hdr[conn.progress[4]..]),
+                                std::io::IoSlice::new(&body[conn.progress[5]..]),
+                            ];
+                            match conn.stream.write_vectored(&slices) {
+                                Ok(0) => {
+                                    close.push(fd);
+                                    break;
+                                }
+                                Ok(mut written) => {
+                                    for (i, len) in lengths.iter().enumerate() {
+                                        let take = (len - conn.progress[i]).min(written);
+                                        conn.progress[i] += take;
+                                        written -= take;
+                                        if written == 0 {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(ref error)
+                                    if error.kind() == std::io::ErrorKind::Interrupted =>
+                                {
+                                    continue;
+                                }
+                                Err(ref error)
+                                    if error.kind() == std::io::ErrorKind::WouldBlock =>
+                                {
+                                    break;
+                                }
+                                Err(_) => {
+                                    close.push(fd);
                                     break;
                                 }
                             }
-                        }
-                        Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => {
-                            close.push(fd);
-                            break;
                         }
                     }
                 }
@@ -2878,12 +2955,14 @@ fn handle_persistent_connection(
         // `leftover` is what `read_request_line` pulled past the request `\n`.
         let mut tail_len = 0usize;
         let mut wants_close = false;
+        let mut is_head = false;
         let outcome = drain_request_tracked(
             stream,
             &leftover,
             Duration::from_secs(1),
             &mut tail_len,
             &mut wants_close,
+            &mut is_head,
         );
         if outcome == DrainOutcome::NoRequest {
             return Ok(());
@@ -2991,7 +3070,7 @@ fn read_request_line(
     // (the 512-byte one-shot read).  Handle a line completed inside it without
     // another syscall, and seed the accumulator otherwise.
     if let Some(nl) = memchr::memchr(b'\n', prefix) {
-        if nl >= 8192 {
+        if nl >= MAX_REQUEST_LINE {
             *too_large = true;
             let _ = drain_request(stream, &prefix[nl + 1..], Duration::from_millis(100));
             return None;
@@ -3048,7 +3127,7 @@ fn read_request_line(
         let chunk = &buf[..n];
         match memchr::memchr(b'\n', chunk) {
             Some(nl) => {
-                if line.len() + nl > 8192 {
+                if line.len() + nl >= MAX_REQUEST_LINE {
                     *too_large = true;
                     // The request line is over the cap.  `chunk[nl + 1..]`
                     // arrived past the newline and the kernel may hold more;
@@ -3076,7 +3155,7 @@ fn read_request_line(
                 return Some((line.into(), leftover));
             }
             None => {
-                if line.len() + n > 8192 {
+                if line.len() + n >= MAX_REQUEST_LINE {
                     *too_large = true;
                     let _ = drain_request(stream, &[], Duration::from_millis(100));
                     return None;
@@ -3360,12 +3439,12 @@ fn dispatch_request_meta(request_line: &str) -> (HttpResponse, bool) {
         );
     }
     let response = match canonical_path_code(target) {
-        Some(code) => match explain_page_cached(code.as_str()) {
+        Some(code) => match explain_page_cached(code) {
             Some(page) => HttpResponse::from_cache("200 OK", "", page),
             None => HttpResponse::from_owned(
                 "404 Not Found",
                 "",
-                not_found_page_cached(code.as_str()),
+                not_found_page_cached(code),
             ),
         },
         None => {
