@@ -459,6 +459,20 @@ mod x86_64 {
         let sp = _mm256_set1_epi8(0x20);
         let del = _mm256_set1_epi8(0x7F);
         let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
+            let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
+            let bad_a = unsafe {
+                _mm256_or_si256(_mm256_cmpgt_epi8(sp, a), _mm256_cmpeq_epi8(a, del))
+            };
+            let bad_b = unsafe {
+                _mm256_or_si256(_mm256_cmpgt_epi8(sp, b), _mm256_cmpeq_epi8(b, del))
+            };
+            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad_a, bad_b)) } != 0 {
+                return false;
+            }
+            i += 64;
+        }
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
@@ -549,6 +563,34 @@ mod x86_64 {
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
         let mut i = 0usize;
+        while i + 128 <= s.len() {
+            let m0 = unsafe {
+                _mm256_movemask_epi8(_mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i))
+            };
+            let m1 = unsafe {
+                _mm256_movemask_epi8(_mm256_loadu_si256(
+                    s.as_ptr().add(i + 32) as *const __m256i
+                ))
+            };
+            let m2 = unsafe {
+                _mm256_movemask_epi8(_mm256_loadu_si256(
+                    s.as_ptr().add(i + 64) as *const __m256i
+                ))
+            };
+            let m3 = unsafe {
+                _mm256_movemask_epi8(_mm256_loadu_si256(
+                    s.as_ptr().add(i + 96) as *const __m256i
+                ))
+            };
+            if (m0 | m1 | m2 | m3) != 0 {
+                for (off, mask) in [(0, m0), (32, m1), (64, m2), (96, m3)] {
+                    if mask != 0 {
+                        return Some(i + off + mask.trailing_zeros() as usize);
+                    }
+                }
+            }
+            i += 128;
+        }
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
@@ -566,6 +608,20 @@ mod x86_64 {
         let sp = _mm512_set1_epi8(0x20);
         let del = _mm512_set1_epi8(0x7F);
         let mut i = 0usize;
+        while i + 256 <= s.len() {
+            let a = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
+            let b = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) };
+            let c = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) };
+            let d = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) };
+            let bad = (_mm512_cmpgt_epi8_mask(sp, a) | _mm512_cmpeq_epi8_mask(a, del))
+                | (_mm512_cmpgt_epi8_mask(sp, b) | _mm512_cmpeq_epi8_mask(b, del))
+                | (_mm512_cmpgt_epi8_mask(sp, c) | _mm512_cmpeq_epi8_mask(c, del))
+                | (_mm512_cmpgt_epi8_mask(sp, d) | _mm512_cmpeq_epi8_mask(d, del));
+            if bad != 0 {
+                return false;
+            }
+            i += 256;
+        }
         while i + 64 <= s.len() {
             let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
             let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
@@ -645,6 +701,23 @@ mod x86_64 {
     #[target_feature(enable = "avx512f,avx512bw")]
     pub(super) unsafe fn next_non_ascii_byte_avx512(s: &[u8]) -> Option<usize> {
         let mut i = 0usize;
+        while i + 256 <= s.len() {
+            let m0 = unsafe { _mm512_movepi8_mask(_mm512_loadu_si512(s.as_ptr().add(i).cast())) };
+            let m1 =
+                unsafe { _mm512_movepi8_mask(_mm512_loadu_si512(s.as_ptr().add(i + 64).cast())) };
+            let m2 =
+                unsafe { _mm512_movepi8_mask(_mm512_loadu_si512(s.as_ptr().add(i + 128).cast())) };
+            let m3 =
+                unsafe { _mm512_movepi8_mask(_mm512_loadu_si512(s.as_ptr().add(i + 192).cast())) };
+            if (m0 | m1 | m2 | m3) != 0 {
+                for (off, mask) in [(0, m0), (64, m1), (128, m2), (192, m3)] {
+                    if mask != 0 {
+                        return Some(i + off + mask.trailing_zeros() as usize);
+                    }
+                }
+            }
+            i += 256;
+        }
         while i + 64 <= s.len() {
             let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
             let mask = unsafe { _mm512_movepi8_mask(v) };
@@ -661,6 +734,18 @@ mod x86_64 {
         let sp = _mm_set1_epi8(0x20);
         let del = _mm_set1_epi8(0x7F);
         let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
+            let b = unsafe { _mm_loadu_si128(s.as_ptr().add(i + 16) as *const __m128i) };
+            let bad_a =
+                unsafe { _mm_or_si128(_mm_cmpgt_epi8(sp, a), _mm_cmpeq_epi8(a, del)) };
+            let bad_b =
+                unsafe { _mm_or_si128(_mm_cmpgt_epi8(sp, b), _mm_cmpeq_epi8(b, del)) };
+            if unsafe { _mm_movemask_epi8(_mm_or_si128(bad_a, bad_b)) } != 0 {
+                return false;
+            }
+            i += 32;
+        }
         while i + 16 <= s.len() {
             let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
             let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
@@ -744,6 +829,28 @@ mod x86_64 {
     #[target_feature(enable = "sse2")]
     pub(super) unsafe fn next_non_ascii_byte_sse2(s: &[u8]) -> Option<usize> {
         let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let m0 = unsafe {
+                _mm_movemask_epi8(_mm_loadu_si128(s.as_ptr().add(i) as *const __m128i))
+            };
+            let m1 = unsafe {
+                _mm_movemask_epi8(_mm_loadu_si128(s.as_ptr().add(i + 16) as *const __m128i))
+            };
+            let m2 = unsafe {
+                _mm_movemask_epi8(_mm_loadu_si128(s.as_ptr().add(i + 32) as *const __m128i))
+            };
+            let m3 = unsafe {
+                _mm_movemask_epi8(_mm_loadu_si128(s.as_ptr().add(i + 48) as *const __m128i))
+            };
+            if (m0 | m1 | m2 | m3) != 0 {
+                for (off, mask) in [(0, m0), (16, m1), (32, m2), (48, m3)] {
+                    if mask != 0 {
+                        return Some(i + off + mask.trailing_zeros() as usize);
+                    }
+                }
+            }
+            i += 64;
+        }
         while i + 16 <= s.len() {
             let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
             let mask = unsafe { _mm_movemask_epi8(v) };
@@ -778,6 +885,20 @@ mod neon {
         let sp = unsafe { vdupq_n_u8(0x20) };
         let del = unsafe { vdupq_n_u8(0x7F) };
         let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            let b = unsafe { vld1q_u8(s.as_ptr().add(i + 16)) };
+            let bad = |v: uint8x16_t| unsafe {
+                let lt = vcltq_u8(v, sp);
+                let eq = vceqq_u8(v, del);
+                let high = vcgeq_u8(v, vdupq_n_u8(0x80));
+                vorrq_u8(vorrq_u8(lt, eq), high)
+            };
+            if unsafe { any_nonzero(vorrq_u8(bad(a), bad(b))) } {
+                return false;
+            }
+            i += 32;
+        }
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
             let lt = unsafe { vcltq_u8(v, sp) };
@@ -863,6 +984,20 @@ mod neon {
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
         let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let chunks = [
+                unsafe { vld1q_u8(s.as_ptr().add(i)) },
+                unsafe { vld1q_u8(s.as_ptr().add(i + 16)) },
+                unsafe { vld1q_u8(s.as_ptr().add(i + 32)) },
+                unsafe { vld1q_u8(s.as_ptr().add(i + 48)) },
+            ];
+            for (off, v) in chunks.into_iter().enumerate() {
+                if let Some(lane) = unsafe { first_high_lane(v) } {
+                    return Some(i + off * 16 + lane);
+                }
+            }
+            i += 64;
+        }
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
             if let Some(lane) = unsafe { first_high_lane(v) } {
@@ -906,6 +1041,13 @@ mod tests {
             let mut v = [b'a'; 32];
             v[lane] = 0x80;
             assert_eq!(next_non_ascii_byte(&v), Some(lane), "lane {lane}");
+        }
+        // Cross every unrolled block boundary: a high byte only in the last
+        // chunk must still be located exactly.
+        for at in [64, 127, 128, 255, 256, 300] {
+            let mut v = vec![b'a'; 320];
+            v[at] = 0xC3;
+            assert_eq!(next_non_ascii_byte(&v), Some(at), "offset {at}");
         }
     }
 

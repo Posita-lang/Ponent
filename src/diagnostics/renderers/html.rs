@@ -2,7 +2,7 @@
 
 use crate::ast::FileId;
 use crate::ast::Span;
-use crate::diagnostics::emitter::stylesheet::dark_css_cached;
+use crate::diagnostics::emitter::stylesheet::dark_css_min_cached;
 
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::DiagnosticLevel;
@@ -84,7 +84,7 @@ impl Renderer for HtmlRenderer {
              <title>Ponent Compiler Diagnostics</title>\n\
              <style>\n",
         )?;
-        out.write_str(dark_css_cached())?;
+        out.write_str(dark_css_min_cached())?;
         out.write_str(
             "\n\
              body { font-family: 'DejaVu Sans Mono', monospace; background: var(--bg); color: var(--fg); padding: 20px; }\n\

@@ -336,6 +336,26 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
             "        category: ErrorCategory::{},",
             e.category_variant
         );
+        let _ = write!(rs, "        related: &[");
+        for (i, rel) in e.related.iter().enumerate() {
+            if i > 0 {
+                rs.push_str(", ");
+            }
+            let _ = write!(rs, "{rel:?}");
+        }
+        let _ = writeln!(rs, "],");
+        let _ = write!(rs, "        siblings: &[");
+        let mut first = true;
+        for other in entries.iter().filter(|other| {
+            other.category_variant == e.category_variant && other.code != e.code
+        }) {
+            if !first {
+                rs.push_str(", ");
+            }
+            first = false;
+            let _ = write!(rs, "{:?}", other.code);
+        }
+        let _ = writeln!(rs, "],");
         let _ = writeln!(
             rs,
             "        explain: include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/error_codes/{}\")),",
@@ -345,20 +365,8 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
     }
     rs.push_str("];\n");
 
-    // Generated "see also" table: previously a hand-maintained `PAIRS`
-    // slice in `error_code.rs`, which could drift from the registry.
-    rs.push_str("\npub(crate) const RELATED_CODES: &[(&str, &[&str])] = &[\n");
-    for e in entries.iter().filter(|e| !e.related.is_empty()) {
-        let _ = write!(rs, "    ({:?}, &[", e.code);
-        for (i, rel) in e.related.iter().enumerate() {
-            if i > 0 {
-                rs.push_str(", ");
-            }
-            let _ = write!(rs, "{rel:?}");
-        }
-        rs.push_str("]),\n");
-    }
-    rs.push_str("];\n");
+    // Generated "see also" data now lives inside each `CodeEntry.related`;
+// no separate lookup table is emitted.
 
     // Emit one `ErrCode` associated constant per entry so production call
     // sites write `ErrCode::E030` (a typo is a compile error) instead of

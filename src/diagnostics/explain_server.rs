@@ -2048,16 +2048,16 @@ fn build_explain_page(ec: &ErrCode) -> String {
     // Curated or category-sibling related codes for a "see also"
     // section — the same source of truth used by the terminal renderer.
     let explicit = crate::diagnostics::error_code::related_codes_of(ec.code());
-    let related: SmallVec<[&'static str; 4]> = if explicit.is_empty() {
+    let related: &[&'static str] = if explicit.is_empty() {
         crate::diagnostics::error_code::category_siblings_of(ec.code(), 4)
     } else {
-        SmallVec::from_slice(explicit)
+        explicit
     };
     let see_also = if related.is_empty() {
         String::new()
     } else {
         let mut s = String::from("<div class=\"see-also\"><h3>See also</h3><ul>\n");
-        for rel in &related {
+        for rel in related {
             let title = crate::diagnostics::error_code::lookup(rel)
                 .map(|e| e.title)
                 .unwrap_or("(unknown)");

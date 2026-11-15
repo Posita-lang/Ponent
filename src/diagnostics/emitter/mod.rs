@@ -49,8 +49,9 @@ enum FileKey {
 }
 
 struct FilesSeen {
-    /// Previous key — the grouped-batch fast path skips the scan on a repeat.
-    last: Option<FileKey>,
+    /// Index of the previous key in `seen` — no second ownership of a
+    /// `FileKey::Name` (and no `CompactString` clone) on repeat-heavy batches.
+    last: Option<usize>,
     seen: FilesSeenInner,
 }
 
@@ -66,7 +67,7 @@ enum FilesSeenInner {
         id_names: SmallVec<[(crate::ast::FileId, CompactString); INLINE_FILES]>,
     },
     Large {
-        seen: rustc_hash::FxHashSet<FileKey>,
+        seen: indexmap::IndexSet<FileKey, rustc_hash::FxBuildHasher>,
         /// Present by construction in Large mode; no `Option` invariant.
         names: NameIndex,
     },
@@ -92,29 +93,56 @@ impl FilesSeen {
         }
     }
 
+    fn key_at(&self, index: usize) -> Option<&FileKey> {
+        match &self.seen {
+            FilesSeenInner::Small { seen, .. } => seen.get(index),
+            FilesSeenInner::Large { seen, .. } => seen.get_index(index),
+        }
+    }
+
+    fn last_id(&self) -> Option<crate::ast::FileId> {
+        match self.last.and_then(|i| self.key_at(i)) {
+            Some(FileKey::Id(id)) => Some(*id),
+            _ => None,
+        }
+    }
+
+    fn last_name(&self) -> Option<&str> {
+        match self.last.and_then(|i| self.key_at(i)) {
+            Some(FileKey::Name(name)) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
     fn insert(&mut self, name: &str, id: Option<crate::ast::FileId>) {
-        // Grouped batches repeat the same file: check the last key before
+        // Grouped batches repeat the same file: check the last index before
         // constructing `FileKey::Name`, which would allocate for long paths.
-        match (self.last.as_ref(), id) {
-            (Some(FileKey::Id(prev)), Some(id)) if *prev == id => {
+        if let Some(id) = id {
+            if self.last_id() == Some(id) {
                 self.add_id_name(id, name);
                 return;
             }
-            (Some(FileKey::Name(prev)), None) if prev.as_str() == name => return,
-            (Some(FileKey::Id(prev)), None) if self.id_name_known(*prev, name) => return,
-            _ => {}
+        } else {
+            if self.last_name() == Some(name) {
+                return;
+            }
+            if let Some(prev) = self.last_id()
+                && self.id_name_known(prev, name)
+            {
+                return;
+            }
+        }
+        // A span-less diagnostic falls back to the display name; if a
+        // spanned diagnostic already registered that name, this is the same
+        // file for summary purposes.  Check before constructing
+        // `FileKey::Name`, which would allocate for long paths.
+        if id.is_none() && self.name_seen(name) {
+            return;
         }
         let key = match id {
             Some(id) => FileKey::Id(id),
             None => FileKey::Name(CompactString::from(name)),
         };
-        // A span-less diagnostic falls back to the display name; if a
-        // spanned diagnostic already registered that name, this is the same
-        // file for summary purposes.
-        if id.is_none() && self.name_seen(name) {
-            self.last = Some(key);
-            return;
-        }
         // A span-less name was seen first, then a spanned diagnostic with the
         // same display name arrives: claim the anonymous entry in place.  This
         // is essential: leaving `Name` in `seen` would make a later, distinct
@@ -125,49 +153,56 @@ impl FilesSeen {
             self.claim_anonymous(name, id);
             return;
         }
-        self.insert_seen_key(&key);
+        let last = self.insert_seen_key(key);
         if let Some(id) = id {
             self.add_id_name(id, name);
         } else {
             self.add_anonymous_name(name);
         }
-        self.last = Some(key);
+        self.last = Some(last);
     }
 
-    fn insert_seen_key(&mut self, key: &FileKey) {
+    /// Insert `key` and return its index in the active store.  Moving the key
+    /// into the store is what removes the old `last` clone in Small mode.
+    fn insert_seen_key(&mut self, key: FileKey) -> usize {
         let mut spill = None;
-        match &mut self.seen {
+        let index = match &mut self.seen {
             FilesSeenInner::Small { seen, id_names } => {
-                if !seen.contains(key) {
-                    if seen.len() < INLINE_FILES {
-                        seen.push(key.clone());
-                    } else {
-                        let mut set: rustc_hash::FxHashSet<FileKey> = seen.drain(..).collect();
-                        set.insert(key.clone());
-                        let names = NameIndex::from_seen(&set, id_names);
-                        spill = Some((set, names));
-                    }
+                if let Some(pos) = seen.iter().position(|known| *known == key) {
+                    pos
+                } else if seen.len() < INLINE_FILES {
+                    let pos = seen.len();
+                    seen.push(key);
+                    pos
+                } else {
+                    let mut set: indexmap::IndexSet<FileKey, rustc_hash::FxBuildHasher> =
+                        seen.drain(..).collect();
+                    let (index, _) = set.insert_full(key);
+                    let names = NameIndex::from_seen(&set, id_names);
+                    spill = Some((set, names));
+                    index
                 }
             }
-            FilesSeenInner::Large { seen, .. } => {
-                seen.insert(key.clone());
-            }
-        }
+            FilesSeenInner::Large { seen, .. } => seen.insert_full(key).0,
+        };
         if let Some((seen, names)) = spill {
             self.seen = FilesSeenInner::Large { seen, names };
         }
+        index
     }
 
     /// Replace an anonymous `Name(name)` entry with `Id(id)` without changing
     /// the summary length, and update the name indexes.
     fn claim_anonymous(&mut self, name: &str, id: crate::ast::FileId) {
         let old = FileKey::Name(CompactString::from(name));
+        let last_index;
         match &mut self.seen {
             FilesSeenInner::Small { seen, id_names } => {
                 let Some(pos) = seen.iter().position(|key| *key == old) else {
                     unreachable!("claim_anonymous called without an anonymous entry")
                 };
                 seen[pos] = FileKey::Id(id);
+                last_index = pos;
                 if !id_names.iter().any(|(known_id, known_name)| {
                     *known_id == id && known_name == name
                 }) {
@@ -175,14 +210,14 @@ impl FilesSeen {
                 }
             }
             FilesSeenInner::Large { seen, names } => {
-                seen.remove(&old);
-                seen.insert(FileKey::Id(id));
+                let _ = seen.shift_remove(&old);
+                last_index = seen.insert_full(FileKey::Id(id)).0;
                 names.anon.remove(name);
                 names.claimed.insert(CompactString::from(name));
                 names.id_names.insert((id, CompactString::from(name)));
             }
         }
-        self.last = Some(FileKey::Id(id));
+        self.last = Some(last_index);
     }
 
     fn add_id_name(&mut self, id: crate::ast::FileId, name: &str) {
@@ -251,7 +286,7 @@ impl FilesSeen {
 
 impl NameIndex {
     fn from_seen(
-        seen: &rustc_hash::FxHashSet<FileKey>,
+        seen: &indexmap::IndexSet<FileKey, rustc_hash::FxBuildHasher>,
         id_names: &SmallVec<[(crate::ast::FileId, CompactString); INLINE_FILES]>,
     ) -> Self {
         let mut index = NameIndex {
@@ -306,6 +341,7 @@ struct BatchShared<'a, 'src, R: Renderer> {
     renderer: &'a R,
     opts: &'a DiagOpts,
     prebuilt: &'a [Prebuilt],
+    string_pool: &'a std::sync::Mutex<Vec<String>>,
     streaming: bool,
 }
 
@@ -335,22 +371,35 @@ fn worker_render_dynamic<R: Renderer>(
             break;
         }
         let orig = shared.order[claim];
+        let mut buf = shared
+            .string_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or_default();
+        buf.clear();
         let buf = match &cx {
             Some(cx) => {
                 let mut guard = shared.cells[orig]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 let diag: &mut Diagnostic<'_> = &mut **guard;
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     diag.humanize();
-                    let mut buf = String::with_capacity(256);
                     shared.renderer.render_into(diag, cx, &mut buf);
-                    buf
-                }))
-                .unwrap_or_else(|_| RENDER_PANIC_PLACEHOLDER.to_string())
+                }));
+                if rendered.is_err() {
+                    buf.clear();
+                    buf.push_str(RENDER_PANIC_PLACEHOLDER);
+                }
+                buf
             }
             // Setup panic: keep draining the queue so slots/latch cannot stall.
-            None => RENDER_PANIC_PLACEHOLDER.to_string(),
+            None => {
+                buf.clear();
+                buf.push_str(RENDER_PANIC_PLACEHOLDER);
+                buf
+            }
         };
         *shared.slots[orig]
             .lock()
@@ -386,6 +435,13 @@ pub struct Emitter<R, M> {
     pool: std::sync::OnceLock<crate::pool::WorkerPool>,
     /// Reused across batch emits: weights and claim order.
     batch: BatchScratch,
+    /// Rendered `String` buffers returned by earlier batches, reused by
+    /// resident workers instead of a fresh allocation per diagnostic.
+    string_pool: std::sync::Mutex<Vec<String>>,
+    /// Cross-batch line tables keyed by `(FileId, source_fingerprint)`.
+    /// `Prebuilt` owns its `Arc` tables, so no source lifetime is captured.
+    file_index_cache:
+        std::cell::RefCell<crate::smallvec::SmallVec<[(crate::ast::FileId, u64, Prebuilt); 8]>>,
 }
 
 impl<R: Renderer, M: MakeSink> Emitter<R, M> {
@@ -403,6 +459,8 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             parallelism,
             pool: std::sync::OnceLock::new(),
             batch: BatchScratch::default(),
+            string_pool: std::sync::Mutex::new(Vec::new()),
+            file_index_cache: std::cell::RefCell::new(crate::smallvec::SmallVec::new()),
         }
     }
 
@@ -768,7 +826,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             if first {
                 first = false;
             } else if !separator.is_empty() {
-                sink.write_str(separator)?;
+                buf.insert_str(0, separator);
             }
             sink.write_str(&buf)?;
         }
@@ -793,20 +851,36 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 let key = (src.as_ptr() as usize, src.len());
                 *source_weight.entry(key).or_default() += weights[i];
                 if seen.insert(key) {
-                    let idx = LineIndex::new(src);
-                    #[cfg(debug_assertions)]
-                    let fingerprint = crate::diagnostics::render::source_fingerprint(src);
-                    #[cfg(not(debug_assertions))]
-                    let fingerprint = 0u64;
-                    out.push((
-                        key.0,
-                        key.1,
-                        std::sync::Arc::clone(idx.starts_arc()),
-                        idx.ascii(),
-                        std::sync::Arc::clone(idx.char_prefixes_arc()),
-                        idx.generation(),
-                        fingerprint,
-                    ));
+                    let file_id = diag.spans.primary_ref().first().map(|s| s.file);
+                    let fingerprint =
+                        crate::diagnostics::render::source_fingerprint(src);
+                    let cached = file_id.and_then(|id| {
+                        self.file_index_cache.borrow().iter().find_map(|(f, h, p)| {
+                            (*f == id && *h == fingerprint).then(|| p.clone())
+                        })
+                    });
+                    if let Some(p) = cached {
+                        out.push((key.0, key.1, p.2, p.3, p.4, p.5, fingerprint));
+                    } else {
+                        let idx = LineIndex::new(src);
+                        let entry = (
+                            key.0,
+                            key.1,
+                            std::sync::Arc::clone(idx.starts_arc()),
+                            idx.ascii(),
+                            std::sync::Arc::clone(idx.char_prefixes_arc()),
+                            idx.generation(),
+                            fingerprint,
+                        );
+                        out.push(entry.clone());
+                        if let Some(id) = file_id {
+                            let mut cache = self.file_index_cache.borrow_mut();
+                            if cache.len() >= 8 {
+                                cache.pop();
+                            }
+                            cache.insert(0, (id, fingerprint, entry));
+                        }
+                    }
                 }
             }
         }
@@ -853,6 +927,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             renderer: &self.renderer,
             opts: &self.opts,
             prebuilt: &prebuilt,
+            string_pool: &self.string_pool,
             streaming: false,
         };
         let pool = self
@@ -869,10 +944,11 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             }));
         }
         pool.submit(jobs).wait();
+        let string_pool = shared.string_pool;
         let BatchShared { slots, .. } = shared;
         let mut first = true;
         for slot in slots {
-            let buf = slot
+            let mut buf = slot
                 .into_inner()
                 .unwrap_or_else(|e| e.into_inner())
                 .unwrap_or_else(|| RENDER_PANIC_PLACEHOLDER.to_string());
@@ -882,9 +958,18 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             if first {
                 first = false;
             } else if !separator.is_empty() {
-                sink.write_str(separator)?;
+                buf.insert_str(0, separator);
             }
             sink.write_str(&buf)?;
+            if buf.capacity() <= 64 * 1024 {
+                let mut pool = string_pool
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if pool.len() < 64 {
+                    buf.clear();
+                    pool.push(buf);
+                }
+            }
         }
         Ok(())
     }
@@ -920,6 +1005,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             renderer: &self.renderer,
             opts: &self.opts,
             prebuilt: &prebuilt,
+            string_pool: &self.string_pool,
             streaming: true,
         };
         let pool = self
@@ -939,7 +1025,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let mut result: io::Result<()> = Ok(());
         let mut first = true;
         for cursor in 0..n {
-            let buf = {
+            let mut buf = {
                 let mut slot = shared.slots[cursor]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
@@ -957,14 +1043,21 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             if first {
                 first = false;
             } else if !separator.is_empty() {
-                if let Err(err) = sink.write_str(separator) {
-                    result = Err(err);
-                    break;
-                }
+                buf.insert_str(0, separator);
             }
             if let Err(err) = sink.write_str(&buf) {
                 result = Err(err);
                 break;
+            }
+            if buf.capacity() <= 64 * 1024 {
+                let mut pool = shared
+                    .string_pool
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if pool.len() < 64 {
+                    buf.clear();
+                    pool.push(buf);
+                }
             }
         }
         wait.wait();

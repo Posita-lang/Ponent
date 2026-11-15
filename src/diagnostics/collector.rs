@@ -41,6 +41,8 @@ pub struct DiagCtxt<'src> {
     /// store is kept at 2 rather than widened.
     diags: SmallVec<[Diagnostic<'src>; 2]>,
     reported_len: usize,
+    /// Lowest index that may still lack `source`; `attach_source` starts here.
+    first_unspanned: usize,
     /// If false, warning-level diagnostics are suppressed.
     /// Push-time gate: when `false`, warning-level diagnostics pushed
     /// *afterwards* are suppressed at `push` (returning a suppressed
@@ -81,6 +83,7 @@ impl<'src> DiagCtxt<'src> {
         DiagCtxt {
             diags: SmallVec::new(),
             reported_len: 0,
+            first_unspanned: 0,
             can_emit_warnings: true,
             errors: 0,
             warnings: 0,
@@ -104,7 +107,14 @@ impl<'src> DiagCtxt<'src> {
             }
             _ => {}
         }
+        let index = self.diags.len();
+        let has_source = diag.source().is_some();
         self.diags.push(diag);
+        if !has_source {
+            self.first_unspanned = self.first_unspanned.min(index);
+        } else if index == self.first_unspanned {
+            self.first_unspanned += 1;
+        }
         EmissionGuarantee::emitted()
     }
 
@@ -152,11 +162,13 @@ impl<'src> DiagCtxt<'src> {
     /// already-emitted diagnostics (e.g. to render them elsewhere), and source
     /// attachment is idempotent.  It is not re-rendered in place.
     pub fn attach_source(&mut self, source: &'src str) {
-        for diag in &mut self.diags {
+        let start = self.first_unspanned.min(self.diags.len());
+        for diag in &mut self.diags[start..] {
             if diag.source().is_none() {
                 diag.set_source(Some(source));
             }
         }
+        self.first_unspanned = self.diags.len();
     }
 
     /// Total diagnostics (reported + unreported).
@@ -241,11 +253,13 @@ impl<'src> DiagCtxt<'src> {
             }
             self.diags.truncate(keep);
         }
+        self.first_unspanned = self.first_unspanned.min(self.diags.len());
     }
 
     pub fn clear(&mut self) {
         self.diags.clear();
         self.reported_len = 0;
+        self.first_unspanned = 0;
         self.errors = 0;
         self.warnings = 0;
         self.unreported_errors = 0;
@@ -406,6 +420,7 @@ impl<'src> DiagCtxt<'src> {
             self.errors = 0;
             self.warnings = 0;
             self.unreported_errors = 0;
+            self.first_unspanned = 0;
             return all;
         }
         let unreported = all.split_off(self.reported_len);
@@ -419,6 +434,7 @@ impl<'src> DiagCtxt<'src> {
         self.unreported_errors = 0;
         // Put the still-reported prefix back: `split_off` left it in `all`.
         self.diags = SmallVec::from_vec(all);
+        self.first_unspanned = self.first_unspanned.min(self.diags.len());
         unreported
     }
 
@@ -433,6 +449,7 @@ impl<'src> DiagCtxt<'src> {
             self.errors = 0;
             self.warnings = 0;
             self.unreported_errors = 0;
+            self.first_unspanned = 0;
             return all;
         }
         let unreported = all.split_off(self.reported_len);
@@ -445,6 +462,7 @@ impl<'src> DiagCtxt<'src> {
         }
         self.diags = SmallVec::from_vec(unreported);
         self.reported_len = 0;
+        self.first_unspanned = 0;
         all
     }
 
@@ -510,9 +528,14 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
                 warnings += 1;
             }
         }
+        let first_unspanned = diags
+            .iter()
+            .position(|d| d.source().is_none())
+            .unwrap_or(diags.len());
         DiagCtxt {
             diags: SmallVec::from_vec(diags),
             reported_len: 0,
+            first_unspanned,
             can_emit_warnings: true,
             errors,
             warnings,

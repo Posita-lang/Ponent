@@ -2116,10 +2116,10 @@ pub fn explain_error_code_with_depth(
     }
 
     let explicit = crate::diagnostics::error_code::related_codes_of(code.code());
-    let related: SmallVec<[&'static str; 4]> = if explicit.is_empty() {
+    let related: &[&'static str] = if explicit.is_empty() {
         crate::diagnostics::error_code::category_siblings_of(code.code(), 4)
     } else {
-        SmallVec::from_slice(explicit)
+        explicit
     };
     if !related.is_empty() {
         let _ = writeln!(out);
@@ -2128,7 +2128,7 @@ pub fn explain_error_code_with_depth(
         } else {
             out.push_str("See also:\n");
         }
-        for rel in &related {
+        for rel in related {
             out.push_str("  ");
             out.push_str(rel);
             if let Some(entry) = crate::diagnostics::error_code::lookup(rel) {

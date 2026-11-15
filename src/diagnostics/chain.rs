@@ -46,7 +46,7 @@ enum ChainSuffix<'a> {
     /// [`ChainEntryKind::as_static_str`] returns a borrow into the cached
     /// `OnceLock` table, so there is no allocation to own and no `Cow`
     /// discriminant to carry.
-    Kind { kind: &'static str },
+    Kind { kind: &'static str, width: usize },
 }
 
 impl<'a> ChainSuffix<'a> {
@@ -70,7 +70,7 @@ impl<'a> ChainSuffix<'a> {
                     + 1
                     + dec_digits((*col).saturating_add(1) as u64)
             }
-            ChainSuffix::Kind { kind } => 2 + visible_width(kind),
+            ChainSuffix::Kind { width, .. } => 2 + width,
         }
     }
 
@@ -105,7 +105,7 @@ impl<'a> ChainSuffix<'a> {
                     push_uint(out, (*col).saturating_add(1) as u64);
                 }
             }
-            ChainSuffix::Kind { kind } => {
+            ChainSuffix::Kind { kind, .. } => {
                 out.push_str(": ");
                 out.push_str(kind);
             }
@@ -192,6 +192,27 @@ impl ChainEntryKind {
                 fluent::chain_defines().into_owned(),
             ],
         }
+    }
+
+    /// Cached display width of [`Self::as_static_str`], computed once per
+    /// `(kind, lang)` alongside the label table.
+    pub fn label_width(&self) -> usize {
+        static WIDTHS: std::sync::OnceLock<[usize; 4]> = std::sync::OnceLock::new();
+        let widths = WIDTHS.get_or_init(|| {
+            [
+                visible_width(ChainEntryKind::Call.as_static_str()),
+                visible_width(ChainEntryKind::Inlined.as_static_str()),
+                visible_width(ChainEntryKind::Reference.as_static_str()),
+                visible_width(ChainEntryKind::Defines.as_static_str()),
+            ]
+        });
+        let idx = match self {
+            ChainEntryKind::Call => 0,
+            ChainEntryKind::Inlined => 1,
+            ChainEntryKind::Reference => 2,
+            ChainEntryKind::Defines => 3,
+        };
+        widths[idx]
     }
 }
 
@@ -642,6 +663,7 @@ impl<'src> CallChain<'src> {
                 }
                 _ => ChainSuffix::Kind {
                     kind: entry.kind.as_static_str(),
+                    width: entry.kind.label_width(),
                 },
             };
             let suffix_cols = suffix.cols(file_cols);
@@ -1121,6 +1143,7 @@ mod tests {
         for kind in [ChainEntryKind::Call, ChainEntryKind::Inlined] {
             let s = ChainSuffix::Kind {
                 kind: kind.as_static_str(),
+                width: kind.label_width(),
             };
             let mut out = String::new();
             s.write_into(&mut out);

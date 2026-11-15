@@ -183,3 +183,47 @@ pub fn light_css_cached() -> &'static str {
     static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CSS.get_or_init(|| Stylesheet::light().to_html_css_root_only())
 }
+
+/// Minify the generated CSS: drop comment lines and indentation/newlines.
+/// The generated grammar is only `:root`/`html.light` blocks of declarations,
+/// so concatenating trimmed lines is semantics-preserving.
+fn minify_css(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    for line in css.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("/*") || t.starts_with('*') || t.ends_with("*/") {
+            continue;
+        }
+        out.push_str(t);
+    }
+    out
+}
+
+/// Minified dark CSS, computed once.
+pub fn dark_css_min_cached() -> &'static str {
+    static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSS.get_or_init(|| minify_css(dark_css_cached()))
+}
+
+/// Minified light CSS, computed once.
+pub fn light_css_min_cached() -> &'static str {
+    static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSS.get_or_init(|| minify_css(light_css_cached()))
+}
+
+#[cfg(all(test, not(feature = "shuttle")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minified_css_removes_layout_and_is_smaller() {
+        let full = dark_css_cached();
+        let min = dark_css_min_cached();
+        assert!(min.len() < full.len());
+        assert!(!min.contains('\n'));
+        assert!(min.contains(":root {"));
+        assert!(min.contains("html.light {"));
+        assert!(min.contains("--error-border:"));
+        assert!(light_css_min_cached().contains(":root {"));
+    }
+}
