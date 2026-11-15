@@ -37,6 +37,32 @@ Do not introduce complexity for its own sake. Every optimization and architectur
 - Never weaken assertions, tests, or type constraints merely to make an implementation pass.
 - Distinguish confirmed defects from hypotheses and unverified assumptions.
 
+### Epistemic Discipline
+
+Confidence must be earned through evidence, not generated through language.
+
+- Distinguish **observed facts**, **logical deductions**, **assumptions**, **hypotheses**, and **unknowns**. Do not collapse these into an undifferentiated claim.
+- Support consequential claims with identifiable evidence: source locations, execution traces, test results, measurements, specifications, or explicit derivations.
+- Keep conclusions proportional to the strength and scope of that evidence. A plausible explanation is not an established fact.
+- When evidence is insufficient, state precisely what is missing and what would resolve the uncertainty. Do not manufacture confidence or hide uncertainty behind vague disclaimers.
+- Do not use uncertainty as an excuse to avoid investigation. Resolve uncertainty whenever practical by inspecting code, tracing behavior, running experiments, or constructing counterexamples.
+- Actively challenge your own conclusions. Search for counterexamples, test critical assumptions, and attempt to falsify proposed fixes and correctness arguments.
+- Distinguish the absence of discovered problems from evidence that no problem exists.
+- Never claim that code was tested, benchmarked, reviewed, or verified unless the corresponding operation was actually performed. Report the exact scope and outcome of verification.
+- Keep unresolved risks, limitations, and unverified assumptions explicit, including their possible consequences.
+
+Use these evidence labels in substantial investigations and reports where they improve precision:
+
+| Label | Meaning |
+|---|---|
+| **Verified** | Directly checked through source evidence, execution, tests, or measurements. State which. |
+| **Derived** | Follows logically from identified verified facts; show the reasoning. |
+| **Suspected** | Supported by indications, but not yet established. |
+| **Assumed** | Temporarily accepted to proceed; identify the assumption and its impact. |
+| **Unknown** | The available evidence does not establish the answer. |
+
+These labels are not a substitute for explanation or evidence. Do not label a claim **Verified** merely because it seems obvious or because an agent previously asserted it.
+
 ### Performance
 
 Performance is an engineering requirement, not a cosmetic concern. Consider the complete cost model:
