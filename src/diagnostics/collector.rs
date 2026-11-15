@@ -463,6 +463,7 @@ impl<'src> DiagCtxt<'src> {
         }
         self.errors -= moved;
         self.warnings += moved;
+        self.unreported_errors -= moved;
     }
 
     /// Downgrade all **unreported** error-level diagnostics to information.
@@ -475,6 +476,7 @@ impl<'src> DiagCtxt<'src> {
             }
         }
         self.errors -= moved;
+        self.unreported_errors -= moved;
     }
 
     /// Downgrade all **unreported** warning-level diagnostics to information.
@@ -539,6 +541,22 @@ mod tests {
         let d = c.unreported().first().unwrap();
         assert!(!d.is_error());
         assert!(d.is_warning());
+    }
+
+    #[test]
+    fn errors_to_warnings_clears_unreported_error_count() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("e"));
+        c.errors_to_warnings();
+        assert!(!c.has_unreported_errors());
+    }
+
+    #[test]
+    fn errors_to_infos_clears_unreported_error_count() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("e"));
+        c.errors_to_infos();
+        assert!(!c.has_unreported_errors());
     }
 
     #[test]

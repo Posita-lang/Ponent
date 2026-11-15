@@ -515,6 +515,14 @@ impl ErrCode {
         }
     }
 
+    /// `true` when the code came from the validated registry.  Registry codes
+    /// are `^[EW]\d{3}$` (printable ASCII), so callers may skip terminal
+    /// sanitization; only the untrusted [`Other`](ErrCodeRepr::Other) spelling
+    /// needs it.
+    pub(crate) fn is_known(&self) -> bool {
+        matches!(self.0, ErrCodeRepr::Known(_))
+    }
+
     /// The canonical spelling used by `Eq`/`Hash`: table entries resolve to
     /// their registered code, so case spellings of one code compare equal.
     /// Unknown codes with no entry fall back to their verbatim string, which

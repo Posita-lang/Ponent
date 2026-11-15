@@ -316,30 +316,6 @@ impl<'a> RenderCtx<'a> {
     pub(crate) fn line_index<'s>(&self, source: &'s str) -> LineIndex<'s> {
         let ptr = source.as_ptr() as usize;
         let len = source.len();
-        if len <= STABLE_CACHE_MAX_SOURCE {
-            if let Some(cache_ref) = self.line_cache {
-                let fingerprint = source_fingerprint(source);
-                let mut cache = cache_ref.borrow_mut();
-                if let Some(pos) = cache.iter().position(|entry| {
-                    entry.fingerprint == fingerprint
-                        && entry.text.len() == len
-                        && entry.text == source
-                }) {
-                    if pos > 0 {
-                        let entry = cache.remove(pos);
-                        cache.insert(0, entry);
-                    }
-                    let entry = &cache[0];
-                    return LineIndex::from_shared(
-                        source,
-                        Arc::clone(&entry.starts),
-                        entry.ascii,
-                        Arc::clone(&entry.char_prefixes),
-                        entry.generation,
-                    );
-                }
-            }
-        }
         {
             let mut cache = self.source_index.borrow_mut();
             if let Some(pos) = cache.iter().position(|c| c.ptr == ptr && c.len == len) {
@@ -416,6 +392,30 @@ impl<'a> RenderCtx<'a> {
                     Arc::clone(&e.char_prefixes),
                     e.generation,
                 );
+            }
+        }
+        if len <= STABLE_CACHE_MAX_SOURCE {
+            if let Some(cache_ref) = self.line_cache {
+                let fingerprint = source_fingerprint(source);
+                let mut cache = cache_ref.borrow_mut();
+                if let Some(pos) = cache.iter().position(|entry| {
+                    entry.fingerprint == fingerprint
+                        && entry.text.len() == len
+                        && entry.text == source
+                }) {
+                    if pos > 0 {
+                        let entry = cache.remove(pos);
+                        cache.insert(0, entry);
+                    }
+                    let entry = &cache[0];
+                    return LineIndex::from_shared(
+                        source,
+                        Arc::clone(&entry.starts),
+                        entry.ascii,
+                        Arc::clone(&entry.char_prefixes),
+                        entry.generation,
+                    );
+                }
             }
         }
         let idx = LineIndex::new(source);

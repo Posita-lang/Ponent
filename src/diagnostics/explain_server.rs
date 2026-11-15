@@ -187,10 +187,6 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     let deadline = Instant::now() + ACCEPT_BUDGET;
     let mut idle_deadline: Option<Instant> = None;
     let mut served = false;
-    // Keep the first real I/O error instead of overwriting it with every
-    // later transient failure; the first one is the most likely root cause
-    // when the budget expires without a page being served.
-    let mut first_error: Option<std::io::Error> = None;
 
     // A9.2: accept speculative preconnects into a poll-set instead of
     // servicing them serially.  A silent preconnect sends nothing, so `poll`
@@ -274,9 +270,6 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                     // wall-clock deadline, exactly as `wait_readable` does.
                     continue;
                 }
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
                 // M5: a transient `ENOMEM`/`EINTR`-class failure must not end
                 // the wait while the browser may still connect.  Give up only
                 // after a sustained, consecutive error run.
@@ -299,11 +292,6 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             if listener_offset == 1
                 && fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
             {
-                if first_error.is_none() {
-                    first_error = Some(std::io::Error::from(
-                        std::io::ErrorKind::ConnectionAborted,
-                    ));
-                }
                 break;
             }
             if listener_offset == 1 && fds[0].revents & libc::POLLIN != 0 {
@@ -327,9 +315,6 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                             // fails (EMFILE/ENFILE/...).  Sleeping here bounds
                             // the otherwise immediate re-poll to a hot spin.
                             accept_errors += 1;
-                            if first_error.is_none() {
-                                first_error = Some(e);
-                            }
                             let ms = (50u64 << accept_errors.min(4)).min(1000);
                             std::thread::sleep(Duration::from_millis(ms));
                             break;
@@ -534,8 +519,6 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
 
     let result = if served {
         Ok(())
-    } else if let Some(e) = first_error {
-        Err(e)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,

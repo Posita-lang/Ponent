@@ -62,11 +62,12 @@ impl Default for ShortRenderer {
 /// keeps the one-line contract: a bare `\r` would otherwise make a terminal
 /// redraw the line, and some line-oriented parsers would truncate it.
 #[inline]
-fn push_flattened(out: &mut String, msg: &str) {
+fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
     let bytes = msg.as_bytes();
 
-    // Fast path: no break byte — straight copy.
-    let Some(first) = memchr::memchr3(b'\n', b'\r', b'\t', bytes) else {
+    // Fast path: no break byte — straight copy.  The caller already scanned
+    // for the first break while sanitizing, so this needs no second memchr3.
+    let Some(first) = first else {
         out.push_str(msg);
         return;
     };
@@ -145,7 +146,7 @@ impl Renderer for ShortRenderer {
         // scalar growth pre-scan and no possibility of under-booking.  Unused
         // in release?  No: both are written below.
         let raw_msg = diag.message();
-        let (sanitized, has_break) =
+        let (sanitized, break_at) =
             super::super::sanitize_for_terminal_flatten_with_break(raw_msg);
 
         // ---- Size the reservation to the exact bytes ---------------------
@@ -245,8 +246,8 @@ impl Renderer for ShortRenderer {
         // A multi-line message would break the one-line format, and a stray
         // `\r` would make a terminal redraw the line.  `push_flattened`
         // consumes the break runs the sanitizer preserved as layout bytes.
-        if has_break {
-            push_flattened(out, &sanitized);
+        if let Some(first) = break_at {
+            push_flattened(out, &sanitized, Some(first));
         } else {
             out.push_str(&sanitized);
         }
@@ -331,7 +332,11 @@ mod tests {
                     crate::diagnostics::sanitize_for_terminal(s)
                 };
                 let mut out = String::new();
-                push_flattened(&mut out, &sanitized);
+                push_flattened(
+                    &mut out,
+                    &sanitized,
+                    memchr::memchr3(b'\n', b'\r', b'\t', sanitized.as_bytes()),
+                );
                 assert!(
                     out.len() <= sanitized.len(),
                     "push_flattened grew {s:?} (keep_breaks={keep_breaks}): \

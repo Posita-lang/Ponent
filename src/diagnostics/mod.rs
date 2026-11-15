@@ -659,18 +659,17 @@ impl MultiSpan {
             // against an `O(n log n)` sort per read.  Return a borrow of the
             // cache rather than cloning it: the cache lives behind `&self`,
             // so the borrow is exact and the dirty path costs no extra copy.
-            let _ = self.sorted_cache.set(out.into_vec().into_boxed_slice());
-            // Two threads may both compute and both attempt `set`; the loser
-            // then reads the winner's value.  `OnceLock::set` is release and
-            // `get` is acquire, so a successful `set` *or* a concurrent
-            // winner's `set` is visible here — the value cannot be observed as
-            // `None`.  This relies on `OnceLock`'s synchronization: replacing
-            // it with an unsynchronized cell would make the read racy.
-            debug_assert!(
-                self.sorted_cache.get().is_some(),
-                "sorted cache holds the winner's value when `set` loses the race"
-            );
-            Cow::Borrowed(self.sorted_cache.get().expect("just set"))
+            match self.sorted_cache.set(out.into_vec().into_boxed_slice()) {
+                Ok(()) => {
+                    // Two threads may both compute and both attempt `set`; a
+                    // successful `set` or the winner's value is visible here
+                    // because `OnceLock` is acquire/release.
+                    Cow::Borrowed(self.sorted_cache.get().expect("just set"))
+                }
+                // We lost the set race.  Our sorted+deduped view is identical
+                // to the winner's; return it instead of discarding the work.
+                Err(own) => Cow::Owned(own.into_vec()),
+            }
         }
     }
 }
@@ -2868,11 +2867,11 @@ pub(crate) fn sanitize_for_terminal_flatten(s: &str) -> Cow<'_, str> {
     sanitize_for_terminal_flatten_with_break(s).0
 }
 
-pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>, bool) {
+pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>, Option<usize>) {
     let bytes = s.as_bytes();
-    let (has_high, dirty, has_c1, has_break) = scan_terminal_control_flags_flatten(bytes);
+    let (has_high, dirty, has_c1, break_at) = scan_terminal_control_flags_flatten(bytes);
     if !has_high && !dirty {
-        return (Cow::Borrowed(s), has_break);
+        return (Cow::Borrowed(s), break_at);
     }
     // Non-ASCII with no C0/C1/DEL *and* no bidi override/isolate: borrow.
     // Bidi formatting characters (U+202A–U+202E, U+2066–U+2069) are neither
@@ -2880,7 +2879,7 @@ pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>
     // probed separately (see [`sanitize_for_terminal`] for the spoofing
     // rationale) and must reach the owned path for removal.
     if has_high && !dirty && !has_c1 && !has_bidi_override_bytes(bytes) {
-        return (Cow::Borrowed(s), has_break);
+        return (Cow::Borrowed(s), break_at);
     }
     // Layout-only ASCII (`\n`/`\r`/`\t` are the only controls) is already
     // covered by the first branch: the scanner excludes those bytes from
@@ -2899,7 +2898,7 @@ pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>
                     c
                 }
             })
-            .collect()), has_break);
+            .collect()), break_at);
     }
     (Cow::Owned(s.chars()
         .map(|c| {
@@ -2909,7 +2908,7 @@ pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>
                 c
             }
         })
-        .collect()), has_break)
+        .collect()), break_at)
 }
 
 /// Replace control characters with U+FFFD so external text cannot inject
@@ -3125,11 +3124,10 @@ pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool, bo
 /// [`scan_terminal_control_flags_multiline`] variant for
 /// [`sanitize_for_terminal_flatten`]: `\t`, `\n` *and* `\r` are excluded from
 /// the dirty set, because those are exactly the layout bytes the flatten path
-/// keeps or consumes (`push_flattened`).  Returns `(has_high, dirty, has_c1)`;
-/// `has_c1` flags a `0xC2 0x80..=0x9F` sequence.  A multi-line message with no
-/// other controls therefore stays `Cow::Borrowed`, and flagged-lane resolution
-/// (not whole-chunk rescans) keeps tab/newline/CR-dense text at SWAR speed.
-fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, bool) {
+/// keeps or consumes (`push_flattened`).  Returns `(has_high, dirty,
+/// has_c1, first_break)`, where `first_break` is the byte offset of the first
+/// `\t`/`\n`/`\r`.
+fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, Option<usize>) {
     const HI: u64 = 0x8080_8080_8080_8080;
     const SP: u64 = 0x2020_2020_2020_2020;
     const DEL: u64 = 0x7F7F_7F7F_7F7F_7F7F;
@@ -3141,7 +3139,7 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, bool) {
     let mut has_high = false;
     let mut dirty = false;
     let mut has_c1 = false;
-    let mut has_break = false;
+    let mut first_break = None;
     let mut i = 0;
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
@@ -3158,7 +3156,10 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, bool) {
             let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI;
             let nl = !(((x ^ NL) | HI).wrapping_sub(ONES)) & HI;
             let cr = !(((x ^ CR) | HI).wrapping_sub(ONES)) & HI;
-            has_break |= tab | nl | cr != 0;
+            let breaks = tab | nl | cr;
+            if first_break.is_none() && breaks != 0 {
+                first_break = Some(i + breaks.trailing_zeros() as usize / 8);
+            }
             if lt20 & !tab & !nl & !cr != 0 {
                 dirty = true;
             }
@@ -3168,11 +3169,13 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, bool) {
     for j in i..s.len() {
         let b = s[j];
         has_high |= b >= 0x80;
-        has_break |= matches!(b, b'\t' | b'\n' | b'\r');
+        if first_break.is_none() && matches!(b, b'\t' | b'\n' | b'\r') {
+            first_break = Some(j);
+        }
         dirty |= (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F;
         has_c1 |= b == 0xC2 && s.get(j + 1).is_some_and(|b| (0x80..=0x9F).contains(b));
     }
-    (has_high, dirty, has_c1, has_break)
+    (has_high, dirty, has_c1, first_break)
 }
 
 /// Unicode bidirectional formatting characters: the U+202A–U+202E
@@ -5203,7 +5206,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let (has_high, dirty, _has_c1, _has_break) = scan_terminal_control_flags_flatten(&bytes);
+            let (has_high, dirty, _has_c1, _break_at) = scan_terminal_control_flags_flatten(&bytes);
             let _ = has_high;
             assert_eq!(dirty, reference(&bytes), "{bytes:?}");
         }

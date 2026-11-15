@@ -21,6 +21,11 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io;
 
+struct EscapeEntry {
+    value: std::sync::Arc<str>,
+    referenced: bool,
+}
+
 /// HTML renderer — generates diagnostic output as HTML.
 /// Inspired by Austral's Reporter.ml which produces interactive call trees.
 pub struct HtmlRenderer {
@@ -1133,8 +1138,6 @@ impl HtmlRenderer {
             // range policy suppresses middle-line underlines, so derive the
             // connector column from the label span, matching the glyph
             // renderer's policy exactly.
-            let line_start = starts.get(line_idx).map_or(source.len(), |&s| s as usize);
-            let line_end = line_start + line.len();
             for &i in label_window.active() {
                 let (start, end) = label_line_ranges[i];
                 if line_idx <= start
@@ -1210,35 +1213,69 @@ impl HtmlRenderer {
         // workers otherwise contend on one global `Mutex` for the same static
         // label strings.  Duplication is bounded and per-thread.
         thread_local! {
-            static ESCAPE_CACHE: RefCell<rustc_hash::FxHashMap<String, std::sync::Arc<str>>> =
-                RefCell::new(rustc_hash::FxHashMap::default());
+            static ESCAPE_CACHE: RefCell<(
+                rustc_hash::FxHashMap<compact_str::CompactString, EscapeEntry>,
+                std::collections::VecDeque<compact_str::CompactString>,
+            )> = RefCell::new((
+                rustc_hash::FxHashMap::default(),
+                std::collections::VecDeque::new(),
+            ));
         }
-        let mut hit = None;
-        ESCAPE_CACHE.with(|cell| {
-            let cache = cell.borrow();
-            if let Some(value) = cache.get(s) {
-                hit = Some(std::sync::Arc::clone(value));
-            }
+        // Hash lookup costs more than escaping a tiny string, so keep short
+        // strings entirely out of the cache.
+        if s.len() <= 64 {
+            let escaped = self.escape(s);
+            out.push_str(escaped.as_ref());
+            return;
+        }
+        let key = compact_str::CompactString::from(s);
+        let hit = ESCAPE_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            cache.0.get_mut(s).map(|entry| {
+                entry.referenced = true;
+                std::sync::Arc::clone(&entry.value)
+            })
         });
         if let Some(value) = hit {
             out.push_str(&value);
             return;
         }
         let escaped = self.escape(s);
-        if escaped.len() > 4096
-            || matches!(escaped, std::borrow::Cow::Borrowed(_))
-        {
+        if escaped.len() > 4096 {
             out.push_str(escaped.as_ref());
             return;
         }
+        let value: std::sync::Arc<str> = std::sync::Arc::from(escaped.as_ref());
         ESCAPE_CACHE.with(|cell| {
             let mut cache = cell.borrow_mut();
-            if cache.len() >= 1024 {
-                cache.clear();
+            while cache.0.len() >= 1024 {
+                let Some(old) = cache.1.pop_front() else {
+                    break;
+                };
+                let evict = match cache.0.get_mut(&old) {
+                    Some(entry) if entry.referenced => {
+                        entry.referenced = false;
+                        false
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
+                if evict {
+                    cache.0.remove(&old);
+                    break;
+                }
+                cache.1.push_back(old);
             }
-            cache.insert(s.to_string(), std::sync::Arc::from(escaped.as_ref()));
+            cache.0.insert(
+                key.clone(),
+                EscapeEntry {
+                    value: std::sync::Arc::clone(&value),
+                    referenced: false,
+                },
+            );
+            cache.1.push_back(key);
         });
-        out.push_str(escaped.as_ref());
+        out.push_str(&value);
     }
 
     /// Escape text for HTML element content *and* single/double-quoted

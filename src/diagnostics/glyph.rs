@@ -1452,7 +1452,13 @@ impl GlyphRenderer {
         // joined `String` when the hyperlink branch will discard it.
         let sanitized_codes: SmallVec<[Cow<'_, str>; 2]> = all_codes
             .iter()
-            .map(|c| super::sanitize_for_terminal(c.code()))
+            .map(|c| {
+                if c.is_known() {
+                    Cow::Borrowed(c.code())
+                } else {
+                    super::sanitize_for_terminal(c.code())
+                }
+            })
             .collect();
         // Visible width of the comma-joined codes, computed from parts
         // (sanitization can inject U+FFFD, so each piece goes through
@@ -1946,16 +1952,26 @@ impl GlyphRenderer {
         gutter_tail.push(' ');
 
         let primary_end_line = idx.to_linecol(primary_span.end_as_usize()).line;
+        // A suggestion span contributes context rows; precompute its coverage
+        // once so the row loop does an O(1) array lookup instead of scanning
+        // every suggestion per row.
+        let mut sug_covered = vec![false; last_line.saturating_sub(first_line) + 1];
+        for &(a, b) in suggestion_lines.iter().flatten() {
+            let lo = a.max(first_line);
+            let hi = b.min(last_line);
+            if lo <= hi {
+                for line in lo..=hi {
+                    sug_covered[line - first_line] = true;
+                }
+            }
+        }
         for line_idx in first_line..=last_line {
             // O(1) slice via the shared index instead of indexing a
             // whole-file `Vec<&str>` that was collected only for this.
             let line = idx.line(line_idx);
             let context_only = (line_idx < start_pos.line || line_idx > primary_end_line)
                 && label_window.is_idle_for(line_idx)
-                && !suggestion_lines
-                    .iter()
-                    .flatten()
-                    .any(|&(a, b)| line_idx >= a && line_idx <= b);
+                && !sug_covered[line_idx - first_line];
             // One grapheme walk converts this row's byte ranges to display
             // columns, measures the line's width, and emits the highlighted
             // source text — replacing the three separate passes over the
@@ -2084,8 +2100,6 @@ impl GlyphRenderer {
             // gets a bare `|` at the label's start column (start/end rows
             // keep their underline segments).
             if !label_window.active().is_empty() {
-                let line_start = starts.get(line_idx).map_or(source.len(), |&s| s as usize);
-                let line_end = line_start + line.len();
                 for &i in label_window.active() {
                     let (start, end) = label_line_ranges[i + 1];
                     if line_idx <= start
@@ -2876,7 +2890,25 @@ impl GlyphRenderer {
         let prefix_cols = self.prefix_cols(DiagnosticLevel::Note);
         let sanitized = super::sanitize_for_terminal_multiline(msg);
         let level_label = DiagnosticLevel::Note.label();
-        let segments = self.wrap_msg(&sanitized, prefix_cols);
+        let suffix_cols = suffix.map_or(0, |s| 4 + visible_width(s));
+        let avail_full = self.max_width.saturating_sub(prefix_cols).max(1);
+        let mut last_text = String::new();
+        let mut segments = self.wrap_msg(&sanitized, prefix_cols);
+        // Wrap the full measure first; only re-wrap the final segment if the
+        // locator suffix would overflow it.  This mirrors chain.rs and avoids
+        // wasting suffix width on every non-final line.
+        if suffix_cols > 0
+            && let Some(last_seg) = segments.last()
+            && visible_width_with_tab(last_seg.as_ref(), self.tab_width) + suffix_cols > avail_full
+        {
+            let narrow = avail_full.saturating_sub(suffix_cols).max(1);
+            last_text = segments.pop().expect("non-empty wrap").into_owned();
+            segments.extend(super::wrap::wrap_optimal(
+                &last_text,
+                narrow,
+                self.tab_width,
+            ));
+        }
         let last = segments.len().saturating_sub(1);
         for (i, seg) in segments.iter().enumerate() {
             if i == 0 {
@@ -4999,7 +5031,7 @@ pub(crate) fn byte_offset_to_display(line: &str, byte_offset: usize, tab_width: 
     let mut col = 0usize;
     let mut byte = 0usize;
     for g in line.graphemes(true) {
-        if byte >= byte_offset {
+        if byte + g.len() > byte_offset {
             break;
         }
         col += grapheme_width(g, col, tab_width);
@@ -6064,6 +6096,25 @@ mod tests {
     }
 
     #[test]
+    fn byte_offset_display_uses_containing_cluster_start() {
+        let line = "e\u{0301}f"; // graphemes: "e\u{0301}" (3 bytes), "f" (1 byte)
+        assert_eq!(byte_offset_to_display(line, 0, DEFAULT_TAB_WIDTH), 0);
+        assert_eq!(
+            byte_offset_to_display(line, 1, DEFAULT_TAB_WIDTH),
+            0,
+            "offset inside the combining cluster must snap to its start"
+        );
+        assert_eq!(
+            byte_offset_to_display(line, 2, DEFAULT_TAB_WIDTH),
+            0,
+            "the combining mark is still inside the first cluster"
+        );
+        assert_eq!(byte_offset_to_display(line, 3, DEFAULT_TAB_WIDTH), 1);
+        assert_eq!(byte_offset_to_display(line, 4, DEFAULT_TAB_WIDTH), 2);
+        assert_eq!(byte_offset_to_display(line, 5, DEFAULT_TAB_WIDTH), 2);
+    }
+
+    #[test]
     fn byte_range_display_respects_clusters() {
         let line = "e\u{0301}f"; // graphemes: "e" | "e\u{0301}" | "f", bytes: 0 | 1-2 | 3
         // span covering whole é cluster (bytes 0..2) → start_col 0, width 1
@@ -6753,6 +6804,28 @@ mod tests {
     /// A help message longer than `max_width` wraps, and each continuation
     /// line must place the `│` bar **before** the padding — the bar stays in
     /// the gutter and the text aligns under the first line's message.
+    #[test]
+    fn note_locator_suffix_respects_max_width() {
+        let opts = crate::diagnostics::DiagOpts {
+            max_width: 40,
+            ..crate::diagnostics::DiagOpts::default()
+        };
+        let renderer = GlyphRenderer::with_opts(false, Some(&opts));
+        let mut out = String::new();
+        renderer.write_note_line_with(
+            &mut out,
+            "this is a very long note message that must wrap before its locator",
+            Some("f.ps:12:3"),
+        );
+        for line in out.lines() {
+            assert!(
+                visible_width(line) <= 40,
+                "note line exceeds max width: {line:?}"
+            );
+        }
+        assert!(out.lines().last().unwrap().contains(" at f.ps:12:3"));
+    }
+
     /// Regression: `write_help_line` (and `write_note_line`) once pushed the
     /// pad before the bar, shifting the bar right by `prefix_cols - 1`
     /// columns and mis-aligning every continuation line.

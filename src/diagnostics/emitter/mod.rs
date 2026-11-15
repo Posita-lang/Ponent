@@ -749,7 +749,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let mut seen: rustc_hash::FxHashSet<(usize, usize)> =
             rustc_hash::FxHashSet::default();
         let mut out: Vec<Prebuilt> = Vec::new();
-        for (i, diag) in filtered.iter().enumerate() {
+        for diag in filtered.iter() {
             if let Some(src) = diag.source() {
                 let key = (src.as_ptr() as usize, src.len());
                 if seen.insert(key) {
@@ -767,7 +767,6 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                         idx.generation(),
                         fingerprint,
                     ));
-                    let _ = i;
                 }
             }
         }
