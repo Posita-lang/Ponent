@@ -18,6 +18,7 @@ mod arena;
 mod ast;
 mod cli;
 mod diagnostics;
+mod pool;
 mod hir {
     pub mod bii;
     pub mod builtins;

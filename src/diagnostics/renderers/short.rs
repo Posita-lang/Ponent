@@ -377,6 +377,17 @@ mod tests {
     }
 
     #[test]
+    fn source_without_span_keeps_file_prefix() {
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_file_name("input.ps")
+            .with_source("fn main() {}\n");
+        let opts = DiagOpts::default();
+        let out = ShortRenderer::new().render(&diag, &ctx(&opts));
+        assert_eq!(out, "input.ps: error[E030]: boom\n");
+    }
+
+    #[test]
     fn colored_wraps_only_the_tag() {
         let diag = Diagnostic::error("boom")
             .with_code_str(ErrCode::E030)

@@ -25,6 +25,10 @@ use std::sync::Arc;
 /// `position()` over N small entries — at 16 that is trivial next to one
 /// avoided scan.
 pub(crate) const CACHE_SLOTS: usize = 16;
+/// Largest source copied into the cross-emit stable line cache.  The cache
+/// keeps a source copy so a hit can verify content equality — pointer-keyed
+/// global caching would be unsound once a caller frees the buffer.
+const STABLE_CACHE_MAX_SOURCE: usize = 512 * 1024;
 
 /// How many prebuilt tables the parallel prebuild injects directly into each
 /// worker's LRU.  Must not exceed [`CACHE_SLOTS`] (excess inserts would evict
@@ -35,7 +39,7 @@ const _: () = assert!(PRELOAD_SLOTS <= CACHE_SLOTS);
 
 /// One `OnceLock` per file name (2.1): concurrent workers racing on the same
 /// name pay one `canonicalize`, not one each.
-type FileUrlMap = Arc<
+pub(crate) type FileUrlMap = Arc<
     std::sync::RwLock<
         FxHashMap<String, Arc<std::sync::OnceLock<Arc<str>>>>,
     >,
@@ -108,6 +112,20 @@ struct CachedSourceIndex {
     /// debug panic at the exact render that would have corrupted output.
     #[cfg(debug_assertions)]
     fingerprint: u64,
+}
+
+/// Cross-emit line-index entry.  Unlike [`CachedSourceIndex`], the key is a
+/// *content* fingerprint plus the stored source text: the source buffer may be
+/// freed between `emit` calls, so a pointer key would be unsound.  Equality is
+/// re-checked on every hit, making hash collisions a miss rather than wrong
+/// line numbers.
+struct StableSourceIndex {
+    text: String,
+    fingerprint: u64,
+    starts: Arc<[u32]>,
+    ascii: bool,
+    char_prefixes: Arc<CharPrefixMap>,
+    generation: u64,
 }
 
 /// Cheap content fingerprint for the debug ABA tripwire: mixes the first and
@@ -225,6 +243,10 @@ pub struct RenderCtx<'a> {
     /// same source.  The cache is dropped with the ctx at the end of the
     /// batch, so no key can outlive its source.
     source_index: RefCell<SmallVec<[CachedSourceIndex; CACHE_SLOTS]>>,
+    /// Cross-emit content-verified cache, present only on the hoisted
+    /// single-diagnostic path.  Entries carry a source copy so a hit cannot
+    /// alias a freed/reused allocation.
+    line_cache: Option<&'a RefCell<SmallVec<[StableSourceIndex; CACHE_SLOTS]>>>,
     /// Per-batch cache of `file://` URLs keyed by filename, so a batch of M
     /// diagnostics over one file pays one `canonicalize` (3–6 `stat`
     /// syscalls) instead of M.  Only touched on the interactive hyperlink
@@ -257,6 +279,7 @@ impl<'a> RenderCtx<'a> {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
+            line_cache: None,
             file_urls: Arc::default(),
             scratch: CtxCell::Owned(RefCell::new(SectionScratch::new())),
             shared: None,
@@ -279,6 +302,7 @@ impl<'a> RenderCtx<'a> {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
+            line_cache: Some(&shared.line_cache),
             file_urls: Arc::clone(&shared.file_urls),
             scratch: CtxCell::Borrowed(&shared.scratch),
             shared: None,
@@ -292,6 +316,30 @@ impl<'a> RenderCtx<'a> {
     pub(crate) fn line_index<'s>(&self, source: &'s str) -> LineIndex<'s> {
         let ptr = source.as_ptr() as usize;
         let len = source.len();
+        if len <= STABLE_CACHE_MAX_SOURCE {
+            if let Some(cache_ref) = self.line_cache {
+                let fingerprint = source_fingerprint(source);
+                let mut cache = cache_ref.borrow_mut();
+                if let Some(pos) = cache.iter().position(|entry| {
+                    entry.fingerprint == fingerprint
+                        && entry.text.len() == len
+                        && entry.text == source
+                }) {
+                    if pos > 0 {
+                        let entry = cache.remove(pos);
+                        cache.insert(0, entry);
+                    }
+                    let entry = &cache[0];
+                    return LineIndex::from_shared(
+                        source,
+                        Arc::clone(&entry.starts),
+                        entry.ascii,
+                        Arc::clone(&entry.char_prefixes),
+                        entry.generation,
+                    );
+                }
+            }
+        }
         {
             let mut cache = self.source_index.borrow_mut();
             if let Some(pos) = cache.iter().position(|c| c.ptr == ptr && c.len == len) {
@@ -404,6 +452,25 @@ impl<'a> RenderCtx<'a> {
                 fingerprint: source_fingerprint(source),
             },
         );
+        if len <= STABLE_CACHE_MAX_SOURCE {
+            if let Some(cache_ref) = self.line_cache {
+                let mut cache = cache_ref.borrow_mut();
+                if cache.len() >= CACHE_SLOTS {
+                    cache.pop();
+                }
+                cache.insert(
+                    0,
+                    StableSourceIndex {
+                        text: source.to_owned(),
+                        fingerprint: source_fingerprint(source),
+                        starts: Arc::clone(idx.starts_arc()),
+                        ascii: idx.ascii(),
+                        char_prefixes: Arc::clone(idx.char_prefixes_arc()),
+                        generation: idx.generation(),
+                    },
+                );
+            }
+        }
         idx
     }
 
@@ -531,6 +598,9 @@ impl<'a> RenderCtx<'a> {
 pub struct SharedRenderState {
     pub(crate) file_urls: FileUrlMap,
     pub(crate) scratch: RefCell<SectionScratch>,
+    /// Content-verified line tables that survive across `emit` calls.  Bounded
+    /// by `CACHE_SLOTS`; entries over `STABLE_CACHE_MAX_SOURCE` are not copied.
+    pub(crate) line_cache: RefCell<SmallVec<[StableSourceIndex; CACHE_SLOTS]>>,
     /// Grow-once scratch buffer for the single-diagnostic [`Emitter::emit`]
     /// path: the rendered text is copied into the sink and dropped, so one
     /// reused `String` avoids a heap allocation/free per diagnostic in an
@@ -543,6 +613,7 @@ impl SharedRenderState {
         Self {
             file_urls: Arc::default(),
             scratch: RefCell::new(SectionScratch::new()),
+            line_cache: RefCell::new(SmallVec::new()),
             render_buf: RefCell::new(String::new()),
         }
     }
@@ -574,6 +645,35 @@ mod tests {
         assert!(
             !Arc::ptr_eq(first.starts_arc(), third.starts_arc()),
             "a different source must not alias the cached table",
+        );
+    }
+
+    #[test]
+    fn hoisted_line_index_is_reused_across_contexts() {
+        let opts = DiagOpts::default();
+        let shared = SharedRenderState::new();
+        let src = "a\nb\nc\n";
+        let first = {
+            let cx = RenderCtx::hoisted(&opts, None, &shared);
+            Arc::clone(cx.line_index(src).starts_arc())
+        };
+        let second = {
+            let cx = RenderCtx::hoisted(&opts, None, &shared);
+            Arc::clone(cx.line_index(src).starts_arc())
+        };
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "hoisted ctx must reuse the content-verified line table",
+        );
+
+        let changed = "a\nB\nc\n";
+        let third = {
+            let cx = RenderCtx::hoisted(&opts, None, &shared);
+            Arc::clone(cx.line_index(changed).starts_arc())
+        };
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "changed content must not alias the cached table",
         );
     }
 

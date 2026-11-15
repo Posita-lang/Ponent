@@ -14,7 +14,7 @@ use crate::smallvec::SmallVec;
 use compact_str::CompactString;
 use std::io;
 
-/// Test-only arrival counter: proves `render_parallel` was actually taken, so
+/// Test-only arrival counter: proves the resident-pool path was actually taken, so
 /// a "parallel == serial" test cannot pass vacuously through the serial branch.
 #[cfg(test)]
 static PARALLEL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -260,6 +260,95 @@ impl NameIndex {
     }
 }
 
+/// Non-borrowing per-batch scratch.  `filtered`/`items` hold `&mut
+/// Diagnostic` and therefore cannot live here; weights and claim order are
+/// plain integers and are reused across emits.
+#[derive(Default)]
+struct BatchScratch {
+    weights: Vec<usize>,
+    order: Vec<usize>,
+}
+
+/// Prebuilt line-table entry shared by all workers.
+type Prebuilt = (
+    usize,
+    usize,
+    std::sync::Arc<[u32]>,
+    bool,
+    std::sync::Arc<CharPrefixMap>,
+    u64,
+    u64,
+);
+
+/// One batch shared with resident workers.  No lifetime erasure: the
+/// diagnostics live behind `Mutex` cells, so Rust's borrow checker proves the
+/// exclusive access that the GLM plan obtained with unsafe raw pointers.
+struct BatchShared<'a, 'src, R: Renderer> {
+    next: std::sync::atomic::AtomicUsize,
+    /// Claim order (weights descending for throughput, index order for
+    /// streaming).
+    order: &'a [usize],
+    cells: Vec<std::sync::Mutex<&'a mut Diagnostic<'src>>>,
+    slots: Vec<std::sync::Mutex<Option<String>>>,
+    slot_cv: std::sync::Condvar,
+    renderer: &'a R,
+    opts: &'a DiagOpts,
+    prebuilt: &'a [Prebuilt],
+    streaming: bool,
+}
+
+/// Resident-pool worker for one batch.  Claims are atomic and each cell is
+/// locked exactly for its own render, so weight-model lies only affect claim
+/// order, not load balance.
+fn worker_render_dynamic<R: Renderer>(
+    shared: &BatchShared<'_, '_, R>,
+    sources: std::sync::Arc<SharedSources>,
+    urls: crate::diagnostics::render::FileUrlMap,
+) {
+    let cx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        RenderCtx::for_parallel_worker(
+            shared.opts,
+            None,
+            sources,
+            urls,
+            &shared.prebuilt[..shared.prebuilt.len().min(PRELOAD_SLOTS)],
+        )
+    }))
+    .ok();
+    loop {
+        let claim = shared
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if claim >= shared.order.len() {
+            break;
+        }
+        let orig = shared.order[claim];
+        let buf = match &cx {
+            Some(cx) => {
+                let mut guard = shared.cells[orig]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let diag: &mut Diagnostic<'_> = &mut **guard;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    diag.humanize();
+                    let mut buf = String::new();
+                    shared.renderer.render_into(diag, cx, &mut buf);
+                    buf
+                }))
+                .unwrap_or_else(|_| RENDER_PANIC_PLACEHOLDER.to_string())
+            }
+            // Setup panic: keep draining the queue so slots/latch cannot stall.
+            None => RENDER_PANIC_PLACEHOLDER.to_string(),
+        };
+        *shared.slots[orig]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(buf);
+        if shared.streaming {
+            shared.slot_cv.notify_all();
+        }
+    }
+}
+
 /// Composes a renderer with a sink factory and emits batches of diagnostics.
 pub struct Emitter<R, M> {
     renderer: R,
@@ -280,6 +369,13 @@ pub struct Emitter<R, M> {
     /// is a syscall and host affinity effectively does not change over a
     /// compiler process's lifetime, so a per-batch query is pure overhead.
     parallelism: usize,
+    /// Resident render pool.  Lazily built on the first parallel batch, so a
+    /// CLI run that never reaches the threshold pays no threads.
+    pool: std::sync::OnceLock<crate::pool::WorkerPool>,
+    /// Set by [`Self::emit_all_streaming`] for the duration of one batch.
+    streaming: bool,
+    /// Reused across batch emits: weights and claim order.
+    batch: BatchScratch,
 }
 
 impl<R: Renderer, M: MakeSink> Emitter<R, M> {
@@ -295,6 +391,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             filter,
             shared: SharedRenderState::new(),
             parallelism,
+            pool: std::sync::OnceLock::new(),
+            streaming: false,
+            batch: BatchScratch::default(),
         }
     }
 
@@ -382,6 +481,36 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         self.emit_ordered(diags, &mut sink)
     }
 
+    /// Streaming batch emit: write diagnostics to the sink in batch order as
+    /// soon as their render completes.  Intended for interactive/LSP sinks
+    /// where first-token latency matters; ordinary compiler batches should
+    /// use [`Self::emit_all_iter`].
+    pub fn emit_all_streaming<'r, 'src, I>(&mut self, diags: I) -> io::Result<()>
+    where
+        'src: 'r,
+        I: IntoIterator<Item = &'r mut Diagnostic<'src>>,
+        I::IntoIter: DoubleEndedIterator,
+    {
+        let mut sink = self.make_sink.make();
+        self.streaming = true;
+        let result = self.emit_ordered(diags, &mut sink);
+        self.streaming = false;
+        result
+    }
+
+    /// Streaming emit to a caller-provided sink, mirroring
+    /// [`Self::emit_all_to`] but consuming slots as they complete.
+    pub fn emit_all_streaming_to<S: DiagnosticSink>(
+        &mut self,
+        diags: &mut [Diagnostic<'_>],
+        sink: &mut S,
+    ) -> io::Result<()> {
+        self.streaming = true;
+        let result = self.emit_ordered(diags.iter_mut(), sink);
+        self.streaming = false;
+        result
+    }
+
     /// Escape hatch: write to a caller-provided sink without a `MakeSink`.
     ///
     /// Honours [`DiagOpts::reverse_errors`] exactly like [`Self::emit_all_iter`].
@@ -433,6 +562,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // a hard cap so a pathological hint cannot over-allocate.
         const HARD_CAP: usize = 4096;
         let cap = hi.unwrap_or(lo.min(64)).min(HARD_CAP);
+        let mut batch = std::mem::take(&mut self.batch);
+        batch.weights.clear();
+        batch.weights.reserve(cap);
         let mut filtered: SmallVec<[&'r mut Diagnostic<'src>; 16]> =
             SmallVec::with_capacity(cap);
         // Cheap render-cost proxy summed over the batch.  The parallel
@@ -442,7 +574,6 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // Per-diagnostic weights, parallel to `filtered`.  Collected once here
         // so the parallel split consumes this single model instead of
         // recomputing the closure (and risking a drift between two copies).
-        let mut weights: SmallVec<[usize; 16]> = SmallVec::with_capacity(cap);
 
         // The distinct-file set feeds only the summary line, which is gated
         // on `errors > 0 || warnings > 0` — so tracking files for a batch of
@@ -500,7 +631,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 + diag.spans.primary_ref().len()
                 + usize::from(diag.kind().is_some()) * 4;
             total_weight += weight;
-            weights.push(weight);
+            batch.weights.push(weight);
             filtered.push(diag);
         }
         let num_renderable = filtered.len();
@@ -524,17 +655,24 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // would spawn 64 threads for one diagnostic each — ~3 ms of
         // `spawn`/`join` for work that barely amortises.
         let num_threads = num_threads.min((num_renderable / MIN_CHUNK).max(1));
-        if num_renderable >= PARALLEL_THRESHOLD
+        if self.streaming
+            && num_renderable >= PARALLEL_THRESHOLD
             && total_weight >= WEIGHT_THRESHOLD
             && num_threads > 1
         {
-            self.render_parallel(filtered.as_mut_slice(), &weights, sink, num_threads)?;
+            self.render_streaming(filtered.as_mut_slice(), &mut batch, sink, num_threads)?;
+        } else if num_renderable >= PARALLEL_THRESHOLD
+            && total_weight >= WEIGHT_THRESHOLD
+            && num_threads > 1
+        {
+            self.render_dynamic(filtered.as_mut_slice(), &mut batch, sink, num_threads)?;
         } else {
             // Serial path: one batch ctx, with the URL cache and scratch
             // hoisted onto the emitter so they survive across batches.
             let cx = RenderCtx::hoisted(&self.opts, None, &self.shared);
             self.render_sequential(filtered.as_mut_slice(), sink, &cx)?;
         }
+        self.batch = batch;
 
         // ── Phase 3: trailer.  Always single-threaded. ─────────────────────
         // The suppressed note is a human-facing trailer: like the summary, it
@@ -582,7 +720,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // Render *before* deciding on the separator: the separator is
             // inserted between *rendered* diagnostics only, so a diagnostic
             // whose renderer emits nothing contributes no separator either —
-            // exactly the stitcher's semantics in [`Self::render_parallel`]
+            // exactly the dynamic renderer's stitcher semantics
             // (the two paths are byte-identical for every `Renderer`, not
             // just the built-ins).
             buf.clear();
@@ -600,309 +738,209 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         Ok(())
     }
 
-    /// Parallel batch renderer.  Splits `filtered` (rendered diagnostics
-    /// only) into `num_threads` chunks, renders each into its own `String`
-    /// on its own scoped thread (each thread has its own `RenderCtx`, so
-    /// `char_prefixes`/scratch never cross thread boundaries; the line
-    /// tables and the `file://` URL cache *are* shared, via `SharedSources`
-    /// and one `Arc<RwLock<…>>` URL map), and stitches the chunk buffers
-    /// back in batch order with the renderer's separator.
-    ///
-    /// # Correctness
-    ///
-    /// * `split_at_mut` gives each thread exclusive ownership of its
-    ///   `&mut Diagnostic` slice, so the internal `humanize` mutations are
-    ///   disjoint.
-    /// * Every chunk holds ≥ `MIN_CHUNK` real diagnostics (the spawn cap is
-    ///   `num_renderable / MIN_CHUNK`), but a renderer may still emit
-    ///   nothing for a diagnostic — so an empty chunk `String` stays
-    ///   possible.  Empty chunks contribute no separator, and each chunk
-    ///   inserts its separator only between *rendered* diagnostics, so the
-    ///   final stream is byte-identical to [`Self::render_sequential`] for
-    ///   every `Renderer`, including ones that render empty output.
-    /// * `renderer` and `opts` are `Sync` (`Renderer: Send + Sync`, `DiagOpts`
-    ///   is plain data), so `&R` and `&DiagOpts` are safely shared.
-    fn render_parallel<S: DiagnosticSink>(
+    /// Prebuild every distinct source's line tables once per batch and sort
+    /// them by aggregate render weight, so resident workers preload their
+    /// small LRU with the sources they are most likely to touch.
+    fn prebuild_sources(
         &self,
-        filtered: &mut [&mut Diagnostic<'_>],
+        filtered: &[&mut Diagnostic<'_>],
         weights: &[usize],
-        sink: &mut S,
-        num_threads: usize,
-    ) -> io::Result<()> {
-        // LPT (longest processing time first): assign each diagnostic, heaviest
-        // first, to the currently lightest bin.  This is the classic
-        // 4/3-approximation makespan heuristic and prevents one monster
-        // render from starving a worker (the greedy contiguous split could
-        // strand the whole heavy tail in one chunk).  Bins are non-contiguous;
-        // workers tag each rendered piece with its original index and the
-        // stitch below restores serial order, so the stream stays
-        // byte-identical.  Weights were computed once in Phase 1 (one model,
-        // so the gate and this split cannot drift).
-        let n = filtered.len();
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
-        let mut bins: Vec<SmallVec<[usize; 16]>> = (0..num_threads).map(|_| SmallVec::new()).collect();
-        let mut heap = std::collections::BinaryHeap::new();
-        for bin in 0..num_threads {
-            heap.push(std::cmp::Reverse((0usize, bin)));
-        }
-        for i in order {
-            let std::cmp::Reverse((load, bin)) = heap.pop().expect("non-empty bin heap");
-            let next = load + weights[i];
-            bins[bin].push(i);
-            heap.push(std::cmp::Reverse((next, bin)));
-        }
-        let mut bin_of = vec![0usize; n];
-        let mut bin_lens: Vec<usize> = Vec::with_capacity(num_threads);
-        for (b, bin) in bins.iter().enumerate() {
-            if bin.is_empty() {
-                continue;
-            }
-            bin_lens.push(bin.len());
-            for &i in bin {
-                bin_of[i] = b;
-            }
-        }
-        // Fewer than two non-empty bins (single-core or one diagnostic):
-        // spawn/join overhead buys nothing, render serially.
-        if bin_lens.len() < 2 {
-            let cx = RenderCtx::hoisted(&self.opts, None, &self.shared);
-            return self.render_sequential(filtered, sink, &cx);
-        }
-        #[cfg(test)]
-        PARALLEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let separator = self.renderer.render_separator();
-        let renderer = &self.renderer;
-        let opts = &self.opts;
-
-        // Pre-build the line tables once in the *main* thread, before
-        // spawning: without this, every worker lazily rebuilds a
-        // `LineIndex::new(source)` on its first diagnostic — `(T-1) ×
-        // O(source_len)` redundant SWAR scans per batch, which on a large
-        // single source can rival the render itself.  Sources are keyed by
-        // `(ptr, len)` (every `Diagnostic<'src>` in a batch borrows a source
-        // alive for the whole call, so the key is unambiguous).  The batch is
-        // finite and its sources are alive for the whole call, so *every*
-        // distinct source is prebuilt — not just the `CACHE_SLOTS` the
-        // per-worker LRU keeps warm; sources beyond those slots are shared
-        // via the `SharedSources` map instead of being re-scanned T times.
-        // Workers inject the first `CACHE_SLOTS` entries directly into their
-        // LRU (preserving the preload semantics for the covered slots) and
-        // consult the shared map for the rest.  Each entry also shares one
-        // `char_prefixes` map (the hint is an `AtomicUsize` and a racy store
-        // can only cost a re-anchor, never a wrong answer), so a non-ASCII
-        // source's per-line sparse tables are built once per *batch*, not
-        // once per thread.  So is the `file://` URL cache: one
-        // `canonicalize` per file per batch, not once per worker per file.
-        let mut prebuilt: Vec<(
-            usize,
-            usize,
-            std::sync::Arc<[u32]>,
-            bool,
-            std::sync::Arc<CharPrefixMap>,
-            u64,
-            u64,
-        )> = {
-            // The prebuild is *not* a batched render: a `RenderCtx` here would
-            // grow its `source_index` LRU cache only for it to be dropped at
-            // the end of this block, so the raw constructor does the same work
-            // with none of the bookkeeping.
-            let mut seen: rustc_hash::FxHashSet<(usize, usize)> =
-                rustc_hash::FxHashSet::default();
-            let mut out = Vec::new();
-            for diag in filtered.iter() {
-                if let Some(src) = diag.source() {
-                    let key = (src.as_ptr() as usize, src.len());
-                    if seen.insert(key) {
-                        let idx = LineIndex::new(src);
-                        let fingerprint = {
-                                #[cfg(debug_assertions)]
-                                {
-                                    crate::diagnostics::render::source_fingerprint(src)
-                                }
-                                #[cfg(not(debug_assertions))]
-                                {
-                                    0
-                                }
-                            };
-                            out.push((
-                                key.0,
-                                key.1,
-                                std::sync::Arc::clone(idx.starts_arc()),
-                                idx.ascii(),
-                                std::sync::Arc::clone(idx.char_prefixes_arc()),
-                                idx.generation(),
-                                fingerprint,
-                            ));
-                    }
+    ) -> (Vec<Prebuilt>, std::sync::Arc<SharedSources>) {
+        let mut seen: rustc_hash::FxHashSet<(usize, usize)> =
+            rustc_hash::FxHashSet::default();
+        let mut out: Vec<Prebuilt> = Vec::new();
+        for (i, diag) in filtered.iter().enumerate() {
+            if let Some(src) = diag.source() {
+                let key = (src.as_ptr() as usize, src.len());
+                if seen.insert(key) {
+                    let idx = LineIndex::new(src);
+                    #[cfg(debug_assertions)]
+                    let fingerprint = crate::diagnostics::render::source_fingerprint(src);
+                    #[cfg(not(debug_assertions))]
+                    let fingerprint = 0u64;
+                    out.push((
+                        key.0,
+                        key.1,
+                        std::sync::Arc::clone(idx.starts_arc()),
+                        idx.ascii(),
+                        std::sync::Arc::clone(idx.char_prefixes_arc()),
+                        idx.generation(),
+                        fingerprint,
+                    ));
+                    let _ = i;
                 }
             }
-            out
-        };
-        // Sort by aggregate render weight before workers preload their LRU:
-        // first-seen order can put a cold source in a PRELOAD_SLOTS slot while
-        // the hot source falls back to the shared map on every probe.
+        }
         let mut source_weight: rustc_hash::FxHashMap<(usize, usize), usize> =
             rustc_hash::FxHashMap::default();
         for (i, diag) in filtered.iter().enumerate() {
             if let Some(src) = diag.source() {
                 *source_weight
                     .entry((src.as_ptr() as usize, src.len()))
-                    .or_default() += weights[i];
+                    .or_default() += weights.get(i).copied().unwrap_or(0);
             }
         }
-        prebuilt.sort_by_key(|entry| {
+        out.sort_by_key(|entry| {
             std::cmp::Reverse(*source_weight.get(&(entry.0, entry.1)).unwrap_or(&0))
         });
-        let shared_sources = SharedSources::from_entries(&prebuilt);
-        // Share the emitter's hoisted URL cache across all workers *and*
-        // across batches: cloning the `Arc` (not the map) is legal even though
-        // `SharedRenderState` is `!Sync` via its `RefCell`s, because the map
-        // itself is `Arc<RwLock<…>>`.  Without this the parallel path paid one
-        // `canonicalize` per file per batch even when a serial `emit` had
-        // already warmed the cache.
-        let shared_urls = std::sync::Arc::clone(&self.shared.file_urls);
-        // A slice reference (Copy) so each `move` closure shares the prebuilt
-        // tables instead of the first `spawn` moving the `Vec` itself.
-        let prebuilt: &[(
-            usize,
-            usize,
-            std::sync::Arc<[u32]>,
-            bool,
-            std::sync::Arc<CharPrefixMap>,
-            u64,
-            u64,
-        )] = &prebuilt;
-
-        // LPT bins are non-contiguous, so materialise each bin as a contiguous run
-        // for `split_at_mut`, tagging every piece with its original index; the
-        // final sort restores serial order byte-for-byte.
-        let mut items: Vec<(usize, &mut Diagnostic<'_>)> = filtered
-            .iter_mut()
-            .enumerate()
-            .map(|(i, d)| (i, &mut **d))
-            .collect();
-        items.sort_by_key(|(i, _)| (bin_of[*i], *i));
-
-        let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(bin_lens.len());
-            let mut rest_items: &mut [(usize, &mut Diagnostic<'_>)] = &mut items;
-
-            for &take in bin_lens.iter() {
-                let (chunk, remaining) = rest_items.split_at_mut(take);
-                rest_items = remaining;
-
-                let shared_sources = std::sync::Arc::clone(&shared_sources);
-                let shared_urls = std::sync::Arc::clone(&shared_urls);
-                let indices: Vec<usize> = chunk.iter().map(|(orig, _)| *orig).collect();
-                handles.push((
-                    indices,
-                    s.spawn(move || {
-                    // One-shot worker constructor: shared line tables, shared
-                    // URL cache, and the preloaded LRU in a single call, so a
-                    // worker cannot silently miss one of the setup steps.
-                    let cx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        RenderCtx::for_parallel_worker(
-                            opts,
-                            None,
-                            shared_sources,
-                            shared_urls,
-                            &prebuilt[..prebuilt.len().min(PRELOAD_SLOTS)],
-                        )
-                    })) {
-                        Ok(cx) => cx,
-                        Err(_) => {
-                            return chunk
-                                .iter()
-                                .map(|(orig, _)| {
-                                    (*orig, RENDER_PANIC_PLACEHOLDER.to_string())
-                                })
-                                .collect();
-                        }
-                    };
-                    // One malformed diagnostic must not abort the whole batch.  Catch
-                    // at the chunk granularity first (one unwind frame per
-                    // chunk instead of per diagnostic); on a panic, redo the
-                    // chunk per-diagnostic so the placeholder lands only in
-                    // the failing slot and the other renders are preserved.
-                    let chunk_result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| {
-                            let mut pieces: Vec<(usize, String)> =
-                                Vec::with_capacity(chunk.len());
-                            for (orig, diag) in chunk.iter_mut() {
-                                let orig = *orig;
-                                diag.humanize();
-                                let mut buf = String::new();
-                                renderer.render_into(*diag, &cx, &mut buf);
-                                if !buf.is_empty() {
-                                    pieces.push((orig, buf));
-                                }
-                            }
-                            pieces
-                        }),
-                    );
-                    let pieces = match chunk_result {
-                        Ok(pieces) => pieces,
-                        Err(_) => {
-                            let mut pieces: Vec<(usize, String)> =
-                                Vec::with_capacity(chunk.len());
-                            for (orig, diag) in chunk.iter_mut() {
-                                let orig = *orig;
-                                let rendered = std::panic::catch_unwind(
-                                    std::panic::AssertUnwindSafe(|| {
-                                        diag.humanize();
-                                        let mut buf = String::new();
-                                        renderer.render_into(*diag, &cx, &mut buf);
-                                        buf
-                                    }),
-                                );
-                                match rendered {
-                                    Ok(buf) if !buf.is_empty() => {
-                                        pieces.push((orig, buf));
-                                    }
-                                    Ok(_) => {}
-                                    Err(_) => pieces.push((
-                                        orig,
-                                        RENDER_PANIC_PLACEHOLDER.to_string(),
-                                    )),
-                                }
-                            }
-                            pieces
-                        }
-                    };
-                    pieces
-                })));
-            }
-
-            // Gather in bin order, then restore the batch's original order.
-            // Streaming per chunk is impossible with LPT bins; the retained
-            // memory is the same Σ(rendered) as the old collect-then-stitch
-            // shape.
-            let mut all: Vec<(usize, String)> = Vec::new();
-            for (indices, h) in handles {
-                match h.join() {
-                    Ok(pieces) => all.extend(pieces),
-                    Err(_) => {
-                        for index in indices {
-                            all.push((index, RENDER_PANIC_PLACEHOLDER.to_string()));
-                        }
-                    }
-                }
-            }
-            all.sort_by_key(|(i, _)| *i);
-            let mut first = true;
-            for (_, buf) in all {
-                if first {
-                    first = false;
-                } else if !separator.is_empty() {
-                    sink.write_str(separator)?;
-                }
-                sink.write_str(&buf)?;
-            }
-            Ok(())
-        })
+        let shared = SharedSources::from_entries(&out);
+        (out, shared)
     }
+
+    /// Resident-pool dynamic-claim renderer.  Replaces the LPT bin split:
+    /// claims are atomic, so a wrong weight model only changes claim order,
+    /// never load balance.  Slots are indexed by original position and
+    /// stitched in order, preserving byte-identical output.
+    fn render_dynamic<S: DiagnosticSink>(
+        &self,
+        filtered: &mut [&mut Diagnostic<'_>],
+        scratch: &mut BatchScratch,
+        sink: &mut S,
+        num_workers: usize,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        PARALLEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let separator = self.renderer.render_separator();
+        let (prebuilt, shared_sources) = self.prebuild_sources(filtered, &scratch.weights);
+        let shared_urls = std::sync::Arc::clone(&self.shared.file_urls);
+        let n = filtered.len();
+        scratch.order.clear();
+        scratch.order.extend(0..n);
+        let weights = &scratch.weights;
+        scratch
+            .order
+            .sort_by(|&a, &b| weights.get(b).cmp(&weights.get(a)).then(a.cmp(&b)));
+        let cells: Vec<std::sync::Mutex<&mut Diagnostic<'_>>> = filtered
+            .iter_mut()
+            .map(|diag| std::sync::Mutex::new(&mut **diag))
+            .collect();
+        let shared = BatchShared {
+            next: std::sync::atomic::AtomicUsize::new(0),
+            order: &scratch.order,
+            cells,
+            slots: (0..n).map(|_| std::sync::Mutex::new(None)).collect(),
+            slot_cv: std::sync::Condvar::new(),
+            renderer: &self.renderer,
+            opts: &self.opts,
+            prebuilt: &prebuilt,
+            streaming: false,
+        };
+        let pool = self
+            .pool
+            .get_or_init(|| crate::pool::WorkerPool::new(self.parallelism));
+        let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
+        let shared_ref = &shared;
+        let mut jobs = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let sources = std::sync::Arc::clone(&shared_sources);
+            let urls = std::sync::Arc::clone(&shared_urls);
+            jobs.push(crate::pool::SendJob::new(move || {
+                worker_render_dynamic(shared_ref, sources, urls)
+            }));
+        }
+        pool.submit(jobs).wait();
+        let BatchShared { slots, .. } = shared;
+        let mut first = true;
+        for slot in slots {
+            let buf = slot
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|| RENDER_PANIC_PLACEHOLDER.to_string());
+            if buf.is_empty() {
+                continue;
+            }
+            if first {
+                first = false;
+            } else if !separator.is_empty() {
+                sink.write_str(separator)?;
+            }
+            sink.write_str(&buf)?;
+        }
+        Ok(())
+    }
+
+    /// Streaming renderer: workers claim in index order, the main thread
+    /// consumes slots in index order and writes each completed diagnostic
+    /// immediately.  The ordinary non-streaming path remains the default.
+    fn render_streaming<S: DiagnosticSink>(
+        &self,
+        filtered: &mut [&mut Diagnostic<'_>],
+        scratch: &mut BatchScratch,
+        sink: &mut S,
+        num_workers: usize,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        PARALLEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let separator = self.renderer.render_separator();
+        let (prebuilt, shared_sources) = self.prebuild_sources(filtered, &scratch.weights);
+        let shared_urls = std::sync::Arc::clone(&self.shared.file_urls);
+        let n = filtered.len();
+        scratch.order.clear();
+        scratch.order.extend(0..n);
+        let cells: Vec<std::sync::Mutex<&mut Diagnostic<'_>>> = filtered
+            .iter_mut()
+            .map(|diag| std::sync::Mutex::new(&mut **diag))
+            .collect();
+        let shared = BatchShared {
+            next: std::sync::atomic::AtomicUsize::new(0),
+            order: &scratch.order,
+            cells,
+            slots: (0..n).map(|_| std::sync::Mutex::new(None)).collect(),
+            slot_cv: std::sync::Condvar::new(),
+            renderer: &self.renderer,
+            opts: &self.opts,
+            prebuilt: &prebuilt,
+            streaming: true,
+        };
+        let pool = self
+            .pool
+            .get_or_init(|| crate::pool::WorkerPool::new(self.parallelism));
+        let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
+        let shared_ref = &shared;
+        let mut jobs = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let sources = std::sync::Arc::clone(&shared_sources);
+            let urls = std::sync::Arc::clone(&shared_urls);
+            jobs.push(crate::pool::SendJob::new(move || {
+                worker_render_dynamic(shared_ref, sources, urls)
+            }));
+        }
+        let wait = pool.submit(jobs);
+        let mut result: io::Result<()> = Ok(());
+        let mut first = true;
+        for cursor in 0..n {
+            let buf = {
+                let mut slot = shared.slots[cursor]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                while slot.is_none() {
+                    slot = shared
+                        .slot_cv
+                        .wait(slot)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                slot.take().expect("slot filled")
+            };
+            if buf.is_empty() {
+                continue;
+            }
+            if first {
+                first = false;
+            } else if !separator.is_empty() {
+                if let Err(err) = sink.write_str(separator) {
+                    result = Err(err);
+                    break;
+                }
+            }
+            if let Err(err) = sink.write_str(&buf) {
+                result = Err(err);
+                break;
+            }
+        }
+        wait.wait();
+        result
+    }
+
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]
@@ -928,7 +966,7 @@ mod tests {
     }
 
     /// 1.4: `reverse_errors` + `max_errors` must admit the *last* diagnostics
-    /// in render order, and the LPT stitch must not disturb that order.
+    /// in render order, and the slot stitch must not disturb that order.
     #[test]
     fn reverse_errors_max_errors_emit_last_in_original_order() {
         let mut diags: Vec<Diagnostic<'static>> = (0..96)
@@ -993,7 +1031,7 @@ mod tests {
     /// contributes no separator, whether it sits inside a chunk or *starts*
     /// one right after a non-empty chunk (the double-separator case).  The batch
     /// is large enough that both the count (≥ 64) and total-weight (≥ 256)
-    /// gates pass, and the test asserts that `render_parallel` was actually
+    /// gates pass, and the test asserts that the parallel path was actually
     /// entered on multi-core hosts — the previous 128 one-line diagnostics
     /// stayed under the weight threshold and silently tested the serial path.
     #[test]
@@ -1032,6 +1070,84 @@ mod tests {
             .join("|");
         assert_eq!(serial, expected, "serial path regressed:\n{serial}");
         assert_eq!(parallel, serial, "parallel output diverged from serial");
+    }
+
+    /// Renders every message as `ok`, panicking on `boom`; used to pin the
+    /// per-diagnostic unwind boundary in the resident-pool path.
+    struct PanicOnBoom;
+
+    impl Renderer for PanicOnBoom {
+        fn render(&self, diag: &Diagnostic<'_>, _cx: &RenderCtx<'_>) -> String {
+            assert!(diag.message() != "boom", "intentional render panic");
+            "ok".to_string()
+        }
+        fn render_separator(&self) -> &str {
+            "|"
+        }
+        fn render_summary(&self, _errors: usize, _warnings: usize) -> String {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn dynamic_claims_isolate_render_panics() {
+        let opts = DiagOpts::default();
+        let mut emitter = Emitter::new(PanicOnBoom, string(), opts);
+        if emitter.parallelism <= 1 {
+            return;
+        }
+        const N: usize = 512;
+        let mut diags: Vec<Diagnostic<'static>> = (0..N)
+            .map(|i| {
+                if i % 128 == 0 {
+                    Diagnostic::warning("boom")
+                } else {
+                    Diagnostic::warning("ok")
+                }
+            })
+            .collect();
+        let mut sink = StringSink::new();
+        emitter.emit_all_to(&mut diags, &mut sink).unwrap();
+        let out = sink.into_string();
+        assert_eq!(out.matches("ok").count(), N - N / 128);
+        assert_eq!(
+            out.matches("diagnostic rendering panicked").count(),
+            N / 128,
+            "every failed diagnostic must get exactly one placeholder: {out}"
+        );
+    }
+
+    #[test]
+    fn streaming_matches_sequential_output() {
+        const N: usize = 512;
+        let opts = DiagOpts::default();
+        let mut emitter = Emitter::new(EveryOtherEmpty, string(), opts.clone());
+        let before = PARALLEL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut diags = alternating_diags(N);
+        let mut sink = StringSink::new();
+        emitter
+            .emit_all_streaming_to(&mut diags, &mut sink)
+            .unwrap();
+        let streaming = sink.into_string();
+        if emitter.parallelism > 1 {
+            assert!(
+                PARALLEL_CALLS.load(std::sync::atomic::Ordering::Relaxed) > before,
+                "streaming test must exercise the parallel path"
+            );
+        }
+
+        let mut serial_diags = alternating_diags(N);
+        let mut serial_refs: Vec<&mut Diagnostic<'static>> = serial_diags.iter_mut().collect();
+        let mut serial_sink = StringSink::new();
+        let cx = RenderCtx::new(&opts, None);
+        emitter
+            .render_sequential(&mut serial_refs, &mut serial_sink, &cx)
+            .unwrap();
+        assert_eq!(
+            streaming,
+            serial_sink.into_string(),
+            "streaming output must be byte-identical to serial"
+        );
     }
 
     /// `quiet` must gate the suppressed note exactly like the summary: the

@@ -987,6 +987,29 @@ mod tests {
     }
 
     #[test]
+    fn push_json_str_resyncs_at_control_structural_boundaries() {
+        for ctrl in ['\n', '\r', '\t', '\u{0}', '\u{1f}'] {
+            for structural in ['"', '\\'] {
+                for pad in 0..16 {
+                    let input = format!("{}{ctrl}{structural}{}", "a".repeat(pad), "b".repeat(8));
+                    let mut escaped = String::new();
+                    JsonRenderer::push_json_str(&mut escaped, &input);
+                    let v: serde_json::Value = serde_json::from_str(&escaped)
+                        .unwrap_or_else(|e| panic!("invalid JSON ({ctrl:?} {structural:?} {pad}): {e}"));
+                    assert_eq!(v, serde_json::Value::String(input));
+
+                    let input = format!("{}{structural}{ctrl}{}", "a".repeat(pad), "b".repeat(8));
+                    let mut escaped = String::new();
+                    JsonRenderer::push_json_str(&mut escaped, &input);
+                    let v: serde_json::Value = serde_json::from_str(&escaped)
+                        .unwrap_or_else(|e| panic!("invalid JSON ({structural:?} {ctrl:?} {pad}): {e}"));
+                    assert_eq!(v, serde_json::Value::String(input));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn json_round_trips_message_with_control_char() {
         let diag = Diagnostic::error("a\x07b").with_span(Span::new(FileId::DUMMY, 0, 1));
         let json = json_of(&diag, false);
