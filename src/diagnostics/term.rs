@@ -51,16 +51,75 @@ impl ColorDepth {
 /// one consistent environment snapshot so `detect_color` and
 /// `detect_color_depth` cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ColorCaps {
+pub struct ColorCaps {
     /// Whether ANSI colour should be emitted on `stderr`.
     pub color: bool,
     /// The palette depth to render at.
     pub depth: ColorDepth,
 }
 
+/// All terminal capabilities from one environment snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermCaps {
+    pub color: bool,
+    pub depth: ColorDepth,
+    pub unicode: bool,
+    pub width: usize,
+}
+
+impl TermCaps {
+    pub fn detect() -> Self {
+        let stderr_is_tty = io::stderr().is_terminal();
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+        let colorterm_env = std::env::var_os("COLORTERM");
+        let term_env = std::env::var_os("TERM");
+        let term_program_env = std::env::var_os("TERM_PROGRAM");
+        let colorterm = colorterm_env.as_deref().and_then(OsStr::to_str);
+        let term = term_env.as_deref().and_then(OsStr::to_str);
+        let term_program = term_program_env.as_deref().and_then(OsStr::to_str);
+        let clicolor = std::env::var_os("CLICOLOR");
+        let clicolor_force = std::env::var_os("CLICOLOR_FORCE");
+        let force_color = std::env::var_os("FORCE_COLOR");
+        let wt_session = std::env::var_os("WT_SESSION").is_some_and(|v| !v.is_empty());
+        let caps = color_caps_decision_with_terminal(
+            no_color,
+            clicolor.as_deref(),
+            clicolor_force.as_deref(),
+            force_color.as_deref(),
+            colorterm,
+            term,
+            wt_session,
+            term_program,
+            stderr_is_tty,
+        );
+        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
+        let term_dumb = term == Some("dumb");
+        let columns = std::env::var_os("COLUMNS");
+        TermCaps {
+            color: caps.color,
+            depth: caps.depth,
+            unicode: unicode_decision_os(locale.as_deref(), term_dumb),
+            width: width_decision(
+                columns.as_deref().and_then(OsStr::to_str),
+                terminal_size::terminal_size_of(io::stderr())
+                    .map(|(Width(w), _)| w as usize),
+            ),
+        }
+    }
+}
+
+/// Snapshot the colour-related environment once, so `color` and `depth` can
+/// never describe different environments.
+pub fn detect_color_caps() -> ColorCaps {
+    color_caps_from_env(io::stderr().is_terminal())
+}
+
 /// ASCII-only, allocation-free case-insensitive substring test.
 fn contains_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> bool {
-    hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+    needle.is_empty()
+        || (hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle)))
 }
 
 /// ASCII-only, allocation-free case-insensitive suffix test.
@@ -71,14 +130,16 @@ fn ends_with_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> bool {
 /// Node/chalk-compatible `FORCE_COLOR` level: `1` → 16 colours,
 /// `2` → 256, `3` → true colour.  Anything else carries no level.
 fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
-    match v.to_str() {
-        // Node maps `true` and the empty string to level 1 (16 colours).  The
-        // on/off decision already treats them as "force on", so the depth
-        // decision must not escape the force and resolve to a *higher* depth.
-        Some("1") | Some("true") | Some("") => Some(ColorDepth::Sixteen),
-        Some("2") => Some(ColorDepth::TwoFiftySix),
-        Some("3") => Some(ColorDepth::TrueColor),
-        _ => None,
+    let s = v.to_str()?.trim();
+    match s {
+        "" | "true" => Some(ColorDepth::Sixteen),
+        "false" | "0" => None,
+        _ => s.parse::<u8>().ok().and_then(|n| match n {
+            0 => None,
+            1 => Some(ColorDepth::Sixteen),
+            2 => Some(ColorDepth::TwoFiftySix),
+            _ => Some(ColorDepth::TrueColor),
+        }),
     }
 }
 
@@ -86,7 +147,7 @@ fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
 /// merely "don't force"): a CI script silencing colour must not get colour on
 /// a TTY.
 fn force_color_is_off(v: &OsStr) -> bool {
-    matches!(v.to_str(), Some("0") | Some("false"))
+    matches!(v.to_str().map(str::trim), Some("0") | Some("false"))
 }
 
 /// Detect the terminal's colour depth from `FORCE_COLOR`, `COLORTERM` and
@@ -99,18 +160,7 @@ fn force_color_is_off(v: &OsStr) -> bool {
 ///   4. `TERM` ends with `256color` → [`ColorDepth::TwoFiftySix`]
 ///   5. Otherwise → [`ColorDepth::Sixteen`]
 pub fn detect_color_depth() -> ColorDepth {
-    let colorterm = std::env::var("COLORTERM").ok();
-    let term = std::env::var("TERM").ok();
-    let force_color = std::env::var_os("FORCE_COLOR");
-    let wt_session = std::env::var_os("WT_SESSION").is_some_and(|v| !v.is_empty());
-    let term_program = std::env::var("TERM_PROGRAM").ok();
-    color_depth_decision_with_terminal(
-        colorterm.as_deref(),
-        term.as_deref(),
-        force_color.as_deref(),
-        wt_session,
-        term_program.as_deref(),
-    )
+    detect_color_caps().depth
 }
 
 /// [`color_depth_decision_with_terminal`] without the terminal-family
@@ -178,8 +228,7 @@ pub(crate) fn color_depth_decision_with_terminal(
 ///   5. `TERM=dumb` → off.
 ///   6. Otherwise: on iff `stderr` is a terminal.
 pub fn detect_color() -> bool {
-    let caps = color_caps_from_env(io::stderr().is_terminal());
-    caps.color
+    detect_color_caps().color
 }
 
 /// Snapshot the colour-related environment once and fold it through the pure
@@ -189,22 +238,25 @@ fn color_caps_from_env(stderr_is_tty: bool) -> ColorCaps {
     // no-color.org: "when present and not an empty string".  CI harnesses set
     // `NO_COLOR=""` to mean "inherit", so an empty value must NOT disable.
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-    let colorterm = std::env::var("COLORTERM").ok();
-    let term = std::env::var("TERM").ok();
     let clicolor = std::env::var_os("CLICOLOR");
     let clicolor_force = std::env::var_os("CLICOLOR_FORCE");
     let force_color = std::env::var_os("FORCE_COLOR");
     let wt_session = std::env::var_os("WT_SESSION").is_some_and(|v| !v.is_empty());
-    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let colorterm_env = std::env::var_os("COLORTERM");
+    let term_env = std::env::var_os("TERM");
+    let term_program_env = std::env::var_os("TERM_PROGRAM");
+    let colorterm = colorterm_env.as_deref().and_then(OsStr::to_str);
+    let term = term_env.as_deref().and_then(OsStr::to_str);
+    let term_program = term_program_env.as_deref().and_then(OsStr::to_str);
     color_caps_decision_with_terminal(
         no_color,
         clicolor.as_deref(),
         clicolor_force.as_deref(),
         force_color.as_deref(),
-        colorterm.as_deref(),
-        term.as_deref(),
+        colorterm,
+        term,
         wt_session,
-        term_program.as_deref(),
+        term_program,
         stderr_is_tty,
     )
 }
@@ -314,21 +366,28 @@ pub(crate) fn color_decision(
 pub fn detect_unicode() -> bool {
     let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
-        .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()));
+        .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
     let term_dumb = std::env::var_os("TERM").as_deref() == Some(OsStr::new("dumb"));
-    unicode_decision(locale.as_deref(), term_dumb)
+    unicode_decision_os(locale.as_deref(), term_dumb)
 }
 
-pub(crate) fn unicode_decision(locale: Option<&str>, term_dumb: bool) -> bool {
+fn unicode_decision_os(locale: Option<&OsStr>, term_dumb: bool) -> bool {
     if term_dumb {
         return false;
     }
     match locale {
         Some(v) => {
-            let v = v.as_bytes();
+            let v = v.as_encoded_bytes();
             contains_ignore_ascii_case(v, b"utf-8") || contains_ignore_ascii_case(v, b"utf8")
         }
         None => true,
+    }
+}
+
+pub(crate) fn unicode_decision(locale: Option<&str>, term_dumb: bool) -> bool {
+    match locale {
+        Some(v) if !v.is_empty() => unicode_decision_os(Some(OsStr::new(v)), term_dumb),
+        _ => unicode_decision_os(None, term_dumb),
     }
 }
 
@@ -374,10 +433,11 @@ static HYPERLINK_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 pub fn supports_hyperlinks() -> bool {
     *HYPERLINK_CACHE.get_or_init(|| {
         let no_hyperlink = std::env::var_os("NO_HYPERLINK").is_some_and(|v| !v.is_empty());
-        hyperlink_decision(
-            no_hyperlink,
-            supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr),
-        )
+        if no_hyperlink {
+            false
+        } else {
+            hyperlink_decision(false, supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr))
+        }
     })
 }
 
@@ -387,12 +447,30 @@ pub(crate) fn hyperlink_decision(no_hyperlink: bool, probe_on_stderr: bool) -> b
 
 /// Whether `b` may appear literally in a `file://` URL path (RFC 3986
 /// unreserved characters plus the path delimiters this crate emits).
+const URL_SAFE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = matches!(
+            i as u8,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'/'
+                | b':'
+                | b'-'
+                | b'_'
+                | b'.'
+                | b'~'
+        );
+        i += 1;
+    }
+    table
+};
+
 #[inline]
 fn is_url_safe(b: u8) -> bool {
-    matches!(
-        b,
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'-' | b'_' | b'.' | b'~'
-    )
+    URL_SAFE[b as usize]
 }
 
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
@@ -410,12 +488,20 @@ const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 /// so a file literally named `\\?\foo` must keep its bytes instead of being
 /// rewritten into a different URL.
 fn verbatim_prefix_len(bytes: &[u8]) -> Option<usize> {
+    if !cfg!(windows) {
+        return None;
+    }
     const UNC: &[u8] = b"\\\\?\\UNC\\";
-    for prefix in [UNC, b"\\\\?\\".as_slice(), b"\\\\.\\".as_slice()] {
+    if bytes.len() >= UNC.len() && bytes[..UNC.len()].eq_ignore_ascii_case(UNC) {
+        let rest = &bytes[UNC.len()..];
+        if rest.contains(&b'\\') {
+            return Some(UNC.len());
+        }
+    }
+    for prefix in [b"\\\\?\\".as_slice(), b"\\\\.\\".as_slice()] {
         if let Some(rest) = bytes.strip_prefix(prefix) {
             let drive = rest.len() >= 2 && rest[0].is_ascii_alphabetic() && rest[1] == b':';
-            let unc = prefix.len() == UNC.len() && rest.contains(&b'\\');
-            if drive || unc {
+            if drive {
                 return Some(prefix.len());
             }
         }
@@ -423,10 +509,7 @@ fn verbatim_prefix_len(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-fn encode_file_url_path_into(out: &mut String, s: &[u8]) {
-    // One pass to size the buffer exactly (`len + 2 * unsafe_count`) and find
-    // the first unsafe byte: the owned path must not re-validate the whole
-    // prefix byte by byte (the old two-pass `count` + `position`).
+fn scan_url_path(s: &[u8]) -> (usize, usize) {
     let mut unsafe_count = 0usize;
     let mut first_unsafe = s.len();
     for (i, &b) in s.iter().enumerate() {
@@ -437,18 +520,35 @@ fn encode_file_url_path_into(out: &mut String, s: &[u8]) {
             }
         }
     }
+    (first_unsafe, unsafe_count)
+}
+
+fn encode_scanned_path(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
     out.reserve(s.len().saturating_add(unsafe_count.saturating_mul(2)));
-    // `is_url_safe` only admits ASCII, so this prefix is valid UTF-8.
-    out.push_str(std::str::from_utf8(&s[..first_unsafe]).expect("URL-safe bytes are ASCII"));
-    for &b in &s[first_unsafe..] {
-        if is_url_safe(b) {
-            out.push(b as char);
+    let mut buf: Vec<u8> = Vec::with_capacity(s.len().saturating_add(unsafe_count.saturating_mul(2)));
+    buf.extend_from_slice(&s[..first_unsafe]);
+    let mut i = first_unsafe;
+    while i < s.len() {
+        if is_url_safe(s[i]) {
+            let start = i;
+            while i < s.len() && is_url_safe(s[i]) {
+                i += 1;
+            }
+            buf.extend_from_slice(&s[start..i]);
         } else {
-            out.push('%');
-            out.push(HEX_UPPER[(b >> 4) as usize] as char);
-            out.push(HEX_UPPER[(b & 0xF) as usize] as char);
+            let b = s[i];
+            buf.push(b'%');
+            buf.push(HEX_UPPER[(b >> 4) as usize]);
+            buf.push(HEX_UPPER[(b & 0xF) as usize]);
+            i += 1;
         }
     }
+    out.push_str(std::str::from_utf8(&buf).expect("encoded URL path is ASCII"));
+}
+
+fn encode_file_url_path_into(out: &mut String, s: &[u8]) {
+    let (first_unsafe, unsafe_count) = scan_url_path(s);
+    encode_scanned_path(out, s, first_unsafe, unsafe_count);
 }
 
 /// Percent-encode the bytes that are unsafe in a `file://` URL path.
@@ -458,12 +558,13 @@ fn encode_file_url_path_into(out: &mut String, s: &[u8]) {
 /// keeps a filename from terminating the enclosing OSC 8 hyperlink early or
 /// injecting terminal control codes.
 pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
-    if s.iter().all(|&b| is_url_safe(b)) {
+    let (first_unsafe, unsafe_count) = scan_url_path(s);
+    if first_unsafe == s.len() {
         // As above: the safe set is ASCII, so this is valid UTF-8.
         return Cow::Borrowed(std::str::from_utf8(s).expect("URL-safe bytes are ASCII"));
     }
-    let mut out = String::new();
-    encode_file_url_path_into(&mut out, s);
+    let mut out = String::with_capacity(s.len().saturating_add(unsafe_count.saturating_mul(2)));
+    encode_scanned_path(&mut out, s, first_unsafe, unsafe_count);
     Cow::Owned(out)
 }
 
@@ -521,6 +622,13 @@ pub fn path_to_file_url(path: &std::path::Path) -> String {
     // path shape: on POSIX `\` is a filename byte, and a name like `\\?\foo`
     // must not be rewritten.
     let strip = verbatim_prefix_len(raw);
+    if cfg!(windows)
+        && strip.is_none()
+        && (raw.starts_with(b"\\\\?\\") || raw.starts_with(b"\\\\.\\"))
+    {
+        // Volume-GUID / device paths have no safe `file://` representation.
+        return "file://".to_string();
+    }
     // Windows paths use `\`, but URLs require `/`.  Gate strictly on the
     // platform: on POSIX a `\` is a legal filename byte and must be
     // percent-encoded (`%5C`), not rewritten into a path separator (which
@@ -545,12 +653,14 @@ pub fn path_to_file_url(path: &std::path::Path) -> String {
         Cow::Borrowed(raw)
     };
 
-    let distro = std::env::var("WSL_DISTRO_NAME").ok();
+    let distro = std::env::var("WSL_DISTRO_NAME")
+        .ok()
+        .filter(|s| !s.is_empty());
     format_file_url(&bytes, distro.as_deref())
 }
 
 fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(path.len() + distro.map_or(0, str::len) + 32);
     if let Some(distro) = distro
         && !distro.is_empty()
     {
@@ -595,7 +705,14 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
     // RFC 8089 canonical form `file://server/share/file` instead of the
     // four-slash form strict parsers treat differently.
     if let Some(rest) = path.strip_prefix(b"//") {
-        out.push_str("file://");
+        let looks_like_drive = rest.len() >= 2
+            && rest[1] == b':'
+            && (cfg!(windows) || distro.is_some() || rest[0].is_ascii_uppercase());
+        if looks_like_drive {
+            out.push_str("file:///");
+        } else {
+            out.push_str("file://");
+        }
         encode_file_url_path_into(&mut out, rest);
         return out;
     }
@@ -764,8 +881,11 @@ mod tests {
 
     #[test]
     fn verbatim_prefix_only_stripped_for_windows_shapes() {
-        assert_eq!(verbatim_prefix_len(b"\\\\?\\C:\\x"), Some(4));
-        assert_eq!(verbatim_prefix_len(b"\\\\?\\UNC\\server\\share"), Some(8));
+        let windows = if cfg!(windows) { Some(4) } else { None };
+        assert_eq!(verbatim_prefix_len(b"\\\\?\\C:\\x"), windows);
+        let unc = if cfg!(windows) { Some(8) } else { None };
+        assert_eq!(verbatim_prefix_len(b"\\\\?\\UNC\\server\\share"), unc);
+        assert_eq!(verbatim_prefix_len(b"\\\\?\\unc\\server\\share"), unc);
         // A POSIX filename that merely starts with the prefix bytes keeps them.
         assert_eq!(verbatim_prefix_len(b"\\\\?\\foo"), None);
         assert_eq!(verbatim_prefix_len(b"\\\\.\\bar"), None);
@@ -811,6 +931,21 @@ mod tests {
             color_depth_decision(Some("truecolor"), Some("xterm"), None),
             ColorDepth::TrueColor
         );
+    }
+
+    #[test]
+    fn force_color_level_clamps_and_trims() {
+        assert_eq!(force_color_level(OsStr::new("4")), Some(ColorDepth::TrueColor));
+        assert_eq!(force_color_level(OsStr::new(" 2")), Some(ColorDepth::TwoFiftySix));
+        assert_eq!(force_color_level(OsStr::new("03")), Some(ColorDepth::TrueColor));
+        assert_eq!(force_color_level(OsStr::new("0")), None);
+        assert!(force_color_is_off(OsStr::new(" false ")));
+    }
+
+    #[test]
+    fn empty_locale_and_needle_are_unset() {
+        assert!(unicode_decision(Some(""), false));
+        assert!(contains_ignore_ascii_case(b"anything", b""));
     }
 
     #[test]
@@ -914,6 +1049,10 @@ mod tests {
         assert_eq!(
             format_file_url(b"//server/share/file.rs", None),
             "file://server/share/file.rs"
+        );
+        assert_eq!(
+            format_file_url(b"//C:/Users/user/file.rs", None),
+            "file:///C:/Users/user/file.rs"
         );
         assert_eq!(
             format_file_url(b"/home/user/file.rs", Some("Ubuntu 20.04")),

@@ -311,21 +311,32 @@ impl std::str::FromStr for ErrorCategory {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let lower = s.to_ascii_lowercase();
-        match lower.as_str() {
-            "parse" | "parse error" => Ok(ErrorCategory::Parse),
-            "resolution" | "resolution error" => Ok(ErrorCategory::Resolution),
-            "type" | "type error" => Ok(ErrorCategory::Type),
-            "contract" | "contract error" => Ok(ErrorCategory::Contract),
-            "trait" | "trait error" => Ok(ErrorCategory::Trait),
-            "inference" | "inference error" => Ok(ErrorCategory::Inference),
-            "internal" | "internal error" => Ok(ErrorCategory::Internal),
-            "generic" | "error" => Ok(ErrorCategory::Generic),
-            _ => Err(format!(
-                "unknown error category `{s}` (valid: parse, resolution, type, \
-                 contract, trait, inference, internal, generic)"
-            )),
+        for (name, category) in [
+            ("parse", ErrorCategory::Parse),
+            ("parse error", ErrorCategory::Parse),
+            ("resolution", ErrorCategory::Resolution),
+            ("resolution error", ErrorCategory::Resolution),
+            ("type", ErrorCategory::Type),
+            ("type error", ErrorCategory::Type),
+            ("contract", ErrorCategory::Contract),
+            ("contract error", ErrorCategory::Contract),
+            ("trait", ErrorCategory::Trait),
+            ("trait error", ErrorCategory::Trait),
+            ("inference", ErrorCategory::Inference),
+            ("inference error", ErrorCategory::Inference),
+            ("internal", ErrorCategory::Internal),
+            ("internal error", ErrorCategory::Internal),
+            ("generic", ErrorCategory::Generic),
+            ("error", ErrorCategory::Generic),
+        ] {
+            if s.eq_ignore_ascii_case(name) {
+                return Ok(category);
+            }
         }
+        Err(format!(
+            "unknown error category `{s}` (valid: parse, resolution, type, \
+             contract, trait, inference, internal, generic)"
+        ))
     }
 }
 
@@ -357,7 +368,7 @@ enum ErrCodeRepr {
     /// a slot shape check + `CODE_INDEX` read per comparison/hash.  `None`
     /// means the code is genuinely unregistered (both `new` and `unknown`
     /// resolve before storing).
-    Other(Box<OtherCode>),
+    Other(std::sync::Arc<OtherCode>),
 }
 
 /// Boxed payload of [`ErrCodeRepr::Other`].
@@ -377,7 +388,9 @@ impl fmt::Debug for ErrCode {
 /// stay uniform and the explain server's error paths can use it directly.
 impl fmt::Display for ErrCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.code())
+        // `code()` is verbatim for untrusted `unknown` inputs; any `{}` sink
+        // may be a terminal, so neutralize C0/C1/DEL before writing.
+        f.write_str(&super::sanitize_for_terminal(self.code()))
     }
 }
 
@@ -410,6 +423,7 @@ pub struct UnknownCode<'a>(pub Cow<'a, str>);
 /// Fallback metadata for error codes not present in [`CODE_TABLE`].
 pub(crate) static UNKNOWN_CODE_ENTRY: CodeEntry = CodeEntry {
     code: "",
+    slot: u16::MAX,
     title: "unknown error",
     category: ErrorCategory::Generic,
     explain: "No detailed explanation is available for this error code yet.",
@@ -465,7 +479,7 @@ impl ErrCode {
         // Unknown: stored verbatim — never invent case for arbitrary
         // strings that are not error codes.  Both lookups above already
         // failed, so the cached canonical resolution is `None`.
-        ErrCode(ErrCodeRepr::Other(Box::new(OtherCode {
+        ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode {
             raw: CompactString::from(code),
             canonical: None,
         })))
@@ -500,7 +514,7 @@ impl ErrCode {
         // spelling such as `e030` must still compare/hash as `E030`, but the
         // table walk is a construction cost, not a per-comparison one.
         let canonical = resolve(&raw);
-        ErrCode(ErrCodeRepr::Other(Box::new(OtherCode { raw, canonical })))
+        ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode { raw, canonical })))
     }
 
     /// The code string, e.g. "E030" or "W113".
@@ -598,13 +612,23 @@ impl ErrCode {
     ///
     /// Returns an `Arc<str>`: a cache hit is a refcount bump, not a heap
     /// allocation + copy of an immutable 40–80+ byte URL.
+    fn slot(&self) -> Option<u16> {
+        match &self.0 {
+            ErrCodeRepr::Known(e) => Some(e.slot),
+            ErrCodeRepr::Other(o) => o
+                .canonical
+                .map(|e| e.slot)
+                .or_else(|| code_slot(o.raw.as_str()).map(|s| s as u16)),
+        }
+    }
+
     pub fn url(&self) -> std::sync::Arc<str> {
         // Canonical spelling, not the verbatim echo: `unknown("e030")` resolves
         // to the E030 entry (title/category/explain all do), so its URL must be
         // the registered `/E030` — not a `/e030` the doc site 404s — and it
         // must hit the per-slot cache like any other spelling of that code.
         let code = self.canonical();
-        let Some(slot) = code_slot(code) else {
+        let Some(slot) = self.slot() else {
             return explain_url(code).into();
         };
         if EXPLAIN_PORT.get().is_some() {
@@ -612,13 +636,13 @@ impl ErrCode {
             // split so a later `set_explain_port` can never observe a stale
             // doc-URL host.
             static URL_CACHE: SlotCache = SlotCache::new();
-            cached_slot_string(&URL_CACHE, slot as u16, || explain_url(code))
+            cached_slot_string(&URL_CACHE, slot, || explain_url(code))
         } else {
             // No explain server: the doc URL depends only on the code.
             // Disjoint from the port cache (this branch is taken only while
             // the port is unset, and the port is set-once).
             static DOC_URL_CACHE: SlotCache = SlotCache::new();
-            cached_slot_string(&DOC_URL_CACHE, slot as u16, || {
+            cached_slot_string(&DOC_URL_CACHE, slot, || {
                 explain_url_with_port(code, None)
             })
         }
@@ -638,19 +662,26 @@ impl ErrCode {
     /// builds the OSC 8 hyperlink once and clones thereafter.  Unknown codes
     /// (arbitrary bytes, no slot) bypass the cache and rebuild every call.
     pub fn url_ansi(&self) -> std::sync::Arc<str> {
-        let Some(slot) = code_slot(self.canonical()) else {
+        let canonical = self.canonical();
+        let Some(slot) = self.slot() else {
             return self.url_ansi_build().into();
         };
+        // The cached string embeds the *visible* spelling, not the canonical
+        // one.  Letting `unknown("e030")` populate slot 30 would make a later
+        // canonical `E030` render the wrong link text.
+        if self.code() != canonical {
+            return self.url_ansi_build().into();
+        }
         if EXPLAIN_PORT.get().is_some() {
             static URL_ANSI_CACHE: SlotCache = SlotCache::new();
-            cached_slot_string(&URL_ANSI_CACHE, slot as u16, || self.url_ansi_build())
+            cached_slot_string(&URL_ANSI_CACHE, slot, || self.url_ansi_build())
         } else {
             // No explain server: memoize the OSC 8 form of the doc URL, the
             // same way the doc URL itself is memoized in `url`.  Disjoint
             // from the port cache, so a later `set_explain_port` cannot
             // return a stale doc host.
             static DOC_URL_ANSI_CACHE: SlotCache = SlotCache::new();
-            cached_slot_string(&DOC_URL_ANSI_CACHE, slot as u16, || self.url_ansi_build())
+            cached_slot_string(&DOC_URL_ANSI_CACHE, slot, || self.url_ansi_build())
         }
     }
 
@@ -663,7 +694,7 @@ impl ErrCode {
         // cache) only to format it again; assemble straight into the result.
         let mut out = CompactString::default();
         out.push_str("\x1b]8;;");
-        if code_slot(self.canonical()).is_some() {
+        if self.slot().is_some() {
             out.push_str(&self.url());
         } else {
             out.push_str(&explain_url(self.canonical()));
@@ -678,6 +709,7 @@ impl ErrCode {
 /// A single entry in the error code lookup table.
 pub(crate) struct CodeEntry {
     pub(crate) code: &'static str,
+    pub(crate) slot: u16,
     pub(crate) title: &'static str,
     pub(crate) category: ErrorCategory,
     explain: &'static str,
@@ -702,6 +734,10 @@ const _: () = {
         assert!(b[1].is_ascii_digit());
         assert!(b[2].is_ascii_digit());
         assert!(b[3].is_ascii_digit());
+        assert!(
+            CODE_TABLE[i].slot as usize
+                == code_slot(CODE_TABLE[i].code).expect("validated code shape")
+        );
         i += 1;
     }
 };
@@ -823,13 +859,19 @@ pub fn related_codes_of(code: &str) -> &'static [&'static str] {
     {
         return cached;
     }
-    let built = RELATED_CODES
-        .iter()
-        .find_map(|(src, rel)| (*src == entry.code).then_some(*rel))
-        .unwrap_or(&[]);
-    if let Ok(mut map) = cache.write() {
-        let _ = map.entry(slot).or_default().set(built);
-    }
+    static RELATED_MAP: std::sync::OnceLock<
+        rustc_hash::FxHashMap<&'static str, &'static [&'static str]>,
+    > = std::sync::OnceLock::new();
+    let map = RELATED_MAP.get_or_init(|| {
+        let mut map = rustc_hash::FxHashMap::default();
+        for &(src, rel) in RELATED_CODES {
+            map.entry(src).or_insert(rel);
+        }
+        map
+    });
+    let built = map.get(entry.code).copied().unwrap_or(&[]);
+    let mut map = cache.write().unwrap_or_else(|e| e.into_inner());
+    let _ = map.entry(slot).or_default().set(built);
     built
 }
 
@@ -865,32 +907,10 @@ pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4
         }
         map
     });
-    // Production callers ask for 4; a per-slot `OnceLock` array makes the
-    // hit path a single atomic load, with no `RwLock` or `LiteMap` search.
-    // Other `max` values keep the general keyed cache below.
-    if max == 4 {
-        static SIBLING4: std::sync::OnceLock<
-            Box<[std::sync::OnceLock<SmallVec<[&'static str; 4]>>]>,
-        > = std::sync::OnceLock::new();
-        let cells = SIBLING4.get_or_init(|| {
-            (0..DIRECT_ADDRESS_SLOTS)
-                .map(|_| std::sync::OnceLock::new())
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
-        });
-        return cells[slot as usize]
-            .get_or_init(|| build_siblings(by_category, entry, max))
-            .clone();
-    }
-    // The per-code *answer* is memoised per `(slot, max)`: `max` is a
-    // call-site constant in the renderers today, but the function is `pub`
-    // and nothing enforces a single `max` — keying the cache by the slot
-    // alone made a caller asking for `max = 2` after `max = 4` silently get
-    // the four-entry list.  The slots live in a lazily-populated flat map —
-    // a `LiteMap`, a sorted flat vector with O(log n) lookup and no
-    // hash-table shell — rather than a fixed `CODE_INDEX_SLOTS`-sized
-    // array, so a process that touches a handful of codes pays only for
-    // those codes; the per-slot `OnceLock` keeps the hit path lock-free.
+    // All `max` values use the same lazily-populated keyed cache: a fixed
+    // 2000-cell array cost ~160 KiB in processes that touch only a few codes.
+    // The per-key `OnceLock` still makes the hit path lock-free after the
+    // first `LiteMap` lookup.
     static SIBLING_CACHE: std::sync::OnceLock<
         std::sync::RwLock<LiteMap<(u16, usize), std::sync::OnceLock<SmallVec<[&'static str; 4]>>>>,
     > = std::sync::OnceLock::new();
@@ -913,9 +933,8 @@ pub fn category_siblings_of(code: &str, max: usize) -> SmallVec<[&'static str; 4
     // value we built is byte-identical to whatever won the race — return it
     // directly instead of re-acquiring the read lock and cloning the winner.
     let built = build_siblings(by_category, &entry, max);
-    if let Ok(mut m) = cache.write() {
-        let _ = m.entry((slot, max)).or_default().set(built.clone());
-    }
+    let mut m = cache.write().unwrap_or_else(|e| e.into_inner());
+    let _ = m.entry((slot, max)).or_default().set(built.clone());
     built
 }
 
@@ -943,6 +962,12 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn skip_char_literal_handles_hex_escapes() {
+        assert_eq!(skip_char_literal(b"'\\x41'foo", 0), 6);
+        assert_eq!(skip_char_literal(b"'\\x28'", 0), 6);
+    }
 
     /// Lowercase input must resolve like `ErrCode::new`/`entry` do: the
     /// sibling list is computed from the canonical entry, not returned empty
@@ -980,6 +1005,33 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// The only ESC bytes in the result are the four that frame the OSC 8
     /// sequence (`\x1b]8;;` … `\x1b\\` … `\x1b]8;;` … `\x1b\\`).  This holds
     /// regardless of whether `EXPLAIN_PORT` was set by another test.
+    #[test]
+    fn url_ansi_keeps_visible_spelling_per_instance() {
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lower = ErrCode::unknown("e030");
+        let upper = ErrCode::new("E030");
+        let _ = lower.url_ansi();
+        let upper_out = upper.url_ansi();
+        assert!(
+            upper_out.ends_with("E030\x1b]8;;\x1b\\"),
+            "canonical link text poisoned: {upper_out:?}"
+        );
+        let lower_out = lower.url_ansi();
+        assert!(
+            lower_out.ends_with("e030\x1b]8;;\x1b\\"),
+            "verbatim link text lost: {lower_out:?}"
+        );
+    }
+
+    #[test]
+    fn display_sanitizes_untrusted_code() {
+        let ec = ErrCode::unknown("E0\x1b]8;;evil\x07");
+        let out = format!("{ec}");
+        assert!(!out.contains('\x1b'), "ESC leaked: {out:?}");
+        assert!(!out.contains('\x07'), "BEL leaked: {out:?}");
+        assert!(out.contains('\u{FFFD}'), "controls not replaced: {out:?}");
+    }
+
     #[test]
     fn url_ansi_cannot_inject_osc() {
         let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1182,6 +1234,11 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
                 if j < len {
                     j += 1;
                 }
+            } else if bytes[j] == b'x' {
+                // `'\xNN'` consumes the introducer plus exactly two hex
+                // digits; otherwise the closing quote is mistaken for the
+                // start of a lifetime.
+                j = (j + 3).min(len);
             } else {
                 j += 1;
             }

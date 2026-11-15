@@ -400,7 +400,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 }
             }
 
-            let mut handoff: SmallVec<[(TcpStream, SmallVec<[u8; 512]>, PendingAction); 8]> =
+            let mut handoff: SmallVec<[(TcpStream, SmallVec<[u8; 512]>, PendingAction, Option<RequestHead>); 8]> =
                 SmallVec::new();
             for &(i, action) in remove.iter().rev() {
                 let p = pending.swap_remove(i);
@@ -408,7 +408,12 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                     let mut stream = p.stream;
                     let _ = stream.shutdown(Shutdown::Both);
                 } else {
-                    handoff.push((p.stream, p.buf, action));
+                    let head = if action == PendingAction::Serve {
+                        parse_request_head(&p.buf)
+                    } else {
+                        None
+                    };
+                    handoff.push((p.stream, p.buf, action, head));
                 }
             }
 
@@ -418,7 +423,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 // successful write so the accept loop can stop.
                 let delivered = std::sync::atomic::AtomicBool::new(false);
                 std::thread::scope(|scope| {
-                    for (mut stream, buf, action) in handoff.drain(..) {
+                    for (mut stream, buf, action, head) in handoff.drain(..) {
                         if action == PendingAction::TooLarge {
                             let _ = std::thread::Builder::new()
                             .stack_size(64 * 1024)
@@ -437,7 +442,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                             .stack_size(64 * 1024)
                             .spawn_scoped(scope, move || {
                             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                serve_page_after_prefix(&mut stream, html, Some(expected), &buf)
+                                serve_page_after_prefix(&mut stream, html, Some(expected), &buf, head)
                             }));
                             // `serve_page_after_prefix` parses the request
                             // line exactly once and returns true only after
@@ -469,13 +474,19 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     // Non-unix targets have no raw `poll`; keep the serial accept loop.  The
     // deadline still bounds a silent preconnect.
     #[cfg(not(unix))]
-    while Instant::now() < deadline {
+    loop {
+        let now = Instant::now();
+        if now >= idle_deadline.unwrap_or(deadline) {
+            break;
+        }
         match listener.accept() {
             Ok((mut stream, _)) => match serve_page_expected(&mut stream, &html, Some(&expected_path))
             {
                 Ok(true) => {
                     served = true;
-                    break;
+                    if idle_deadline.is_none() {
+                        idle_deadline = Some(now + POST_SERVE_IDLE);
+                    }
                 }
                 Ok(false) => continue,
                 Err(e) => {
@@ -706,6 +717,7 @@ fn header_end(buf: &[u8]) -> Option<usize> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 struct HeaderFraming {
     content_length: Option<usize>,
     has_transfer_encoding: bool,
@@ -718,6 +730,38 @@ struct HeaderFraming {
     connection_close: bool,
 }
 
+/// One parsed request head shared between the poll handoff and the worker.
+#[derive(Debug, Clone)]
+struct RequestHead {
+    line: CompactString,
+    head_end: usize,
+    framing: HeaderFraming,
+}
+
+fn parse_request_head(buf: &[u8]) -> Option<RequestHead> {
+    let nl = memchr::memchr(b'\n', buf)?;
+    let raw = &buf[..nl];
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let line = std::str::from_utf8(raw).ok()?;
+    let head_end = header_end(buf)?;
+    if head_end > MAX_HEADER {
+        return None;
+    }
+    Some(RequestHead {
+        line: line.into(),
+        head_end,
+        framing: scan_framing(&buf[..head_end]),
+    })
+}
+
+/// Parse `Content-Length`/`Transfer-Encoding`/`Connection` from a complete
+/// header block.
+///
+/// Identical duplicate `Content-Length` values are accepted; conflicting
+/// duplicates set `ambiguous`, and either that or any `Transfer-Encoding`
+/// forces close + drain instead of keep-alive.  This is a deliberate
+/// smuggling-adjacent leniency: it never leaves a reusable connection with
+/// unread body bytes.
 fn scan_framing(headers: &[u8]) -> HeaderFraming {
     let mut framing = HeaderFraming {
         content_length: None,
@@ -819,6 +863,73 @@ fn arm_read_timeout_until(stream: &mut TcpStream, deadline: Instant) -> std::io:
 /// reads correct.  The scan itself is incremental : only bytes appended by
 /// the latest read are searched, with a 3-byte carry, so a dribbling client
 /// costs O(n) total scan work instead of O(n²).
+fn drain_after_head(
+    stream: &mut TcpStream,
+    framing: HeaderFraming,
+    already_read: usize,
+    budget: Duration,
+) -> DrainOutcome {
+    let deadline = Instant::now() + budget;
+    let mut sink = [0u8; 4096];
+    if framing.has_transfer_encoding || framing.ambiguous || framing.oversized {
+        loop {
+            if Instant::now() >= deadline {
+                return DrainOutcome::HeadersOnly;
+            }
+            if arm_read_timeout_until(stream, deadline).is_err() {
+                return DrainOutcome::HeadersOnly;
+            }
+            match stream.read(&mut sink) {
+                Ok(0) => return DrainOutcome::Complete,
+                Ok(_) => {}
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return DrainOutcome::HeadersOnly;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return DrainOutcome::HeadersOnly,
+            }
+        }
+    }
+    let mut remaining = framing
+        .content_length
+        .unwrap_or(0)
+        .saturating_sub(already_read);
+    while remaining > 0 {
+        if Instant::now() >= deadline {
+            return DrainOutcome::HeadersOnly;
+        }
+        if arm_read_timeout_until(stream, deadline).is_err() {
+            return DrainOutcome::HeadersOnly;
+        }
+        let want = remaining.min(sink.len());
+        match stream.read(&mut sink[..want]) {
+            Ok(0) => return DrainOutcome::HeadersOnly,
+            Ok(n) => remaining = remaining.saturating_sub(n),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return DrainOutcome::HeadersOnly;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return DrainOutcome::HeadersOnly,
+        }
+    }
+    DrainOutcome::Complete
+}
+
+fn drain_or_pre(
+    stream: &mut TcpStream,
+    prefix: &[u8],
+    pre: Option<DrainOutcome>,
+    budget: Duration,
+) -> DrainOutcome {
+    pre.unwrap_or_else(|| drain_request(stream, prefix, budget))
+}
+
 fn drain_request(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> DrainOutcome {
     let mut tail_len = 0;
     let mut wants_close = false;
@@ -898,6 +1009,10 @@ fn drain_request_tracked(
             break;
         }
         if arm_read_timeout_until(stream, deadline).is_err() {
+            // A failed timeout install must not close with unread bytes.
+            // `drain_until_eof` is non-recursive and still attempts a short
+            // best-effort drain with a direct timeout.
+            drain_until_eof(stream, Duration::from_millis(100), false);
             break;
         }
         match stream.read(&mut buf[..want]) {
@@ -1191,13 +1306,8 @@ fn format_http_date(secs: u64) -> String {
 }
 
 fn write_header_too_large(stream: &mut TcpStream) -> std::io::Result<()> {
-    stream.write_all(
-        b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
-          Cache-Control: no-store\r\n\
-          Content-Type: text/plain; charset=utf-8\r\n\
-          Content-Length: 0\r\n\
-          Connection: close\r\n\r\n",
-    )?;
+    let page = too_large_page();
+    write_prepared_conn(stream, page.head_parts(), "", false)?;
     stream.shutdown(Shutdown::Write)
 }
 
@@ -1428,7 +1538,7 @@ fn serve_page_expected(
         let _ = stream.shutdown(Shutdown::Both);
         return Ok(false);
     }
-    serve_page_after_prefix(stream, body, expected_path, &first[..first_n])
+    serve_page_after_prefix(stream, body, expected_path, &first[..first_n], None)
 }
 
 /// Post-probe serving shared by the blocking non-unix/test path and the
@@ -1440,23 +1550,40 @@ fn serve_page_after_prefix(
     body: &str,
     expected_path: Option<&str>,
     first: &[u8],
+    head: Option<RequestHead>,
 ) -> std::io::Result<bool> {
     stream.set_nonblocking(false)?;
     let _ = stream.set_nodelay(true);
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-    // H4//the routed one-shot decides method and path only on a
-    // *complete* request line.  `read_request_line` finishes a line split
-    // across TCP reads (or longer than the 512-byte probe) exactly once and
-    // returns the header-prefix leftover, so a partial `"GE"` cannot become a
-    // 405 and a long target cannot skip the deferred routing check.
-    let (line, leftover) = if expected_path.is_some() {
+    let (line, leftover, pre_drain) = if let Some(head) = head {
+        let end = head.head_end.min(first.len());
+        let mut leftover: SmallVec<[u8; 512]> = SmallVec::new();
+        leftover.extend_from_slice(&first[end..]);
+        let drain = drain_after_head(
+            stream,
+            head.framing,
+            leftover.len(),
+            Duration::from_secs(1),
+        );
+        (head.line, leftover, Some(drain))
+    } else if expected_path.is_some() {
         let mut too_large = false;
-        match read_request_line(stream, first, Duration::from_secs(2), &mut too_large) {
-            Some(pair) => pair,
+        let mut malformed = false;
+        match read_request_line(
+            stream,
+            first,
+            Duration::from_secs(2),
+            &mut too_large,
+            &mut malformed,
+        ) {
+            Some((line, leftover)) => (line, leftover, None),
             None => {
                 if too_large {
                     let _ = write_header_too_large(stream);
+                    linger_after_half_close(stream);
+                } else if malformed {
+                    let _ = write_prepared(stream, bad_request_head(), "");
                     linger_after_half_close(stream);
                 }
                 let _ = stream.shutdown(Shutdown::Both);
@@ -1465,7 +1592,11 @@ fn serve_page_after_prefix(
         }
     } else {
         // Test-only `serve_page`: keep the method-agnostic drain path.
-        (CompactString::new(""), SmallVec::from_slice(first))
+        (
+            CompactString::new(""),
+            SmallVec::from_slice(first),
+            None,
+        )
     };
     let prefix: &[u8] = &leftover;
 
@@ -1473,7 +1604,7 @@ fn serve_page_after_prefix(
         // Finding 6: validate the full three-token grammar and version before
         // any routing decision, exactly like the persistent dispatcher.
         let Some(req) = parse_request_line(line.as_ref()) else {
-            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             return finish_head(
                 stream,
                 drain,
@@ -1483,7 +1614,7 @@ fn serve_page_after_prefix(
         };
         let head_only = req.method == "HEAD";
         if !matches!(req.version, "HTTP/1.0" | "HTTP/1.1") {
-            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             return finish_head(
                 stream,
                 drain,
@@ -1494,7 +1625,7 @@ fn serve_page_after_prefix(
         // [4]2: origin-form is required; `GET E030 HTTP/1.1` must not be
         // served by the one-shot while the persistent router rejects it.
         if !req.target.starts_with('/') {
-            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             return finish_head(
                 stream,
                 drain,
@@ -1506,7 +1637,7 @@ fn serve_page_after_prefix(
         // 405 with `Allow: GET, HEAD` and keep waiting for the real page request.
         if req.method != "GET" && req.method != "HEAD" {
             stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             return finish_head(
                 stream,
                 drain,
@@ -1531,7 +1662,7 @@ fn serve_page_after_prefix(
                     && let Some(page) = explain_page_cached(code)
                 {
                     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-                    let drain = drain_request(stream, prefix, Duration::from_secs(1));
+                    let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
                     if head_only {
                         return finish_head(
                             stream,
@@ -1547,7 +1678,7 @@ fn serve_page_after_prefix(
                         }
                         DrainOutcome::HeadersOnly => {
                             write_prepared_parts(stream, page.head_parts(), &page.body)?;
-                            linger_after_half_close(stream);
+                            linger_after_half_close_for(stream, Duration::from_secs(1));
                         }
                         DrainOutcome::Complete => {
                             write_prepared_parts(stream, page.head_parts(), &page.body)?;
@@ -1570,7 +1701,7 @@ fn serve_page_after_prefix(
                 let key = decoded.strip_prefix('/').unwrap_or(decoded.as_str());
                 let key = if key.is_empty() { "/" } else { key };
                 let page = not_found_page_cached(key);
-                let drain = drain_request(stream, prefix, Duration::from_secs(1));
+                let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
                 if head_only {
                     return finish_head(
                         stream,
@@ -1585,7 +1716,7 @@ fn serve_page_after_prefix(
                     }
                     DrainOutcome::HeadersOnly => {
                         let _ = write_prepared_parts(stream, page.head_parts(), &page.body);
-                        linger_after_half_close(stream);
+                        linger_after_half_close_for(stream, Duration::from_secs(1));
                     }
                     DrainOutcome::Complete => {
                         let _ = write_prepared_parts(stream, page.head_parts(), &page.body);
@@ -1603,7 +1734,7 @@ fn serve_page_after_prefix(
         // HEAD gets the identical GET head (including Content-Length) and no body.
         if head_only {
             stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-            let drain = drain_request(stream, prefix, Duration::from_secs(1));
+            let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             let head = render_head("200 OK", "", body.len());
             return finish_head(
                 stream,
@@ -1614,7 +1745,7 @@ fn serve_page_after_prefix(
         }
     }
 
-    match drain_request(stream, prefix, Duration::from_secs(1)) {
+    match drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1)) {
         DrainOutcome::NoRequest => {
             let _ = stream.shutdown(Shutdown::Both);
             Ok(false)
@@ -1624,7 +1755,7 @@ fn serve_page_after_prefix(
             // response, half-close, and linger until EOF/budget .
             let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
             write_response(stream, "200 OK", "", body)?;
-            linger_after_half_close(stream);
+            linger_after_half_close_for(stream, Duration::from_secs(1));
             Ok(true)
         }
         DrainOutcome::Complete => {
@@ -1700,7 +1831,7 @@ where
         }
         DrainOutcome::HeadersOnly => {
             write_head(stream)?;
-            linger_after_half_close(stream);
+            linger_after_half_close_for(stream, Duration::from_secs(1));
             Ok(delivered)
         }
         DrainOutcome::Complete => {
@@ -1722,8 +1853,12 @@ where
 /// A single 256-byte read is not a drain: if the client is still streaming a
 /// larger body, unread bytes remain and the final close can RST the response
 /// just written .
+fn linger_after_half_close_for(stream: &mut TcpStream, budget: Duration) {
+    drain_until_eof(stream, budget, true);
+}
+
 fn linger_after_half_close(stream: &mut TcpStream) {
-    drain_until_eof(stream, Duration::from_millis(50), true);
+    linger_after_half_close_for(stream, Duration::from_millis(50));
 }
 
 /// Escape a string for HTML embedding.
@@ -2067,6 +2202,12 @@ fn serve_explain_persistent_impl(
     let _ = build_index_page();
     let _ = csp_style_src();
     let _ = csp_script_src();
+    // Protocol-error pages are pure constants too; prewarm them so the first
+    // malformed/overload request does not pay a build on the accept path.
+    let _ = bad_request_response();
+    let _ = method_not_allowed_response();
+    let _ = shed_page();
+    let _ = too_large_page();
     // Linux uses a single non-blocking epoll reactor: one event loop owns
     // every connection, so a slow client costs no thread and cannot delay
     // accepts.  Other platforms keep the scoped thread-per-connection path.
@@ -2308,6 +2449,9 @@ fn serve_explain_persistent_epoll(
         /// Response kept alive for the write duration; slices are written
         /// directly with `write_vectored` (head, Connection header, body).
         response: Option<HttpResponse>,
+        /// Date snapshot for the in-flight response; fixed for all partial
+        /// writes so the `progress[3]` cursor always indexes one string.
+        date: Option<std::sync::Arc<str>>,
         conn_hdr: &'static [u8],
         progress: [usize; 6],
         state: u8,
@@ -2382,6 +2526,7 @@ fn serve_explain_persistent_epoll(
         .map(|_| libc::epoll_event { events: 0, u64: 0 })
         .collect();
     let mut consecutive_accept_errors = 0usize;
+    let mut accept_backoff_ms = 50u64;
     let first_deadline = Instant::now() + Duration::from_secs(10);
     let mut served_any = false;
     let mut last_served = Instant::now();
@@ -2427,10 +2572,17 @@ fn serve_explain_persistent_epoll(
         for event in &events[..ready as usize] {
             let fd = event.u64 as i32;
             if fd == listener_fd {
+                if event.events & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "explain server: listener error",
+                    ));
+                }
                 for _ in 0..ACCEPT_BATCH {
                     match accept_nonblocking(listener) {
                         Ok(stream) => {
                             consecutive_accept_errors = 0;
+                            accept_backoff_ms = 50;
                             let _ = stream.set_nodelay(true);
                             let conn_fd = stream.as_raw_fd();
                             let normal = conns.values().filter(|c| !c.overload).count();
@@ -2446,6 +2598,7 @@ fn serve_explain_persistent_epoll(
                                             stream,
                                             buf: Vec::new(),
                                             response: None,
+                                            date: None,
                                             conn_hdr: b"",
                                             progress: [0; 6],
                                             state: READING,
@@ -2468,6 +2621,7 @@ fn serve_explain_persistent_epoll(
                                         stream,
                                         buf: Vec::new(),
                                         response: None,
+                                        date: None,
                                         conn_hdr: b"",
                                         progress: [0; 6],
                                         state: READING,
@@ -2509,11 +2663,12 @@ fn serve_explain_persistent_epoll(
                                 )
                             ) =>
                         {
-                            consecutive_accept_errors += 1;
-                            if consecutive_accept_errors >= 100 {
-                                return Err(error);
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
+                            // Match the thread path: fd/memory exhaustion is
+                            // environmental.  Back off and let success reset
+                            // it; only a genuinely dead listener reaches the
+                            // terminal counter.
+                            std::thread::sleep(Duration::from_millis(accept_backoff_ms));
+                            accept_backoff_ms = (accept_backoff_ms * 2).min(1000);
                             break;
                         }
                         Err(ref error)
@@ -2637,14 +2792,7 @@ fn serve_explain_persistent_epoll(
                 }) else {
                     if eof {
                         close.push(fd);
-                    } else if conn.buf.is_empty() {
-                        // Only an already-served keep-alive slot gets the
-                        // idle budget; a fresh preconnect keeps its shorter
-                        // first-byte deadline.
-                        if conn.served {
-                            conn.deadline = Instant::now() + KEEP_ALIVE_IDLE;
-                        }
-                    } else {
+                    } else if !conn.buf.is_empty() {
                         // First byte seen: the header budget starts now and
                         // is never extended by later reads.
                         let header_deadline = *conn
@@ -2786,12 +2934,19 @@ fn serve_explain_persistent_epoll(
 
             if conn.state == WRITING {
                 let mut finished = false;
+                let date = match conn.date.as_ref() {
+                    Some(date) => std::sync::Arc::clone(date),
+                    None => {
+                        let date = http_date_header();
+                        conn.date = Some(std::sync::Arc::clone(&date));
+                        date
+                    }
+                };
                 match conn.response.as_ref() {
                     None => finished = true,
                     Some(response) => {
                         let head = response.head_parts();
                         let body = response.body().as_bytes();
-                        let date = http_date_header();
                         let lengths = [
                             head[0].len(),
                             head[1].len(),
@@ -2860,6 +3015,7 @@ fn serve_explain_persistent_epoll(
                         conn.header_scan.reset();
                         conn.served = true;
                         conn.response = None;
+                        conn.date = None;
                         conn.progress = [0; 6];
                         conn.state = READING;
                         conn.header_deadline = None;
@@ -2940,11 +3096,15 @@ fn handle_persistent_connection(
         stream.set_read_timeout(Some(budget))?;
         first_request = false;
         let mut too_large = false;
+        let mut malformed = false;
         let Some((line, leftover)) =
-            read_request_line(stream, &[], budget, &mut too_large)
+            read_request_line(stream, &[], budget, &mut too_large, &mut malformed)
         else {
             if too_large {
                 let _ = write_header_too_large(stream);
+                linger_after_half_close(stream);
+            } else if malformed {
+                let _ = write_prepared(stream, bad_request_head(), "");
                 linger_after_half_close(stream);
             }
             return Ok(());
@@ -3018,6 +3178,11 @@ struct ParsedRequestLine<'a> {
 }
 
 /// One-pass request-line grammar: exactly `method target version`, no extras.
+///
+/// Deliberately uses ASCII-whitespace splitting rather than a single-SP
+/// grammar: the loopback one-shot and persistent backends share this parser
+/// and must accept the same bytes. Tightening one backend alone would create
+/// a cross-platform routing difference for `GET\t/E030`.
 fn parse_request_line(line: &str) -> Option<ParsedRequestLine<'_>> {
     let mut parts = line.split_ascii_whitespace();
     let method = parts.next()?;
@@ -3065,6 +3230,7 @@ fn read_request_line(
     prefix: &[u8],
     budget: Duration,
     too_large: &mut bool,
+    malformed: &mut bool,
 ) -> Option<(CompactString, SmallVec<[u8; 512]>)> {
     // A caller may already hold the line prefix from an earlier probe
     // (the 512-byte one-shot read).  Handle a line completed inside it without
@@ -3078,6 +3244,7 @@ fn read_request_line(
         let raw = &prefix[..nl];
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         let Ok(line) = std::str::from_utf8(raw) else {
+            *malformed = true;
             let _ = drain_request(stream, &prefix[nl + 1..], Duration::from_millis(100));
             return None;
         };
@@ -3149,6 +3316,7 @@ fn read_request_line(
                 // Invalid UTF-8 is a malformed request, not a reason to leave
                 // the rest of the request unread (which would RST on close).
                 let Ok(line) = std::str::from_utf8(&line[..]) else {
+                    *malformed = true;
                     let _ = drain_request(stream, &leftover, Duration::from_millis(100));
                     return None;
                 };
@@ -3622,12 +3790,14 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     // map key.  A cache hit sets the referenced bit; eviction sweeps the ring,
     // clearing bits and skipping referenced entries.
     struct Entry {
+        key: CompactString,
         page: std::sync::OnceLock<std::sync::Arc<OwnedPage>>,
         referenced: std::sync::atomic::AtomicBool,
+        live: std::sync::atomic::AtomicBool,
     }
     struct Shard {
         map: rustc_hash::FxHashMap<CompactString, std::sync::Arc<Entry>>,
-        ring: std::collections::VecDeque<CompactString>,
+        ring: std::collections::VecDeque<std::sync::Arc<Entry>>,
     }
     static CACHE: std::sync::OnceLock<Box<[std::sync::Mutex<Shard>]>> =
         std::sync::OnceLock::new();
@@ -3679,36 +3849,54 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         // hand's candidate after two full rotations.
         let mut evicted = false;
         for _ in 0..PER_SHARD_CAP.saturating_mul(2) {
-            let Some(key) = guard.ring.pop_front() else {
+            let Some(entry) = guard.ring.pop_front() else {
                 break;
             };
-            if !guard.map.contains_key(&key) {
+            if !entry.live.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
             }
-            let referenced = guard.map.get(&key).is_some_and(|entry| {
-                entry
-                    .referenced
-                    .swap(false, std::sync::atomic::Ordering::Relaxed)
-            });
-            if referenced {
-                guard.ring.push_back(key);
+            if entry
+                .referenced
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                guard.ring.push_back(entry);
             } else {
-                guard.map.remove(&key);
+                entry
+                    .live
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                if guard
+                    .map
+                    .get(&entry.key)
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry))
+                {
+                    guard.map.remove(&entry.key);
+                }
                 evicted = true;
                 break;
             }
         }
-        if !evicted && let Some(key) = guard.ring.pop_front() {
-            guard.map.remove(&key);
+        if !evicted && let Some(entry) = guard.ring.pop_front() {
+            entry
+                .live
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            if guard
+                .map
+                .get(&entry.key)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry))
+            {
+                guard.map.remove(&entry.key);
+            }
         }
     }
+    let key = CompactString::from(code);
     let entry = std::sync::Arc::new(Entry {
+        key: key.clone(),
         page: std::sync::OnceLock::new(),
         referenced: std::sync::atomic::AtomicBool::new(true),
+        live: std::sync::atomic::AtomicBool::new(true),
     });
-    let key = CompactString::from(code);
-    guard.map.insert(key.clone(), std::sync::Arc::clone(&entry));
-    guard.ring.push_back(key);
+    guard.map.insert(key, std::sync::Arc::clone(&entry));
+    guard.ring.push_back(std::sync::Arc::clone(&entry));
     drop(guard);
     std::sync::Arc::clone(entry.page.get_or_init(|| {
         std::sync::Arc::new(build(code))

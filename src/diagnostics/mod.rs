@@ -212,11 +212,12 @@ impl DiagOpts {
     /// `max_width` likewise for `--width`.  [`term::supports_hyperlinks`]
     /// exists for the renderer-side follow-up that consumes it.
     pub fn detect() -> Self {
+        let caps = term::TermCaps::detect();
         DiagOpts {
-            use_color: term::detect_color(),
-            use_unicode: term::detect_unicode(),
-            max_width: term::detect_width(),
-            color_depth: term::detect_color_depth(),
+            use_color: caps.color,
+            use_unicode: caps.unicode,
+            max_width: caps.width,
+            color_depth: caps.depth,
             tab_width: 4,
             ..Default::default()
         }
@@ -900,7 +901,7 @@ pub struct Diagnostic<'src> {
     /// Multi-span annotations for source-context rendering
     labels: CovariantVec<'src, Label<'src>, 1>,
     /// Zig-style call chain tracing how the error was reached
-    call_chain: Option<CallChain<'src>>,
+    call_chain: Option<std::sync::Arc<CallChain<'src>>>,
     /// Retained source text for `^`-underline rendering.  Borrowed from the
     /// driver's source buffer, so attaching it to every diagnostic in a
     /// compilation costs nothing.
@@ -1024,7 +1025,7 @@ impl<'src> Diagnostic<'src> {
         &self.labels
     }
     pub fn call_chain(&self) -> Option<&CallChain<'src>> {
-        self.call_chain.as_ref()
+        self.call_chain.as_deref()
     }
     pub fn source(&self) -> Option<&str> {
         self.source
@@ -1539,7 +1540,7 @@ impl<'src> Diagnostic<'src> {
 
     /// Attach a call chain (Zig-style `referenced by`).
     pub fn with_call_chain(mut self, chain: CallChain<'src>) -> Self {
-        self.call_chain = Some(chain);
+        self.call_chain = Some(std::sync::Arc::new(chain));
         self
     }
 

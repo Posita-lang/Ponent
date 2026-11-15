@@ -324,6 +324,12 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
     for e in entries {
         let _ = writeln!(rs, "    CodeEntry {{");
         let _ = writeln!(rs, "        code: {:?},", e.code);
+        let b = e.code.as_bytes();
+        let prefix = if b[0] == b'E' { 0 } else { 1 };
+        let n = (b[1] - b'0') as usize * 100
+            + (b[2] - b'0') as usize * 10
+            + (b[3] - b'0') as usize;
+        let _ = writeln!(rs, "        slot: {},", prefix * 1000 + n);
         let _ = writeln!(rs, "        title: {:?},", e.title);
         let _ = writeln!(
             rs,

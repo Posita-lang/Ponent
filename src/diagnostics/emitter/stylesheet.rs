@@ -89,59 +89,41 @@ impl Stylesheet {
     /// copies: a field added to the struct is a compile error in exactly one
     /// place, and the two blocks cannot drift.
     fn css_vars(&self) -> String {
-        // Destructure instead of reading `self.*`: adding a field to
-        // `Stylesheet` then fails to compile here, so a new theme variable
-        // cannot be silently dropped from the emitted CSS.
-        let Stylesheet {
-            bg,
-            fg,
-            diag_bg,
-            border,
-            error_border,
-            error_bg,
-            warning_border,
-            warning_bg,
-            help_border,
-            help_bg,
-            accent,
-            muted,
-            source_fg,
-            suggestion,
-            help_text,
-            highlight_bg,
-            underline,
-            explain_fg,
-            toggle_bg,
-        } = *self;
-        // 19 declarations at ~28 chars each; reserve up front so the `write!`
-        // chain does not grow the buffer.
-        let mut s = String::with_capacity(640);
-        let fields: [(&str, &str); 19] = [
-            ("--bg", bg),
-            ("--fg", fg),
-            ("--diag-bg", diag_bg),
-            ("--border", border),
-            ("--error-border", error_border),
-            ("--error-bg", error_bg),
-            ("--warning-border", warning_border),
-            ("--warning-bg", warning_bg),
-            ("--help-border", help_border),
-            ("--help-bg", help_bg),
-            ("--accent", accent),
-            ("--muted", muted),
-            ("--source-fg", source_fg),
-            ("--suggestion", suggestion),
-            ("--help-text", help_text),
-            ("--highlight-bg", highlight_bg),
-            ("--underline", underline),
-            ("--explain-fg", explain_fg),
-            ("--toggle-bg", toggle_bg),
-        ];
-        use std::fmt::Write as _;
-        for (name, value) in fields {
-            let _ = writeln!(s, "            {name}: {value};");
+        macro_rules! css_vars {
+            ($($field:ident => $name:literal),+ $(,)?) => {{
+                // The pattern has no `..`, so a new `Stylesheet` field is a
+                // compile error here until it is added to this one list.
+                let Stylesheet { $($field,)+ } = *self;
+                // 19 declarations at ~28 chars each; reserve up front.
+                let mut s = String::with_capacity(640);
+                use std::fmt::Write as _;
+                $(
+                    let _ = writeln!(s, "            {}: {};", $name, $field);
+                )+
+                s
+            }};
         }
-        s
+        css_vars!(
+            bg => "--bg",
+            fg => "--fg",
+            diag_bg => "--diag-bg",
+            border => "--border",
+            error_border => "--error-border",
+            error_bg => "--error-bg",
+            warning_border => "--warning-border",
+            warning_bg => "--warning-bg",
+            help_border => "--help-border",
+            help_bg => "--help-bg",
+            accent => "--accent",
+            muted => "--muted",
+            source_fg => "--source-fg",
+            suggestion => "--suggestion",
+            help_text => "--help-text",
+            highlight_bg => "--highlight-bg",
+            underline => "--underline",
+            explain_fg => "--explain-fg",
+            toggle_bg => "--toggle-bg",
+        )
     }
 
     /// Render a standalone `:root` block for this theme — no `html.light`
@@ -151,7 +133,7 @@ impl Stylesheet {
         let mut out = String::with_capacity(700);
         out.push_str(":root {\n");
         out.push_str(&self.css_vars());
-        out.push_str("        }");
+        out.push_str("        }\n");
         out
     }
 
@@ -170,8 +152,14 @@ impl Stylesheet {
             "        }\n        /* ── Light theme (activated by adding .light to <html>) ── */\n        html.light {\n",
         );
         out.push_str(&light.css_vars());
-        out.push_str("        }");
+        out.push_str("        }\n");
         out
+    }
+}
+
+impl Default for Stylesheet {
+    fn default() -> Self {
+        Self::dark()
     }
 }
 

@@ -108,6 +108,13 @@ pub struct FixSet<'src> {
     edits: Vec<FixEdit<'src>>,
 }
 
+#[derive(Default)]
+struct ResolveScratch {
+    p: Vec<usize>,
+    w: Vec<u64>,
+    take: Vec<bool>,
+}
+
 impl<'src> FixSet<'src> {
     /// Collect applicable fixes from `diags`.
     ///
@@ -234,16 +241,24 @@ impl<'src> FixSet<'src> {
             by_file.entry(edit.span.file).or_default().push(edit);
         }
         let mut result = Vec::new();
+        let mut scratch = ResolveScratch::default();
         for (_file, group) in by_file {
-            Self::resolve_file(group, &mut result);
+            let start = result.len();
+            Self::resolve_file(group, &mut result, &mut scratch);
+            // Files are visited in ascending FileId order; only the selected
+            // subset inside one file needs source order.
+            result[start..].sort_by_key(|e| {
+                (e.span.start_as_usize(), e.span.end_as_usize())
+            });
         }
-        result.sort_by_key(|e| {
-            (e.span.file, e.span.start_as_usize(), e.span.end_as_usize())
-        });
         result
     }
 
-    fn resolve_file(mut group: Vec<FixEdit<'src>>, out: &mut Vec<FixEdit<'src>>) {
+    fn resolve_file(
+        mut group: Vec<FixEdit<'src>>,
+        out: &mut Vec<FixEdit<'src>>,
+        scratch: &mut ResolveScratch,
+    ) {
         group.sort_by_key(|e| (e.span.end_as_usize(), e.span.start_as_usize()));
         let n = group.len();
         if n == 0 {
@@ -272,7 +287,9 @@ impl<'src> FixSet<'src> {
         // of cloning its `Cow` payload a second time.
         let mut group: Vec<Option<FixEdit<'src>>> =
             group.into_iter().map(Some).collect();
-        let mut p = vec![0usize; n];
+        scratch.p.clear();
+        scratch.p.resize(n, 0);
+        let p = &mut scratch.p;
         for (i, edit) in group.iter().enumerate() {
             let edit = edit.as_ref().expect("group slot filled");
             p[i] = group[..i].partition_point(|earlier| {
@@ -287,8 +304,12 @@ impl<'src> FixSet<'src> {
         // W[i] = best weight over the first i edits.  On equal weight we
         // exclude the current edit; because `group` is end-sorted, this
         // retains the edit that ends first, then starts first.
-        let mut w = vec![0u64; n + 1];
-        let mut take = vec![false; n + 1];
+        scratch.w.clear();
+        scratch.w.resize(n + 1, 0);
+        scratch.take.clear();
+        scratch.take.resize(n + 1, false);
+        let w = &mut scratch.w;
+        let take = &mut scratch.take;
         for i in 1..=n {
             let weight = applicability_weight(
                 group[i - 1]
@@ -473,6 +494,10 @@ pub fn apply_fixes<'src, 's>(
 ) -> (Cow<'s, str>, usize) {
     let set = FixSet::collect(diags, hints);
     let anchor = set.edits.first().map(|e| e.span.file);
+    debug_assert!(
+        anchor.is_none_or(|f| set.edits.iter().all(|e| e.span.file == f)),
+        "apply_fixes called on a multi-file set; use apply_fixes_for_file",
+    );
     set.apply_filtered_count(source, |e| anchor.is_none_or(|f| e.span.file == f))
 }
 
@@ -505,6 +530,20 @@ mod tests {
             .with_code_str(ErrCode::E030)
             .with_span(span)
             .with_span_suggestion(span, replacement, "apply fix", app)
+    }
+
+    #[test]
+    fn identical_span_prefers_higher_applicability_weight() {
+        let span = Span::new(FileId::DUMMY, 0, 3);
+        let a = diag_with_fix(span, "AAA", Applicability::MaybeIncorrect);
+        let b = diag_with_fix(span, "BBB", Applicability::MachineApplicable);
+        let set = FixSet::collect(&[a, b], FixHints::All);
+        assert_eq!(set.len(), 1);
+        assert_eq!(
+            set.iter().next().unwrap().replacement,
+            "BBB",
+            "higher-weight edit must win"
+        );
     }
 
     #[test]

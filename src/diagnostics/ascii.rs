@@ -78,7 +78,7 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
         // flags itself, so the overall answer is unchanged. Do not "fix" the
         // mask into a per-byte test.
         let v = x ^ DEL;
-        if ((x | x.wrapping_sub(SP)) | (v.wrapping_sub(ONES) & !v)) & HI != 0 {
+        if ((x | x.wrapping_sub(SP)) | (v.wrapping_sub(ONES))) & HI != 0 {
             return false;
         }
         i += 16;
@@ -90,7 +90,7 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
         let v = x ^ DEL64;
-        if ((x | x.wrapping_sub(SP64)) | (v.wrapping_sub(ONES64) & !v)) & HI64 != 0 {
+        if ((x | x.wrapping_sub(SP64)) | (v.wrapping_sub(ONES64))) & HI64 != 0 {
             return false;
         }
         i += 8;
@@ -151,7 +151,7 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
         let x = u128::from_le_bytes(s[i..i + 16].try_into().unwrap());
         // Any byte >= 0x80: not printable, and no per-byte exception exists.
         let q = x ^ DEL;
-        if (x | (q.wrapping_sub(ONES) & !q)) & HI != 0 {
+        if (x | (q.wrapping_sub(ONES))) & HI != 0 {
             return false;
         }
         // Exact `< 0x20` lanes (see the derivation above).
@@ -175,7 +175,7 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
         let q = x ^ DEL64;
-        if (x | (q.wrapping_sub(ONES64) & !q)) & HI64 != 0 {
+        if (x | (q.wrapping_sub(ONES64))) & HI64 != 0 {
             return false;
         }
         let lt20 = !((x | HI64).wrapping_sub(SP64)) & HI64;
@@ -231,7 +231,7 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
         // A high byte is never printable and has no per-byte exception, so
         // reject before paying for the other masks.
         let v = x ^ DEL;
-        if (x | (v.wrapping_sub(ONES) & !v)) & HI != 0 {
+        if (x | (v.wrapping_sub(ONES))) & HI != 0 {
             return false;
         }
         // Exact `< 0x20` lanes (see `is_printable_ascii_multiline`).
@@ -252,7 +252,7 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
         let v = x ^ DEL64;
-        if (x | (v.wrapping_sub(ONES64) & !v)) & HI64 != 0 {
+        if (x | (v.wrapping_sub(ONES64))) & HI64 != 0 {
             return false;
         }
         let lt20 = !((x | HI64).wrapping_sub(SP64)) & HI64;
@@ -316,7 +316,7 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     while i + 16 <= s.len() {
         let x = u128::from_le_bytes(s[i..i + 16].try_into().unwrap());
         let v = x ^ DEL;
-        if (x | (v.wrapping_sub(ONES) & !v)) & HI != 0 {
+        if (x | (v.wrapping_sub(ONES))) & HI != 0 {
             return AsciiClass::Other;
         }
         let lt20 = !((x | HI).wrapping_sub(SP)) & HI;

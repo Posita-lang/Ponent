@@ -318,9 +318,9 @@ impl<'src> DiagCtxt<'src> {
     /// `error_count` + `warning_count` are each a full scan; callers that
     /// need both (summary renderers, tests) can share this single pass
     /// instead of paying two.  `is_error` and `is_warning` are disjoint
-    /// (Fatal/Error vs Warning), so the `else if` is exact.  Note `check`
-    /// still uses `has_errors`, which short-circuits on the first error and
-    /// is therefore strictly cheaper than this full pass.
+    /// (Fatal/Error vs Warning), so the `else if` is exact.  `check` uses the
+    /// O(1) `has_errors` tally; `summary` is also O(1) in release and only
+    /// pays the debug cross-check below.
     ///
     /// In debug builds this additionally performs an O(n) tally/invariant
     /// cross-check; release builds are the O(1) accessor implied above.

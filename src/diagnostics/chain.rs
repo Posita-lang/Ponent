@@ -205,9 +205,11 @@ impl ChainEntryKind {
 #[derive(Debug, Clone)]
 pub struct CallChain<'src> {
     entries: Vec<ChainEntry<'src>>,
+    /// Per-chain memo for [`Self::scan`]; invalidated by [`Self::push`].
+    facts: std::sync::OnceLock<ChainFacts>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct ChainFacts {
     any_spanned: bool,
     entry_count: usize,
@@ -237,16 +239,19 @@ impl<'src> CallChain<'src> {
     pub fn new() -> Self {
         CallChain {
             entries: Vec::new(),
+            facts: std::sync::OnceLock::new(),
         }
     }
 
     pub fn push(&mut self, entry: ChainEntry<'src>) {
         self.entries.push(entry);
+        self.facts = std::sync::OnceLock::new();
     }
 
     pub fn push_call(span: Span, message: impl Into<Cow<'src, str>>) -> Self {
         CallChain {
             entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), message)],
+            facts: std::sync::OnceLock::new(),
         }
     }
 
@@ -268,6 +273,12 @@ impl<'src> CallChain<'src> {
     /// could overflow the stack on a hostile deep chain before the render
     /// cap ever applied.
     fn scan(&self) -> ChainFacts {
+        *self
+            .facts
+            .get_or_init(|| self.compute_facts())
+    }
+
+    fn compute_facts(&self) -> ChainFacts {
         let mut any_spanned = false;
         let mut total = 0usize;
         let mut message_bytes = 0usize;
@@ -287,7 +298,7 @@ impl<'src> CallChain<'src> {
                 .saturating_add(chain.entries.len())
                 .min(MAX_RESERVE_ENTRIES);
             for entry in &chain.entries {
-                any_spanned |= entry.span.is_some();
+                any_spanned = any_spanned || entry.span.is_some();
                 message_bytes = message_bytes
                     .saturating_add(entry.message.len())
                     .min(MAX_RESERVE_MESSAGE_BYTES);
@@ -319,6 +330,12 @@ impl<'src> CallChain<'src> {
     /// When `source` is provided, entries carrying a span are rendered with
     /// their `file:line:col` location (matching the example above); otherwise
     /// the entry's [`ChainEntryKind`] label is shown instead.
+    ///
+    /// # Same-file assumption
+    ///
+    /// Every spanned entry must belong to `source`'s file; foreign-file spans
+    /// would be located against the wrong line index.  Use
+    /// [`Self::render_into`] with an explicit anchor for mixed chains.
     pub fn render(&self, use_color: bool, source: Option<&str>, file_name: &str) -> String {
         self.render_with_index(
             use_color,
@@ -334,6 +351,8 @@ impl<'src> CallChain<'src> {
     /// `source` (the emitter's per-batch cache) instead of rescanning the file
     /// once per entry via `byte_to_linecol`, and wraps long entry messages to
     /// `max_width` display columns using `tab_width`-column tab stops.
+    ///
+    /// Inherits [`Self::render`]'s same-file assumption.
     pub(crate) fn render_with_index(
         &self,
         use_color: bool,
@@ -463,7 +482,7 @@ impl<'src> CallChain<'src> {
             // control byte.  A custom `RenderCtx::file_url` can violate the
             // upstream contracts, so degrade to plain text here.  Validating
             // once per chain also removes a per-entry byte scan.
-            if candidate.chars().any(char::is_control) {
+            if !candidate.is_ascii() || candidate.bytes().any(|b| b.is_ascii_control()) {
                 None
             } else {
                 Some(candidate)
@@ -493,6 +512,19 @@ impl<'src> CallChain<'src> {
             out,
             &capped,
         );
+    }
+
+    fn ascii_tabbed_width(s: &str, start_col: usize, tab_width: usize) -> usize {
+        let tab_width = tab_width.max(1);
+        let mut col = start_col;
+        for &b in s.as_bytes() {
+            if b == b'\t' {
+                col += tab_width - (col % tab_width);
+            } else {
+                col += 1;
+            }
+        }
+        col - start_col
     }
 
     fn expand_message_tabs<'a>(
@@ -610,22 +642,25 @@ impl<'src> CallChain<'src> {
             // line of a long message.
             // C3: dominant-case fast path — a short printable-ASCII message
             // that fits on one line needs no `wrap_optimal` and no `Vec`.
-            // The ASCII gate is load-bearing: it makes the multiline
-            // sanitizer the identity (one display cell per byte) and excludes
-            // `\t`/`\n`, so byte length == display width.
-            if class == super::ascii::AsciiClass::Printable
-                && !message.is_empty()
-                // The `is_printable_ascii` gate above proves the message has
-                // no tab/newline and no byte outside 0x20..=0x7E, so the only
-                // possible whitespace is `' '`.
-                // #1: the slow `wrap_optimal` trims edge spaces; a short
-                // `"  foo  "` must render identically, so the fast path
-                // declines when an edge space is present (byte checks are
-                // exact for the printable-ASCII gate above).
-                && !message.starts_with(' ')
-                && !message.ends_with(' ')
-                && message.len() + indent_cols + suffix_cols <= max_width
-            {
+            // `PrintableOrTab` extends the same path to tab-indented single
+            // lines; tabs are measured from the real indent column.
+            let fast_width = match class {
+                super::ascii::AsciiClass::Printable => Some(message.len()),
+                super::ascii::AsciiClass::PrintableOrTab => Some(Self::ascii_tabbed_width(
+                    message.as_ref(),
+                    indent_cols,
+                    tab_width,
+                )),
+                super::ascii::AsciiClass::Other => None,
+            };
+            if fast_width.is_some_and(|width| {
+                !message.is_empty()
+                    // `wrap_optimal` trims edge spaces; decline so the fast
+                    // path cannot diverge on `"  foo  "`.
+                    && !message.starts_with(' ')
+                    && !message.ends_with(' ')
+                    && width + indent_cols + suffix_cols <= max_width
+            }) {
                 super::renderers::fmt::push_spaces(out, indent_cols);
                 out.push_str(color_on);
                 out.push_str(message.as_ref());
@@ -703,6 +738,35 @@ mod tests {
         let entry_line = out.lines().nth(1).expect("entry line");
         assert!(entry_line.starts_with("    "), "out: {out}");
         assert!(entry_line.contains("called from here"), "out: {out}");
+    }
+
+    #[test]
+    fn tab_fast_path_matches_wrap_for_tabbed_message() {
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(ChainEntryKind::Call, None, "a\tb"));
+        let out = chain.render_with_index(false, None, "", None, 40, 4);
+        assert!(out.lines().nth(1).unwrap().contains("a\tb"), "out: {out}");
+        let wrapped = crate::diagnostics::wrap::wrap_optimal("a\tb", 36, 4);
+        assert_eq!(wrapped.as_slice(), [Cow::Borrowed("a\tb")]);
+    }
+
+    #[test]
+    fn internal_double_spaces_match_wrap_fast_path() {
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(ChainEntryKind::Call, None, "a  b"));
+        let out = chain.render_with_index(false, None, "", None, 40, 4);
+        assert!(out.lines().nth(1).unwrap().contains("a  b"), "out: {out}");
+        let wrapped = crate::diagnostics::wrap::wrap_optimal("a  b", 36, 4);
+        assert_eq!(wrapped.as_slice(), [Cow::Borrowed("a  b")]);
+    }
+
+    #[test]
+    fn edge_spaces_decline_fast_path_without_changing_text() {
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(ChainEntryKind::Call, None, "  foo  "));
+        let out = chain.render_with_index(false, None, "", None, 40, 4);
+        let line = out.lines().nth(1).expect("entry line");
+        assert!(line.trim_start().starts_with("foo"), "out: {out}");
     }
 
     #[test]
@@ -869,6 +933,7 @@ mod tests {
         let span = Span::new(FileId::DUMMY, 0, 3);
         let mut inner = CallChain {
             entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")],
+            ..CallChain::new()
         };
         // Single-character messages: at depth ≥ 64 the indent exceeds the
         // measure, and a multi-character word would be split one grapheme per
@@ -878,6 +943,7 @@ mod tests {
                 .with_children(vec![inner]);
             inner = CallChain {
                 entries: vec![entry],
+                ..CallChain::new()
             };
         }
         let out = inner.render(false, Some("def main() {}"), "f.ps");
@@ -897,6 +963,7 @@ mod tests {
         let span = Span::new(FileId::DUMMY, 0, 3);
         let leaf = || CallChain {
             entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")],
+            ..CallChain::new()
         };
         // Two identical linear branches that both cross the cap.  The old
         // recursion emitted one `...` per branch; the contract is one marker
@@ -907,6 +974,7 @@ mod tests {
                 chain = CallChain {
                     entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")
                         .with_children(vec![chain])],
+                    ..CallChain::new()
                 };
             }
             chain
@@ -914,6 +982,7 @@ mod tests {
         let branch = CallChain {
             entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "root")
                 .with_children(vec![deep(), deep()])],
+            ..CallChain::new()
         };
         let out = branch.render(false, Some("def main() {}"), "f.ps");
         assert_eq!(
@@ -935,6 +1004,7 @@ mod tests {
                 Some(Span::new(FileId::DUMMY, 0, 3)),
                 "leaf",
             )],
+            ..CallChain::new()
         };
         let parent = ChainEntry::new(
             ChainEntryKind::Call,
@@ -944,6 +1014,7 @@ mod tests {
         .with_children(vec![leaf]);
         let chain = CallChain {
             entries: vec![parent],
+            ..CallChain::new()
         };
         let out = chain.render(false, Some("def main() {}"), "f.ps");
         let parent_line = out.lines().find(|l| l.contains("parent")).unwrap();
