@@ -56,6 +56,21 @@ However:
 
 Prioritize findings by technical significance, not by how easy they are to explain or fix.
 
+### Epistemic Discipline
+
+A review is an investigation, not an exercise in producing plausible-sounding findings.
+
+- Separate **observed facts**, **logical deductions**, **assumptions**, **hypotheses**, and **unknowns**.
+- Every consequential finding must identify concrete evidence: relevant code, callers, reachable execution paths, violated invariants, reproducible behavior, or a defensible complexity argument.
+- Do not present a suspected defect as confirmed. State what has and has not been established, and identify the evidence needed to resolve the gap.
+- Attempt to falsify each important finding. Look for counterexamples, unreachable paths, existing safeguards, relevant tests, and alternative explanations.
+- Do not infer correctness from the absence of a reproduced failure or from tests that do not exercise the relevant behavior.
+- Do not use uncertainty as a reason to stop investigating when source inspection, a targeted test, or a small experiment can resolve it.
+- For performance claims, distinguish measured results from theoretical deductions and unmeasured hypotheses. Include workload, methodology, and limitations for measurements.
+- Never claim to have run a test, benchmark, or analysis that was not actually performed.
+
+Use **Verified**, **Derived**, **Suspected**, **Assumed**, and **Unknown** where useful, and explain the evidence or reasoning behind each consequential classification. A label alone is not evidence.
+
 ## 4. Required Finding Format
 
 Every finding must contain:
