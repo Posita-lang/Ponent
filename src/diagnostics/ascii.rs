@@ -1061,6 +1061,21 @@ mod tests {
     fn ref_tab(s: &[u8]) -> bool {
         s.iter().all(|&b| b == 0x09 || (0x20..=0x7E).contains(&b))
     }
+    fn ref_classify(s: &[u8]) -> AsciiClass {
+        let mut tab = false;
+        for &b in s {
+            if b == b'\t' {
+                tab = true;
+            } else if !(0x20..=0x7E).contains(&b) {
+                return AsciiClass::Other;
+            }
+        }
+        if tab {
+            AsciiClass::PrintableOrTab
+        } else {
+            AsciiClass::Printable
+        }
+    }
 
     /// Deterministic LCG: covers every byte value and every length 0..=40,
     /// so both the SWAR body and the ≤7-byte tail are exercised.
@@ -1085,6 +1100,74 @@ mod tests {
                 ref_tab(&bytes),
                 "{bytes:?}"
             );
+        }
+    }
+
+    #[test]
+    fn forced_swar_covers_all_u128_lanes_and_bytes() {
+        SWAR_FORCED.with(|f| f.set(true));
+        for lane in 0..16 {
+            for value in 0..=255u8 {
+                let mut v = [b'a'; 16];
+                v[lane] = value;
+                assert_eq!(
+                    is_printable_ascii(&v),
+                    ref_single(&v),
+                    "single lane {lane} byte {value:#04x}"
+                );
+                assert_eq!(
+                    is_printable_ascii_multiline(&v),
+                    ref_multi(&v),
+                    "multi lane {lane} byte {value:#04x}"
+                );
+                assert_eq!(
+                    is_printable_ascii_or_tab(&v),
+                    ref_tab(&v),
+                    "tab lane {lane} byte {value:#04x}"
+                );
+                assert_eq!(
+                    classify_ascii(&v),
+                    ref_classify(&v),
+                    "class lane {lane} byte {value:#04x}"
+                );
+            }
+        }
+        SWAR_FORCED.with(|f| f.set(false));
+    }
+
+    #[test]
+    fn classify_ascii_matches_predicates_on_random_bytes() {
+        let mut seed = 0xA5A5_1234_9ABC_DEF0u64;
+        for _ in 0..5000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(11);
+            let len = (seed % 97) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(11);
+                    (seed & 0xFF) as u8
+                })
+                .collect();
+            let class = classify_ascii(&bytes);
+            let single = is_printable_ascii(&bytes);
+            let tab = is_printable_ascii_or_tab(&bytes);
+            let multi = is_printable_ascii_multiline(&bytes);
+            assert_eq!(class == AsciiClass::Printable, single, "{bytes:?}");
+            assert_eq!(
+                class == AsciiClass::PrintableOrTab,
+                tab && !single,
+                "{bytes:?}"
+            );
+            assert_eq!(class == AsciiClass::Other, !tab, "{bytes:?}");
+            assert_eq!(class == AsciiClass::Other, !multi, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn next_non_ascii_covers_all_offsets_through_256() {
+        for at in 0..=256 {
+            let mut v = vec![b'a'; 320];
+            v[at] = 0xC3;
+            assert_eq!(next_non_ascii_byte(&v), Some(at), "offset {at}");
         }
     }
 

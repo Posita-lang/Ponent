@@ -357,8 +357,8 @@ fn check_msg(f: Fam, site: &'static str) -> Option<String> {
     held_with(|h| {
         // Fast path: `check` runs on EVERY registered lock acquisition, and
         // the overwhelmingly common state is nothing held at all — skip the
-        // 12-cell row scan when the vector is empty.  (A u32 bitmask with
-        // `trailing_zeros` iteration would also work; FAMS=12 fits, but the
+        // 13-cell row scan when the vector is empty.  (A u32 bitmask with
+        // `trailing_zeros` iteration would also work; FAMS=13 fits, but the
         // zero-skip keeps the code uniform and the scan is already cheap.)
         if h.iter().all(|&n| n == 0) {
             return None;

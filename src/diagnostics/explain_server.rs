@@ -428,8 +428,11 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                             let _ = std::thread::Builder::new()
                             .stack_size(64 * 1024)
                             .spawn_scoped(scope, move || {
-                                let _ = stream.set_nonblocking(false);
-                                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                                if stream.set_nonblocking(false).is_err() {
+                                let _ = stream.shutdown(Shutdown::Both);
+                                return;
+                            }
+                            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
                                 let _ = write_header_too_large(&mut stream);
                                 linger_after_half_close(&mut stream);
                             });
@@ -776,6 +779,11 @@ fn scan_framing(headers: &[u8]) -> HeaderFraming {
             continue;
         };
         let name_raw = &line[..colon];
+        if name_raw.first().is_some_and(|&b| b == b' ' || b == b'\t') {
+            // RFC 7230 §3.2.4 forbids leading whitespace (obsolete line fold).
+            framing.ambiguous = true;
+            continue;
+        }
         if name_raw
             .last()
             .is_some_and(|&b| b == b' ' || b == b'\t')
@@ -2745,7 +2753,13 @@ fn serve_explain_persistent_epoll(
                 let mut header_progress = HeaderProgress::Incomplete;
                 loop {
                     let mut chunk = [0u8; 8192];
-                    match conn.stream.read(&mut chunk) {
+                    let cap = MAX_HEADER + 8192;
+                    let want = cap.saturating_sub(conn.buf.len()).min(chunk.len());
+                    if want == 0 {
+                        header_progress = HeaderProgress::TooLargeHeader;
+                        break;
+                    }
+                    match conn.stream.read(&mut chunk[..want]) {
                         Ok(0) => {
                             eof = true;
                             break;
@@ -3073,6 +3087,9 @@ fn handle_persistent_connection(
     stream: &mut TcpStream,
     served: &AtomicUsize,
 ) -> std::io::Result<()> {
+    // Accepted sockets inherit O_NONBLOCK on some BSD/macOS listeners; the
+    // blocking handler plus read/write timeouts is the intended regime.
+    stream.set_nonblocking(false)?;
     let _ = stream.set_nodelay(true);
     // A client that stops reading must not wedge `write_all` on a full
     // socket buffer; the response is a few KB, well under one write, but a
@@ -3274,6 +3291,9 @@ fn read_request_line(
         }
         let n = {
             if arm_read_timeout_until(stream, deadline).is_err() {
+                if !line.is_empty() {
+                    let _ = drain_request(stream, &[], Duration::from_millis(100));
+                }
                 return None;
             }
             match stream.read(&mut buf) {
@@ -3737,7 +3757,11 @@ fn build_not_found_page(code: &str) -> String {
     // O5: filter control characters and escape HTML in one pass straight into
     // the destination — no intermediate `sanitized` String and no collected
     // positions for this untrusted-input path.
-    write_html_escaped_filtered(&mut out, code);
+    let echo = match code.char_indices().nth(256) {
+        Some((cut, _)) => std::borrow::Cow::Owned(format!("{}…", &code[..cut])),
+        None => std::borrow::Cow::Borrowed(code),
+    };
+    write_html_escaped_filtered(&mut out, &echo);
     out.push_str(
         "</code> is registered.</p>\n\
          <p><a href=\"/\">Back to the index</a></p>\n\
@@ -3809,10 +3833,8 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
             body: std::sync::Arc::from(body),
         }
     };
-    // L5: over-long keys are built inline and never admitted.
-    if code.len() > 128 {
-        return std::sync::Arc::new(build(code));
-    }
+    // Over-long keys are bounded in the body and still admitted; the cache cap
+    // bounds entry count, and the reflected key is truncated to 256 chars.
     let shards = CACHE.get_or_init(|| {
         (0..SHARDS)
             .map(|_| {

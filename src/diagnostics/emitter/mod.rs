@@ -210,7 +210,9 @@ impl FilesSeen {
                 }
             }
             FilesSeenInner::Large { seen, names } => {
-                let _ = seen.shift_remove(&old);
+                // Order is irrelevant: `last` is reassigned from `insert_full` and
+                // no consumer iterates `seen` in order (only `len`/`get_index`).
+                let _ = seen.swap_remove(&old);
                 last_index = seen.insert_full(FileKey::Id(id)).0;
                 names.anon.remove(name);
                 names.claimed.insert(CompactString::from(name));
@@ -481,7 +483,8 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     ///
     /// Note: `max_errors` is a *batch* budget — [`Self::emit`] enforces no
     /// cross-call limit, so an LSP-style loop must track its own if it needs
-    /// one.
+    /// one.  Unlike the batch paths, a `humanize` panic here propagates; only
+    /// `Renderer::render_into` panics are converted to the placeholder.
     pub fn emit(&mut self, diag: &mut Diagnostic<'_>) -> io::Result<()> {
         if !self.filter.matches(diag) {
             return Ok(());
@@ -496,7 +499,6 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let mut buf = self.shared.render_buf.borrow_mut();
         buf.clear();
         let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            diag.humanize();
             self.renderer.render_into(diag, &cx, &mut buf);
         }));
         if rendered.is_err() {
@@ -1361,16 +1363,22 @@ mod tests {
     }
 
     #[test]
-    fn files_seen_anonymous_name_claimed_by_one_id_then_another_counts_two() {
+#[test]
+    fn files_seen_large_spill_preserves_last_and_claim() {
         let mut seen = FilesSeen::new();
-        seen.insert("module.rs", None);
-        seen.insert("module.rs", Some(FileId::from_raw(1)));
-        assert_eq!(seen.len(), 1, "anonymous name should merge with first id");
-        seen.insert("module.rs", Some(FileId::from_raw(2)));
-        assert_eq!(
-            seen.len(),
-            2,
-            "the anonymous entry was consumed by Id(1); Id(2) is a second file"
-        );
+        for i in 1..=6u32 {
+            seen.insert(&format!("f{i}.rs"), Some(FileId::from_raw(i)));
+        }
+        assert_eq!(seen.len(), 6);
+        // `last` memo must still hit after the Small→Large spill.
+        seen.insert("f6.rs", Some(FileId::from_raw(6)));
+        assert_eq!(seen.len(), 6);
+        seen.insert("f3.rs", Some(FileId::from_raw(3)));
+        assert_eq!(seen.len(), 6);
+        // Anonymous entry spilled first, then claimed by a real id.
+        seen.insert("anon.rs", None);
+        assert_eq!(seen.len(), 7);
+        seen.insert("anon.rs", Some(FileId::from_raw(7)));
+        assert_eq!(seen.len(), 7, "wrong span-less claim in Large mode");
     }
 }

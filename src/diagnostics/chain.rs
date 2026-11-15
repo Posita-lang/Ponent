@@ -172,16 +172,17 @@ impl ChainEntryKind {
     /// skipping the `Cow` wrapper.  The underlying `cached_label_static!`
     /// table is the sole cache; `as_str` delegates here so only one
     /// `OnceLock<[String; N]>` is instantiated per `(type, lang)`.
-    pub fn as_static_str(&self) -> &'static str {
-        // Explicit variant → index mapping: `*self as usize` would silently
-        // swap labels if the enum were ever reordered; a match arms the
-        // reorder into a non-exhaustive compile error instead.
-        let idx = match self {
+    const fn index(self) -> usize {
+        match self {
             ChainEntryKind::Call => 0,
             ChainEntryKind::Inlined => 1,
             ChainEntryKind::Reference => 2,
             ChainEntryKind::Defines => 3,
-        };
+        }
+    }
+
+    pub fn as_static_str(&self) -> &'static str {
+        let idx = self.index();
         cached_label_static! {
             n = 4,
             variant = idx,
@@ -206,12 +207,7 @@ impl ChainEntryKind {
                 visible_width(ChainEntryKind::Defines.as_static_str()),
             ]
         });
-        let idx = match self {
-            ChainEntryKind::Call => 0,
-            ChainEntryKind::Inlined => 1,
-            ChainEntryKind::Reference => 2,
-            ChainEntryKind::Defines => 3,
-        };
+        let idx = self.index();
         widths[idx]
     }
 }
@@ -235,6 +231,7 @@ struct ChainFacts {
     any_spanned: bool,
     entry_count: usize,
     message_bytes: usize,
+    indent_bytes: usize,
 }
 
 /// Read-only per-chain invariants threaded through the recursive entry walk.
@@ -301,8 +298,8 @@ impl<'src> CallChain<'src> {
 
     fn compute_facts(&self) -> ChainFacts {
         let mut any_spanned = false;
-        let mut total = 0usize;
         let mut message_bytes = 0usize;
+        let mut indent_bytes = 0usize;
         let mut visited = 0usize;
         let mut stack: SmallVec<[(&CallChain<'src>, usize); 8]> = SmallVec::new();
         stack.push((self, 0));
@@ -310,7 +307,7 @@ impl<'src> CallChain<'src> {
             if depth > MAX_CHAIN_DEPTH {
                 continue;
             }
-            if total >= MAX_RESERVE_ENTRIES && message_bytes >= MAX_RESERVE_MESSAGE_BYTES {
+            if visited >= MAX_RESERVE_ENTRIES && message_bytes >= MAX_RESERVE_MESSAGE_BYTES {
                 break;
             }
             for entry in &chain.entries {
@@ -318,6 +315,9 @@ impl<'src> CallChain<'src> {
                     break 'outer;
                 }
                 visited += 1;
+                indent_bytes = indent_bytes
+                    .saturating_add(4 + depth * 4)
+                    .min(MAX_RESERVE_MESSAGE_BYTES);
                 any_spanned = any_spanned || entry.span.is_some();
                 message_bytes = message_bytes
                     .saturating_add(entry.message.len())
@@ -329,11 +329,11 @@ impl<'src> CallChain<'src> {
                 }
             }
         }
-        total = visited;
         ChainFacts {
             any_spanned,
-            entry_count: total,
+            entry_count: visited,
             message_bytes,
+            indent_bytes,
         }
     }
 
@@ -392,7 +392,8 @@ impl<'src> CallChain<'src> {
         // entry is a deliberate over-estimate to avoid reallocation on the
         // coloured path.
         let facts = self.scan();
-        let mut out = String::with_capacity(64 + facts.message_bytes + facts.entry_count * 64);
+        let mut out =
+            String::with_capacity(64 + facts.message_bytes + facts.indent_bytes + facts.entry_count * 64);
         self.render_into_with_facts(
             use_color, source, file_name, idx, max_width, tab_width, None, None, facts, &mut out,
         );
@@ -502,7 +503,7 @@ impl<'src> CallChain<'src> {
             // control byte.  A custom `RenderCtx::file_url` can violate the
             // upstream contracts, so degrade to plain text here.  Validating
             // once per chain also removes a per-entry byte scan.
-            if !candidate.is_ascii() || candidate.bytes().any(|b| b.is_ascii_control()) {
+            if candidate.bytes().any(|b| b.is_ascii_control() || b >= 0x80) {
                 None
             } else {
                 Some(candidate)
@@ -720,11 +721,16 @@ impl<'src> CallChain<'src> {
                 if narrow < avail_full
                     && let Some(last_seg) = segs.pop()
                 {
-                    let overflow = super::glyph::visible_width_with_tab(
-                        last_seg.as_ref(),
-                        tab_width,
-                    ) + suffix_cols
-                        > avail_full;
+                    let last_width = match class {
+                        super::ascii::AsciiClass::Printable => last_seg.as_ref().len(),
+                        super::ascii::AsciiClass::PrintableOrTab => {
+                            Self::ascii_tabbed_width(last_seg.as_ref(), indent_cols, tab_width)
+                        }
+                        super::ascii::AsciiClass::Other => {
+                            super::glyph::visible_width_with_tab(last_seg.as_ref(), tab_width)
+                        }
+                    };
+                    let overflow = last_width + suffix_cols > avail_full;
                     if overflow {
                         last_text = last_seg.into_owned();
                         let reparsed = super::wrap::wrap_optimal(&last_text, narrow, tab_width);

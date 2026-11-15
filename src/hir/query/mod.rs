@@ -1629,17 +1629,23 @@ where
         // wide `ADMIT_SAMPLE_COUNTER` is only the fallback for a thread that
         // has not touched this cache's stat slot yet (the cold path
         // registers it a moment later anyway).
-        let n = STAT_SLOTS.with(|m| {
-            let m = m.borrow();
-            match m.get(&self.arena_id) {
-                Some(slot) => slot.admit_sample.fetch_add(1, Ordering::Relaxed),
-                None => ADMIT_SAMPLE_COUNTER.with(|c| {
-                    let n = c.get();
-                    c.set(n.wrapping_add(1));
-                    n
-                }),
-            }
-        });
+        let n = if let Some(n) = self
+            .with_last_stat(|slot| slot.admit_sample.fetch_add(1, Ordering::Relaxed))
+        {
+            n
+        } else {
+            STAT_SLOTS.with(|m| {
+                let m = m.borrow();
+                match m.get(&self.arena_id) {
+                    Some(slot) => slot.admit_sample.fetch_add(1, Ordering::Relaxed),
+                    None => ADMIT_SAMPLE_COUNTER.with(|c| {
+                        let n = c.get();
+                        c.set(n.wrapping_add(1));
+                        n
+                    }),
+                }
+            })
+        };
         if n % ADMIT_SAMPLE_PERIOD != 0 {
             return;
         }
@@ -2607,6 +2613,11 @@ where
             let out = match shard.map.get(key).copied() {
                 Some(idx) => {
                     let slot = &shard.slots[idx as usize];
+                    assert_ne!(
+                        slot.node,
+                        dep_graph::DepNodeIndex(0),
+                        "value-cache and tracked surfaces mixed on one DefaultCache instance"
+                    );
                     if let Some(v) = &slot.value {
                         // C1: capture BEFORE the value clone (see the trait
                         // method's doc).  Only captured on a value-returning
@@ -2687,6 +2698,11 @@ where
             }
             let out = {
                 let slot = &shard.slots[idx as usize];
+                assert_ne!(
+                    slot.node,
+                    dep_graph::DepNodeIndex(0),
+                    "value-cache and tracked surfaces mixed on one DefaultCache instance"
+                );
                 if let Some(v) = &slot.value {
                     let epoch = capture(slot.node);
                     let keep = green(slot.node);
@@ -2799,6 +2815,13 @@ where
         // re-allocating one.  One shard lock at a time
         // (DepGraph::reset discipline); payloads drop after ALL locks
         // release.
+        //
+        // The sketch/aging reset below runs after every shard lock is
+        // released, and `staged_global` is snapshotted per shard.  A stage
+        // landing in either window can lose its sketch bump or be briefly
+        // under-reported by `len()`; both are admission/accounting-only and
+        // self-correcting (the same window `DefIdCache::staged.store(0)`
+        // documents).
         let mut dropped: Vec<V> = Vec::new();
         for (s, shard_lock) in self.shards.iter().enumerate() {
             // One shard lock at a time (DepGraph::reset discipline).
@@ -3757,7 +3780,7 @@ fn erase_value<'q, 'src, Q: Query<'q, 'src>>(provided: Q::Value) -> Stored<'q, '
     let erased = <Q::Storage as Erasable<'q, Q::Value>>::provided_to_erased(provided);
     #[cfg(debug_assertions)]
     if <Q::Storage as Erasable<'q, Q::Value>>::IS_ARENA {
-        note_arena_orphan(std::mem::size_of::<Q::Value>());
+        note_arena_orphan(<Q::Storage as Erasable<'q, Q::Value>>::ORPHAN_FOOTPRINT);
     }
     erased
 }
@@ -4415,6 +4438,7 @@ fn probe<'src, 'q, Q: Query<'q, 'src>, S: Scheduler>(
         .cache
         .as_ref()
         .expect("untracked query reached the tracked probe path");
+    let eval_always = vtable.descriptor.eval_always;
     // Reuse the cache's green verdict when it consulted one (a red value
     // is then already suppressed), so the check is not repeated here.
     let mut probed_green: Option<bool> = None;
@@ -4458,12 +4482,18 @@ fn probe<'src, 'q, Q: Query<'q, 'src>, S: Scheduler>(
         // critical section, but `epoch_of` only takes the dep-side TLS
         // snapshot — never a cache shard lock — so no cross-family lock is
         // acquired; contract 3 holds).
-        &mut |node| dep_graph.epoch_of(node),
+        &mut |node| {
+            if eval_always {
+                0
+            } else {
+                dep_graph.epoch_of(node)
+            }
+        },
         // Green check inside the cache's critical section, BEFORE the
         // value clone: a red node's value is never served, so the clone is
         // skipped.  The verdict is cached for the caller.
         &mut |node| {
-            let g = dep_graph.is_green(node);
+            let g = !eval_always && dep_graph.is_green(node);
             probed_green = Some(g);
             g
         },

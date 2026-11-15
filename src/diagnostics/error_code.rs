@@ -390,9 +390,13 @@ impl fmt::Debug for ErrCode {
 /// stay uniform and the explain server's error paths can use it directly.
 impl fmt::Display for ErrCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `code()` is verbatim for untrusted `unknown` inputs; any `{}` sink
-        // may be a terminal, so neutralize C0/C1/DEL before writing.
-        f.write_str(&super::sanitize_for_terminal(self.code()))
+        // Registry codes are validated printable ASCII; only untrusted
+        // `unknown` spellings need the control-byte scan/allocation.
+        if self.is_known() {
+            f.write_str(self.code())
+        } else {
+            f.write_str(&super::sanitize_for_terminal(self.code()))
+        }
     }
 }
 
@@ -930,6 +934,12 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     }
 
     #[test]
+    fn display_known_code_is_verbatim() {
+        assert_eq!(format!("{}", ErrCode::new("E030")), "E030");
+        assert_eq!(format!("{}", ErrCode::new("e030")), "E030");
+    }
+
+    #[test]
     fn display_sanitizes_untrusted_code() {
         let ec = ErrCode::unknown("E0\x1b]8;;evil\x07");
         let out = format!("{ec}");
@@ -1363,16 +1373,19 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             if let Some(q) = ch_quote {
                 let mut j = q + 1;
                 if j < bytes.len() && bytes[j] == b'\\' {
-                    j += 2;
-                    if j - 1 < bytes.len()
-                        && bytes[j - 1] == b'u'
-                        && j < bytes.len()
-                        && bytes[j] == b'{'
-                    {
-                        while j < bytes.len() && bytes[j] != b'}' {
-                            j += 1;
+                    j += 1;
+                    if j < bytes.len() {
+                        match bytes[j] {
+                            b'x' => j = (j + 3).min(bytes.len()),
+                            b'u' if j + 1 < bytes.len() && bytes[j + 1] == b'{' => {
+                                j += 2;
+                                while j < bytes.len() && bytes[j] != b'}' {
+                                    j += 1;
+                                }
+                                j = (j + 1).min(bytes.len());
+                            }
+                            _ => j += 1,
                         }
-                        j += 1;
                     }
                 } else if j < bytes.len() {
                     let c = src[j..].chars().next().unwrap();
@@ -1412,9 +1425,9 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     }
 
     /// Every literal code passed to `ErrCode::new` / `with_code_str` must be
-    /// present in [`CODE_TABLE`].  A missing entry would `debug_assert!`-panic
-    /// (`ErrCode::new`) or silently degrade to "unknown error"
-    /// (`with_code_str`).  Scans the crate source, including the conditional
+    /// present in [`CODE_TABLE`].  A missing entry silently degrades to
+    /// "unknown error" in both `ErrCode::new` and `with_code_str`; this test is
+    /// the sole guard.  Scans the crate source, including conditional
     /// forms like `with_code_str(if … { "E109" } else { "E110" })`.
     #[test]
     fn literal_codes_are_all_in_code_table() {
@@ -1552,6 +1565,7 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let s = "with_code_str(\"E903\")";
             let r = r#"ErrCode::new("E904")"#;
             let c = '"';
+            let h = '\x41';
             let lt: &'static str = "ok";
             let real = Diagnostic::error(m).with_code_str("E030");
         "##;

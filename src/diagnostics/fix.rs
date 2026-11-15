@@ -375,6 +375,7 @@ impl<'src> FixSet<'src> {
     /// never meant to touch (the `start < last` guard below catches only the
     /// accidental overlaps, not the wrong-file ones that happen to land in
     /// order).
+    #[must_use = "apply returns the rewritten source; write it out or the fix is lost"]
     pub fn apply<'s>(&self, source: &'s str) -> Cow<'s, str> {
         // Anchor on the first edit's file and apply only that file's edits.
         // A multi-file set must never splice another file's byte offsets into
@@ -402,8 +403,30 @@ impl<'src> FixSet<'src> {
     /// A file with no matching edits borrows `source` unchanged — the
     /// filter runs in one pass and no per-file `FixSet` (nor a clone of its
     /// edits) is materialized.
+    #[must_use = "apply_for_file returns the rewritten source; write it out or the fix is lost"]
     pub fn apply_for_file<'s>(&self, source: &'s str, file: FileId) -> Cow<'s, str> {
         self.apply_filtered(source, |e| e.span.file == file)
+    }
+
+    /// [`Self::apply`] plus the number of edits that actually spliced.
+    #[must_use = "apply_counted returns the rewritten source and count"]
+    pub fn apply_counted<'s>(&self, source: &'s str) -> (Cow<'s, str>, usize) {
+        let anchor = self.edits.first().map(|e| e.span.file);
+        debug_assert!(
+            anchor.is_none_or(|f| self.edits.iter().all(|e| e.span.file == f)),
+            "FixSet::apply_counted called on a multi-file set; use apply_for_file_counted",
+        );
+        self.apply_filtered_count(source, |e| anchor.is_none_or(|f| e.span.file == f))
+    }
+
+    /// [`Self::apply_for_file`] plus the number of edits that actually spliced.
+    #[must_use = "apply_for_file_counted returns the rewritten source and count"]
+    pub fn apply_for_file_counted<'s>(
+        &self,
+        source: &'s str,
+        file: FileId,
+    ) -> (Cow<'s, str>, usize) {
+        self.apply_filtered_count(source, |e| e.span.file == file)
     }
 
     /// The single-file forward pass shared by [`Self::apply`] and
@@ -735,21 +758,32 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_edits_apply_in_reverse_source_order() {
+    fn disjoint_edits_apply_regardless_of_collection_order() {
         let src = "aaa bbb ccc";
-        let d1 = diag_with_fix(
-            Span::new(FileId::DUMMY, 0, 3),
-            "XXX",
-            Applicability::MachineApplicable,
-        );
-        let d2 = diag_with_fix(
-            Span::new(FileId::DUMMY, 8, 11),
-            "ZZZ",
-            Applicability::MachineApplicable,
-        );
-        let set = FixSet::collect(&[d1, d2], FixHints::Auto);
-        assert_eq!(set.len(), 2);
-        assert_eq!(set.apply(src), "XXX bbb ZZZ");
+        let make = || {
+            (
+                diag_with_fix(
+                    Span::new(FileId::DUMMY, 0, 3),
+                    "XXX",
+                    Applicability::MachineApplicable,
+                ),
+                diag_with_fix(
+                    Span::new(FileId::DUMMY, 8, 11),
+                    "ZZZ",
+                    Applicability::MachineApplicable,
+                ),
+            )
+        };
+        for reverse in [false, true] {
+            let (d1, d2) = make();
+            let set = if reverse {
+                FixSet::collect(&[d2, d1], FixHints::Auto)
+            } else {
+                FixSet::collect(&[d1, d2], FixHints::Auto)
+            };
+            assert_eq!(set.len(), 2);
+            assert_eq!(set.apply(src), "XXX bbb ZZZ");
+        }
     }
 
     /// Regression guard for the lifetime threading: a `Cow::Borrowed`
@@ -841,8 +875,10 @@ mod tests {
             .with_span(Span::new(FileId::DUMMY, 0, 2))
             .with_suggestions(vec![sug]);
         let set = FixSet::collect(&[diag], FixHints::All);
-        // Must not panic.
-        let _ = set.apply(src);
+        assert_eq!(set.len(), 1, "collect has no source and cannot filter");
+        let (out, applied) = set.apply_counted(src);
+        assert_eq!(applied, 0);
+        assert_eq!(out, src);
     }
 
     #[test]

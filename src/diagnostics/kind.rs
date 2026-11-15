@@ -443,8 +443,8 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 if traceback.is_empty() {
                     msg
                 } else {
-                    let mut s = String::with_capacity(64 + traceback.len() * 32);
-                    msg.render_into(&mut s);
+                    let mut s = String::with_capacity(64 + traceback.len() * 64);
+                    msg.render_into_owned(&mut s);
                     s.push('\n');
                     s.push('\n');
                     s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
@@ -820,8 +820,8 @@ impl<'src> DiagnosticKind<'src> {
                     if traceback.is_empty() {
                         msg
                     } else {
-                        let mut s = String::with_capacity(64 + traceback.len() * 32);
-                        msg.render_into(&mut s);
+                        let mut s = String::with_capacity(64 + traceback.len() * 64);
+                        msg.render_into_owned(&mut s);
                         s.push('\n');
                         s.push('\n');
                         s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
@@ -875,7 +875,7 @@ mod humanizer_differential_tests {
                 span: span(0, 3),
                 found_span: Some(span(4, 8)),
                 reason: Some(Cow::Borrowed("nope")),
-                context: None,
+                context: Some(TypeCtx::FunctionArg),
             },
             DiagnosticKind::TypeMismatch {
                 expected: Cow::Borrowed("A"),
@@ -931,6 +931,11 @@ mod humanizer_differential_tests {
                     (ComptimeReason::Assertion, Some(span(0, 1))),
                     (ComptimeReason::ComptimeBlock, None),
                 ],
+            },
+            DiagnosticKind::Comptime {
+                kind: ComptimeErrorKind::StepLimitExceeded,
+                span: span(0, 1),
+                traceback: Vec::new(),
             },
         ]
     }

@@ -2766,6 +2766,17 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
         // `compute` cannot return `Result`, so a mismatch folds to the
         // rejected-body shape (the same arm the item-kind guard uses): the
         // release build degrades loudly instead of silently.
+        #[cfg(test)]
+        {
+            FN_BODY_COMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Tag = the system's MONOTONIC id (`system_id()`), not its
+            // address — the address-reuse hazard the LATENT note below
+            // used to carry is gone.
+            let system_id = provider.query_system().system_id();
+            if let Ok(mut log) = FN_BODY_COMPUTE_LOG.lock() {
+                log.push((system_id, *key));
+            }
+        }
         if harness.session_stamp != ctx_borrow.session_id {
             return FnBodyCheck {
                 hir: crate::hir::hir::HirStmt::Error,
@@ -2783,17 +2794,6 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
                     harness.session_stamp, ctx_borrow.session_id
                 ))],
             };
-        }
-        #[cfg(test)]
-        {
-            FN_BODY_COMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Tag = the system's MONOTONIC id (`system_id()`), not its
-            // address — the address-reuse hazard the LATENT note below
-            // used to carry is gone.
-            let system_id = provider.query_system().system_id();
-            if let Ok(mut log) = FN_BODY_COMPUTE_LOG.lock() {
-                log.push((system_id, *key));
-            }
         }
         // Key-shape totality guard (runs BEFORE any worker-pool work): the
         // key must address a FREE function.  A mis-minted/stale

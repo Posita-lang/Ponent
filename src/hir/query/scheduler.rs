@@ -312,14 +312,15 @@ impl TestScheduler {
         let deadline = Instant::now() + PARK_TIMEOUT;
         #[cfg(feature = "shuttle")]
         // No wall clock exists under shuttle, so the deadline is a yield
-        // BUDGET: each wake-without-park costs one unit.  The bound only
-        // exists to convert the documented failure mode (a predicate typo
-        // matching no schedule point) from a model-check HANG into this
-        // panic — any correct choreography observes its park in a handful
-        // of wakes.  Smaller than the old 1M so a typo'd predicate surfaces
-        // in bounded steps instead of burning 100 × 1M yields per
-        // `check_random` iteration; `set_park_timeout` does NOT control this
-        // (it is wall-clock only), so the constant is the single knob.
+        // BUDGET: each wake-without-park costs one unit.  It bounds a predicate
+        // typo that keeps producing spurious wakeups; a predicate that never
+        // parks and never notifies leaves the task blocked in `state_cv.wait`,
+        // which shuttle's deadlock detector reports (condvars have no
+        // timeout, so this budget cannot cover the no-notify case).
+        // Smaller than the old 1M so a typo'd predicate surfaces in bounded
+        // steps instead of burning 100 × 1M yields per `check_random`
+        // iteration; `set_park_timeout` does NOT control this (it is
+        // wall-clock only), so the constant is the single knob.
         let mut yield_budget = 100_000u64;
         // NOTE (test-author contract): a test that legitimately needs more
         // than 100k yields (very large HIT_ROUNDS, deep schedules) will trip

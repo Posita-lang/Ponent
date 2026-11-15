@@ -108,11 +108,13 @@ impl<'src> DiagCtxt<'src> {
             _ => {}
         }
         let index = self.diags.len();
+        debug_assert!(self.first_unspanned <= index);
         let has_source = diag.source().is_some();
         self.diags.push(diag);
-        if !has_source {
-            self.first_unspanned = self.first_unspanned.min(index);
-        } else if index == self.first_unspanned {
+        // Invariant: `first_unspanned <= index` before the push, so a new
+        // unspanned diag never moves the frontier left.  A spanned diag only
+        // advances it when it was exactly the frontier element.
+        if has_source && index == self.first_unspanned {
             self.first_unspanned += 1;
         }
         EmissionGuarantee::emitted()
@@ -162,6 +164,7 @@ impl<'src> DiagCtxt<'src> {
     /// already-emitted diagnostics (e.g. to render them elsewhere), and source
     /// attachment is idempotent.  It is not re-rendered in place.
     pub fn attach_source(&mut self, source: &'src str) {
+        debug_assert!(self.first_unspanned <= self.diags.len());
         let start = self.first_unspanned.min(self.diags.len());
         for diag in &mut self.diags[start..] {
             if diag.source().is_none() {
@@ -278,6 +281,9 @@ impl<'src> DiagCtxt<'src> {
         &mut self,
         emitter: &mut Emitter<R, M>,
     ) -> io::Result<()> {
+        if self.reported_len == self.diags.len() {
+            return Ok(());
+        }
         emitter.emit_all(&mut self.diags[self.reported_len..])?;
         self.reported_len = self.diags.len();
         self.unreported_errors = 0;
@@ -443,8 +449,9 @@ impl<'src> DiagCtxt<'src> {
         if self.reported_len == 0 {
             return Vec::new();
         }
+        let reported_len = self.reported_len;
         let mut all = std::mem::take(&mut self.diags).into_vec();
-        if self.reported_len == all.len() {
+        if reported_len == all.len() {
             self.reported_len = 0;
             self.errors = 0;
             self.warnings = 0;
@@ -452,7 +459,7 @@ impl<'src> DiagCtxt<'src> {
             self.first_unspanned = 0;
             return all;
         }
-        let unreported = all.split_off(self.reported_len);
+        let unreported = all.split_off(reported_len);
         for d in &all {
             if d.is_error() {
                 self.errors = self.errors.saturating_sub(1);
@@ -462,7 +469,7 @@ impl<'src> DiagCtxt<'src> {
         }
         self.diags = SmallVec::from_vec(unreported);
         self.reported_len = 0;
-        self.first_unspanned = 0;
+        self.first_unspanned = self.first_unspanned.saturating_sub(reported_len);
         all
     }
 

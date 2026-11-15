@@ -256,6 +256,27 @@ pub(crate) fn acquire_test_lang_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Sets `Lang` for the lifetime of the guard and restores the previous value
+/// on drop, including on panic unwind.
+#[cfg(all(test, not(feature = "shuttle")))]
+pub(crate) struct LangGuard(Lang);
+
+#[cfg(all(test, not(feature = "shuttle")))]
+impl LangGuard {
+    pub(crate) fn new(lang: Lang) -> Self {
+        let previous = Lang::current();
+        Lang::set(lang);
+        Self(previous)
+    }
+}
+
+#[cfg(all(test, not(feature = "shuttle")))]
+impl Drop for LangGuard {
+    fn drop(&mut self) {
+        Lang::set(self.0);
+    }
+}
+
 /// Supported languages.
 ///
 /// The discriminants are the values stored in [`LANG`]; they are deliberately
@@ -329,14 +350,15 @@ fn detect_from_env() -> Lang {
 /// Pure BCP-47 primary-subtag classification, split out so it is testable
 /// without mutating the process environment.
 fn detect_from_str(env: &str) -> Lang {
-    let env = env.to_lowercase();
     // Compare the BCP-47 *primary* subtag exactly: a prefix test would let
     // `zha` (Zhuang, ISO 639-3) match `zh`, and `ru*` collides similarly.
     let primary = env.split(['-', '_']).next().unwrap_or("");
-    match primary {
-        "ru" => Lang::Ru,
-        "zh" => Lang::Zh,
-        _ => Lang::En,
+    if primary.eq_ignore_ascii_case("ru") {
+        Lang::Ru
+    } else if primary.eq_ignore_ascii_case("zh") {
+        Lang::Zh
+    } else {
+        Lang::En
     }
 }
 
@@ -357,9 +379,7 @@ pub fn render<'msg, 'src>(
     if is_ftl_slug(msg) {
         // Zero-arg slug: build-time cached, returns borrowed — no formatting
         // and no allocation after the first call per (slug, lang).
-        if pairs.is_empty()
-            && let Some(c) = fluent::zero_arg_slug(msg)
-        {
+        if let Some(c) = fluent::zero_arg_slug(msg) {
             return c;
         }
         if let Some(s) = try_fluent(msg, pairs) {
@@ -376,9 +396,7 @@ pub fn render_into<'msg, 'src>(
     out: &mut String,
 ) {
     if is_ftl_slug(msg) {
-        if pairs.is_empty()
-            && let Some(c) = fluent::zero_arg_slug(msg)
-        {
+        if let Some(c) = fluent::zero_arg_slug(msg) {
             out.push_str(&c);
             return;
         }
@@ -419,12 +437,8 @@ fn lang_id() -> &'static LanguageIdentifier {
     // `Lang` discriminants start at 1 (`LANG_EN`), so the table index is
     // `discriminant - 1`.  A future 0-discriminant variant underflows and must
     // fail loudly instead of aliasing another language.
-    let discriminant = Lang::current() as usize;
-    debug_assert!(
-        (1..=N_LANGS).contains(&discriminant),
-        "Lang discriminant {discriminant} outside 1..={N_LANGS}"
-    );
-    lang_id_at(discriminant - 1)
+    let lang_idx = Lang::current().index();
+    lang_id_at(lang_idx)
 }
 
 /// `None` when the slug is unknown even after the loader's fallback chain
@@ -538,9 +552,7 @@ pub fn render_into_owned<'msg, 'src>(
     out: &mut String,
 ) {
     if is_ftl_slug(msg) {
-        if pairs.is_empty()
-            && let Some(c) = fluent::zero_arg_slug(msg)
-        {
+        if let Some(c) = fluent::zero_arg_slug(msg) {
             out.push_str(&c);
             return;
         }
@@ -638,7 +650,7 @@ macro_rules! cached_label {
             ::std::sync::OnceLock::new(),
             ::std::sync::OnceLock::new(),
         ];
-        let lang_idx = ($crate::diagnostics::i18n::Lang::current() as usize) - 1;
+        let lang_idx = $crate::diagnostics::i18n::Lang::current().index();
         // `Lang` starts at discriminant 1 (`LANG_EN = 1`), so the index is
         // `discriminant - 1` and must stay in `0..3`.  A new variant with
         // discriminant 0 would wrap to `usize::MAX`; the debug assert names
@@ -673,7 +685,7 @@ macro_rules! cached_label_static {
             ::std::sync::OnceLock::new(),
             ::std::sync::OnceLock::new(),
         ];
-        let lang_idx = ($crate::diagnostics::i18n::Lang::current() as usize) - 1;
+        let lang_idx = $crate::diagnostics::i18n::Lang::current().index();
         // Same invariant as `cached_label!`: `LANG_EN = 1` anchors the
         // `discriminant - 1` index in `0..3`; a 0-discriminant variant would
         // wrap and must fail the debug assertion, not index garbage in

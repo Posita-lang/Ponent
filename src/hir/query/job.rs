@@ -354,7 +354,6 @@ impl QueryLatch {
         //
         // Notifying while holding the mutex means woken waiters briefly
         // re-block on it (`hurry-up-and-wait`), but that is one lock/unlock
-        // round-trip per waiter — trivial next to a lost wakeup.
         let _tw = crate::hir::query::sync_order::Acquired::acquire(
             crate::hir::query::sync_order::Fam::LatchPark,
             "job.latch.resolve",

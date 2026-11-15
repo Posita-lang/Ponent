@@ -52,6 +52,9 @@ pub trait Erasable<'q, Provided>: Sized {
     const RECOVERY_SUPPORTED: bool;
     /// `true` for [`Arena`] storage; drives the debug-build orphan gauge.
     const IS_ARENA: bool;
+    /// Bytes a recompute orphans under this storage path.  `Arena` must use
+    /// the pointee size, not `size_of::<&V>()`; `Owned` values are freed.
+    const ORPHAN_FOOTPRINT: usize;
 
     /// Provider side → cache side.  Runs once per fresh compute, inside
     /// the staging critical section.
@@ -81,6 +84,7 @@ where
     // Owned values: a handler returns the value like any compute would.
     const RECOVERY_SUPPORTED: bool = true;
     const IS_ARENA: bool = false;
+    const ORPHAN_FOOTPRINT: usize = std::mem::size_of::<V>();
 
     #[inline]
     fn provided_to_erased(provided: V) -> Self::Erased {
@@ -132,6 +136,7 @@ where
     // `QueryVTable::new` asserts this at registration.
     const RECOVERY_SUPPORTED: bool = false;
     const IS_ARENA: bool = true;
+    const ORPHAN_FOOTPRINT: usize = std::mem::size_of::<V>();
 
     #[inline]
     fn provided_to_erased(provided: &'q V) -> Self::Erased {
