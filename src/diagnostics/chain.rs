@@ -258,49 +258,54 @@ impl<'src> CallChain<'src> {
         &self.entries
     }
 
-    /// Whether any entry (at any depth) carries a span.  Used to gate the
-    /// `file://` URL computation so a kind-only chain pays no `canonicalize`.
+    /// One traversal for both facts: whether any reachable entry has a span
+    /// (the hyperlink gate) and how many entries the renderer will emit (the
+    /// reserve estimate).  Two identical DFS walks previously paid the tree
+    /// twice.
     ///
     /// Iterative with an explicit worklist and the same depth bound as
     /// [`Self::render_entries`]: the old recursive version ran *first* and
     /// could overflow the stack on a hostile deep chain before the render
     /// cap ever applied.
-    /// One traversal for both facts: whether any reachable entry has a span (the
-/// hyperlink gate) and how many entries the renderer will emit (the reserve
-/// estimate).  Two identical DFS walks previously paid the tree twice.
-fn scan(&self) -> ChainFacts {
-    let mut any_spanned = false;
-    let mut total = 0usize;
-    let mut message_bytes = 0usize;
-    let mut stack: SmallVec<[(&CallChain<'src>, usize); 8]> = SmallVec::new();
-    stack.push((self, 0));
-    while let Some((chain, depth)) = stack.pop() {
-        if depth > MAX_CHAIN_DEPTH {
-            continue;
-        }
-        total = total
-            .saturating_add(chain.entries.len())
-            .min(MAX_RESERVE_ENTRIES);
-        for entry in &chain.entries {
-            any_spanned |= entry.span.is_some();
-            message_bytes = message_bytes
-                .saturating_add(entry.message.len())
-                .min(MAX_RESERVE_MESSAGE_BYTES);
-            if let Some(children) = &entry.children {
-                for child in children {
-                    stack.push((child, depth + 1));
+    fn scan(&self) -> ChainFacts {
+        let mut any_spanned = false;
+        let mut total = 0usize;
+        let mut message_bytes = 0usize;
+        let mut stack: SmallVec<[(&CallChain<'src>, usize); 8]> = SmallVec::new();
+        stack.push((self, 0));
+        while let Some((chain, depth)) = stack.pop() {
+            if depth > MAX_CHAIN_DEPTH {
+                continue;
+            }
+            if any_spanned
+                && total >= MAX_RESERVE_ENTRIES
+                && message_bytes >= MAX_RESERVE_MESSAGE_BYTES
+            {
+                break;
+            }
+            total = total
+                .saturating_add(chain.entries.len())
+                .min(MAX_RESERVE_ENTRIES);
+            for entry in &chain.entries {
+                any_spanned |= entry.span.is_some();
+                message_bytes = message_bytes
+                    .saturating_add(entry.message.len())
+                    .min(MAX_RESERVE_MESSAGE_BYTES);
+                if let Some(children) = &entry.children {
+                    for child in children {
+                        stack.push((child, depth + 1));
+                    }
                 }
             }
         }
+        ChainFacts {
+            any_spanned,
+            entry_count: total,
+            message_bytes,
+        }
     }
-    ChainFacts {
-        any_spanned,
-        entry_count: total,
-        message_bytes,
-    }
-}
 
-/// Flattened entry count (all depths), capped like the renderer.  Used to
+    /// Flattened entry count (all depths), capped like the renderer.  Used to
     /// reserve the output buffer up front so a nested chain does not pay
     /// repeated reallocation.  Test-only: production sizing uses `scan()`'s
     /// `ChainFacts` directly.
@@ -350,20 +355,7 @@ fn scan(&self) -> ChainFacts {
         let facts = self.scan();
         let mut out = String::with_capacity(64 + facts.message_bytes + facts.entry_count * 32);
         self.render_into_with_facts(
-            use_color,
-            source,
-            file_name,
-            idx,
-            max_width,
-            tab_width,
-            None,
-            None,
-            ChainFacts {
-                any_spanned: facts.any_spanned,
-                entry_count: facts.entry_count,
-                message_bytes: facts.message_bytes,
-            },
-            &mut out,
+            use_color, source, file_name, idx, max_width, tab_width, None, None, facts, &mut out,
         );
         out
     }
@@ -404,20 +396,7 @@ fn scan(&self) -> ChainFacts {
     ) {
         let facts = self.scan();
         self.render_into_with_facts(
-            use_color,
-            source,
-            file_name,
-            idx,
-            max_width,
-            tab_width,
-            cx,
-            anchor,
-            ChainFacts {
-                any_spanned: facts.any_spanned,
-                entry_count: facts.entry_count,
-                message_bytes: facts.message_bytes,
-            },
-            out,
+            use_color, source, file_name, idx, max_width, tab_width, cx, anchor, facts, out,
         );
     }
 
@@ -516,6 +495,25 @@ fn scan(&self) -> ChainFacts {
         );
     }
 
+    fn expand_message_tabs<'a>(
+        message: &'a str,
+        tab_width: usize,
+        start_col: usize,
+    ) -> Cow<'a, str> {
+        let tab_width = tab_width.max(1);
+        if start_col % tab_width == 0 || !message.contains('\t') {
+            return Cow::Borrowed(message);
+        }
+        let mut out = String::with_capacity(message.len() + 8);
+        for (i, line) in message.split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(super::glyph::expand_tabs_from_col(line, tab_width, start_col).as_ref());
+        }
+        Cow::Owned(out)
+    }
+
     fn render_entries(
         &self,
         env: &RenderEnv<'_>,
@@ -550,15 +548,35 @@ fn scan(&self) -> ChainFacts {
         // `" ".repeat(..)` per entry (the old `indent_cow` was O(depth²)
         // allocation on pathological chains).
         let indent_cols = 4 + depth * 4;
+        let tab_width = tab_width.max(1);
+        let tab_aligned = indent_cols % tab_width == 0;
+        let avail_full = max_width.saturating_sub(indent_cols).max(1);
         let color_on = if use_color { "\x1b[34m" } else { "" };
         let color_off = if use_color { "\x1b[0m" } else { "" };
 
         for entry in &self.entries {
-            // Multiline sanitizer, not the plain one: a call-chain entry may
-            // carry layout-intended `\n`/`\t`, and `wrap_optimal` below
-            // supports hard newlines — the plain variant destroyed them into
-            // U+FFFD before wrapping ever saw them.
-            let message = super::sanitize_for_terminal_multiline(&entry.message);
+            // One ASCII classification serves both sanitizer selection and the
+            // fast-path gate: printable/tab-only input is untouched by the
+            // multiline sanitizer, so scanning it twice was dead work.
+            let class = super::ascii::classify_ascii(entry.message.as_bytes());
+            let sanitized: Cow<'_, str> = if class == super::ascii::AsciiClass::Other {
+                // Multiline sanitizer, not the plain one: a call-chain entry
+                // may carry layout-intended `\n`/`\t`, and `wrap_optimal`
+                // below supports hard newlines — the plain variant destroyed
+                // them into U+FFFD before wrapping ever saw them.
+                super::sanitize_for_terminal_multiline(entry.message.as_ref())
+            } else {
+                Cow::Borrowed(entry.message.as_ref())
+            };
+            // `wrap_optimal` measures tabs from column 0.  The entry is
+            // actually printed after `indent_cols`; when that is not a tab
+            // stop, expand tabs with the real starting column so wrapping
+            // cannot under-estimate the rendered width.
+            let message: Cow<'_, str> = if tab_aligned {
+                sanitized
+            } else {
+                Self::expand_message_tabs(sanitized.as_ref(), tab_width, indent_cols)
+            };
             let suffix = match (source, entry.span, idx) {
                 (Some(_), Some(span), Some(idx))
                     if anchor.map_or(true, |a| span.file == a) =>
@@ -590,13 +608,12 @@ fn scan(&self) -> ChainFacts {
             // we re-wrap the final segment narrower — using the reduced width
             // for *every* line would waste 12–20 columns on each non-final
             // line of a long message.
-            let avail_full = max_width.saturating_sub(indent_cols).max(1);
             // C3: dominant-case fast path — a short printable-ASCII message
             // that fits on one line needs no `wrap_optimal` and no `Vec`.
             // The ASCII gate is load-bearing: it makes the multiline
             // sanitizer the identity (one display cell per byte) and excludes
             // `\t`/`\n`, so byte length == display width.
-            if super::ascii::is_printable_ascii(message.as_bytes())
+            if class == super::ascii::AsciiClass::Printable
                 && !message.is_empty()
                 // The `is_printable_ascii` gate above proves the message has
                 // no tab/newline and no byte outside 0x20..=0x7E, so the only
@@ -626,6 +643,12 @@ fn scan(&self) -> ChainFacts {
                 // one allocation instead of one per segment).
                 let last_text: String;
                 let mut segs = super::wrap::wrap_optimal(&message, avail_full, tab_width);
+                if segs.is_empty() {
+                    // Defensive: `wrap_optimal("")` currently returns `[""]`,
+                    // but an empty segment list would silently drop the
+                    // indent, suffix and newline for this entry.
+                    segs.push(Cow::Borrowed(""));
+                }
                 let narrow = avail_full.saturating_sub(suffix_cols).max(1);
                 if narrow < avail_full
                     && let Some(last_seg) = segs.last()
@@ -671,6 +694,29 @@ impl<'src> Default for CallChain<'src> {
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_message_keeps_entry_indent_and_suffix() {
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(ChainEntryKind::Call, None, ""));
+        let out = chain.render(false, None, "");
+        let entry_line = out.lines().nth(1).expect("entry line");
+        assert!(entry_line.starts_with("    "), "out: {out}");
+        assert!(entry_line.contains("called from here"), "out: {out}");
+    }
+
+    #[test]
+    fn custom_tab_width_accounts_for_indent_column() {
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(ChainEntryKind::Call, None, "abcdefg\tX"));
+        let out = chain.render_with_index(false, None, "", None, 30, 8);
+        for line in out.lines().skip(1) {
+            assert!(
+                crate::diagnostics::glyph::visible_width_with_tab(line, 8) <= 30,
+                "line exceeds width: {line:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_render_includes_location_with_source() {
