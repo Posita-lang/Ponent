@@ -246,22 +246,22 @@ static LANG: AtomicU8 = AtomicU8::new(LANG_UNSET);
 /// Guards tests that mutate the process-global [`LANG`]: parallel tests
 /// share one atomic, so a test that sets a language must hold this lock
 /// while it renders.
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
 static TEST_LANG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire [`TEST_LANG_LOCK`].  Poison is irrelevant for `()`, so a
 /// panicking test cannot wedge the others.
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
 pub(crate) fn acquire_test_lang_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Sets `Lang` for the lifetime of the guard and restores the previous value
 /// on drop, including on panic unwind.
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
 pub(crate) struct LangGuard(Lang);
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
 impl LangGuard {
     pub(crate) fn new(lang: Lang) -> Self {
         let previous = Lang::current();
@@ -270,7 +270,7 @@ impl LangGuard {
     }
 }
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
 impl Drop for LangGuard {
     fn drop(&mut self) {
         Lang::set(self.0);

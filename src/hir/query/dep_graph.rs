@@ -155,8 +155,10 @@ impl Default for ContentClass {
 ///
 ///     stored(X) <= min over closure(X) of stored
 ///
-/// (a mark of any closure node then bumps `rev[stored(X)]` and kills
-/// the stamp, forcing the walk).  That invariant is maintained
+/// (a mark of any MEDIUM/HIGH closure node bumps `rev[stored(X)]`; a
+/// LOW closure node is covered by the strictly stronger
+/// `dirty_generation` check, not by `rev[0]`) and kills the stamp,
+/// forcing the walk).  That invariant is maintained
 /// STRUCTURALLY, not trusted:
 ///
 /// - the finish-time `min(declared, reads)` aggregation keeps each
@@ -2207,13 +2209,13 @@ pub struct DepGraph<S: Scheduler> {
             Option<Arc<Vec<Arc<StampBlock>>>>,
         )>,
     >,
-    /// Per-durability-level mark counters.  `rev[l]` counts every 0→1
-    /// mark of a node whose durability is `>= l` (a durability-`d` mark
-    /// bumps levels `0..=d`; a HIGH change bumps all three).  The
-    /// durability fast path serves a verified node without re-walking
-    /// when its per-level stamp is `>= rev[node.dur]` — a HIGH-dur
-    /// node's stamp survives LOW/MEDIUM marks because they never bump
-    /// its level's counter.
+    /// Per-durability-level mark counters.  For `l >= 1`, `rev[l]` counts
+    /// every 0→1 mark of a node whose durability is `>= l` (a
+    /// durability-`d >= 1` mark bumps levels `1..=d`; a HIGH change
+    /// bumps MEDIUM and HIGH).  `rev[0]` is retained only for indexing
+    /// stability and is intentionally never bumped: a LOW node's fast
+    /// path is gated by `dirty_generation`, which is strictly stronger
+    /// than any level counter (every mark bumps it after its rev adds).
     ///
     /// Soundness shape: `rev[d]`'s RMW is the mark's linearization point
     /// FOR LEVEL-`d` FAST SERVES.  It is NOT self-contained: because the
@@ -3111,6 +3113,51 @@ impl<S: Scheduler> DepGraph<S> {
         (DirtySnap::Owned(dirty), StampSnap::Owned(stamps))
     }
 
+    /// Batched dirty + epochs snapshot for the cached hit path: ONE
+    /// `table_gen` load and one TLS slot fetch serve both, preserving the
+    /// C1 capture-before-green order (epoch word is read before the dirty
+    /// word inside `green_with_epoch`).
+    fn dirty_epochs_snapshot(&self) -> (DirtySnap<'_>, EpochSnap<'_>) {
+        let tbl_gen = self.table_gen.load(Ordering::Acquire);
+        let cell = self
+            .dirty_table_cache
+            .get_or(|| std::cell::RefCell::new((u64::MAX, None, None, None)));
+        if let Ok(r) = cell.try_borrow() {
+            if r.0 == tbl_gen {
+                let dirty_ref =
+                    std::cell::Ref::filter_map(std::cell::Ref::clone(&r), |t| {
+                        t.1.as_ref().map(|a| &**a)
+                    });
+                let epoch_ref =
+                    std::cell::Ref::filter_map(r, |t| t.2.as_ref().map(|a| &**a));
+                if let (Ok(d), Ok(e)) = (dirty_ref, epoch_ref) {
+                    return (DirtySnap::Cached(d), EpochSnap::Cached(e));
+                }
+            }
+        }
+        let (dirty, epochs, _) = self.refresh_shared_slot(&cell);
+        (DirtySnap::Owned(dirty), EpochSnap::Owned(epochs))
+    }
+
+    /// One snapshot/round-trip for the two hit-path queries: the node's
+    /// epoch is read FIRST (C1 capture-before-green), then its dirty bit.
+    #[inline]
+    pub(crate) fn green_with_epoch(&self, node: DepNodeIndex) -> (bool, u64) {
+        debug_assert_ne!(
+            node.0, DepNodeIndex::ZERO.0,
+            "green_with_epoch called with DepNodeIndex::ZERO"
+        );
+        let (dirty, epochs) = self.dirty_epochs_snapshot();
+        let epoch = epochs
+            .get(block_of(node.0))
+            .map(|b| b[epoch_word_of(node.0)].load(Ordering::Acquire) & EPOCH_MASK)
+            .unwrap_or(0);
+        let green = dirty.get(block_of(node.0)).is_none_or(|b| {
+            b[word_of(node.0)].load(Ordering::Acquire) & mask_of(node.0) == 0
+        });
+        (green, epoch)
+    }
+
     /// Generation-validated snapshot of the epochs table: same protocol
     /// as [`Self::dirty_snapshot`] (shared `table_gen`, shared slot, same
     /// soundness argument — epoch blocks are append-only and `Arc`-shared
@@ -3287,22 +3334,10 @@ impl<S: Scheduler> DepGraph<S> {
                  that the node was never allocated",
                 self.next_index.load(Ordering::Relaxed),
             );
-            // Per-level add BEFORE the generation bump, the same
-            // load-bearing order as the live-block branch below (see
-            // there for the straddle argument): a verifier that observes
-            // the generation bump must also observe this add, or the
-            // durability fast path could re-admit a node whose closure
-            // was just marked.  Nothing is cached post-`reset` today, so
-            // the order is doctrine rather than a live bug here.
-            //
-            // The per-level bump is conservative at LOW — the level every
-            // real mark bumps, and the same skew the missing-durability
-            // read takes everywhere else.  The early return used to skip
-            // it, leaving this branch as the one place the "every 0→1
-            // mark bumps the per-level counters" invariant was not
-            // upheld (benign today — post-`reset` zeroes `rev` and every
-            // stamp — but the invariant must not depend on that).
-            self.rev[Durability::LOW as usize].fetch_add(1, Ordering::AcqRel);
+            // No per-level add: LOW nodes are gated by `dirty_generation` alone
+            // (see the proof at the live-block rev loop below), so rev[0]
+            // is intentionally untouched.  The generation bump is the entire
+            // invalidation for this branch.
             self.dirty_generation.fetch_add(1, Ordering::AcqRel);
             return;
         }
@@ -3353,7 +3388,13 @@ impl<S: Scheduler> DepGraph<S> {
         // the range can never run off the array — but if `Durability`
         // ever gains a level, `rev`'s length must grow with it (see the
         // field doc).
-        for l in 0..=(d as usize) {
+        // C1: rev[0] is intentionally NOT bumped.  For a LOW node the
+        // per-level check is skipped (the global `dirty_generation` check
+        // above is strictly stronger: every mark bumps it after the rev
+        // adds), so no verifier can consult rev[0] to re-admit.  MEDIUM/
+        // HIGH marks still bump their levels because a MEDIUM/HIGH fast
+        // path must die on any mark of durability >= its own.
+        for l in 1..=(d as usize) {
             self.rev[l].fetch_add(1, Ordering::AcqRel);
         }
         // 0→1: a red bit may postdate any verified_gen stamp: the stamp
@@ -3463,8 +3504,8 @@ impl<S: Scheduler> DepGraph<S> {
             );
             let Some(block) = snap.get(block_of(node.0)) else {
                 // Post-`reset` reader: no cached value can exist, but keep
-                // `mark_dirty`'s missing-block accounting — a rev[LOW] add
-                // and (below) the generation bump, no bit, no epoch CAS.
+                // `mark_dirty`'s missing-block accounting — the generation
+                // bump only (C1: no rev[0] add).
                 // The epoch-silence here is safe ONLY because the reader was
                 // never allocated (post-`reset`, `next_index` restarted at
                 // 1 and `reset` cleared every `rev_edges` list, so no
@@ -3495,7 +3536,6 @@ impl<S: Scheduler> DepGraph<S> {
                         self.next_index.load(Ordering::Relaxed),
                     );
                 }
-                level_counts[0] += 1;
                 any = true;
                 continue;
             };
@@ -3524,7 +3564,7 @@ impl<S: Scheduler> DepGraph<S> {
                 continue; // already red — stamps were invalidated when it turned red
             }
             any = true;
-            for l in 0..=(d as usize) {
+            for l in 1..=(d as usize) {
                 level_counts[l] += 1;
             }
         }
@@ -5423,8 +5463,16 @@ impl<S: Scheduler> DepGraph<S> {
             // query is LOW, so this disjunct only ever fires for queries that
             // opted in; the seqlock-fallback walk disables it.
             if allow_durability_fast_path {
+                let dur = dur_of(node);
+                // C1: a LOW stamp is never re-admitted through the level
+                // counter — any mark (LOW included) bumped dirty_generation
+                // after its rev adds, so the global check above already
+                // failed.  Reading rev[0] here would only duplicate that
+                // verdict.
                 let vl = slot.map_or(0, |s| s.verified_lvl.load(Ordering::Acquire));
-                if vl >= self.rev[dur_of(node) as usize].load(Ordering::Acquire) {
+                if dur != Durability::LOW
+                    && vl >= self.rev[dur as usize].load(Ordering::Acquire)
+                {
                     // Re-certify at the CURRENT generation.
                     // The level stamp proves the closure is unaffected by
                     // the lower-durability marks that bumped
@@ -5548,8 +5596,13 @@ impl<S: Scheduler> DepGraph<S> {
                 // Per-level durability fast path — same structural
                 // contract as the root check above.
                 if allow_durability_fast_path {
+                    let dur = dur_of(n);
                     let vl = sslot.map_or(0, |s| s.verified_lvl.load(Ordering::Acquire));
-                    if vl >= self.rev[dur_of(n) as usize].load(Ordering::Acquire) {
+                    // Same C1 proof as the root arm: LOW is decided by the
+                    // global generation check, not rev[0].
+                    if dur != Durability::LOW
+                        && vl >= self.rev[dur as usize].load(Ordering::Acquire)
+                    {
                         // Same re-certification as the root path: the node
                         // was not expanded because its level stamp proves
                         // its subtree unaffected, so stamp it at the
@@ -6155,7 +6208,7 @@ mod tests {
         // A LOW-level mark (user source): must not bump rev[HIGH].
         let low = dg.allocate_node_index(ContentClass::SEMANTIC);
         dg.invalidate(low, &q());
-        assert_eq!(dg.rev_of(Durability::LOW), 2);
+        assert_eq!(dg.rev_of(Durability::LOW), 0);
         assert_eq!(dg.rev_of(Durability::HIGH), 1);
         // Fast path: still all-green at level HIGH, no walk needed.
         assert_eq!(dg.verify_green_transitive_with_dirty(root), None);
@@ -6305,7 +6358,7 @@ mod tests {
     /// skipped.  Benign today (post-`reset` zeroes `rev` and every
     /// stamp), but the invariant must not depend on that.
     #[test]
-    fn mark_dirty_missing_block_still_bumps_low_level() {
+    fn mark_dirty_missing_block_does_not_bump_low_level() {
         let dg = DepGraph::new(Arc::new(NoOpScheduler));
         let before = dg.rev_of(Durability::LOW);
         // Node index 9_999_999 lives in block 2441 — far beyond the
@@ -6314,12 +6367,9 @@ mod tests {
         dg.invalidate(DepNodeIndex(9_999_999), &q());
         assert_eq!(
             dg.rev_of(Durability::LOW),
-            before + 1,
-            "a missing-block mark must bump rev[LOW] (conservative level)"
+            before,
+            "C1: LOW is gated by dirty_generation, not rev[0]"
         );
-        // HIGH is NOT bumped — the node's durability is unknown (LOW is
-        // the conservative read), and over-bumping HIGH would needlessly
-        // kill the HIGH fast path.
         assert_eq!(dg.rev_of(Durability::HIGH), 0);
     }
 
@@ -6813,15 +6863,19 @@ mod tests {
             );
         });
         assert_eq!(dg.durability_of(x), Durability::LOW);
-        // A subsequent LOW-level mark must keep forcing the walk (the
-        // re-stamp after the retry is taken at the lowered level's
-        // counter, which now moves with LOW marks).
+        // A subsequent LOW-level mark must still force the walk — now via
+        // `dirty_generation`, since C1 removed the rev[0] bump entirely.
         let low = dg.allocate_node_index(ContentClass::SEMANTIC);
         dg.invalidate(low, &q());
-        assert_eq!(dg.verify_green_transitive_with_dirty(x), None);
         assert!(
-            dg.verified_lvl_of(x) > vl_before,
-            "the post-lowering re-stamp must ride the LOW counter, not the abandoned HIGH one"
+            !dg.is_globally_verified(x),
+            "a LOW mark must invalidate the generation stamp"
+        );
+        assert_eq!(dg.verify_green_transitive_with_dirty(x), None);
+        assert_eq!(
+            dg.verified_lvl_of(x),
+            0,
+            "C1: a LOW stamp carries no moving rev counter; the generation is authority"
         );
     }
 

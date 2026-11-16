@@ -4442,6 +4442,7 @@ fn probe<'src, 'q, Q: Query<'q, 'src>, S: Scheduler>(
     // Reuse the cache's green verdict when it consulted one (a red value
     // is then already suppressed), so the check is not repeated here.
     let mut probed_green: Option<bool> = None;
+    let fused_hit: std::cell::Cell<Option<(bool, u64)>> = std::cell::Cell::new(None);
     let (node, cached, fresh, capture_epoch) = cache.probe_with_epoch(
         key,
         |_no_cache_shard| {
@@ -4486,14 +4487,23 @@ fn probe<'src, 'q, Q: Query<'q, 'src>, S: Scheduler>(
             if eval_always {
                 0
             } else {
-                dep_graph.epoch_of(node)
+                let (green, epoch) = dep_graph.green_with_epoch(node);
+                fused_hit.set(Some((green, epoch)));
+                epoch
             }
         },
         // Green check inside the cache's critical section, BEFORE the
         // value clone: a red node's value is never served, so the clone is
         // skipped.  The verdict is cached for the caller.
         &mut |node| {
-            let g = !eval_always && dep_graph.is_green(node);
+            let g = if eval_always {
+                false
+            } else if let Some((green, _)) = fused_hit.take() {
+                green
+            } else {
+                // Caches that consult green without a preceding capture.
+                dep_graph.is_green(node)
+            };
             probed_green = Some(g);
             g
         },
