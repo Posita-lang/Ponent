@@ -130,6 +130,7 @@ fn ends_with_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> bool {
 /// Node/chalk-compatible `FORCE_COLOR` level: `1` → 16 colours,
 /// `2` → 256, `3` **or any larger numeric value** → true colour.  Anything
 /// non-numeric (other than `true`/`false`/empty) carries no level.
+/// Matching is case-sensitive (`TRUE` is not `true`), mirroring Node.
 fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
     let s = v.to_str()?.trim();
     match s {
@@ -530,6 +531,25 @@ fn scan_url_path(s: &[u8]) -> (usize, usize) {
     (first_unsafe, unsafe_count)
 }
 
+fn wsl_distro_name() -> Option<String> {
+    let name = std::env::var("WSL_DISTRO_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    #[cfg(target_os = "linux")]
+    {
+        // SSH/CI can forward WSL_DISTRO_NAME to a native Linux host.  Only
+        // translate when the kernel also identifies as WSL; if /proc cannot
+        // be read, keep the env-only fallback.
+        if let Ok(version) = std::fs::read_to_string("/proc/version") {
+            let lower = version.to_ascii_lowercase();
+            if !lower.contains("microsoft") && !lower.contains("wsl") {
+                return None;
+            }
+        }
+    }
+    Some(name)
+}
+
 fn encode_scanned_path(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
     out.reserve(s.len().saturating_add(unsafe_count.saturating_mul(2)));
     // A safe byte is ASCII by construction (URL_SAFE only contains ASCII),
@@ -683,9 +703,7 @@ pub fn path_to_file_url(path: &std::path::Path) -> String {
         Cow::Borrowed(raw)
     };
 
-    let distro = std::env::var("WSL_DISTRO_NAME")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let distro = wsl_distro_name();
     format_file_url(&bytes, distro.as_deref())
 }
 

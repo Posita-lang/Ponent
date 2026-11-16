@@ -474,7 +474,7 @@ impl<'src> DiagMessage<'src> {
         match self {
             DiagMessage::Static(s) => out.push_str(&s),
             DiagMessage::Slug { slug, pairs } => {
-                crate::diagnostics::i18n::render_into_owned(slug, pairs, out);
+                crate::diagnostics::i18n::render_into_slug(slug, pairs, out);
             }
         }
     }
@@ -2745,7 +2745,7 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
     };
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
-    let _ = emitter.emit_all_iter(collector.iter_mut());
+    let _ = emitter.emit_all_iter(collector.iter_mut().map(|h| h.into_diagnostic()));
     // `iter_mut`'s contract is humanize-only.  Recompute in release too so a
     // future caller that changes a level cannot desynchronize `has_errors` /
     // `check`; `summary` keeps the debug cross-check.
@@ -4236,7 +4236,7 @@ mod tests {
                     .into())
             });
         assert!(result.is_err());
-        for diag in ctxt.iter_mut() {
+        for mut diag in ctxt.iter_mut() {
             diag.humanize();
             assert_eq!(diag.spans.primary().as_slice(), &[adorn_span][..]);
             // Kind derivation itself is unaffected.

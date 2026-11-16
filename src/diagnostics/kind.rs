@@ -362,6 +362,16 @@ fn comptime_message<'a>(kind: &ComptimeErrorKind) -> DiagMessage<'a> {
     }
 }
 
+fn name_not_found_help<'src>(
+    suggestions: &[Cow<'src, str>],
+) -> Option<Cow<'src, str>> {
+    if suggestions.is_empty() {
+        None
+    } else {
+        Some(crate::diagnostics::i18n::fluent::did_you_mean(suggestions.join("` or `")).lift())
+    }
+}
+
 fn type_mismatch_message<'src>(
     expected: &Cow<'src, str>,
     found: &Cow<'src, str>,
@@ -636,14 +646,7 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 Some(crate::diagnostics::i18n::fluent::help_cast_or_change().lift())
             }
             DiagnosticKind::NameNotFound { suggestions, .. } => {
-                if suggestions.is_empty() {
-                    None
-                } else {
-                    Some(
-                        crate::diagnostics::i18n::fluent::did_you_mean(suggestions.join("` or `"))
-                            .lift(),
-                    )
-                }
+                name_not_found_help(suggestions.as_slice())
             }
             _ => None,
         }
@@ -749,11 +752,7 @@ impl<'src> DiagnosticKind<'src> {
                 };
                 let mut labels = CovariantVec::new();
                 labels.push(Label::new(span, fluent::label_not_in_scope().lift()));
-                let help = if suggestions.is_empty() {
-                    None
-                } else {
-                    Some(fluent::did_you_mean(suggestions.join("` or `")).lift())
-                };
+                let help = name_not_found_help(suggestions.as_slice());
                 (message, labels, help, vec![])
             }
             DiagnosticKind::DuplicateDefinition {

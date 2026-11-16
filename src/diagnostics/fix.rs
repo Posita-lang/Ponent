@@ -685,6 +685,24 @@ mod tests {
     /// Zero-length edits are insertions; duplicates at one point collapse to the
     /// highest-weight edit, while an insertion at a replacement boundary is a
     /// disjoint half-open interval and composes with the replacement.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "multi-file")]
+    fn apply_rejects_multi_file_set() {
+        let d1 = diag_with_fix(
+            Span::new(FileId::from_raw(1), 0, 1),
+            "a",
+            Applicability::MachineApplicable,
+        );
+        let d2 = diag_with_fix(
+            Span::new(FileId::from_raw(2), 0, 1),
+            "b",
+            Applicability::MachineApplicable,
+        );
+        let set = FixSet::collect(&[d1, d2], FixHints::Auto);
+        let _ = set.apply("x");
+    }
+
     #[test]
     fn insertion_inside_replacement_wins_as_shorter_interval() {
         let src = "abcdef";

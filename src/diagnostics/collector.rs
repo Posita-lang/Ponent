@@ -69,6 +69,30 @@ pub struct DiagCtxt<'src> {
 /// enough to make that a silent per-context stack cost.
 const _: () = assert!(std::mem::size_of::<DiagCtxt<'_>>() <= 1024);
 
+/// Mutable view restricted to the emitter's humanize boundary.  `Deref`
+/// exposes read access; obtaining `&mut Diagnostic` requires the explicit
+/// `into_diagnostic`, so a future caller cannot change a level through the
+/// iterator by accident.
+pub(crate) struct HumanizeOnly<'a, 'src>(&'a mut Diagnostic<'src>);
+
+impl<'a, 'src> HumanizeOnly<'a, 'src> {
+    pub(crate) fn humanize(&mut self) {
+        self.0.humanize();
+    }
+
+    /// Explicit escape for the emitter's render path.
+    pub(crate) fn into_diagnostic(self) -> &'a mut Diagnostic<'src> {
+        self.0
+    }
+}
+
+impl<'a, 'src> std::ops::Deref for HumanizeOnly<'a, 'src> {
+    type Target = Diagnostic<'src>;
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
 impl<'src> DiagCtxt<'src> {
     /// Enable/disable warning emission for **subsequent** pushes.
     ///
@@ -194,8 +218,8 @@ impl<'src> DiagCtxt<'src> {
     /// humanizes each diagnostic at its render boundary.
     pub(crate) fn iter_mut(
         &mut self,
-    ) -> impl DoubleEndedIterator<Item = &mut Diagnostic<'src>> + ExactSizeIterator {
-        self.diags.iter_mut()
+    ) -> impl DoubleEndedIterator<Item = HumanizeOnly<'_, 'src>> + ExactSizeIterator {
+        self.diags.iter_mut().map(HumanizeOnly)
     }
 
     /// Humanize every unreported diagnostic in place.

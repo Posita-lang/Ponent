@@ -2285,13 +2285,6 @@ impl GlyphRenderer {
                     out.push('\n');
                     let sanitized_msg = super::sanitize_for_terminal_multiline(msg);
                     let segments = self.wrap_msg(&sanitized_msg, prefix_cols);
-                    // Localized label for an inline help annotation.  Compute
-                    // the prefix once (label + ":" + " ") and derive both the
-                    // first-line write and the continuation gutter from it so
-                    // a non-English label keeps its wrapped continuation
-                    // aligned.
-                    let help_label = crate::diagnostics::DiagnosticLevel::Help.label();
-                    let help_cols = visible_width(help_label.as_ref()) + 2;
                     for (i, seg) in segments.iter().enumerate() {
                         // Fixed gutter first, written straight into `out`
                         // (reusing its capacity); the segment text follows.
@@ -3627,7 +3620,11 @@ pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
     // b2`) covers *all* the cases the display-column check did — including
     // zero-width ranges strictly inside a multi-byte grapheme, which
     // `byte_range_to_display` expands to the whole cluster.
-    let primary_ranges = merged_primary_ranges(ranges, meta, len);
+    let primary_ranges = if highlight_on.is_empty() && highlight_off.is_empty() {
+        SmallVec::new()
+    } else {
+        merged_primary_ranges(ranges, meta, len)
+    };
 
     // ── ASCII fast path: byte offset ≡ display column ──
     // One classification pass feeds both byte-level branches below; testing

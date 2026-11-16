@@ -611,8 +611,9 @@ impl ErrCode {
     /// ever prints a handful of codes never allocates a
     /// `CODE_INDEX_SLOTS`-sized table of `OnceLock` shells eagerly.  A batch
     /// of *N* diagnostics sharing a code builds the URL once and clones
-    /// thereafter.  Unknown codes (arbitrary bytes, no slot) bypass the
-    /// cache and rebuild every call.
+    /// thereafter.  Unknown codes outside the `^[EW]\d{3}$` shape bypass the
+    /// cache; a shape-valid unregistered code (e.g. `E999`) still occupies its
+    /// slot and is cached, so repeated emissions do not rebuild the URL.
     ///
     /// Returns an `Arc<str>`: a cache hit is a refcount bump, not a heap
     /// allocation + copy of an immutable 40–80+ byte URL.
@@ -670,15 +671,26 @@ impl ErrCode {
     /// `SlotCache` note there), so a batch of *N* diagnostics sharing a code
     /// builds the OSC 8 hyperlink once and clones thereafter.  Unknown codes
     /// (arbitrary bytes, no slot) bypass the cache and rebuild every call.
+    fn ansi_cacheable(&self) -> bool {
+        match &self.0 {
+            ErrCodeRepr::Known(_) => true,
+            // `None` (unregistered but shape-valid, e.g. E999) keeps the
+            // historical slot-cache behavior; only a non-canonical spelling
+            // must bypass the cache.
+            ErrCodeRepr::Other(o) => o
+                .canonical
+                .is_none_or(|e| e.code == o.raw.as_str()),
+        }
+    }
+
     pub fn url_ansi(&self) -> std::sync::Arc<str> {
-        let canonical = self.canonical();
         let Some(slot) = self.slot() else {
             return self.url_ansi_build().into();
         };
         // The cached string embeds the *visible* spelling, not the canonical
         // one.  Letting `unknown("e030")` populate slot 30 would make a later
         // canonical `E030` render the wrong link text.
-        if self.code() != canonical {
+        if !self.ansi_cacheable() {
             return self.url_ansi_build().into();
         }
         if EXPLAIN_PORT.get().is_some() {

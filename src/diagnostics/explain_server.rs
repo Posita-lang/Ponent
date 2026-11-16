@@ -44,20 +44,7 @@ impl PendingConn {
     }
 }
 
-/// Serve the explanation for `code` on an already-bound `listener`.
-/// The listener must have been bound to `127.0.0.1:<port>` by the caller
-/// (e.g. via `TcpListener::bind("127.0.0.1:0")`).
-///
-/// Returns an error if no client sends an HTTP request within the accept
-/// budget (10 s: a browser cold start, profile-lock waits, and extension
-/// loading can take several seconds before the first request), so the
-/// caller can surface a warning instead of silently pretending the page
-/// was served.  Connections that never send a request — the browser's
-/// speculative preconnects — are closed and the wait continues, so a
-/// preconnect cannot consume the single page this call exists to serve.
-/// The listener may be blocking or non-blocking on entry; the mode is restored
-/// on every return path (queried via `socket2::SockRef` on Unix, with the
-/// blocking fallback contract on non-Unix).
+/// Wrap `libc::epoll_ctl`, converting a non-zero return into `io::Error`.
 #[cfg(target_os = "linux")]
 fn epoll_ctl_checked(
     epfd: i32,
@@ -157,6 +144,20 @@ fn enable_tcp_defer_accept(listener: &TcpListener) {
 #[cfg(any(not(target_os = "linux"), test))]
 fn enable_tcp_defer_accept(_listener: &TcpListener) {}
 
+/// Serve the explanation for `code` on an already-bound `listener`.
+/// The listener must have been bound to `127.0.0.1:<port>` by the caller
+/// (e.g. via `TcpListener::bind("127.0.0.1:0")`).
+///
+/// Returns an error if no client sends an HTTP request within the accept
+/// budget (10 s: a browser cold start, profile-lock waits, and extension
+/// loading can take several seconds before the first request), so the
+/// caller can surface a warning instead of silently pretending the page
+/// was served.  Connections that never send a request — the browser's
+/// speculative preconnects — are closed and the wait continues, so a
+/// preconnect cannot consume the single page this call exists to serve.
+/// The listener may be blocking or non-blocking on entry; the mode is restored
+/// on every return path (queried via `socket2::SockRef` on Unix, with the
+/// blocking fallback contract on non-Unix).
 pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> {
     // `ErrCode::new` carries a `debug_assert!` that aborts on unknown codes;
     // `code` here comes from the CLI (`ponent explain <CODE>`), so a typo
@@ -871,6 +872,33 @@ fn arm_read_timeout_until(stream: &mut TcpStream, deadline: Instant) -> std::io:
 /// reads correct.  The scan itself is incremental : only bytes appended by
 /// the latest read are searched, with a 3-byte carry, so a dribbling client
 /// costs O(n) total scan work instead of O(n²).
+/// Drain a request whose framing cannot be established (chunked, ambiguous,
+/// oversized) until peer EOF or the deadline.  One canonical loop for
+/// `drain_after_head` and `drain_request_tracked`.
+fn drain_unframed(stream: &mut TcpStream, deadline: Instant) -> DrainOutcome {
+    let mut sink = [0u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return DrainOutcome::HeadersOnly;
+        }
+        if arm_read_timeout_until(stream, deadline).is_err() {
+            return DrainOutcome::HeadersOnly;
+        }
+        match stream.read(&mut sink) {
+            Ok(0) => return DrainOutcome::Complete,
+            Ok(_) => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return DrainOutcome::HeadersOnly;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return DrainOutcome::HeadersOnly,
+        }
+    }
+}
+
 fn drain_after_head(
     stream: &mut TcpStream,
     framing: HeaderFraming,
@@ -1073,27 +1101,7 @@ fn drain_request_tracked(
         // cutoff is `HeadersOnly` (half-close + linger), never a false
         // `Complete` that would RST away the just-written response .
         *tail_len = 0;
-        let mut sink = [0u8; 4096];
-        loop {
-            if Instant::now() >= deadline {
-                return DrainOutcome::HeadersOnly;
-            }
-            if arm_read_timeout_until(stream, deadline).is_err() {
-                return DrainOutcome::HeadersOnly;
-            }
-            match stream.read(&mut sink) {
-                Ok(0) => return DrainOutcome::Complete,
-                Ok(_) => {}
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    return DrainOutcome::HeadersOnly;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return DrainOutcome::HeadersOnly,
-            }
-        }
+        return drain_unframed(stream, deadline);
     }
     let body_len = framing.content_length.unwrap_or(0);
     // RFC 7231 §5.1.1 permits an immediate final response without inviting
@@ -2488,10 +2496,6 @@ fn serve_explain_persistent_epoll(
         header_deadline: Option<Instant>,
         /// Watermark for incremental header-terminator scanning.
         header_scan: HeaderScan,
-        /// True after this connection has completed at least one response;
-        /// only then does an empty buffer mean keep-alive idle (a fresh
-        /// preconnect must keep its shorter first-byte budget).
-        served: bool,
         /// Over-cap connection waiting for a first byte: silent preconnects are
         /// closed without a response, real requests get the cached 503.
         overload: bool,
@@ -2640,7 +2644,6 @@ fn serve_explain_persistent_epoll(
                                                 + FIRST_BYTE_READ_TIMEOUT,
                                             header_deadline: None,
                                             header_scan: HeaderScan::new(),
-                                            served: false,
                                             overload: true,
                                             body_remaining: 0,
                                         },
@@ -2662,7 +2665,6 @@ fn serve_explain_persistent_epoll(
                                         deadline: Instant::now() + FIRST_BYTE_READ_TIMEOUT,
                                         header_deadline: None,
                                         header_scan: HeaderScan::new(),
-                                        served: false,
                                         overload: false,
                                         body_remaining: 0,
                                     },
@@ -3056,7 +3058,6 @@ fn serve_explain_persistent_epoll(
                     if conn.keep_alive {
                         conn.buf.drain(..conn.consumed);
                         conn.header_scan.reset();
-                        conn.served = true;
                         conn.response = None;
                         conn.date = None;
                         conn.progress = [0; 6];
@@ -3383,41 +3384,16 @@ fn read_request_line(
     }
 }
 
-/// A page head split into `(prefix, shared style, suffix)`.
-///
-/// The `<style>` payload is byte-identical across the large prewarmed page
-/// set, so interning it once removes one CSS copy per page while keeping the
-/// bytes sent to the browser exactly the same.  This is one-shot-safe: unlike
-/// an external stylesheet it needs no second request.
+/// Owned head split into the three vectored-write parts.  The HTTP head is a
+/// single allocation; the other two slices are reserved for the writer's
+/// stable `[head, connection, body]` shape and are always empty.
 type HeadParts = [std::sync::Arc<str>; 3];
 
-fn intern_head_style(style: &str) -> std::sync::Arc<str> {
-    static STYLES: std::sync::OnceLock<
-        std::sync::Mutex<rustc_hash::FxHashSet<std::sync::Arc<str>>>,
-    > = std::sync::OnceLock::new();
-    let map = STYLES.get_or_init(|| std::sync::Mutex::new(rustc_hash::FxHashSet::default()));
-    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(shared) = map.get(style) {
-        return std::sync::Arc::clone(shared);
-    }
-    let shared: std::sync::Arc<str> = std::sync::Arc::from(style);
-    map.insert(std::sync::Arc::clone(&shared));
-    shared
-}
-
-fn split_head(head: String) -> HeadParts {
-    let Some(open) = head.find("<style>") else {
-        return [std::sync::Arc::from(head), std::sync::Arc::from(""), std::sync::Arc::from("")];
-    };
-    let Some(close) = head[open + 7..].find("</style>") else {
-        return [std::sync::Arc::from(head), std::sync::Arc::from(""), std::sync::Arc::from("")];
-    };
-    let style_start = open + 7;
-    let style_end = style_start + close;
+fn head_parts_owned(head: String) -> HeadParts {
     [
-        std::sync::Arc::from(&head[..style_start]),
-        intern_head_style(&head[style_start..style_end]),
-        std::sync::Arc::from(&head[style_end..]),
+        std::sync::Arc::from(head),
+        std::sync::Arc::from(""),
+        std::sync::Arc::from(""),
     ]
 }
 
@@ -3458,7 +3434,7 @@ impl CachedPage {
     fn build(status: &str, extra_headers: &str, body: String) -> Self {
         let head = render_head(status, extra_headers, body.len());
         CachedPage {
-            head: split_head(head),
+            head: head_parts_owned(head),
             body: body.into_boxed_str(),
         }
     }
@@ -3858,7 +3834,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         let body = build_not_found_page(code);
         let head = render_head("404 Not Found", "", body.len());
         OwnedPage {
-            head: split_head(head),
+            head: head_parts_owned(head),
             body: std::sync::Arc::from(body),
         }
     };

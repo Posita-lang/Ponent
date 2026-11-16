@@ -966,6 +966,16 @@ impl HtmlRenderer {
         // every gap (mirrors the glyph renderer's
         // `... (N lines omitted)` between its source sections).
         let mut prev_section_last: Option<usize> = None;
+        if let Some(&(first, _)) = sections.first()
+            && first > 0
+        {
+            html.push_str("<span class='line-num'>");
+            fmt::push_spaces(html, line_num_width);
+            html.push_str(" │ </span>");
+            html.push_str("<span class='fold'>");
+            fmt::push_fold_marker(html, first);
+            html.push_str("</span>\n");
+        }
         for &(sec_first, sec_last) in &sections {
             if let Some(pl) = prev_section_last {
                 let gap = sec_first.saturating_sub(pl + 1);
@@ -1439,6 +1449,12 @@ impl Iterator for HtmlEscapeIter<'_> {
 /// byte.  The escape set matches the source-row loop it replaced (`&`, `<`,
 /// `>`, `"`); the all-clean fast path avoids the char walk entirely.
 fn push_html_escaped(out: &mut String, s: &str) {
+    // Source text is untrusted too: raw C0/DEL/C1 must not reach HTML (the
+    // message path already sanitizes).  Per-run sanitization keeps offsets
+    // within the callback; the row/annotation columns were computed before
+    // this point.
+    let sanitized = crate::diagnostics::sanitize_for_terminal_multiline(s);
+    let s = sanitized.as_ref();
     let bytes = s.as_bytes();
     // Merged iterators for the source-content escape set (`& < > "`): the
     // tag and quote classes advance independently and each byte of the
@@ -1518,6 +1534,15 @@ mod tests {
     use crate::ast::Span;
     use crate::diagnostics::Diagnostic;
     use crate::diagnostics::ErrCode;
+
+    #[test]
+    fn source_control_bytes_are_sanitized() {
+        let diag = Diagnostic::error("x")
+            .with_span(Span::new(crate::ast::FileId::DUMMY, 0, 1))
+            .with_source("a\x01b\n");
+        let html = HtmlRenderer::new().diagnostic_to_html(&diag);
+        assert!(!html.contains('\x01'), "raw control byte in source: {html}");
+    }
 
     /// Multi-file guard, HTML analog of the glyph renderer's
     /// `foreign_primary_spans_render_as_location_only_notes`: a primary span

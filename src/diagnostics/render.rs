@@ -148,6 +148,12 @@ pub(crate) fn source_fingerprint(s: &str) -> u64 {
     for &x in b.iter().rev().take(8) {
         feed(x);
     }
+    // Middle sample: first/last-8-only fingerprints collide for two
+    // same-length sources that share a header/footer and differ in the body.
+    let mid = b.len() / 2;
+    for &x in b.iter().skip(mid).take(8) {
+        feed(x);
+    }
     for x in (b.len() as u64).to_le_bytes() {
         feed(x);
     }
@@ -634,6 +640,14 @@ impl SharedRenderState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_fingerprint_samples_the_middle() {
+        let a = "HEADER00\na\nb\nTAIL0000";
+        let b = "HEADER00\nab\n\nTAIL0000";
+        assert_eq!(a.len(), b.len());
+        assert_ne!(source_fingerprint(a), source_fingerprint(b));
+    }
+
     /// The whole point of the cache: the second render of the same source
     /// reuses the first index's table (an `Arc` clone), not a rebuild.
     #[test]
@@ -840,6 +854,10 @@ pub trait Renderer: Send + Sync {
     /// plural categories (Russian has one/few/many, not a binary —s).
     fn render_suppressed_note(&self, count: usize) -> String {
         let mut s = String::new();
+        // rustc-style annotation prefixes (`= note:`) stay English by
+        // convention; only the payload goes through Fluent.  This keeps the
+        // terminal summary lexically stable for tools while localized counts
+        // still follow CLDR plurals.
         s.push_str("  = note: ");
         crate::diagnostics::i18n::render_into(
             "suppressed-note",

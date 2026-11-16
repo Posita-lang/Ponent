@@ -1219,4 +1219,20 @@ mod tests {
         );
         assert!(out.contains("child"), "child text missing: {out}");
     }
+
+    #[test]
+    fn empty_pretty_batch_is_valid_empty_array() {
+        let opts = crate::diagnostics::DiagOpts::default();
+        let mut emitter = crate::diagnostics::emitter::Emitter::new(
+            JsonRenderer::new(true),
+            crate::diagnostics::sink::string(),
+            opts,
+        );
+        let mut diags: Vec<Diagnostic<'static>> = Vec::new();
+        let mut sink = crate::diagnostics::sink::StringSink::new();
+        emitter.emit_all_to(&mut diags, &mut sink).unwrap();
+        let out = sink.into_string();
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v, serde_json::Value::Array(Vec::new()));
+    }
 }

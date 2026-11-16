@@ -588,6 +588,23 @@ pub fn render_into_owned<'msg, 'src>(
     out.push_str(msg);
 }
 
+/// [`render_into_owned`] for a caller that already knows `msg` is an FTL
+/// slug (`DiagMessage::Slug`), skipping the `is_ftl_slug` byte scan.
+pub fn render_into_slug<'msg, 'src>(
+    msg: &'msg str,
+    pairs: SmallVec<[(&'static str, Cow<'src, str>); 4]>,
+    out: &mut String,
+) {
+    if let Some(c) = fluent::zero_arg_slug(msg) {
+        out.push_str(&c);
+        return;
+    }
+    if try_fluent_owned_into(msg, pairs, out) {
+        return;
+    }
+    out.push_str(msg);
+}
+
 fn try_fluent_owned_into<'msg, 'src>(
     msg: &'msg str,
     pairs: SmallVec<[(&'static str, Cow<'src, str>); 4]>,

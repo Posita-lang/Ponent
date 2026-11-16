@@ -49,6 +49,8 @@ fn x86_level() -> u8 {
     level
 }
 
+const AVX512_MIN_LEN: usize = 256;
+
 #[cfg(test)]
 thread_local! {
     static SWAR_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -86,7 +88,7 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     let level = x86_level();
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && level >= 3 {
+    if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
@@ -168,7 +170,7 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     let level = x86_level();
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && level >= 3 {
+    if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_multiline_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
@@ -250,7 +252,7 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     let level = x86_level();
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && level >= 3 {
+    if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_or_tab_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
@@ -349,7 +351,7 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     #[cfg(target_arch = "x86_64")]
     let level = x86_level();
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && level >= 3 {
+    if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::classify_ascii_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
@@ -421,7 +423,7 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
     let level = x86_level();
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 64 && level >= 3 {
+    if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::next_non_ascii_byte_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
@@ -518,6 +520,22 @@ mod x86_64 {
         let tab_v = _mm256_set1_epi8(0x09);
         let nl_v = _mm256_set1_epi8(0x0A);
         let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
+            let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
+            let bad = |v: __m256i| unsafe {
+                let lt = _mm256_cmpgt_epi8(sp, v);
+                let tab = _mm256_cmpeq_epi8(v, tab_v);
+                let nl = _mm256_cmpeq_epi8(v, nl_v);
+                let off = _mm256_andnot_si256(_mm256_or_si256(tab, nl), lt);
+                let eq = _mm256_cmpeq_epi8(v, del);
+                _mm256_or_si256(eq, off)
+            };
+            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad(a), bad(b))) } != 0 {
+                return false;
+            }
+            i += 64;
+        }
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
@@ -542,6 +560,21 @@ mod x86_64 {
         let del = _mm256_set1_epi8(0x7F);
         let tab_v = _mm256_set1_epi8(0x09);
         let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
+            let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
+            let bad = |v: __m256i| unsafe {
+                let lt = _mm256_cmpgt_epi8(sp, v);
+                let tab = _mm256_cmpeq_epi8(v, tab_v);
+                let off = _mm256_andnot_si256(tab, lt);
+                let eq = _mm256_cmpeq_epi8(v, del);
+                _mm256_or_si256(eq, off)
+            };
+            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad(a), bad(b))) } != 0 {
+                return false;
+            }
+            i += 64;
+        }
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
@@ -565,6 +598,24 @@ mod x86_64 {
         let tab_v = _mm256_set1_epi8(0x09);
         let mut saw_tab = false;
         let mut i = 0usize;
+        while i + 64 <= s.len() {
+            let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
+            let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
+            let classify = |v: __m256i| unsafe {
+                let lt = _mm256_cmpgt_epi8(sp, v);
+                let tab = _mm256_cmpeq_epi8(v, tab_v);
+                let off = _mm256_andnot_si256(tab, lt);
+                let eq = _mm256_cmpeq_epi8(v, del);
+                (_mm256_or_si256(eq, off), _mm256_movemask_epi8(tab))
+            };
+            let (bad_a, tab_a) = classify(a);
+            let (bad_b, tab_b) = classify(b);
+            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad_a, bad_b)) } != 0 {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= tab_a != 0 || tab_b != 0;
+            i += 64;
+        }
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
@@ -663,6 +714,24 @@ mod x86_64 {
         let tab_v = _mm512_set1_epi8(0x09);
         let nl_v = _mm512_set1_epi8(0x0A);
         let mut i = 0usize;
+        while i + 256 <= s.len() {
+            let bad = |v: __m512i| unsafe {
+                let lt = _mm512_cmpgt_epi8_mask(sp, v);
+                let tab = _mm512_cmpeq_epi8_mask(v, tab_v);
+                let nl = _mm512_cmpeq_epi8_mask(v, nl_v);
+                let off = lt & !(tab | nl);
+                let eq = _mm512_cmpeq_epi8_mask(v, del);
+                eq | off
+            };
+            let a = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
+            let b = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) };
+            let c = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) };
+            let d = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) };
+            if bad(a) | bad(b) | bad(c) | bad(d) != 0 {
+                return false;
+            }
+            i += 256;
+        }
         while i + 64 <= s.len() {
             let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
             let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
@@ -684,6 +753,23 @@ mod x86_64 {
         let del = _mm512_set1_epi8(0x7F);
         let tab_v = _mm512_set1_epi8(0x09);
         let mut i = 0usize;
+        while i + 256 <= s.len() {
+            let bad = |v: __m512i| unsafe {
+                let lt = _mm512_cmpgt_epi8_mask(sp, v);
+                let tab = _mm512_cmpeq_epi8_mask(v, tab_v);
+                let off = lt & !tab;
+                let eq = _mm512_cmpeq_epi8_mask(v, del);
+                eq | off
+            };
+            let a = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
+            let b = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) };
+            let c = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) };
+            let d = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) };
+            if bad(a) | bad(b) | bad(c) | bad(d) != 0 {
+                return false;
+            }
+            i += 256;
+        }
         while i + 64 <= s.len() {
             let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
             let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
@@ -705,6 +791,24 @@ mod x86_64 {
         let tab_v = _mm512_set1_epi8(0x09);
         let mut saw_tab = false;
         let mut i = 0usize;
+        while i + 256 <= s.len() {
+            let class = |v: __m512i| unsafe {
+                let lt = _mm512_cmpgt_epi8_mask(sp, v);
+                let tab = _mm512_cmpeq_epi8_mask(v, tab_v);
+                let off = lt & !tab;
+                let eq = _mm512_cmpeq_epi8_mask(v, del);
+                (eq | off, tab)
+            };
+            let (ba, ta) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) });
+            let (bb, tb) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) });
+            let (bc, tc) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) });
+            let (bd, td) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) });
+            if ba | bb | bc | bd != 0 {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= (ta | tb | tc | td) != 0;
+            i += 256;
+        }
         while i + 64 <= s.len() {
             let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
             let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
@@ -1218,6 +1322,28 @@ mod tests {
             v[at] = 0x80;
             assert_eq!(next_non_ascii_byte(&v), Some(at), "offset {at}");
         }
+    }
+
+    #[test]
+    fn long_inputs_cover_unrolled_kernels() {
+        let mut long = vec![b'a'; 700];
+        assert!(is_printable_ascii(&long));
+        assert!(is_printable_ascii_or_tab(&long));
+        assert!(is_printable_ascii_multiline(&long));
+        assert_eq!(classify_ascii(&long), AsciiClass::Printable);
+
+        long[255] = b'\t';
+        assert!(!is_printable_ascii(&long));
+        assert!(is_printable_ascii_or_tab(&long));
+        assert!(is_printable_ascii_multiline(&long));
+        assert_eq!(classify_ascii(&long), AsciiClass::PrintableOrTab);
+
+        long[255] = b'a';
+        long[600] = 0x7F;
+        assert!(!is_printable_ascii(&long));
+        assert!(!is_printable_ascii_or_tab(&long));
+        assert!(!is_printable_ascii_multiline(&long));
+        assert_eq!(classify_ascii(&long), AsciiClass::Other);
     }
 
     #[test]
