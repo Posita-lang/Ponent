@@ -156,7 +156,7 @@ fn make_bundle(lang: LanguageIdentifier, src: &'static str) -> Bundle {
     bundle
 }
 
-fn bundle_for(lang: &LanguageIdentifier) -> &'static Bundle {
+fn bundle_for_in(lang: &LanguageIdentifier) -> &'static Bundle {
     let bundles = bundles();
     // Matches the `language` subtag only: a `zh-Hant` identifier resolves to
     // the `zh` (Simplified) bundle, and `en-GB` to `en`.  That is correct for
@@ -198,8 +198,16 @@ fn format_slug_into(
     out: &mut String,
 ) -> bool {
     let bundles = bundles();
-    let primary = bundle_for(lang);
-    let en = &bundles[0];
+    format_slug_in_into(bundle_for_in(lang), &bundles[0], slug, args, out)
+}
+
+fn format_slug_in_into(
+    primary: &Bundle,
+    en: &Bundle,
+    slug: &str,
+    args: Option<&FluentArgs>,
+    out: &mut String,
+) -> bool {
 
     // Hoisted out of `try_bundle`: a fresh `Vec::new()` per attempt is free
     // on the success path (lazy allocation) but pays a fresh `Drop` per
@@ -509,47 +517,41 @@ fn try_fluent_into<'msg, 'src>(
         // argument map.
         return format_slug_into(lang, msg, None, out);
     }
-    // Single-pass resolve+format: walk the bundle chain once, and build the
-    // argument map lazily — only when a bundle actually has the message.
-    // The old `slug_exists` probe + `format_slug` paid two `get_message`
-    // hash lookups per bundle for the same answer.
+    // Single-pass resolve+format: walk the bundle chain once.  The argument
+    // map is built eagerly once; this path is already past `is_ftl_slug`, and
+    // the map is tiny (≤4 entries).
     let bundles = bundles();
-    let primary = bundle_for(lang);
+    let primary = bundle_for_in(lang);
     let en = &bundles[0];
-    let build_args = || {
-        let mut args = FluentArgs::new();
-        pairs.iter().for_each(|(k, v)| {
-            // `v.clone()` — not `FluentValue::String(v)` by value. `pairs`
-            // arrives as `&[...]` borrowed from `DiagMessage::render_into(&self)`,
-            // so `v` is behind a shared reference and cannot be moved (E0507).
-            // Taking `pairs` by value would force `render_into` to own its
-            // message, breaking the `&self` API (a diagnostic may render more
-            // than once) and rippling through every caller. Under `&self`,
-            // `clone` is the cheapest legal option: `Cow::Borrowed` copies a
-            // pointer (zero heap, the common `&str`-arg path); only `Cow::Owned`
-            // deep-copies — unavoidable without ownership.
-            let value = make_value(v.clone(), k);
-            args.set(*k, value);
-        });
-        args
-    };
+    // Build the argument map once for the whole fallback chain.
+    let mut args = FluentArgs::new();
+    pairs.iter().for_each(|(k, v)| {
+        // `v.clone()` — not `FluentValue::String(v)` by value. `pairs`
+        // arrives as `&[...]` borrowed from `DiagMessage::render_into(&self)`,
+        // so `v` is behind a shared reference and cannot be moved (E0507).
+        // Taking `pairs` by value would force `render_into` to own its
+        // message, breaking the `&self` API (a diagnostic may render more
+        // than once) and rippling through every caller. Under `&self`,
+        // `clone` is the cheapest legal option: `Cow::Borrowed` copies a
+        // pointer (zero heap, the common `&str`-arg path); only `Cow::Owned`
+        // deep-copies — unavoidable without ownership.
+        let value = make_value(v.clone(), k);
+        args.set(*k, value);
+    });
     // P2: resolve each bundle in turn and *retry formatting* on the next one
     // when a bundle has the message but fails to format it (a broken
     // translation, a missing argument in a translation, or a malformed
     // pattern).  The old `find_map` stopped at the first bundle with the
     // message, so one bad localized translation fell all the way back to the
-    // raw slug even when `en` would have formatted cleanly.  The argument map
-    // is still built at most once.
-    let mut args: Option<FluentArgs> = None;
+    // raw slug even when `en` would have formatted cleanly.
     let mut errors = Vec::new();
     let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
     for b in chain {
         let Some(pattern) = b.get_message(msg).and_then(|m| m.value()) else {
             continue;
         };
-        let args = args.get_or_insert_with(|| build_args());
         errors.clear();
-        let val = b.format_pattern(pattern, Some(args), &mut errors);
+        let val = b.format_pattern(pattern, Some(&args), &mut errors);
         if errors.is_empty() {
             out.push_str(&val);
             return true;
@@ -619,7 +621,7 @@ fn try_fluent_owned_into<'msg, 'src>(
     // the message is found — `pairs` is consumed, so the build cannot sit
     // inside the loop.
     let bundles = bundles();
-    let primary = bundle_for(lang);
+    let primary = bundle_for_in(lang);
     let en = &bundles[0];
     let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
     // Retry formatting on the next bundle when this one has the message but
@@ -732,6 +734,21 @@ pub(crate) use cached_label_static;
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_localized_translation_retries_english() {
+        let bad = make_bundle(langid!("ru"), "retry-probe = { $missing }");
+        let en = make_bundle(langid!("en"), "retry-probe = recovered");
+        let mut out = String::new();
+        assert!(format_slug_in_into(
+            &bad,
+            &en,
+            "retry-probe",
+            None,
+            &mut out
+        ));
+        assert_eq!(out, "recovered");
+    }
 
     /// Regression for the discriminant/sentinel collision: every language must
     /// encode to a value that decodes back to itself, and the unset sentinel

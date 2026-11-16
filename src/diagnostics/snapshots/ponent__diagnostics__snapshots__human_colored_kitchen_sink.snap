@@ -26,7 +26,7 @@ expression: out
 \e[2m│\e[0m\e[2m5\e[0m \e[2m│\e[0m }
 \e[2m│  └─\e[0m
 \e[2m│\e[0m  \e[92m= \e[1mnote\e[0m: expected \e[94mInt<32>\e[0m
-\e[2m│\e[0m  \e[94m= \e[1mnote\e[0m: \e[92mcast with `as`\e[0m
+\e[2m│\e[0m  \e[92m= \e[1mnote\e[0m: \e[92mcast with `as`\e[0m
 \e[2m│\e[0m  \e[94m= \e[1mhelp\e[0m: \e[94mchange the return type\e[0m
 \e[36mreferenced by:\e[0m
     \e[34mmain\e[0m: example.ps:1:1

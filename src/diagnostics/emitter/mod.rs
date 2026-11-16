@@ -350,12 +350,14 @@ struct BatchShared<'a, 'src, R: Renderer> {
     /// streaming).
     order: &'a [usize],
     cells: Vec<std::sync::Mutex<&'a mut Diagnostic<'src>>>,
-    slots: Vec<std::sync::Mutex<Option<String>>>,
+    slots: Vec<std::sync::Mutex<Option<(String, usize)>>>,
     slot_cv: std::sync::Condvar,
     renderer: &'a R,
     opts: &'a DiagOpts,
     prebuilt: &'a [Prebuilt],
-    string_pool: &'a std::sync::Mutex<Vec<String>>,
+    /// One buffer pool per resident worker.  A buffer is returned to the pool
+    /// of the worker that produced it, so the hot path has no shared mutex.
+    string_pools: &'a [std::sync::Mutex<Vec<String>>],
     streaming: bool,
 }
 
@@ -366,6 +368,7 @@ fn worker_render_dynamic<R: Renderer>(
     shared: &BatchShared<'_, '_, R>,
     sources: std::sync::Arc<SharedSources>,
     urls: crate::diagnostics::render::FileUrlMap,
+    worker_idx: usize,
 ) {
     let cx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         RenderCtx::for_parallel_worker(
@@ -386,7 +389,7 @@ fn worker_render_dynamic<R: Renderer>(
         }
         let orig = shared.order[claim];
         let mut buf = shared
-            .string_pool
+            .string_pools[worker_idx % shared.string_pools.len()]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop()
@@ -417,7 +420,7 @@ fn worker_render_dynamic<R: Renderer>(
         };
         *shared.slots[orig]
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(buf);
+            .unwrap_or_else(|e| e.into_inner()) = Some((buf, worker_idx));
         if shared.streaming {
             shared.slot_cv.notify_all();
         }
@@ -449,9 +452,9 @@ pub struct Emitter<R, M> {
     pool: std::sync::OnceLock<crate::pool::WorkerPool>,
     /// Reused across batch emits: weights and claim order.
     batch: BatchScratch,
-    /// Rendered `String` buffers returned by earlier batches, reused by
-    /// resident workers instead of a fresh allocation per diagnostic.
-    string_pool: std::sync::Mutex<Vec<String>>,
+    /// One reusable `String` pool per resident worker.  Workers only ever push
+/// into and pop from their own pool, so the old single hot mutex is gone.
+    string_pools: Vec<std::sync::Mutex<Vec<String>>>,
     /// Cross-batch line tables keyed by `(FileId, full-content hash)`.
     /// `Prebuilt` owns its `Arc` tables, so no source lifetime is captured.
     file_index_cache:
@@ -473,7 +476,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             parallelism,
             pool: std::sync::OnceLock::new(),
             batch: BatchScratch::default(),
-            string_pool: std::sync::Mutex::new(Vec::new()),
+            string_pools: (0..parallelism)
+                .map(|_| std::sync::Mutex::new(Vec::new()))
+                .collect(),
             file_index_cache: std::cell::RefCell::new(crate::smallvec::SmallVec::new()),
         }
     }
@@ -945,7 +950,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             renderer: &self.renderer,
             opts: &self.opts,
             prebuilt: &prebuilt,
-            string_pool: &self.string_pool,
+            string_pools: &self.string_pools,
             streaming: false,
         };
         let pool = self
@@ -953,20 +958,22 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             .get_or_init(|| crate::pool::WorkerPool::new(self.parallelism));
         let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
         let shared_ref = &shared;
+        let pool_count = self.string_pools.len();
         let mut jobs = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
+        for worker_idx in 0..num_workers {
             let sources = std::sync::Arc::clone(&shared_sources);
             let urls = std::sync::Arc::clone(&shared_urls);
+            let worker_slot = worker_idx % pool_count;
             jobs.push(crate::pool::SendJob::new(move || {
-                worker_render_dynamic(shared_ref, sources, urls)
+                worker_render_dynamic(shared_ref, sources, urls, worker_slot)
             }));
         }
         pool.submit(jobs).wait();
-        let string_pool = shared.string_pool;
+        let string_pools = shared.string_pools;
         let BatchShared { slots, .. } = shared;
         let mut first = true;
         for slot in slots {
-            let mut buf = slot
+            let (mut buf, owner) = slot
                 .into_inner()
                 .unwrap_or_else(|e| e.into_inner())
                 .expect("every claimed render slot must be filled before stitch");
@@ -980,7 +987,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             }
             sink.write_str(&buf)?;
             if buf.capacity() <= 64 * 1024 {
-                let mut pool = string_pool
+                let mut pool = string_pools[owner]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if pool.len() < 64 {
@@ -1023,7 +1030,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             renderer: &self.renderer,
             opts: &self.opts,
             prebuilt: &prebuilt,
-            string_pool: &self.string_pool,
+            string_pools: &self.string_pools,
             streaming: true,
         };
         let pool = self
@@ -1031,19 +1038,21 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             .get_or_init(|| crate::pool::WorkerPool::new(self.parallelism));
         let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
         let shared_ref = &shared;
+        let pool_count = self.string_pools.len();
         let mut jobs = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
+        for worker_idx in 0..num_workers {
             let sources = std::sync::Arc::clone(&shared_sources);
             let urls = std::sync::Arc::clone(&shared_urls);
+            let worker_slot = worker_idx % pool_count;
             jobs.push(crate::pool::SendJob::new(move || {
-                worker_render_dynamic(shared_ref, sources, urls)
+                worker_render_dynamic(shared_ref, sources, urls, worker_slot)
             }));
         }
         let wait = pool.submit(jobs);
         let mut result: io::Result<()> = Ok(());
         let mut first = true;
         for cursor in 0..n {
-            let mut buf = {
+            let (mut buf, owner) = {
                 let mut slot = shared.slots[cursor]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
@@ -1068,8 +1077,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 break;
             }
             if buf.capacity() <= 64 * 1024 {
-                let mut pool = shared
-                    .string_pool
+                let mut pool = shared.string_pools[owner]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if pool.len() < 64 {

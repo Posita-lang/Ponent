@@ -100,6 +100,34 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
     }
 }
 
+/// Sanitize + flatten in one pass over the original message.  The old
+/// `sanitize_for_terminal_flatten_with_break` returned a break offset into the
+/// *original* bytes; a U+FFFD replacement before that offset shifted the
+/// sanitized string and made `push_flattened` start mid-character.  This
+/// derives both decisions from the same character stream.
+fn push_sanitized_flattened(out: &mut String, msg: &str) {
+    let mut wrote = false;
+    let mut pending_break = false;
+    for c in msg.chars() {
+        if crate::diagnostics::is_bidi_override(c) {
+            continue;
+        }
+        if matches!(c, '\n' | '\r' | '\t') {
+            pending_break = true;
+            continue;
+        }
+        let c = if c.is_control() { '\u{FFFD}' } else { c };
+        if pending_break {
+            if wrote {
+                out.push(' ');
+            }
+            pending_break = false;
+        }
+        out.push(c);
+        wrote = true;
+    }
+}
+
 impl Renderer for ShortRenderer {
     fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
         let file_raw = diag.file_name();
@@ -146,18 +174,14 @@ impl Renderer for ShortRenderer {
             _ => None,
         };
 
-        // Sanitize both untrusted strings once, *before* reserving: the
-        // sanitized lengths are an exact bound (flattening only shrinks; the
-        // sanitizer's U+FFFD growth is already included), so there is no
-        // scalar growth pre-scan and no possibility of under-booking.  Unused
-        // in release?  No: both are written below.
+        // One fused pass handles bidi removal, control replacement and break
+        // collapsing.  `raw_msg.len()` is only a lower bound: U+FFFD growth is
+        // rare, and `String` grows amortized rather than paying a pre-scan.
         let raw_msg = diag.message();
-        let (sanitized, break_at) =
-            super::super::sanitize_for_terminal_flatten_with_break(raw_msg);
 
-        // ---- Size the reservation to the exact bytes ---------------------
+        // ---- Size the reservation to a lower bound -----------------------
         //   location + tag + ": " + message + "\n"
-        let mut len = sanitized.len() + 2 /* ": " */ + 1 /* "\n" */;
+        let mut len = raw_msg.len() + 2 /* ": " */ + 1 /* "\n" */;
         match (linecol, span) {
             (Some((line, col)), _) => {
                 if !file.is_empty() {
@@ -248,11 +272,10 @@ impl Renderer for ShortRenderer {
         }
         out.push_str(": ");
 
-        // ---- Message, flattened in a single pass -------------------------
+        // ---- Message, sanitized and flattened in a single pass ----------
         // A multi-line message would break the one-line format, and a stray
-        // `\r` would make a terminal redraw the line.  `push_flattened`
-        // consumes the break runs the sanitizer preserved as layout bytes.
-        push_flattened(out, &sanitized, break_at);
+        // `\r` would make a terminal redraw the line.
+        push_sanitized_flattened(out, raw_msg);
         out.push('\n');
     }
 
@@ -297,6 +320,31 @@ mod tests {
     /// Pin that over a random corpus in both sanitizer modes — a future
     /// "improvement" to `push_flattened` that grows output would otherwise
     /// make the reserve under-book.
+    #[test]
+    fn fused_sanitize_flatten_matches_reference_bytes() {
+        for raw in [
+            "",
+            "plain",
+            "a\nb",
+            "a\r\n\tb",
+            "\ta\t",
+            "a\t\tb",
+            "a\x01\nb",
+            "a\u{202E}b",
+            "a\u{0085}b",
+            "e\u{0301}\u{FFFD}中",
+            "x\x7f\ny",
+        ] {
+            let sanitized = crate::diagnostics::sanitize_for_terminal_flatten(raw);
+            let break_at = memchr::memchr3(b'\n', b'\r', b'\t', sanitized.as_bytes());
+            let mut want = String::new();
+            push_flattened(&mut want, &sanitized, break_at);
+            let mut got = String::new();
+            push_sanitized_flattened(&mut got, raw);
+            assert_eq!(got, want, "fused mismatch for {raw:?}");
+        }
+    }
+
     #[test]
     fn flattening_never_grows() {
         // xorshift64*, deterministic across runs and platforms.

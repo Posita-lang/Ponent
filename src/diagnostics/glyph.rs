@@ -130,6 +130,8 @@ pub enum Style {
 
 /// Resolves `Style` tokens to ANSI escape codes.
 /// When `use_color` is false, all styles resolve to the empty string.
+const ANSI_RESET: &str = "\x1b[0m";
+
 struct Styles {
     use_color: bool,
     reset: &'static str,
@@ -170,7 +172,7 @@ impl Styles {
             };
             Styles {
                 use_color: true,
-                reset: "\x1b[0m",
+                reset: ANSI_RESET,
                 bold: "\x1b[1m",
                 dim: "\x1b[2m",
                 error: "\x1b[1;91m",
@@ -2914,7 +2916,7 @@ impl GlyphRenderer {
                 out.push_str(self.bc.v);
                 out.push_str(self.s.reset);
                 out.push_str("  ");
-                out.push_str(self.s.help);
+                out.push_str(self.s.note);
                 out.push_str("= ");
                 out.push_str(self.s.bold);
                 out.push_str(level_label);
@@ -4678,6 +4680,13 @@ pub(crate) fn grapheme_width(g: &str, current_col: usize, tab_width: usize) -> u
             None => 0,
         };
     }
+    // 2-byte UTF-8 with lead below U+0300 (0xCC) is Latin-1 supplement /
+    // IPA/extensions: no combining marks in this range, and C1 controls are
+    // already rendered as a single U+FFFD cell.  U+0300+ is 2-byte too, so
+    // gate on the lead byte, not the length alone.
+    if g.len() == 2 && g.as_bytes()[0] < 0xCC {
+        return 1;
+    }
     // Multi-byte cluster: the width depends only on `g` (tabs are the sole
     // column-dependent case and were handled above), so it can be memoised.
     if g.len() > WIDTH_CACHE_MAX_KEY {
@@ -4714,6 +4723,13 @@ pub(crate) fn grapheme_width_cached(
             Some(_) => 1,
             None => 0,
         };
+    }
+    // 2-byte UTF-8 with lead below U+0300 (0xCC) is Latin-1 supplement /
+    // IPA/extensions: no combining marks in this range, and C1 controls are
+    // already rendered as a single U+FFFD cell.  U+0300+ is 2-byte too, so
+    // gate on the lead byte, not the length alone.
+    if g.len() == 2 && g.as_bytes()[0] < 0xCC {
+        return 1;
     }
     if g.len() > WIDTH_CACHE_MAX_KEY {
         return grapheme_width_uncached(g);

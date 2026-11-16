@@ -28,6 +28,9 @@ struct PendingConn {
     accepted_at: Instant,
     buf: SmallVec<[u8; 512]>,
     scan: HeaderScan,
+    /// Header terminator offset already found by `scan`; passed to
+    /// `parse_request_head` so it does not re-search the whole buffer.
+    head_end: Option<usize>,
 }
 
 #[cfg(unix)]
@@ -188,12 +191,13 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     let _nonblocking_guard = RestoreNonblocking::new(listener, true)?;
     enable_tcp_defer_accept(listener);
 
-    let html = build_explain_page(&ec);
+    let html = std::sync::Arc::<str>::from(build_explain_page(&ec));
     // only a request for this code's page consumes the one-shot server.
     // Use the *canonical* spelling: `try_new("e030")` accepted the code, so a
     // browser navigating to `/E030` is the same page — the raw CLI spelling
     // would 404 it and wait out the budget.
-    let expected_path = format!("/{}", ec.code());
+    let expected_path = std::sync::Arc::<str>::from(format!("/{}", ec.code()));
+    let mut workers = JoinWorkers::default();
 
     // A browser cold start routinely takes several seconds before the first
     // request is sent; the old 2 s budget could expire while the browser was
@@ -332,6 +336,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                                 accepted_at: Instant::now(),
                                 buf: SmallVec::new(),
                                 scan: HeaderScan::new(),
+                                head_end: None,
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -373,8 +378,10 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                         }
                         Ok(n) => {
                             pending[i].buf.extend_from_slice(&tmp[..n]);
-                            match pending[i].scan.scan(&pending[i].buf) {
-                                HeaderProgress::Complete(_) => {
+                            let progress = pending[i].scan.scan(&pending[i].buf);
+                            match progress {
+                                HeaderProgress::Complete(end) => {
+                                    pending[i].head_end = Some(end);
                                     action = Some(PendingAction::Serve);
                                     break;
                                 }
@@ -410,7 +417,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                     let _ = stream.shutdown(Shutdown::Both);
                 } else {
                     let head = if action == PendingAction::Serve {
-                        parse_request_head(&p.buf)
+                        parse_request_head(&p.buf, p.head_end)
                     } else {
                         None
                     };
@@ -419,50 +426,48 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             }
 
             if !handoff.is_empty() {
-                // Every target request is served: the page is idempotent and two tabs or
-                // a retry may legitimately race.  `delivered` only records a
-                // successful write so the accept loop can stop.
-                let delivered = std::sync::atomic::AtomicBool::new(false);
-                std::thread::scope(|scope| {
-                    for (mut stream, buf, action, head) in handoff.drain(..) {
-                        if action == PendingAction::TooLarge {
-                            let _ = std::thread::Builder::new()
+                for (mut stream, buf, action, head) in handoff.drain(..) {
+                    if action == PendingAction::TooLarge {
+                        let handle = std::thread::Builder::new()
                             .stack_size(64 * 1024)
-                            .spawn_scoped(scope, move || {
+                            .spawn(move || {
                                 if stream.set_nonblocking(false).is_err() {
-                                let _ = stream.shutdown(Shutdown::Both);
-                                return;
-                            }
-                            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                                    let _ = stream.shutdown(Shutdown::Both);
+                                    return;
+                                }
+                                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
                                 let _ = write_header_too_large(&mut stream);
                                 linger_after_half_close(&mut stream);
                             });
-                            continue;
+                        if let Ok(handle) = handle {
+                            workers.push(handle);
                         }
-                        let expected = &expected_path;
-                        let delivered_ref = &delivered;
-                        let html = &html;
-                        let _ = std::thread::Builder::new()
-                            .stack_size(64 * 1024)
-                            .spawn_scoped(scope, move || {
-                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                serve_page_after_prefix(&mut stream, html, Some(expected), &buf, head)
-                            }));
-                            // `serve_page_after_prefix` parses the request
-                            // line exactly once and returns true only after
-                            // serving the expected target, so the old
-                            // pre-parse (`request_line_targets`) was a second
-                            // parse of the same bytes.
-                            if matches!(r, Ok(Ok(true))) {
-                                delivered_ref.store(true, Ordering::Release);
-                            }
-                        });
+                        continue;
                     }
-                });
-                if delivered.load(Ordering::Acquire) {
-                    served = true;
-                    idle_deadline = Some(Instant::now() + POST_SERVE_IDLE);
+                    let html = std::sync::Arc::clone(&html);
+                    let expected = std::sync::Arc::clone(&expected_path);
+                    let handle = std::thread::Builder::new()
+                        .stack_size(64 * 1024)
+                        .spawn(move || {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                serve_page_after_prefix(
+                                    &mut stream,
+                                    html.as_ref(),
+                                    Some(expected.as_ref()),
+                                    &buf,
+                                    head,
+                                )
+                            }));
+                        });
+                    if let Ok(handle) = handle {
+                        workers.push(handle);
+                    }
                 }
+                // Every handoff is a target request; the worker writes
+                // idempotently.  Keeping the accept loop free lets a second
+                // tab/pipeline be served without waiting for the first linger.
+                served = true;
+                idle_deadline = Some(Instant::now() + POST_SERVE_IDLE);
             }
         }
         for p in pending.drain(..) {
@@ -482,7 +487,11 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             break;
         }
         match listener.accept() {
-            Ok((mut stream, _)) => match serve_page_expected(&mut stream, &html, Some(&expected_path))
+            Ok((mut stream, _)) => match serve_page_expected(
+                &mut stream,
+                html.as_ref(),
+                Some(expected_path.as_ref()),
+            )
             {
                 Ok(true) => {
                     served = true;
@@ -598,6 +607,23 @@ const MAX_HEADER: usize = 64 * 1024;
 /// while the client drains it, without letting `thread::scope`'s join stall
 /// the accept loop for a full second.
 const ONE_SHOT_LINGER: Duration = Duration::from_millis(150);
+
+#[derive(Default)]
+struct JoinWorkers(Vec<std::thread::JoinHandle<()>>);
+
+impl JoinWorkers {
+    fn push(&mut self, handle: std::thread::JoinHandle<()>) {
+        self.0.push(handle);
+    }
+}
+
+impl Drop for JoinWorkers {
+    fn drop(&mut self) {
+        for handle in self.0.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
 const MAX_REQUEST_LINE: usize = 8 * 1024;
 /// Bound one reactor wakeup's accept work so a sustained connect flood cannot
 /// starve established reads/writes/deadlines; level-triggered epoll resumes.
@@ -742,12 +768,12 @@ struct RequestHead {
     framing: HeaderFraming,
 }
 
-fn parse_request_head(buf: &[u8]) -> Option<RequestHead> {
+fn parse_request_head(buf: &[u8], head_end: Option<usize>) -> Option<RequestHead> {
     let nl = memchr::memchr(b'\n', buf)?;
     let raw = &buf[..nl];
     let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
     let line = std::str::from_utf8(raw).ok()?;
-    let head_end = header_end(buf)?;
+    let head_end = head_end.or_else(|| header_end(buf))?;
     if head_end > MAX_HEADER {
         return None;
     }
@@ -3593,6 +3619,7 @@ fn method_not_allowed_response() -> HttpResponse {
 /// rather than being silently routed to the index as the old
 /// `nth(1).unwrap_or("/")` did.  `GET` and `HEAD` are served; other methods
 /// get a `405` with an `Allow` header.
+#[cfg(test)]
 fn dispatch_request(request_line: &str) -> HttpResponse {
     dispatch_request_meta(request_line).0
 }

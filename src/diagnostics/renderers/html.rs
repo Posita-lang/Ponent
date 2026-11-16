@@ -1346,12 +1346,26 @@ impl HtmlRenderer {
     /// must not retain `\n`/`\t`, or a `data-location` attribute and the
     /// visible location header could be split across lines.
     fn escape_filename<'a>(&self, s: &'a str) -> Cow<'a, str> {
-        match crate::diagnostics::sanitize_for_terminal(s) {
-            Cow::Borrowed(clean) => self.escape_clean(clean),
-            Cow::Owned(clean) => match self.escape_clean(&clean) {
-                Cow::Borrowed(_) => Cow::Owned(clean),
-                Cow::Owned(escaped) => Cow::Owned(escaped),
-            },
+        // One pass covers the dominant `src/foo.rs` shape: all bytes are
+        // printable ASCII.  Track HTML specials without a second scan; only
+        // non-ASCII/control filenames (or actual escapes) take a second pass.
+        let mut needs_escape = false;
+        for &b in s.as_bytes() {
+            if !(0x20..0x7F).contains(&b) {
+                return match crate::diagnostics::sanitize_for_terminal(s) {
+                    Cow::Borrowed(clean) => self.escape_clean(clean),
+                    Cow::Owned(clean) => match self.escape_clean(&clean) {
+                        Cow::Borrowed(_) => Cow::Owned(clean),
+                        Cow::Owned(escaped) => Cow::Owned(escaped),
+                    },
+                };
+            }
+            needs_escape |= matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'');
+        }
+        if needs_escape {
+            self.escape_clean(s)
+        } else {
+            Cow::Borrowed(s)
         }
     }
 
@@ -1534,6 +1548,18 @@ mod tests {
     use crate::ast::Span;
     use crate::diagnostics::Diagnostic;
     use crate::diagnostics::ErrCode;
+
+    #[test]
+    fn escape_filename_is_single_pass_and_sanitizes_controls() {
+        let r = HtmlRenderer::new();
+        assert!(matches!(
+            r.escape_filename("src/main.rs"),
+            Cow::Borrowed("src/main.rs")
+        ));
+        assert_eq!(r.escape_filename("a<b&c").as_ref(), "a&lt;b&amp;c");
+        let cleaned = r.escape_filename("a\nb\x01c");
+        assert!(!cleaned.contains('\n') && !cleaned.contains('\x01'), "{cleaned:?}");
+    }
 
     #[test]
     fn source_control_bytes_are_sanitized() {
