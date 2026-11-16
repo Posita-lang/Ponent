@@ -421,19 +421,30 @@ impl<'a> RenderCtx<'a> {
         let idx = LineIndex::new(source);
         // Publish to the cross-worker share (if any) before the LRU insert so
         // a worker rendering a 5th+ distinct source still shares its scan.
-        if let Some(shared) = &self.shared {
-            shared
-                .map
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry((ptr, len))
-                .or_insert_with(|| SharedSourceIndex {
-                    starts: Arc::clone(idx.starts_arc()),
-                    ascii: idx.ascii(),
-                    char_prefixes: Arc::clone(idx.char_prefixes_arc()),
-                    generation: idx.generation(),
-                });
-        }
+        // The losing racer must use the winner's Arcs; keeping its own would
+        // retain a second full `starts`/prefix table until LRU eviction.
+        let shared_entry = if let Some(shared) = &self.shared {
+            let mut map = shared.map.write().unwrap_or_else(|e| e.into_inner());
+            let e = map.entry((ptr, len)).or_insert_with(|| SharedSourceIndex {
+                starts: Arc::clone(idx.starts_arc()),
+                ascii: idx.ascii(),
+                char_prefixes: Arc::clone(idx.char_prefixes_arc()),
+                generation: idx.generation(),
+            });
+            (
+                Arc::clone(&e.starts),
+                e.ascii,
+                Arc::clone(&e.char_prefixes),
+                e.generation,
+            )
+        } else {
+            (
+                Arc::clone(idx.starts_arc()),
+                idx.ascii(),
+                Arc::clone(idx.char_prefixes_arc()),
+                idx.generation(),
+            )
+        };
         let mut cache = self.source_index.borrow_mut();
         // Full: evict the LRU slot (the tail) to keep the cache bounded.
         if cache.len() >= CACHE_SLOTS {
@@ -444,10 +455,10 @@ impl<'a> RenderCtx<'a> {
             CachedSourceIndex {
                 ptr,
                 len,
-                starts: Arc::clone(idx.starts_arc()),
-                ascii: idx.ascii(),
-                char_prefixes: Arc::clone(idx.char_prefixes_arc()),
-                generation: idx.generation(),
+                starts: Arc::clone(&shared_entry.0),
+                ascii: shared_entry.1,
+                char_prefixes: Arc::clone(&shared_entry.2),
+                generation: shared_entry.3,
                 #[cfg(debug_assertions)]
                 fingerprint: source_fingerprint(source),
             },
@@ -463,10 +474,10 @@ impl<'a> RenderCtx<'a> {
                     StableSourceIndex {
                         text: source.to_owned(),
                         fingerprint: source_fingerprint(source),
-                        starts: Arc::clone(idx.starts_arc()),
-                        ascii: idx.ascii(),
-                        char_prefixes: Arc::clone(idx.char_prefixes_arc()),
-                        generation: idx.generation(),
+                        starts: Arc::clone(&shared_entry.0),
+                        ascii: shared_entry.1,
+                        char_prefixes: Arc::clone(&shared_entry.2),
+                        generation: shared_entry.3,
                     },
                 );
             }

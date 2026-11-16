@@ -460,9 +460,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 });
                 if delivered.load(Ordering::Acquire) {
                     served = true;
-                    if idle_deadline.is_none() {
-                        idle_deadline = Some(Instant::now() + POST_SERVE_IDLE);
-                    }
+                    idle_deadline = Some(Instant::now() + POST_SERVE_IDLE);
                 }
             }
         }
@@ -487,9 +485,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             {
                 Ok(true) => {
                     served = true;
-                    if idle_deadline.is_none() {
-                        idle_deadline = Some(now + POST_SERVE_IDLE);
-                    }
+                    idle_deadline = Some(now + POST_SERVE_IDLE);
                 }
                 Ok(false) => continue,
                 Err(e) => {
@@ -597,6 +593,10 @@ const MAX_BODY_DRAIN: usize = 8 * 1024 * 1024;
 /// close happen with request bytes still unread .
 /// Resource caps shared by every HTTP backend.
 const MAX_HEADER: usize = 64 * 1024;
+/// A one-shot response is already on the wire; 150 ms is enough to avoid RST
+/// while the client drains it, without letting `thread::scope`'s join stall
+/// the accept loop for a full second.
+const ONE_SHOT_LINGER: Duration = Duration::from_millis(150);
 const MAX_REQUEST_LINE: usize = 8 * 1024;
 /// Bound one reactor wakeup's accept work so a sustained connect flood cannot
 /// starve established reads/writes/deadlines; level-triggered epoll resumes.
@@ -1591,7 +1591,8 @@ fn serve_page_after_prefix(
                     let _ = write_header_too_large(stream);
                     linger_after_half_close(stream);
                 } else if malformed {
-                    let _ = write_prepared(stream, bad_request_head(), "");
+                    let resp = bad_request_response();
+                    let _ = write_prepared_parts(stream, resp.head_parts(), resp.body());
                     linger_after_half_close(stream);
                 }
                 let _ = stream.shutdown(Shutdown::Both);
@@ -1613,45 +1614,29 @@ fn serve_page_after_prefix(
         // any routing decision, exactly like the persistent dispatcher.
         let Some(req) = parse_request_line(line.as_ref()) else {
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
-            return finish_head(
-                stream,
-                drain,
-                |stream| write_prepared(stream, bad_request_head(), ""),
-                false,
-            );
+            let resp = bad_request_response();
+            return finish_response(stream, drain, &resp, false);
         };
         let head_only = req.method == "HEAD";
         if !matches!(req.version, "HTTP/1.0" | "HTTP/1.1") {
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
-            return finish_head(
-                stream,
-                drain,
-                |stream| write_prepared(stream, bad_request_head(), ""),
-                false,
-            );
+            let resp = bad_request_response();
+            return finish_response(stream, drain, &resp, false);
         }
         // [4]2: origin-form is required; `GET E030 HTTP/1.1` must not be
         // served by the one-shot while the persistent router rejects it.
         if !req.target.starts_with('/') {
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
-            return finish_head(
-                stream,
-                drain,
-                |stream| write_prepared(stream, bad_request_head(), ""),
-                false,
-            );
+            let resp = bad_request_response();
+            return finish_response(stream, drain, &resp, false);
         }
         // A non-GET/HEAD must not receive a full body (protocol violation); answer
         // 405 with `Allow: GET, HEAD` and keep waiting for the real page request.
         if req.method != "GET" && req.method != "HEAD" {
             stream.set_read_timeout(Some(Duration::from_secs(1)))?;
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
-            return finish_head(
-                stream,
-                drain,
-                |stream| write_prepared(stream, method_not_allowed_head(), ""),
-                false,
-            );
+            let resp = method_not_allowed_response();
+            return finish_response(stream, drain, &resp, false);
         }
         if let Some(expected) = expected_path {
             let target = req.target;
@@ -1686,7 +1671,7 @@ fn serve_page_after_prefix(
                         }
                         DrainOutcome::HeadersOnly => {
                             write_prepared_parts(stream, page.head_parts(), &page.body)?;
-                            linger_after_half_close_for(stream, Duration::from_secs(1));
+                            linger_after_half_close_for(stream, ONE_SHOT_LINGER);
                         }
                         DrainOutcome::Complete => {
                             write_prepared_parts(stream, page.head_parts(), &page.body)?;
@@ -1724,7 +1709,7 @@ fn serve_page_after_prefix(
                     }
                     DrainOutcome::HeadersOnly => {
                         let _ = write_prepared_parts(stream, page.head_parts(), &page.body);
-                        linger_after_half_close_for(stream, Duration::from_secs(1));
+                        linger_after_half_close_for(stream, ONE_SHOT_LINGER);
                     }
                     DrainOutcome::Complete => {
                         let _ = write_prepared_parts(stream, page.head_parts(), &page.body);
@@ -1763,7 +1748,7 @@ fn serve_page_after_prefix(
             // response, half-close, and linger until EOF/budget .
             let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
             write_response(stream, "200 OK", "", body)?;
-            linger_after_half_close_for(stream, Duration::from_secs(1));
+            linger_after_half_close_for(stream, ONE_SHOT_LINGER);
             Ok(true)
         }
         DrainOutcome::Complete => {
@@ -1839,11 +1824,41 @@ where
         }
         DrainOutcome::HeadersOnly => {
             write_head(stream)?;
-            linger_after_half_close_for(stream, Duration::from_secs(1));
+            linger_after_half_close_for(stream, ONE_SHOT_LINGER);
             Ok(delivered)
         }
         DrainOutcome::Complete => {
             write_head(stream)?;
+            drain_residual(stream);
+            let _ = stream.shutdown(Shutdown::Both);
+            Ok(delivered)
+        }
+        DrainOutcome::TooLarge => {
+            write_header_too_large(stream)?;
+            linger_after_half_close(stream);
+            Ok(false)
+        }
+    }
+}
+
+fn finish_response(
+    stream: &mut TcpStream,
+    drain: DrainOutcome,
+    response: &HttpResponse,
+    delivered: bool,
+) -> std::io::Result<bool> {
+    match drain {
+        DrainOutcome::NoRequest => {
+            let _ = stream.shutdown(Shutdown::Both);
+            Ok(false)
+        }
+        DrainOutcome::HeadersOnly => {
+            write_prepared_parts(stream, response.head_parts(), response.body())?;
+            linger_after_half_close_for(stream, ONE_SHOT_LINGER);
+            Ok(delivered)
+        }
+        DrainOutcome::Complete => {
+            write_prepared_parts(stream, response.head_parts(), response.body())?;
             drain_residual(stream);
             let _ = stream.shutdown(Shutdown::Both);
             Ok(delivered)
@@ -1921,11 +1936,12 @@ fn escape_html(s: &str) -> Cow<'_, str> {
             // `thread::scope`, the whole persistent server).
             _ => {
                 debug_assert!(false, "HtmlEscapeIter yielded a non-escape byte");
-                // Append the original *char* and skip its
-                // full UTF-8 length.  Advancing by one byte would re-emit the
-                // remaining continuation bytes via the next literal slice.
                 if let Some(ch) = s[idx..].chars().next() {
-                    out.push(ch);
+                    // Defence in depth: never copy an unexpected byte raw
+                    // into HTML, even if the merged iterator's contract grows.
+                    out.push_str("&#");
+                    out.push_str(&(ch as u32).to_string());
+                    out.push(';');
                     start = idx + ch.len_utf8();
                     continue;
                 }
@@ -4630,6 +4646,47 @@ mod tests {
     }
 
     #[test]
+    fn reactor_continues_serving_while_another_connection_drains() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            serve_explain_persistent_bounded(&listener, Duration::from_millis(600))
+        });
+
+        let mut slow = TcpStream::connect(addr).unwrap();
+        slow.write_all(
+            b"GET /E030 HTTP/1.1\r\nHost: x\r\nContent-Length: 100000000\r\n\r\n",
+        )
+        .unwrap();
+        let mut slow_writer = slow.try_clone().unwrap();
+        let writer = std::thread::spawn(move || {
+            let chunk = [b'x'; 8192];
+            for _ in 0..200 {
+                if slow_writer.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut fast = TcpStream::connect(addr).unwrap();
+        fast.set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        fast.write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = fast.read_to_end(&mut response);
+        let _ = writer.join();
+        let _ = slow.shutdown(Shutdown::Both);
+        let _ = server.join();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "reactor was pinned by the draining connection: {:?}",
+            String::from_utf8_lossy(&response[..response.len().min(32)])
+        );
+    }
+
+    #[test]
     fn one_shot_serves_lf_only_request() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4834,6 +4891,17 @@ mod tests {
             assert_eq!(
                 reactor_status, status,
                 "unexpected status for case: {:?}",
+                String::from_utf8_lossy(&request[..request.len().min(32)])
+            );
+            fn body(resp: &[u8]) -> &[u8] {
+                resp.windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map_or(&[], |i| &resp[i + 4..])
+            }
+            assert_eq!(
+                body(&reactor_response),
+                body(&thread_response),
+                "backends disagree on body for request: {:?}",
                 String::from_utf8_lossy(&request[..request.len().min(32)])
             );
         }

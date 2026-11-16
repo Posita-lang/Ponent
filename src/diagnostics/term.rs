@@ -128,13 +128,14 @@ fn ends_with_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Node/chalk-compatible `FORCE_COLOR` level: `1` → 16 colours,
-/// `2` → 256, `3` → true colour.  Anything else carries no level.
+/// `2` → 256, `3` **or any larger numeric value** → true colour.  Anything
+/// non-numeric (other than `true`/`false`/empty) carries no level.
 fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
     let s = v.to_str()?.trim();
     match s {
         "" | "true" => Some(ColorDepth::Sixteen),
-        "false" | "0" => None,
-        _ => s.parse::<u8>().ok().and_then(|n| match n {
+        "false" => None,
+        _ => s.parse::<u64>().ok().and_then(|n| match n {
             0 => None,
             1 => Some(ColorDepth::Sixteen),
             2 => Some(ColorDepth::TwoFiftySix),
@@ -147,7 +148,13 @@ fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
 /// merely "don't force"): a CI script silencing colour must not get colour on
 /// a TTY.
 fn force_color_is_off(v: &OsStr) -> bool {
-    matches!(v.to_str().map(str::trim), Some("0") | Some("false"))
+    let Some(s) = v.to_str().map(str::trim) else {
+        return false;
+    };
+    if s == "false" {
+        return true;
+    }
+    s.parse::<u64>().is_ok_and(|n| n == 0)
 }
 
 /// Detect the terminal's colour depth from `FORCE_COLOR`, `COLORTERM` and
@@ -549,6 +556,18 @@ fn encode_scanned_path(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_c
     }
 }
 
+fn encode_url_component_into(out: &mut String, s: &[u8]) {
+    for &b in s {
+        if b == b'/' || !is_url_safe(b) {
+            out.push('%');
+            out.push(HEX_UPPER[(b >> 4) as usize] as char);
+            out.push(HEX_UPPER[(b & 0xF) as usize] as char);
+        } else {
+            out.push(b as char);
+        }
+    }
+}
+
 fn encode_file_url_path_into(out: &mut String, s: &[u8]) {
     let (first_unsafe, unsafe_count) = scan_url_path(s);
     if first_unsafe == s.len() {
@@ -610,8 +629,12 @@ pub fn path_to_file_url(path: &std::path::Path) -> String {
         match path.canonicalize() {
             Ok(p) => Cow::Owned(p),
             Err(_) => {
-                let base = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from(std::path::MAIN_SEPARATOR_STR));
+                let base = match std::env::current_dir() {
+                    Ok(base) => base,
+                    // No CWD means no honest absolute URL.  Emit the explicit
+                    // sentinel instead of silently linking `/<path>`.
+                    Err(_) => return "file://".to_string(),
+                };
                 Cow::Owned(base.join(path))
             }
         }
@@ -689,7 +712,7 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
             }
         }
         out.push_str("file://wsl.localhost/");
-        encode_file_url_path_into(&mut out, distro.as_bytes());
+        encode_url_component_into(&mut out, distro.as_bytes());
         encode_file_url_path_into(&mut out, path);
         return out;
     }
@@ -884,6 +907,17 @@ mod tests {
                 "FORCE_COLOR={v:?}"
             );
         }
+    }
+
+    #[test]
+    fn force_color_numeric_spellings_are_consistent() {
+        assert_eq!(force_color_level(OsStr::new("00")), None);
+        assert!(force_color_is_off(OsStr::new("00")));
+        assert_eq!(
+            color_depth_decision(None, Some("xterm"), Some(OsStr::new("256"))),
+            ColorDepth::TrueColor
+        );
+        assert!(color(false, None, None, Some("256"), Some("dumb"), false));
     }
 
     #[test]

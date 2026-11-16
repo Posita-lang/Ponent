@@ -11,12 +11,11 @@ use crate::diagnostics::i18n::{cached_label_static, fluent};
 use super::LineIndex;
 use super::term::path_to_file_url;
 
-/// Maximum chain nesting depth rendered/flattened.
-///
-/// One module-level constant: `any_spanned` (hyperlink gating),
-/// `flattened_entry_count` (buffer pre-sizing) and `render_entries` (the
-/// actual cap) must agree, or a drift silently disables links for the
-/// rendered tail or under-reserves.
+/// Maximum rendered depth *offset*: frames at depth 0..=64 are emitted
+/// (65 nesting levels).  One module-level constant: `any_spanned` (hyperlink
+/// gating), `flattened_entry_count` (buffer pre-sizing) and
+/// `render_entries` (the actual cap) must agree, or a drift silently
+/// disables links for the rendered tail or under-reserves.
 const MAX_CHAIN_DEPTH: usize = 64;
 /// Upper bounds for the reserve-estimate walk.  Rendering itself is still
 /// bounded by `MAX_CHAIN_DEPTH`/the caller, but a hostile *wide* chain (many

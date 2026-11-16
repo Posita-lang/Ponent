@@ -410,6 +410,35 @@ impl<'src> DiagCtxt<'src> {
         self.unreported_errors = 0;
     }
 
+    /// Recompute every derived tally/frontier from `diags` and `reported_len`.
+    /// `iter_mut` is intended to be humanize-only; this runs after the
+    /// emitter's pass in release as well, so a caller that changed a level
+    /// through the iterator cannot leave `has_errors`/`check()` disagreeing
+    /// with the actual diagnostics.
+    pub(crate) fn recount_derived_state(&mut self) {
+        let mut errors = 0usize;
+        let mut warnings = 0usize;
+        let mut unreported_errors = 0usize;
+        for (i, d) in self.diags.iter().enumerate() {
+            if d.is_error() {
+                errors += 1;
+                if i >= self.reported_len {
+                    unreported_errors += 1;
+                }
+            } else if d.is_warning() {
+                warnings += 1;
+            }
+        }
+        self.errors = errors;
+        self.warnings = warnings;
+        self.unreported_errors = unreported_errors;
+        self.first_unspanned = self
+            .diags
+            .iter()
+            .position(|d| d.source().is_none())
+            .unwrap_or(self.diags.len());
+    }
+
     /// Drain the unreported list and return it.
     ///
     /// **Retained deliberately** even though no in-tree caller uses it today:

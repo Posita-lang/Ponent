@@ -236,6 +236,15 @@ const LANG_EN: u8 = 1;
 const LANG_RU: u8 = 2;
 const LANG_ZH: u8 = 3;
 
+const _: () = {
+    assert!(Lang::En as u8 != LANG_UNSET);
+    assert!(Lang::Ru as u8 != LANG_UNSET);
+    assert!(Lang::Zh as u8 != LANG_UNSET);
+    assert!(matches!(Lang::from_u8(LANG_EN), Some(Lang::En)));
+    assert!(matches!(Lang::from_u8(LANG_RU), Some(Lang::Ru)));
+    assert!(matches!(Lang::from_u8(LANG_ZH), Some(Lang::Zh)));
+};
+
 /// Number of supported languages. Single source of truth for the bundle
 /// table, the language-id cache and the `cached_label!` arrays (A5) — adding
 /// a `Lang` variant previously meant hunting three separate literals.
@@ -330,7 +339,7 @@ impl Lang {
     /// Decode a raw `LANG` value.  Returns `None` for the unset sentinel and
     /// any value outside the known discriminants.
     #[inline]
-    fn from_u8(n: u8) -> Option<Self> {
+    pub const fn from_u8(n: u8) -> Option<Self> {
         match n {
             LANG_EN => Some(Lang::En),
             LANG_RU => Some(Lang::Ru),
@@ -341,10 +350,17 @@ impl Lang {
 }
 
 fn detect_from_env() -> Lang {
-    let env = std::env::var("PONENT_LANG")
-        .or_else(|_| std::env::var("LANG"))
-        .unwrap_or_default();
-    detect_from_str(&env)
+    let explicit = std::env::var("PONENT_LANG").ok();
+    let fallback = std::env::var("LANG").ok();
+    detect_from_pair(explicit.as_deref(), fallback.as_deref())
+}
+
+fn detect_from_pair(explicit: Option<&str>, fallback: Option<&str>) -> Lang {
+    match (explicit, fallback) {
+        (Some(p), _) => detect_from_str(p),
+        (None, Some(l)) => detect_from_str(l),
+        (None, None) => Lang::En,
+    }
 }
 
 /// Pure BCP-47 primary-subtag classification, split out so it is testable
@@ -353,9 +369,9 @@ fn detect_from_str(env: &str) -> Lang {
     // Compare the BCP-47 *primary* subtag exactly: a prefix test would let
     // `zha` (Zhuang, ISO 639-3) match `zh`, and `ru*` collides similarly.
     let primary = env.split(['-', '_']).next().unwrap_or("");
-    if primary.eq_ignore_ascii_case("ru") {
+    if primary.eq_ignore_ascii_case("ru") || primary.eq_ignore_ascii_case("rus") {
         Lang::Ru
-    } else if primary.eq_ignore_ascii_case("zh") {
+    } else if primary.eq_ignore_ascii_case("zh") || primary.eq_ignore_ascii_case("zho") {
         Lang::Zh
     } else {
         Lang::En
@@ -457,6 +473,19 @@ fn lang_id() -> &'static LanguageIdentifier {
 /// list from the source of truth on every compile.
 use fluent::is_numeric_arg_key;
 
+fn make_value<'s>(v: Cow<'s, str>, key: &str) -> FluentValue<'s> {
+    if !is_numeric_arg_key(key) {
+        return FluentValue::String(v);
+    }
+    match v {
+        Cow::Borrowed(s) => FluentValue::try_number(s),
+        Cow::Owned(s) => match s.parse::<fluent_bundle::types::FluentNumber>() {
+            Ok(n) => n.into(),
+            Err(_) => FluentValue::String(Cow::Owned(s)),
+        },
+    }
+}
+
 fn try_fluent<'msg, 'src>(
     msg: &'msg str,
     pairs: &[(&'static str, Cow<'src, str>)],
@@ -499,11 +528,7 @@ fn try_fluent_into<'msg, 'src>(
             // `clone` is the cheapest legal option: `Cow::Borrowed` copies a
             // pointer (zero heap, the common `&str`-arg path); only `Cow::Owned`
             // deep-copies — unavoidable without ownership.
-            let value = if is_numeric_arg_key(k) {
-                FluentValue::try_number(v.as_ref())
-            } else {
-                FluentValue::String(v.clone())
-            };
+            let value = make_value(v.clone(), k);
             args.set(*k, value);
         });
         args
@@ -603,14 +628,7 @@ fn try_fluent_owned_into<'msg, 'src>(
                     // `FluentNumber` instead.  The policy is the same as the
                     // borrowed path (`try_number` is `parse::<FluentNumber>` with
                     // a `String` fallback).
-                    let value = if is_numeric_arg_key(&k) {
-                        match v.as_ref().parse::<fluent_bundle::types::FluentNumber>() {
-                            Ok(n) => n.into(),
-                            Err(_) => FluentValue::String(v),
-                        }
-                    } else {
-                        FluentValue::String(v)
-                    };
+                    let value = make_value(v, &k);
                     args.set(k, value);
                 });
             args
@@ -645,11 +663,8 @@ macro_rules! cached_label {
         variant = $variant:expr,
         init = [$($init:expr),+ $(,)?],
     ) => {{
-        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] = [
-            ::std::sync::OnceLock::new(),
-            ::std::sync::OnceLock::new(),
-            ::std::sync::OnceLock::new(),
-        ];
+        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] =
+            [const { ::std::sync::OnceLock::new() }; $crate::diagnostics::i18n::N_LANGS];
         let lang_idx = $crate::diagnostics::i18n::Lang::current().index();
         // `Lang` starts at discriminant 1 (`LANG_EN = 1`), so the index is
         // `discriminant - 1` and must stay in `0..3`.  A new variant with
@@ -680,11 +695,8 @@ macro_rules! cached_label_static {
         variant = $variant:expr,
         init = [$($init:expr),+ $(,)?],
     ) => {{
-        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] = [
-            ::std::sync::OnceLock::new(),
-            ::std::sync::OnceLock::new(),
-            ::std::sync::OnceLock::new(),
-        ];
+        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] =
+            [const { ::std::sync::OnceLock::new() }; $crate::diagnostics::i18n::N_LANGS];
         let lang_idx = $crate::diagnostics::i18n::Lang::current().index();
         // Same invariant as `cached_label!`: `LANG_EN = 1` anchors the
         // `discriminant - 1` index in `0..3`; a 0-discriminant variant would
@@ -746,9 +758,17 @@ fn format_slug_into_degrades_without_touching_out() {
         // `zha` is Zhuang, not Chinese: a prefix test would misclassify it.
         assert_eq!(detect_from_str("zha_CN"), Lang::En);
         assert_eq!(detect_from_str("rux"), Lang::En);
+        assert_eq!(detect_from_str("rus_RU"), Lang::Ru);
+        assert_eq!(detect_from_str("zho_TW"), Lang::Zh);
         // Unset / POSIX locale sentinels.
         assert_eq!(detect_from_str(""), Lang::En);
         assert_eq!(detect_from_str("C"), Lang::En);
+
+        // PONENT_LANG wins even when empty (explicit En); absent falls to LANG.
+        assert_eq!(detect_from_pair(Some("ru"), Some("zh_TW")), Lang::Ru);
+        assert_eq!(detect_from_pair(None, Some("zho_CN")), Lang::Zh);
+        assert_eq!(detect_from_pair(Some(""), Some("ru")), Lang::En);
+        assert_eq!(detect_from_pair(None, None), Lang::En);
     }
 
     /// The zero-arg slug cache must be language-aware: fetching under `En`,

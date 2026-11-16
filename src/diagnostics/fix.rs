@@ -166,6 +166,9 @@ impl<'src> FixSet<'src> {
                 });
             }
         }
+        // Stable sort is load-bearing: zero-length dedup and the DP
+        // `include > exclude` tiebreak preserve diagnostic input order for
+        // equal keys.  Do not swap for `sort_unstable_by_key`.
         if !candidates.is_sorted_by_key(|e| {
             (e.span.file, e.span.start_as_usize(), e.span.end_as_usize())
         }) {
@@ -222,6 +225,8 @@ impl<'src> FixSet<'src> {
                             .expect("candidate slot filled")
                             .applicability,
                     );
+                    // Strict `>` preserves diagnostic input order on equal weight; the
+                    // stable sort makes that deterministic for a fixed batch.
                     if applicability_weight(other.applicability) > best_weight {
                         best = j;
                     }
@@ -245,11 +250,12 @@ impl<'src> FixSet<'src> {
         for (_file, group) in by_file {
             let start = result.len();
             Self::resolve_file(group, &mut result, &mut scratch);
-            // Files are visited in ascending FileId order; only the selected
-            // subset inside one file needs source order.
-            result[start..].sort_by_key(|e| {
-                (e.span.start_as_usize(), e.span.end_as_usize())
-            });
+            debug_assert!(
+                result[start..].is_sorted_by_key(|e| {
+                    (e.span.start_as_usize(), e.span.end_as_usize())
+                }),
+                "resolve_file must emit non-overlapping edits in source order"
+            );
         }
         result
     }
@@ -679,6 +685,24 @@ mod tests {
     /// Zero-length edits are insertions; duplicates at one point collapse to the
     /// highest-weight edit, while an insertion at a replacement boundary is a
     /// disjoint half-open interval and composes with the replacement.
+    #[test]
+    fn insertion_inside_replacement_wins_as_shorter_interval() {
+        let src = "abcdef";
+        let repl = diag_with_fix(
+            Span::new(FileId::DUMMY, 2, 5),
+            "XXX",
+            Applicability::MachineApplicable,
+        );
+        let ins = diag_with_fix(
+            Span::new(FileId::DUMMY, 3, 3),
+            "!",
+            Applicability::MachineApplicable,
+        );
+        let set = FixSet::collect(&[repl, ins], FixHints::Auto);
+        assert_eq!(set.len(), 1, "interior insertion is a conflict");
+        assert_eq!(set.apply(src), "abc!def");
+    }
+
     #[test]
     fn zero_length_edits_dedup_at_same_point_and_compose_at_boundaries() {
         let src = "abcdef";

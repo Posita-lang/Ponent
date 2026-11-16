@@ -245,10 +245,6 @@ pub struct GlyphRenderer {
     context_lines: usize,
     max_width: usize,
     bc: &'static BoxChars,
-    /// Whether the Unicode box charset is active. Gates glyphs whose
-    /// East-Asian-Ambiguous width (`√`, U+221A) can break CJK-terminal
-    /// alignment (C10).
-    use_unicode: bool,
     s: Styles,
     /// Visible width of the `│  = ` prefix plus the trailing `: ` — i.e.
     /// everything in the `│  = <label>: ` child/note/help gutter except the
@@ -472,7 +468,6 @@ impl GlyphRenderer {
         };
         GlyphRenderer {
             use_color,
-            use_unicode,
             context_lines,
             max_width,
             bc,
@@ -1084,10 +1079,7 @@ impl GlyphRenderer {
                         .skip(1)
                         .map(|sp| Label::new(*sp, ""))
                         .collect();
-                    let f_line_num_width = (f_idx.text_line_count().saturating_sub(1))
-                        .checked_ilog10()
-                        .unwrap_or(0) as usize
-                        + 1;
+                    let f_line_num_width = f_idx.text_line_count().checked_ilog10().unwrap_or(0) as usize + 1;
                     let section_rendered = self.write_source_section(
                         out,
                         fsource,
@@ -1272,8 +1264,7 @@ impl GlyphRenderer {
                 }
                 if matches!(
                     suggestion.style,
-                    crate::diagnostics::SuggestionStyle::HideCodeAlways
-                        | crate::diagnostics::SuggestionStyle::CompletelyHidden
+                    crate::diagnostics::SuggestionStyle::CompletelyHidden
                 ) {
                     continue;
                 }
@@ -2423,10 +2414,17 @@ impl GlyphRenderer {
             };
             if matches!(
                 suggestion.style,
-                crate::diagnostics::SuggestionStyle::HideCodeAlways
-                    | crate::diagnostics::SuggestionStyle::CompletelyHidden
+                crate::diagnostics::SuggestionStyle::CompletelyHidden
             ) {
                 suggestion_rendered[i] = true;
+                continue;
+            }
+            if matches!(
+                suggestion.style,
+                crate::diagnostics::SuggestionStyle::HideCodeAlways
+            ) {
+                // Hide the diff, but leave `suggestion_rendered[i]` false so
+                // the text-only fallback still emits the help/note message.
                 continue;
             }
             // `suggestion_lines[i]` is precomputed for this section's file
@@ -2491,9 +2489,7 @@ impl GlyphRenderer {
                 // `√` is East-Asian-Ambiguous width; CJK terminals render it
                 // two cells wide, shifting the `-`/`+` payload. Use the
                 // unambiguous ASCII `+` in ASCII mode (C10).
-                crate::diagnostics::Applicability::MachineApplicable => {
-                    if self.use_unicode { "√" } else { ">" }
-                }
+                crate::diagnostics::Applicability::MachineApplicable => ">",
                 crate::diagnostics::Applicability::MaybeIncorrect => "?",
                 _ => "",
             };
@@ -2719,8 +2715,10 @@ impl GlyphRenderer {
         search_from: usize,
     ) -> (Cow<'a, str>, usize) {
         let Some(rel) = plain.get(search_from..).and_then(|rest| rest.find(seg)) else {
-            // Whitespace normalization broke the mapping: emit unstyled.
-            return (Cow::Borrowed(seg), search_from);
+            // Whitespace normalization broke the mapping: emit unstyled and
+            // invalidate the offset cursor so later segments cannot match an
+            // earlier duplicate occurrence.
+            return (Cow::Borrowed(seg), plain.len().max(search_from));
         };
         let start = search_from + rel;
         let end = start + seg.len();
@@ -2903,7 +2901,8 @@ impl GlyphRenderer {
         // Wrap the full measure first; only re-wrap the final segment if the
         // locator suffix would overflow it.  This mirrors chain.rs and avoids
         // wasting suffix width on every non-final line.
-        if suffix_cols > 0
+        if !self.no_wrap
+            && suffix_cols > 0
             && let Some(last_seg) = segments.last()
             && visible_width_with_tab(last_seg.as_ref(), self.tab_width) + suffix_cols > avail_full
         {
@@ -3411,7 +3410,11 @@ pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
         // end segment, and middle lines draw *only* the connector row.  The
         // previous full-line `^^^` on middle lines duplicated the connector
         // and burned underline lanes without adding information.
-        if label_idx.is_some() && multi_line {
+        // Synthetic extra primaries (merged groups) carry an empty message and
+        // must behave like the section primary on every covered row; only
+        // real user labels get the endpoint-only multi-line policy.
+        let synthetic_extra = label_idx.is_some_and(|i| labels[i].message.is_empty());
+        if label_idx.is_some() && multi_line && !synthetic_extra {
             let is_start_line = span_start >= line_start;
             let is_end_line = span_end <= line_end;
             if !is_start_line && !is_end_line {

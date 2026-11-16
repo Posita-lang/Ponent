@@ -908,6 +908,9 @@ fn push_json_escaped<W: std::fmt::Write>(out: &mut W, c: char) {
         '\r' => out.write_str("\\r"),
         '\t' => out.write_str("\\t"),
         c if c.is_control() => {
+            // `0x7F`–`0x9F` are Unicode controls but not JSON-required
+            // escapes (JSON only requires `< 0x20`). The scanner never
+            // selects them, but this arm still emits a valid `\uXXXX`.
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let n = c as u32;
             let buf = [
@@ -993,6 +996,18 @@ mod tests {
                 "U+{:04X} not escaped as {needle}: {escaped}",
                 ctrl as u32
             );
+        }
+    }
+
+    #[test]
+    fn push_json_str_escapes_backspace_and_formfeed() {
+        for (raw, expect) in [("\x08", "\\u0008"), ("\x0C", "\\u000c")] {
+            let input = format!("a{raw}b");
+            let mut out = String::new();
+            JsonRenderer::push_json_str(&mut out, &input);
+            assert!(out.contains(expect), "{raw:?} → {out}");
+            let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+            assert_eq!(v, serde_json::Value::String(input));
         }
     }
 

@@ -97,9 +97,10 @@ fn dur_prop_seqlock_seals_green_verdict_against_inflight_lowering() {
         let low = dg.allocate_node_index(ContentClass::SEMANTIC);
         dg.invalidate(low, &q());
         assert_eq!(dg.verify_green_transitive_with_dirty(x), None);
-        assert!(
-            dg.verified_lvl_of(x) > vl_before,
-            "the post-lowering re-stamp must ride the LOW counter, not the abandoned HIGH one"
+        assert_eq!(
+            dg.verified_lvl_of(x),
+            0,
+            "C1: the post-lowering LOW stamp carries no moving rev counter"
         );
     });
 }

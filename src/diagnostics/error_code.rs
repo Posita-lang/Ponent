@@ -1,10 +1,7 @@
 use compact_str::{CompactString, format_compact};
-use litemap::LiteMap;
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::OnceLock;
-
-use crate::smallvec::SmallVec;
 
 /// The port number of the local explain server, if running.
 static EXPLAIN_PORT: OnceLock<u16> = OnceLock::new();
@@ -67,8 +64,7 @@ const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
 /// Per-slot memoization map shared by [`ErrCode::url`] / [`ErrCode::url_ansi`]
 /// (one `SlotCache` static per (port-set, doc-URL) × (plain, ANSI) quadrant).
 ///
-/// Shape matches `category_siblings_of`'s `SIBLING_CACHE`: a lazily-built
-/// `RwLock<FxHashMap<slot, Arc<str>>>` instead of an eagerly-allocated
+/// Shape: a lazily-built `RwLock<FxHashMap<slot, Arc<str>>>` instead of an eagerly-allocated
 /// `CODE_INDEX_SLOTS`-sized array of `OnceLock` shells — a process that only
 /// renders a handful of distinct codes pays for those codes, not ~256 KB of
 /// shells across the four caches.  The hit path is one map lookup + a
@@ -610,8 +606,8 @@ impl ErrCode {
     /// **Memoization:** once the explain port is fixed ([`set_explain_port`] is
     /// set-once), the result depends only on the code string.  Codes matching
     /// the registry's `^[EW]\d{3}$` shape are cached per [`code_slot`] in a
-    /// lazily-populated map (the same lock-per-key shape
-    /// `category_siblings_of`'s `SIBLING_CACHE` uses) — a process that only
+    /// lazily-populated map (the same lock-per-key shape as `SlotCache`) — a
+    /// process that only
     /// ever prints a handful of codes never allocates a
     /// `CODE_INDEX_SLOTS`-sized table of `OnceLock` shells eagerly.  A batch
     /// of *N* diagnostics sharing a code builds the URL once and clones
@@ -714,7 +710,12 @@ impl ErrCode {
             out.push_str(&explain_url(self.canonical()));
         }
         out.push_str("\x1b\\");
-        out.push_str(&super::sanitize_for_terminal(self.code()));
+        let visible: std::borrow::Cow<'_, str> = if self.is_known() {
+            std::borrow::Cow::Borrowed(self.code())
+        } else {
+            super::sanitize_for_terminal(self.code())
+        };
+        out.push_str(&visible);
         out.push_str("\x1b]8;;\x1b\\");
         out
     }
@@ -986,11 +987,10 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         assert!(ec.url_ansi().contains("E030"));
     }
 
-    /// The sibling cache is keyed by `(slot, max)`: a caller asking for a
-    /// smaller `max` after a larger one must get the truncated list, not the
-    /// first caller's cached answer (the cache is process-global).
+    /// `category_siblings_of` is pure and truncates to `max`; repeated calls
+    /// with different maxima must not share state.
     #[test]
-    fn category_siblings_respects_per_max_cache_key() {
+    fn category_siblings_is_pure_and_truncates() {
         let wide = category_siblings_of("E030", 4);
         let narrow = category_siblings_of("E030", 2);
         assert_eq!(narrow.len(), wide.len().min(2), "narrow max must truncate");

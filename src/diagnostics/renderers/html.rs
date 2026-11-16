@@ -268,7 +268,13 @@ impl HtmlRenderer {
         // Escape the code string once and reuse for both the body code span
         // and the summary `[code]` — `escape` is a full scan, so two calls
         // per diagnostic is pure waste.
-        let code_esc: Option<Cow<'_, str>> = diag.code.as_ref().map(|c| self.escape(c.code()));
+        let code_esc: Option<Cow<'_, str>> = diag.code.as_ref().map(|c| {
+            if c.is_known() {
+                Cow::Borrowed(c.code())
+            } else {
+                self.escape(c.code())
+            }
+        });
 
         html.push_str("<details class='diag ");
         html.push_str(level_class);
@@ -1255,7 +1261,6 @@ impl HtmlRenderer {
             out.push_str(escaped.as_ref());
             return;
         }
-        let key = compact_str::CompactString::from(s);
         let hit = ESCAPE_CACHE.with(|cell| {
             let mut cache = cell.borrow_mut();
             cache.0.get_mut(s).map(|entry| {
@@ -1272,6 +1277,8 @@ impl HtmlRenderer {
             out.push_str(escaped.as_ref());
             return;
         }
+        // Allocate the owned key only on a miss; hits above use `&str`.
+        let key = compact_str::CompactString::from(s);
         let value: std::sync::Arc<str> = std::sync::Arc::from(escaped.as_ref());
         ESCAPE_CACHE.with(|cell| {
             let mut cache = cell.borrow_mut();

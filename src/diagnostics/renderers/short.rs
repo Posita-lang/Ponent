@@ -120,11 +120,17 @@ impl Renderer for ShortRenderer {
         // Borrow the code string directly; the `[E030]` framing and the
         // coloured tag are written straight into the output below, so no
         // intermediate `CompactString` is built.
-        let code_display: Option<Cow<'_, str>> = diag
-            .code()
-            .map(|c| c.code())
-            .filter(|c| !c.is_empty())
-            .map(super::super::sanitize_for_terminal);
+        let code_display: Option<Cow<'_, str>> = diag.code().and_then(|c| {
+            let s = c.code();
+            if s.is_empty() {
+                None
+            } else if c.is_known() {
+                // Registry codes are validated ^[EW]\d{3}$ printable ASCII.
+                Some(Cow::Borrowed(s))
+            } else {
+                Some(super::super::sanitize_for_terminal(s))
+            }
+        });
 
         // Resolve the location *before* allocating: the 1-based line/col
         // digit widths feed the capacity computation, and every accessor
@@ -246,11 +252,7 @@ impl Renderer for ShortRenderer {
         // A multi-line message would break the one-line format, and a stray
         // `\r` would make a terminal redraw the line.  `push_flattened`
         // consumes the break runs the sanitizer preserved as layout bytes.
-        if let Some(first) = break_at {
-            push_flattened(out, &sanitized, Some(first));
-        } else {
-            out.push_str(&sanitized);
-        }
+        push_flattened(out, &sanitized, break_at);
         out.push('\n');
     }
 
@@ -346,6 +348,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fatal_is_spelled_error_for_ci_token_compatibility() {
+        let src = "x\n";
+        let diag = Diagnostic::fatal("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(Span::new(FileId::DUMMY, 0, 1))
+            .with_source(src);
+        let opts = DiagOpts::default();
+        let out = ShortRenderer::new().render(&diag, &ctx(&opts));
+        assert!(out.contains(": error[E030]: "), "{out:?}");
+        assert!(!out.contains("fatal"), "{out:?}");
+    }
+
+    #[test]
+    fn source_without_span_and_empty_file_has_bare_prefix() {
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_source("fn main() {}\n")
+            .with_file_name("");
+        let out = ShortRenderer::new().render(&diag, &ctx(&DiagOpts::default()));
+        assert_eq!(out, "error[E030]: boom\n");
     }
 
     #[test]

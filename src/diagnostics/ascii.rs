@@ -30,6 +30,9 @@ impl AllowedControls {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn x86_level() -> u8 {
+    if swar_forced() {
+        return 0;
+    }
     static LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     let cached = LEVEL.load(std::sync::atomic::Ordering::Relaxed);
     if cached != 0 {
@@ -81,11 +84,13 @@ fn swar_forced() -> bool {
 #[inline]
 pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
+    let level = x86_level();
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
+    if s.len() >= 32 && level >= 2 {
         // SAFETY: AVX2 support was just checked at runtime; the kernel only
         // reads full chunks and defers its tail back to this function.
         return unsafe { x86_64::is_printable_ascii(s) };
@@ -161,11 +166,13 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 #[inline]
 pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
+    let level = x86_level();
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_multiline_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
+    if s.len() >= 32 && level >= 2 {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::is_printable_ascii_multiline(s) };
     }
@@ -241,11 +248,13 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
 #[inline]
 pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
+    let level = x86_level();
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_or_tab_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
+    if s.len() >= 32 && level >= 2 {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::is_printable_ascii_or_tab(s) };
     }
@@ -338,11 +347,13 @@ pub(crate) enum AsciiClass {
 #[inline]
 pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
+    let level = x86_level();
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && level >= 3 {
         return unsafe { x86_64::classify_ascii_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
+    if s.len() >= 32 && level >= 2 {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::classify_ascii(s) };
     }
@@ -408,11 +419,13 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 #[inline]
 pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 64 && x86_level() >= 3 {
+    let level = x86_level();
+    #[cfg(target_arch = "x86_64")]
+    if s.len() >= 64 && level >= 3 {
         return unsafe { x86_64::next_non_ascii_byte_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 32 && x86_level() >= 2 {
+    if s.len() >= 32 && level >= 2 {
         // SAFETY: runtime-checked AVX2; tail is deferred to this function.
         return unsafe { x86_64::next_non_ascii_byte(s) };
     }
@@ -435,6 +448,15 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
             return Some(i + (hi.trailing_zeros() / 8) as usize);
         }
         i += 16;
+    }
+    const HI64: u64 = 0x8080_8080_8080_8080;
+    while i + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        let hi = x & HI64;
+        if hi != 0 {
+            return Some(i + (hi.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
     }
     s[i..].iter().position(|&b| b >= 0x80).map(|off| i + off)
 }
@@ -1163,6 +1185,37 @@ mod tests {
         for at in 0..=256 {
             let mut v = vec![b'a'; 320];
             v[at] = 0xC3;
+            assert_eq!(next_non_ascii_byte(&v), Some(at), "offset {at}");
+        }
+    }
+
+    #[test]
+    fn swar_del_then_tilde_borrow_chain() {
+        SWAR_FORCED.with(|f| f.set(true));
+        for lane in 0..16 {
+            if lane + 1 >= 16 {
+                continue;
+            }
+            let mut v = [b'a'; 16];
+            v[lane] = 0x7F;
+            v[lane + 1] = 0x7E;
+            assert!(!is_printable_ascii(&v), "DEL lane {lane}");
+            assert!(!is_printable_ascii_or_tab(&v), "DEL lane {lane}");
+            assert!(!is_printable_ascii_multiline(&v), "DEL lane {lane}");
+            assert_eq!(classify_ascii(&v), AsciiClass::Other, "DEL lane {lane}");
+        }
+        let mut ok = [b'a'; 16];
+        ok[0] = b' ';
+        ok[1] = b'~';
+        assert!(is_printable_ascii(&ok));
+        SWAR_FORCED.with(|f| f.set(false));
+    }
+
+    #[test]
+    fn next_non_ascii_covers_multi_block_offsets() {
+        for at in [8, 15, 16, 31, 32, 127, 128, 255, 256, 383, 512, 600, 1023] {
+            let mut v = vec![b'a'; 1088];
+            v[at] = 0x80;
             assert_eq!(next_non_ascii_byte(&v), Some(at), "offset {at}");
         }
     }

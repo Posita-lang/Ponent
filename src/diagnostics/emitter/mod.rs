@@ -126,11 +126,6 @@ impl FilesSeen {
             if self.last_name() == Some(name) {
                 return;
             }
-            if let Some(prev) = self.last_id()
-                && self.id_name_known(prev, name)
-            {
-                return;
-            }
         }
         // A span-less diagnostic falls back to the display name; if a
         // spanned diagnostic already registered that name, this is the same
@@ -212,6 +207,10 @@ impl FilesSeen {
             FilesSeenInner::Large { seen, names } => {
                 // Order is irrelevant: `last` is reassigned from `insert_full` and
                 // no consumer iterates `seen` in order (only `len`/`get_index`).
+                // `swap_remove` may move the tail into `old`'s slot, so
+                // `self.last` is untrustworthy between here and the final
+                // reassignment.  Do not read last_id/last_name inside this
+                // function.
                 let _ = seen.swap_remove(&old);
                 last_index = seen.insert_full(FileKey::Id(id)).0;
                 names.anon.remove(name);
@@ -496,7 +495,10 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     ///
     /// Note: `max_errors` is a *batch* budget — [`Self::emit`] enforces no
     /// cross-call limit, so an LSP-style loop must track its own if it needs
-    /// one.  Unlike the batch paths, a `humanize` panic here propagates; only
+    /// one.  A filtered-out diagnostic returns before `begin`/`end`; batch
+    /// paths always run them, so an empty-document renderer must use a batch
+    /// API when it needs the header/footer for an empty set.  Unlike the batch
+    /// paths, a `humanize` panic here propagates; only
     /// `Renderer::render_into` panics are converted to the placeholder.
     pub fn emit(&mut self, diag: &mut Diagnostic<'_>) -> io::Result<()> {
         if !self.filter.matches(diag) {

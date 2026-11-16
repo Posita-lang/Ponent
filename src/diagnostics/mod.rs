@@ -2746,9 +2746,10 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
     let _ = emitter.emit_all_iter(collector.iter_mut());
-    // `iter_mut`'s contract is humanize-only; a future caller that changes a
-    // level through it would desynchronize `errors`/`warnings`.  `summary`
-    // performs the O(n) cross-check in debug and is free in release.
+    // `iter_mut`'s contract is humanize-only.  Recompute in release too so a
+    // future caller that changes a level cannot desynchronize `has_errors` /
+    // `check`; `summary` keeps the debug cross-check.
+    collector.recount_derived_state();
     #[cfg(debug_assertions)]
     let _ = collector.summary();
 }

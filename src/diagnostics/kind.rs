@@ -858,6 +858,14 @@ mod humanizer_differential_tests {
                 reason: None,
                 context: None,
             },
+            DiagnosticKind::TypeMismatch {
+                expected: Cow::Borrowed("A"),
+                found: Cow::Borrowed("B"),
+                span: span(0, 1),
+                found_span: None,
+                reason: None,
+                context: Some(TypeCtx::Unspecified),
+            },
             DiagnosticKind::NoSuchField {
                 field_name: Cow::Borrowed("x"),
                 type_name: Cow::Borrowed("T"),
@@ -870,6 +878,14 @@ mod humanizer_differential_tests {
                 found: Cow::Borrowed("Bool"),
                 span: span(5, 6),
                 param_span: Some(span(7, 8)),
+            },
+            DiagnosticKind::ArgumentTypeMismatch {
+                callee: Cow::Borrowed("f"),
+                param_name: Cow::Borrowed("a"),
+                expected: Cow::Borrowed("Int"),
+                found: Cow::Borrowed("Bool"),
+                span: span(5, 6),
+                param_span: None,
             },
             DiagnosticKind::NameNotFound {
                 name: Cow::Borrowed("n"),
@@ -907,6 +923,11 @@ mod humanizer_differential_tests {
             },
             DiagnosticKind::Comptime {
                 kind: ComptimeErrorKind::StepLimitExceeded,
+                span: span(0, 1),
+                traceback: Vec::new(),
+            },
+            DiagnosticKind::Comptime {
+                kind: ComptimeErrorKind::TypeError("x".into()),
                 span: span(0, 1),
                 traceback: Vec::new(),
             },
