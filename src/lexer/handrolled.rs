@@ -455,25 +455,28 @@ unsafe fn scan_ident_neon(mut p: *const u8, mut len: usize) -> usize {
     let start = p;
     let (lo_d, hi_d, lo_u, hi_u, lo_l, hi_l, us) = unsafe {
         (
-            vdupq_n_s8(0x2F),
-            vdupq_n_s8(0x3A),
-            vdupq_n_s8(0x40),
-            vdupq_n_s8(0x5B),
-            vdupq_n_s8(0x60),
-            vdupq_n_s8(0x7B),
-            vdupq_n_s8(0x5F),
+            vdupq_n_u8(0x2F),
+            vdupq_n_u8(0x3A),
+            vdupq_n_u8(0x40),
+            vdupq_n_u8(0x5B),
+            vdupq_n_u8(0x60),
+            vdupq_n_u8(0x7B),
+            vdupq_n_u8(0x5F),
         )
     };
     while len >= 16 {
         let all_ident = unsafe {
+            // NEON comparison intrinsics return `uint8x16_t` masks even for
+            // the `s8` variants, so the whole scan stays in the unsigned
+            // domain.  Semantically identical for ASCII: any byte >= 0x80
+            // fails the upper bound in `vcgtq_u8(hi, v)` and is rejected.
             let v = vld1q_u8(p);
-            let vs = vreinterpretq_s8_u8(v);
-            let d = vandq_s8(vcgtq_s8(vs, lo_d), vcgtq_s8(hi_d, vs));
-            let u = vandq_s8(vcgtq_s8(vs, lo_u), vcgtq_s8(hi_u, vs));
-            let l = vandq_s8(vcgtq_s8(vs, lo_l), vcgtq_s8(hi_l, vs));
-            let s = vceqq_s8(vs, us);
-            let id = vorrq_s8(vorrq_s8(vorrq_s8(d, u), l), s);
-            vminvq_s8(id) == -1
+            let d = vandq_u8(vcgtq_u8(v, lo_d), vcgtq_u8(hi_d, v));
+            let u = vandq_u8(vcgtq_u8(v, lo_u), vcgtq_u8(hi_u, v));
+            let l = vandq_u8(vcgtq_u8(v, lo_l), vcgtq_u8(hi_l, v));
+            let s = vceqq_u8(v, us);
+            let id = vorrq_u8(vorrq_u8(vorrq_u8(d, u), l), s);
+            vminvq_u8(id) == 0xFF
         };
         if !all_ident {
             let chunk = unsafe { std::slice::from_raw_parts(p, 16) };

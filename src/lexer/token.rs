@@ -143,18 +143,19 @@ unsafe fn scan_whitespace_neon(mut p: *const u8, mut len: usize) -> usize {
     let start = p;
     let (eight, fourteen, space) = unsafe {
         // SAFETY: NEON is baseline on aarch64.
-        (vdupq_n_s8(8), vdupq_n_s8(14), vdupq_n_s8(32))
+        (vdupq_n_u8(8), vdupq_n_u8(14), vdupq_n_u8(32))
     };
     while len >= 16 {
         // SAFETY: `len >= 16` guarantees a valid 16-byte load at `p`.
         let all_ws = unsafe {
+            // NEON comparison intrinsics return `uint8x16_t` masks even for
+            // the `s8` variants, so the scan stays in the unsigned domain.
             let v = vld1q_u8(p);
-            let vs = vreinterpretq_s8_u8(v);
-            let range = vandq_s8(vcgtq_s8(vs, eight), vcgtq_s8(fourteen, vs));
-            let ws = vorrq_s8(range, vceqq_s8(vs, space));
-            // `ws` is 0xFF per whitespace lane, 0x00 otherwise.  `vminvq_s8`
-            // is -1 iff every lane is 0xFF.
-            vminvq_s8(ws) == -1
+            let range = vandq_u8(vcgtq_u8(v, eight), vcgtq_u8(fourteen, v));
+            let ws = vorrq_u8(range, vceqq_u8(v, space));
+            // `ws` is 0xFF per whitespace lane, 0x00 otherwise.  `vminvq_u8`
+            // is 0xFF iff every lane is 0xFF.
+            vminvq_u8(ws) == 0xFF
         };
         if !all_ws {
             // SAFETY: 16 bytes at `p` are valid (`len >= 16`).
