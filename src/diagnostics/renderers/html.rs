@@ -1079,23 +1079,22 @@ impl HtmlRenderer {
             html.push_str(" │ </span>");
 
             let display_width = render_line_merged_with(
-                line,
-                &scratch.ranges_buf,
-                &meta_buf,
-                &mut underlines_buf,
-                html,
-                "<span class='highlight'>",
-                "</span>",
-                &mut scratch.display_buf,
-                &mut scratch.order_buf,
-                &mut scratch.done_buf,
-                &mut scratch.active_buf,
-                tab_width,
-                // Gutter width: `<num> │ ` (padded number + space + `│` +
-                // space) — the terminal column the source text starts at,
-                // so tab stops advance from the absolute cursor column.
-                line_num_width + 3,
-                true,
+                crate::diagnostics::glyph::LineRenderArgs {
+                    line,
+                    ranges: &scratch.ranges_buf,
+                    meta: &meta_buf,
+                    out: &mut underlines_buf,
+                    rendered: html,
+                    highlight_on: "<span class='highlight'>",
+                    highlight_off: "</span>",
+                    display_buf: &mut scratch.display_buf,
+                    order_buf: &mut scratch.order_buf,
+                    done_buf: &mut scratch.done_buf,
+                    active_buf: &mut scratch.active_buf,
+                    tab_width,
+                    content_start_col: line_num_width + 3,
+                    append: true,
+                },
                 push_html_escaped,
             );
             let underlines = &underlines_buf;
@@ -1548,6 +1547,18 @@ mod tests {
     use crate::ast::Span;
     use crate::diagnostics::Diagnostic;
     use crate::diagnostics::ErrCode;
+
+    #[test]
+    fn long_message_escape_cache_is_consistent() {
+        let r = HtmlRenderer::new();
+        let s = "a&b<c>".repeat(100);
+        let mut first = String::new();
+        let mut second = String::new();
+        r.push_escaped_cached(&mut first, &s);
+        r.push_escaped_cached(&mut second, &s);
+        assert_eq!(first, second);
+        assert!(!first.contains("<c>"), "raw HTML survived: {first}");
+    }
 
     #[test]
     fn escape_filename_is_single_pass_and_sanitizes_controls() {

@@ -1983,20 +1983,26 @@ impl GlyphRenderer {
             out.push_str(&gutter_tail);
             let display_width = if context_only {
                 render_line_merged_with(
-                    line,
-                    &[],
-                    &[],
-                    &mut underlines_buf,
-                    out,
-                    highlight_on,
-                    highlight_off,
-                    display_buf,
-                    order_buf,
-                    done_buf,
-                    active_buf,
-                    self.tab_width,
-                    BOX_VERT_WIDTH + line_num_width + 1 + BOX_VERT_WIDTH + 1,
-                    true,
+                    LineRenderArgs {
+                        line,
+                        ranges: &[],
+                        meta: &[],
+                        out: &mut underlines_buf,
+                        rendered: out,
+                        highlight_on,
+                        highlight_off,
+                        display_buf,
+                        order_buf,
+                        done_buf,
+                        active_buf,
+                        tab_width: self.tab_width,
+                        content_start_col: BOX_VERT_WIDTH
+                            + line_num_width
+                            + 1
+                            + BOX_VERT_WIDTH
+                            + 1,
+                        append: true,
+                    },
                     |out, s| out.push_str(s),
                 )
             } else {
@@ -3581,34 +3587,43 @@ fn emit_tab_run<F: FnMut(&mut String, &str)>(
     }
 }
 
+pub(crate) struct LineRenderArgs<'a, 'b> {
+    pub line: &'a str,
+    pub ranges: &'a [(usize, usize)],
+    pub meta: &'a [(char, Option<usize>)],
+    pub out: &'b mut SmallVec<[(usize, usize, char, Option<usize>); 8]>,
+    pub rendered: &'b mut String,
+    pub highlight_on: &'a str,
+    pub highlight_off: &'a str,
+    pub display_buf: &'b mut Vec<(usize, usize)>,
+    pub order_buf: &'b mut Vec<usize>,
+    pub done_buf: &'b mut Vec<bool>,
+    pub active_buf: &'b mut BinaryHeap<Reverse<(usize, usize)>>,
+    pub tab_width: usize,
+    pub content_start_col: usize,
+    pub append: bool,
+}
+
 pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
-    line: &str,
-    ranges: &[(usize, usize)],
-    meta: &[(char, Option<usize>)],
-    out: &mut SmallVec<[(usize, usize, char, Option<usize>); 8]>,
-    rendered: &mut String,
-    highlight_on: &str,
-    highlight_off: &str,
-    display_buf: &mut Vec<(usize, usize)>,
-    order_buf: &mut Vec<usize>,
-    done_buf: &mut Vec<bool>,
-    active_buf: &mut BinaryHeap<Reverse<(usize, usize)>>,
-    tab_width: usize,
-    // Terminal column the line's content starts at — the gutter width
-    // (`│ <num> │ `).  Tab stops advance from the *absolute* cursor column,
-    // so a tab's expansion width is computed from `content_start_col + col`;
-    // the annotation columns recorded in `out` stay content-relative, exactly
-    // as the underline rows that consume them expect.  Test oracles pass 0.
-    content_start_col: usize,
-    // When `false` (the default), `rendered` is cleared first — the
-    // caller reuses it as scratch.  When `true`, the caller passes the
-    // *destination* buffer directly (its existing content — the row's
-    // gutter — is preserved), and the per-row `push_str(&rendered)` copy
-    // disappears: on a plain printable-ASCII row with no primary
-    // annotations the old path copied the same bytes twice.
-    append: bool,
+    args: LineRenderArgs<'_, '_>,
     mut emit: F,
 ) -> usize {
+    let LineRenderArgs {
+        line,
+        ranges,
+        meta,
+        out,
+        rendered,
+        highlight_on,
+        highlight_off,
+        display_buf,
+        order_buf,
+        done_buf,
+        active_buf,
+        tab_width,
+        content_start_col,
+        append,
+    } = args;
     if !append {
         rendered.clear();
     }
@@ -4184,20 +4199,22 @@ fn render_line_merged(
     append: bool,
 ) -> usize {
     render_line_merged_with(
-        line,
-        ranges,
-        meta,
-        out,
-        rendered,
-        highlight_on,
-        highlight_off,
-        display_buf,
-        order_buf,
-        done_buf,
-        active_buf,
-        tab_width,
-        content_start_col,
-        append,
+        LineRenderArgs {
+            line,
+            ranges,
+            meta,
+            out,
+            rendered,
+            highlight_on,
+            highlight_off,
+            display_buf,
+            order_buf,
+            done_buf,
+            active_buf,
+            tab_width,
+            content_start_col,
+            append,
+        },
         |out, s| out.push_str(s),
     )
 }

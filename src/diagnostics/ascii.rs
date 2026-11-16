@@ -106,6 +106,10 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
     if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::is_printable_ascii(s) };
     }
+    #[cfg(target_arch = "wasm32")]
+    if !swar_forced() && s.len() >= 16 {
+        return unsafe { wasm::is_printable_ascii(s) };
+    }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
     const DEL: u128 = 0x7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F;
@@ -185,6 +189,10 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     #[cfg(target_arch = "aarch64")]
     if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::is_printable_ascii_multiline(s) };
+    }
+    #[cfg(target_arch = "wasm32")]
+    if !swar_forced() && s.len() >= 16 {
+        return unsafe { wasm::is_printable_ascii_multiline(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
@@ -267,6 +275,10 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
     #[cfg(target_arch = "aarch64")]
     if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::is_printable_ascii_or_tab(s) };
+    }
+    #[cfg(target_arch = "wasm32")]
+    if !swar_forced() && s.len() >= 16 {
+        return unsafe { wasm::is_printable_ascii_or_tab(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
@@ -367,6 +379,10 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::classify_ascii(s) };
     }
+    #[cfg(target_arch = "wasm32")]
+    if !swar_forced() && s.len() >= 16 {
+        return unsafe { wasm::classify_ascii(s) };
+    }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
     const TAB: u128 = 0x0909_0909_0909_0909_0909_0909_0909_0909;
@@ -438,6 +454,10 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "aarch64")]
     if !swar_forced() && s.len() >= 16 {
         return unsafe { neon::next_non_ascii_byte(s) };
+    }
+    #[cfg(target_arch = "wasm32")]
+    if !swar_forced() && s.len() >= 16 {
+        return unsafe { wasm::next_non_ascii_byte(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
 
@@ -989,6 +1009,164 @@ mod x86_64 {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod wasm {
+    use std::arch::wasm32::*;
+
+    #[inline]
+    unsafe fn any(v: v128) -> bool {
+        unsafe { u8x16_bitmask(v) != 0 }
+    }
+
+    #[target_feature(enable = "simd128")]
+    pub(super) unsafe fn is_printable_ascii(s: &[u8]) -> bool {
+        let sp = u8x16_splat(0x20);
+        let del = u8x16_splat(0x7F);
+        let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
+            let bad = |v: v128| unsafe { v128_or(i8x16_lt(v, sp), u8x16_eq(v, del)) };
+            if unsafe { any(v128_or(bad(a), bad(b))) } {
+                return false;
+            }
+            i += 32;
+        }
+        while i + 16 <= s.len() {
+            let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            if unsafe { any(v128_or(i8x16_lt(v, sp), u8x16_eq(v, del))) } {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii(&s[i..])
+    }
+
+    #[target_feature(enable = "simd128")]
+    pub(super) unsafe fn is_printable_ascii_multiline(s: &[u8]) -> bool {
+        let sp = u8x16_splat(0x20);
+        let del = u8x16_splat(0x7F);
+        let tab = u8x16_splat(0x09);
+        let nl = u8x16_splat(0x0A);
+        let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
+            let bad = |v: v128| unsafe {
+                let lt = i8x16_lt(v, sp);
+                let off = v128_andnot(lt, v128_or(u8x16_eq(v, tab), u8x16_eq(v, nl)));
+                v128_or(u8x16_eq(v, del), off)
+            };
+            if unsafe { any(v128_or(bad(a), bad(b))) } {
+                return false;
+            }
+            i += 32;
+        }
+        while i + 16 <= s.len() {
+            let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            let lt = unsafe { i8x16_lt(v, sp) };
+            let off = unsafe { v128_andnot(lt, v128_or(u8x16_eq(v, tab), u8x16_eq(v, nl))) };
+            if unsafe { any(v128_or(u8x16_eq(v, del), off)) } {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii_multiline(&s[i..])
+    }
+
+    #[target_feature(enable = "simd128")]
+    pub(super) unsafe fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
+        let sp = u8x16_splat(0x20);
+        let del = u8x16_splat(0x7F);
+        let tab = u8x16_splat(0x09);
+        let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
+            let bad = |v: v128| unsafe {
+                v128_or(u8x16_eq(v, del), v128_andnot(i8x16_lt(v, sp), u8x16_eq(v, tab)))
+            };
+            if unsafe { any(v128_or(bad(a), bad(b))) } {
+                return false;
+            }
+            i += 32;
+        }
+        while i + 16 <= s.len() {
+            let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            let bad = unsafe {
+                v128_or(u8x16_eq(v, del), v128_andnot(i8x16_lt(v, sp), u8x16_eq(v, tab)))
+            };
+            if unsafe { any(bad) } {
+                return false;
+            }
+            i += 16;
+        }
+        super::is_printable_ascii_or_tab(&s[i..])
+    }
+
+    #[target_feature(enable = "simd128")]
+    pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
+        let sp = u8x16_splat(0x20);
+        let del = u8x16_splat(0x7F);
+        let tab = u8x16_splat(0x09);
+        let mut saw_tab = false;
+        let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
+            let classify = |v: v128| unsafe {
+                let tabm = u8x16_eq(v, tab);
+                (
+                    v128_or(u8x16_eq(v, del), v128_andnot(i8x16_lt(v, sp), tabm)),
+                    u8x16_bitmask(tabm),
+                )
+            };
+            let (ba, ta) = classify(a);
+            let (bb, tb) = classify(b);
+            if unsafe { any(v128_or(ba, bb)) } {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= ta != 0 || tb != 0;
+            i += 32;
+        }
+        while i + 16 <= s.len() {
+            let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            let tabm = unsafe { u8x16_eq(v, tab) };
+            let bad = unsafe { v128_or(u8x16_eq(v, del), v128_andnot(i8x16_lt(v, sp), tabm)) };
+            if unsafe { any(bad) } {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= unsafe { u8x16_bitmask(tabm) != 0 };
+            i += 16;
+        }
+        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
+    }
+
+    #[target_feature(enable = "simd128")]
+    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
+        let mut i = 0usize;
+        while i + 64 <= s.len() {
+            for off in [0usize, 16, 32, 48] {
+                let v = unsafe { v128_load(s.as_ptr().add(i + off).cast()) };
+                let bits = unsafe { u8x16_bitmask(v) };
+                if bits != 0 {
+                    return Some(i + off + bits.trailing_zeros() as usize);
+                }
+            }
+            i += 64;
+        }
+        while i + 16 <= s.len() {
+            let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
+            let bits = unsafe { u8x16_bitmask(v) };
+            if bits != 0 {
+                return Some(i + bits.trailing_zeros() as usize);
+            }
+            i += 16;
+        }
+        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use std::arch::aarch64::*;
@@ -1045,6 +1223,21 @@ mod neon {
         let tab_v = unsafe { vdupq_n_u8(0x09) };
         let nl_v = unsafe { vdupq_n_u8(0x0A) };
         let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            let b = unsafe { vld1q_u8(s.as_ptr().add(i + 16)) };
+            let bad = |v: uint8x16_t| unsafe {
+                let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
+                let tab = vceqq_u8(v, tab_v);
+                let nl = vceqq_u8(v, nl_v);
+                let off = vbicq_u8(lt, vorrq_u8(tab, nl));
+                vorrq_u8(vceqq_u8(v, del), off)
+            };
+            if unsafe { any_nonzero(vorrq_u8(bad(a), bad(b))) } {
+                return false;
+            }
+            i += 32;
+        }
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
             let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
@@ -1067,6 +1260,20 @@ mod neon {
         let del = unsafe { vdupq_n_u8(0x7F) };
         let tab_v = unsafe { vdupq_n_u8(0x09) };
         let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            let b = unsafe { vld1q_u8(s.as_ptr().add(i + 16)) };
+            let bad = |v: uint8x16_t| unsafe {
+                let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
+                let tab = vceqq_u8(v, tab_v);
+                let off = vbicq_u8(lt, tab);
+                vorrq_u8(vceqq_u8(v, del), off)
+            };
+            if unsafe { any_nonzero(vorrq_u8(bad(a), bad(b))) } {
+                return false;
+            }
+            i += 32;
+        }
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
             let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
@@ -1088,6 +1295,23 @@ mod neon {
         let tab_v = unsafe { vdupq_n_u8(0x09) };
         let mut saw_tab = false;
         let mut i = 0usize;
+        while i + 32 <= s.len() {
+            let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
+            let b = unsafe { vld1q_u8(s.as_ptr().add(i + 16)) };
+            let classify = |v: uint8x16_t| unsafe {
+                let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
+                let tab = vceqq_u8(v, tab_v);
+                let off = vbicq_u8(lt, tab);
+                (vorrq_u8(vceqq_u8(v, del), off), any_nonzero(tab))
+            };
+            let (bad_a, tab_a) = classify(a);
+            let (bad_b, tab_b) = classify(b);
+            if unsafe { any_nonzero(vorrq_u8(bad_a, bad_b)) } {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= tab_a || tab_b;
+            i += 32;
+        }
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
             let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };

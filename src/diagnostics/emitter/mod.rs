@@ -1223,6 +1223,61 @@ mod tests {
     /// entered on multi-core hosts — the previous 128 one-line diagnostics
     /// stayed under the weight threshold and silently tested the serial path.
     #[test]
+    fn human_parallel_matches_serial() {
+        const N: usize = 192;
+        let mk = || -> Vec<Diagnostic<'static>> {
+            (0..N)
+                .map(|i| {
+                    Diagnostic::error(format!(
+                        "error {i} {}",
+                        "x".repeat(96)
+                    ))
+                    .with_code_str("E030")
+                    .with_span(Span::new(FileId::DUMMY, 0, 1))
+                    .with_source("fn main() { let x = 1; }\n")
+                })
+                .collect()
+        };
+        let opts = DiagOpts {
+            quiet: true,
+            ..DiagOpts::default()
+        };
+        let mut emitter = Emitter::new(
+            crate::diagnostics::HumanRenderer::plain(),
+            string(),
+            opts.clone(),
+        );
+        emitter.parallelism = 4;
+        let before = PARALLEL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut parallel_diags = mk();
+        let mut parallel_sink = StringSink::new();
+        emitter
+            .emit_all_to(&mut parallel_diags, &mut parallel_sink)
+            .unwrap();
+        let parallel = parallel_sink.into_string();
+        if emitter.parallelism > 1 {
+            assert!(
+                PARALLEL_CALLS.load(std::sync::atomic::Ordering::Relaxed) > before,
+                "B8 test must exercise the parallel glyph path"
+            );
+        }
+
+        let mut serial_diags = mk();
+        let mut refs: Vec<&mut Diagnostic<'static>> = serial_diags.iter_mut().collect();
+        let mut serial_sink = StringSink::new();
+        let cx = RenderCtx::new(&opts, None);
+        emitter
+            .render_sequential(&mut refs, &mut serial_sink, &cx)
+            .unwrap();
+        let serial = serial_sink.into_string();
+        assert_eq!(
+            parallel, serial,
+            "parallel glyph output diverged from serial"
+        );
+    }
+
+    #[test]
     fn parallel_matches_sequential_when_renders_are_empty() {
         const N: usize = 512;
         let opts = DiagOpts::default();

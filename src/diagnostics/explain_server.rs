@@ -1875,6 +1875,27 @@ where
     }
 }
 
+/// Shared post-response policy for the blocking backends: keep-alive returns
+/// immediately; a framed body drains residual bytes before FIN; an unframed
+/// body lingers to EOF/budget so unread inbound bytes cannot turn the close
+/// into an RST that discards the response.
+fn finish_after_response(
+    stream: &mut TcpStream,
+    outcome: DrainOutcome,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    if keep_alive {
+        return Ok(());
+    }
+    if outcome == DrainOutcome::Complete {
+        drain_residual(stream);
+        let _ = stream.shutdown(Shutdown::Both);
+    } else {
+        linger_after_half_close(stream);
+    }
+    Ok(())
+}
+
 fn finish_response(
     stream: &mut TcpStream,
     drain: DrainOutcome,
@@ -1888,13 +1909,12 @@ fn finish_response(
         }
         DrainOutcome::HeadersOnly => {
             write_prepared_parts(stream, response.head_parts(), response.body())?;
-            linger_after_half_close_for(stream, ONE_SHOT_LINGER);
+            finish_after_response(stream, drain, false)?;
             Ok(delivered)
         }
         DrainOutcome::Complete => {
             write_prepared_parts(stream, response.head_parts(), response.body())?;
-            drain_residual(stream);
-            let _ = stream.shutdown(Shutdown::Both);
+            finish_after_response(stream, drain, false)?;
             Ok(delivered)
         }
         DrainOutcome::TooLarge => {
@@ -2968,10 +2988,7 @@ fn serve_explain_persistent_epoll(
                         .unwrap_or(0)
                         .saturating_sub(already_read)
                 };
-                let keep = matches!(
-                    response.status,
-                    "200 OK" | "400 Bad Request" | "404 Not Found" | "405 Method Not Allowed"
-                )
+                let keep = response_allows_keep_alive(response.status)
                     && !framing.has_transfer_encoding
                     && !framing.ambiguous
                     && !framing.oversized
@@ -3207,10 +3224,7 @@ fn handle_persistent_connection(
         }
         let (response, http11) = dispatch_request_meta(&line);
         let keep_alive = outcome == DrainOutcome::Complete
-            && matches!(
-                response.status,
-                "200 OK" | "400 Bad Request" | "404 Not Found" | "405 Method Not Allowed"
-            )
+            && response_allows_keep_alive(response.status)
             && http11
             && tail_len == 0
             && !wants_close;
@@ -3229,16 +3243,7 @@ fn handle_persistent_connection(
             // swallow an early next request).
             continue;
         }
-        if outcome == DrainOutcome::Complete {
-            // C2: drain residual bytes after the response is on the wire.
-            drain_residual(stream);
-            let _ = stream.shutdown(Shutdown::Both);
-        } else {
-            // The body was not fully drained.  Closing with unread inbound
-            // bytes makes the kernel send RST, which can discard the response
-            // just written — the shared helper loops to EOF/budget .
-            linger_after_half_close(stream);
-        }
+        finish_after_response(stream, outcome, false)?;
         return Ok(());
     }
 }
@@ -3622,6 +3627,16 @@ fn method_not_allowed_response() -> HttpResponse {
 #[cfg(test)]
 fn dispatch_request(request_line: &str) -> HttpResponse {
     dispatch_request_meta(request_line).0
+}
+
+/// Statuses that may keep the connection alive.  Shared by the blocking
+/// thread backend and the epoll reactor so one cannot silently diverge on
+/// which protocol-error responses are reusable.
+fn response_allows_keep_alive(status: &str) -> bool {
+    matches!(
+        status,
+        "200 OK" | "400 Bad Request" | "404 Not Found" | "405 Method Not Allowed"
+    )
 }
 
 fn dispatch_request_meta(request_line: &str) -> (HttpResponse, bool) {
@@ -4805,6 +4820,21 @@ mod tests {
             "silent overload connection must not receive a response"
         );
         drop(idle);
+    }
+
+    #[test]
+    fn keep_alive_status_policy_is_shared() {
+        for status in [
+            "200 OK",
+            "400 Bad Request",
+            "404 Not Found",
+            "405 Method Not Allowed",
+        ] {
+            assert!(response_allows_keep_alive(status), "{status}");
+        }
+        for status in ["500 Internal Server Error", "503 Service Unavailable", "431 ..."] {
+            assert!(!response_allows_keep_alive(status), "{status}");
+        }
     }
 
     #[cfg(target_os = "linux")]

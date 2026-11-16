@@ -199,10 +199,17 @@ pub(crate) fn color_depth_decision_with_terminal(
         return ColorDepth::TrueColor;
     }
     if let Some(tp) = term_program {
-        let tp = tp.as_bytes();
-        if [b"iterm".as_slice(), b"wezterm".as_slice(), b"vscode".as_slice(), b"warp".as_slice()]
-            .into_iter()
-            .any(|n| contains_ignore_ascii_case(tp, n))
+        // Exact, case-insensitive values only: `contains` treated
+        // "not-iTerm.app" or "vscode-fork" as truecolor terminals.
+        if [
+            "iTerm.app",
+            "WezTerm",
+            "vscode",
+            "WarpTerminal",
+            "Warp",
+        ]
+        .iter()
+        .any(|n| tp.eq_ignore_ascii_case(n))
         {
             return ColorDepth::TrueColor;
         }
