@@ -159,11 +159,11 @@ impl JsonRenderer {
         // line/column values are resolved against — a span from any *other*
         // file must not be mapped through this index.
         let anchor_file = diag.spans.first().map(|s| s.file);
-        let needs_index = anchor_file.is_some()
-            || !diag.related_errors.is_empty()
-            || !diag.suggestions.is_empty()
-            || diag.call_chain.as_ref().is_some_and(|c| !c.is_empty())
-            || !diag.labels().is_empty();
+        // Every index consumer (primary span, additional spans, related errors,
+// call chain) first requires an anchor file; labels/suggestions/children
+// never read line/col.  The old four extra disjuncts only forced an O(n)
+// line-index build for diagnostics that could not consume it.
+        let needs_index = anchor_file.is_some();
         let idx = if needs_index {
             diag.source().map(|s| cx.line_index(s))
         } else {
@@ -223,9 +223,9 @@ impl JsonRenderer {
                 sp.u64(span.end as u64);
                 if let Some(source) = diag.source()
                     && let Some(idx) = idx.as_ref()
+                    && span.start_as_usize() <= source.len()
                 {
-                    let (line, col) =
-                        idx.linecol_display(span.start_as_usize().min(source.len()));
+                    let (line, col) = idx.linecol_display(span.start_as_usize());
                     sp.key("line");
                     sp.u64((line + 1) as u64);
                     sp.key("column");
@@ -460,6 +460,16 @@ impl JsonRenderer {
                         super::fmt::push_uint(o, lbl.span.start as u64);
                         flat_key(o, "end");
                         super::fmt::push_uint(o, lbl.span.end as u64);
+                        match diag.file_name_for(lbl.span.file) {
+                            Some(name) => {
+                                flat_key(o, "file");
+                                Self::push_json_str(o, name);
+                            }
+                            None => {
+                                flat_key(o, "fileId");
+                                super::fmt::push_uint(o, lbl.span.file.as_u32() as u64);
+                            }
+                        }
                         flat_key(o, "message");
                         Self::push_json_str(o, &lbl.message);
                         flat_key(o, "kind");

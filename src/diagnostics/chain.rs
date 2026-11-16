@@ -301,31 +301,37 @@ impl<'src> CallChain<'src> {
         let mut message_bytes = 0usize;
         let mut indent_bytes = 0usize;
         let mut visited = 0usize;
-        let mut stack: SmallVec<[(&CallChain<'src>, usize); 8]> = SmallVec::new();
-        stack.push((self, 0));
-        'outer: while let Some((chain, depth)) = stack.pop() {
-            if depth > MAX_CHAIN_DEPTH {
+        // Frame = (chain, depth, next child index).  Processing one entry,
+        // then its children, then the remaining siblings reproduces
+        // `render_entries`'s pre-order exactly — the old LIFO push of all
+        // children visited the last sibling's subtree first, so the cap set
+        // (and therefore `any_spanned` / the hyperlink gate) could differ
+        // from the rendered set at the truncation boundary.
+        let mut stack: SmallVec<[(&CallChain<'src>, usize, usize); 8]> = SmallVec::new();
+        stack.push((self, 0, 0));
+        while let Some((chain, depth, next)) = stack.pop() {
+            if depth > MAX_CHAIN_DEPTH || next >= chain.entries.len() {
                 continue;
             }
-            if visited >= MAX_RESERVE_ENTRIES && message_bytes >= MAX_RESERVE_MESSAGE_BYTES {
+            if visited >= MAX_RESERVE_ENTRIES {
                 break;
             }
-            for entry in &chain.entries {
-                if visited >= MAX_RESERVE_ENTRIES {
-                    break 'outer;
-                }
-                visited += 1;
-                indent_bytes = indent_bytes
-                    .saturating_add(4 + depth * 4)
-                    .min(MAX_RESERVE_MESSAGE_BYTES);
-                any_spanned = any_spanned || entry.span.is_some();
-                message_bytes = message_bytes
-                    .saturating_add(entry.message.len())
-                    .min(MAX_RESERVE_MESSAGE_BYTES);
-                if let Some(children) = &entry.children {
-                    for child in children {
-                        stack.push((child, depth + 1));
-                    }
+            let entry = &chain.entries[next];
+            // Siblings are processed after this entry's entire subtree.
+            if next + 1 < chain.entries.len() {
+                stack.push((chain, depth, next + 1));
+            }
+            visited += 1;
+            indent_bytes = indent_bytes
+                .saturating_add(4 + depth * 4)
+                .min(MAX_RESERVE_MESSAGE_BYTES);
+            any_spanned = any_spanned || entry.span.is_some();
+            message_bytes = message_bytes
+                .saturating_add(entry.message.len())
+                .min(MAX_RESERVE_MESSAGE_BYTES);
+            if let Some(children) = &entry.children {
+                for child in children.iter().rev() {
+                    stack.push((child, depth + 1, 0));
                 }
             }
         }
@@ -550,6 +556,29 @@ impl<'src> CallChain<'src> {
         col - start_col
     }
 
+    /// Capped variant for the fast-path guard: `None` means the measured
+    /// width already exceeds `cap`, so the caller must take the wrap path.
+    fn ascii_tabbed_width_capped(
+        s: &str,
+        start_col: usize,
+        tab_width: usize,
+        cap: usize,
+    ) -> Option<usize> {
+        let tab_width = tab_width.max(1);
+        let mut col = start_col;
+        for &b in s.as_bytes() {
+            if b == b'\t' {
+                col += tab_width - (col % tab_width);
+            } else {
+                col += 1;
+            }
+            if col.saturating_sub(start_col) > cap {
+                return None;
+            }
+        }
+        Some(col - start_col)
+    }
+
     fn expand_message_tabs<'a>(
         message: &'a str,
         tab_width: usize,
@@ -636,11 +665,12 @@ impl<'src> CallChain<'src> {
             // actually printed after `indent_cols`; when that is not a tab
             // stop, expand tabs with the real starting column so wrapping
             // cannot under-estimate the rendered width.
-            let message: Cow<'_, str> = if tab_aligned {
-                sanitized
-            } else {
-                Self::expand_message_tabs(sanitized.as_ref(), tab_width, indent_cols)
-            };
+            let message: Cow<'_, str> =
+                if tab_aligned || class == super::ascii::AsciiClass::Printable {
+                    sanitized
+                } else {
+                    Self::expand_message_tabs(sanitized.as_ref(), tab_width, indent_cols)
+                };
             let suffix = match (source, entry.span, idx) {
                 (Some(_), Some(span), Some(idx))
                     if anchor.map_or(true, |a| span.file == a) =>
@@ -679,19 +709,24 @@ impl<'src> CallChain<'src> {
             // lines; tabs are measured from the real indent column.
             let fast_width = match class {
                 super::ascii::AsciiClass::Printable => Some(message.len()),
-                super::ascii::AsciiClass::PrintableOrTab => Some(Self::ascii_tabbed_width(
-                    message.as_ref(),
-                    indent_cols,
-                    tab_width,
-                )),
+                super::ascii::AsciiClass::PrintableOrTab => {
+                    Self::ascii_tabbed_width_capped(
+                        message.as_ref(),
+                        indent_cols,
+                        tab_width,
+                        max_width.saturating_sub(indent_cols.saturating_add(suffix_cols)),
+                    )
+                }
                 super::ascii::AsciiClass::Other => None,
             };
             if fast_width.is_some_and(|width| {
-                !message.is_empty()
-                    // `wrap_optimal` trims edge spaces; decline so the fast
-                    // path cannot diverge on `"  foo  "`.
-                    && !message.starts_with(' ')
+                // `wrap_optimal` trims edge whitespace; decline both space
+                // and tab edges so the fast path cannot diverge.  An empty
+                // message is safe on the fast path (indent + suffix only).
+                !message.starts_with(' ')
                     && !message.ends_with(' ')
+                    && !message.starts_with('\t')
+                    && !message.ends_with('\t')
                     && width + indent_cols + suffix_cols <= max_width
             }) {
                 super::renderers::fmt::push_spaces(out, indent_cols);
@@ -803,6 +838,28 @@ mod tests {
         assert!(out.lines().nth(1).unwrap().contains("a  b"), "out: {out}");
         let wrapped = crate::diagnostics::wrap::wrap_optimal("a  b", 36, 4);
         assert_eq!(wrapped.as_slice(), [Cow::Borrowed("a  b")]);
+    }
+
+    #[test]
+    fn edge_tabs_decline_fast_path_without_changing_text() {
+        for msg in ["\tfoo", "foo\t"] {
+            let mut chain = CallChain::new();
+            chain.push(ChainEntry::new(ChainEntryKind::Call, None, msg));
+            let out = chain.render_with_index(false, None, "", None, 40, 4);
+            let line = out.lines().nth(1).expect("entry line");
+            // The wrap path trims edge tabs; the fast path must not emit them
+            // raw.  Pin the actual post-wrap text instead of the guard shape.
+            assert!(!line.starts_with('\t'), "edge tab leaked: {out:?}");
+            assert!(!line.trim_end().ends_with('\t'), "edge tab leaked: {out:?}");
+        }
+    }
+
+    #[test]
+    fn empty_message_fast_path_matches_wrap() {
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(ChainEntryKind::Call, None, ""));
+        let out = chain.render_with_index(false, None, "", None, 40, 4);
+        assert_eq!(out.lines().nth(1), Some("    : called from here"));
     }
 
     #[test]

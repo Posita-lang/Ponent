@@ -125,3 +125,27 @@ fold-marker-lines =
        *[other] { $gap } lines omitted
     }
 chain-header = referenced by:
+html-doc-title = Ponent Compiler Diagnostics
+html-h1 = Ponent Compiler Diagnostics
+html-toggle-theme = Toggle theme
+html-summary =
+    { $errors ->
+        [one] 1 error
+       *[other] { $errors } errors
+    }, { $warnings ->
+        [one] 1 warning
+       *[other] { $warnings } warnings
+    }
+html-summary-files =
+    { $files ->
+        [one] in 1 file
+       *[other] in { $files } files
+    }
+type-ctx-annotation = from type annotation
+type-ctx-return-type = from return type
+type-ctx-binop = from operator
+type-ctx-function-arg = from function argument
+type-ctx-field = from field type
+type-ctx-type-alias = from type alias
+type-ctx-contract = from contract
+type-ctx-inference = from type inference

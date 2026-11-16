@@ -34,19 +34,47 @@ pub enum TypeCtx {
     Inference,
 }
 
+impl TypeCtx {
+    /// Localized parenthetical label.  `Unspecified` is empty: callers skip
+    /// the suffix entirely rather than emitting `()`.
+    pub fn label(&self) -> Cow<'static, str> {
+        let variant = match self {
+            TypeCtx::Unspecified => return Cow::Borrowed(""),
+            TypeCtx::Annotation => 1,
+            TypeCtx::ReturnType => 2,
+            TypeCtx::BinOp => 3,
+            TypeCtx::FunctionArg => 4,
+            TypeCtx::Field => 5,
+            TypeCtx::TypeAlias => 6,
+            TypeCtx::Contract => 7,
+            TypeCtx::Inference => 8,
+        };
+        crate::diagnostics::i18n::cached_label! {
+            n = 9,
+            variant = variant,
+            init = [
+                String::new(),
+                crate::diagnostics::i18n::fluent::type_ctx_annotation().into_owned(),
+                crate::diagnostics::i18n::fluent::type_ctx_return_type().into_owned(),
+                crate::diagnostics::i18n::fluent::type_ctx_binop().into_owned(),
+                crate::diagnostics::i18n::fluent::type_ctx_function_arg().into_owned(),
+                crate::diagnostics::i18n::fluent::type_ctx_field().into_owned(),
+                crate::diagnostics::i18n::fluent::type_ctx_type_alias().into_owned(),
+                crate::diagnostics::i18n::fluent::type_ctx_contract().into_owned(),
+                crate::diagnostics::i18n::fluent::type_ctx_inference().into_owned(),
+            ],
+        }
+    }
+}
+
 impl std::fmt::Display for TypeCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TypeCtx::Unspecified => Ok(()),
-            TypeCtx::Annotation => write!(f, "from type annotation"),
-            TypeCtx::ReturnType => write!(f, "from return type"),
-            TypeCtx::BinOp => write!(f, "from operator"),
-            TypeCtx::FunctionArg => write!(f, "from function argument"),
-            TypeCtx::Field => write!(f, "from field type"),
-            TypeCtx::TypeAlias => write!(f, "from type alias"),
-            TypeCtx::Contract => write!(f, "from contract"),
-            TypeCtx::Inference => write!(f, "from type inference"),
+        // Kept for diagnostics/tests that format a TypeCtx directly; the
+        // humanizer uses `label()` so the suffix follows `Lang`.
+        if matches!(self, TypeCtx::Unspecified) {
+            return Ok(());
         }
+        f.write_str(&self.label())
     }
 }
 
@@ -334,6 +362,76 @@ fn comptime_message<'a>(kind: &ComptimeErrorKind) -> DiagMessage<'a> {
     }
 }
 
+fn type_mismatch_message<'src>(
+    expected: &Cow<'src, str>,
+    found: &Cow<'src, str>,
+    reason: Option<&Cow<'src, str>>,
+    context: Option<TypeCtx>,
+) -> DiagMessage<'src> {
+    let has_suffix =
+        reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
+    if !has_suffix {
+        return DiagMessage::Slug {
+            slug: "type-mismatch",
+            pairs: smallvec![("expected", expected.clone()), ("found", found.clone())],
+        };
+    }
+    let mut msg = String::with_capacity(
+        expected.as_ref().len()
+            + found.as_ref().len()
+            + 48
+            + context.map_or(0, |_| 24)
+            + reason.as_ref().map_or(0, |r| r.len() + 8),
+    );
+    crate::diagnostics::i18n::render_into(
+        "type-mismatch",
+        &[("expected", expected.clone()), ("found", found.clone())],
+        &mut msg,
+    );
+    if let Some(ctx) = context
+        && !matches!(ctx, TypeCtx::Unspecified)
+    {
+        let label = ctx.label();
+        if !label.is_empty() {
+            let _ = write!(msg, " ({label})");
+        }
+    }
+    if let Some(r) = reason {
+        let _ = write!(msg, " — {r}");
+    }
+    msg.into()
+}
+
+fn comptime_message_with_traceback<'src>(
+    kind: &ComptimeErrorKind,
+    traceback: &[(ComptimeReason, Option<Span>)],
+) -> DiagMessage<'src> {
+    let msg = comptime_message(kind);
+    if traceback.is_empty() {
+        return msg;
+    }
+    let mut s = String::with_capacity(64 + traceback.len() * 64);
+    msg.render_into_owned(&mut s);
+    s.push_str("\n\n");
+    s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
+    s.push('\n');
+    for (i, (reason, span)) in traceback.iter().enumerate() {
+        if i > 0 {
+            s.push('\n');
+        }
+        let reason_str = reason.as_str();
+        match span {
+            Some(span) => {
+                let _ = write!(s, "  · {reason_str} at offset {}", span.start);
+            }
+            None => {
+                let _ = write!(s, "  · {reason_str}");
+            }
+        }
+    }
+    s.into()
+}
+
 impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
     fn message(&self) -> DiagMessage<'src> {
         match self {
@@ -343,50 +441,7 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 reason,
                 context,
                 ..
-            } => {
-                // Base sentence goes through the `type-mismatch` Fluent slug
-                // (word order lives in locales/*.ftl), so it follows the
-                // active language.  The context/reason suffixes are
-                // structural ASCII (parentheses, em dash) wrapping content
-                // that is itself English (TypeCtx::Display, free-form
-                // reason), so they are appended verbatim — localizing the
-                // punctuation alone would mix scripts mid-sentence.
-                let has_suffix =
-                    reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
-                if has_suffix {
-                    // Pre-size: base sentence ≈ "type mismatch: expected `…`,
-                    // found `…`" plus the fixed `" ("`/`" — "` connectors, so
-                    // a TypeMismatch with context/reason never reallocates.
-                    let mut msg = String::with_capacity(
-                        expected.as_ref().len()
-                            + found.as_ref().len()
-                            + 48
-                            + context.map_or(0, |_| 24)
-                            + reason.as_ref().map_or(0, |r| r.len() + 8),
-                    );
-                    crate::diagnostics::i18n::render_into(
-                        "type-mismatch",
-                        &[("expected", expected.clone()), ("found", found.clone())],
-                        &mut msg,
-                    );
-                    if let Some(ctx) = context
-                        && !matches!(ctx, TypeCtx::Unspecified)
-                    {
-                        use std::fmt::Write;
-                        let _ = write!(msg, " ({ctx})");
-                    }
-                    if let Some(r) = reason {
-                        use std::fmt::Write;
-                        let _ = write!(msg, " — {r}");
-                    }
-                    msg.into()
-                } else {
-                    DiagMessage::Slug {
-                        slug: "type-mismatch",
-                        pairs: smallvec![("expected", expected.clone()), ("found", found.clone()),],
-                    }
-                }
-            }
+            } => type_mismatch_message(expected, found, reason.as_ref(), *context),
             DiagnosticKind::NoSuchField {
                 field_name,
                 type_name,
@@ -438,32 +493,7 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
             },
             DiagnosticKind::Comptime {
                 kind, traceback, ..
-            } => {
-                let msg = comptime_message(kind);
-                if traceback.is_empty() {
-                    msg
-                } else {
-                    let mut s = String::with_capacity(64 + traceback.len() * 64);
-                    msg.render_into_owned(&mut s);
-                    s.push('\n');
-                    s.push('\n');
-                    s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
-                    s.push('\n');
-                    for (i, (reason, span)) in traceback.iter().enumerate() {
-                        if i > 0 {
-                            s.push('\n');
-                        }
-                        let reason_str = reason.as_str();
-                        match span {
-                            Some(span) => {
-                                write!(s, "  · {reason_str} at offset {}", span.start).ok()
-                            }
-                            None => write!(s, "  · {reason_str}").ok(),
-                        };
-                    }
-                    s.into()
-                }
-            }
+            } => comptime_message_with_traceback(kind, traceback),
         }
     }
 
@@ -652,40 +682,7 @@ impl<'src> DiagnosticKind<'src> {
                 reason,
                 context,
             } => {
-                let has_suffix =
-                    reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
-                let message = if has_suffix {
-                    // Pre-size (see `message()`): avoids 1–2 reallocations on
-                    // the common with-context/with-reason path.
-                    let mut msg = String::with_capacity(
-                        expected.as_ref().len()
-                            + found.as_ref().len()
-                            + 48
-                            + context.map_or(0, |_| 24)
-                            + reason.as_ref().map_or(0, |r| r.len() + 8),
-                    );
-                    crate::diagnostics::i18n::render_into(
-                        "type-mismatch",
-                        &[("expected", expected.clone()), ("found", found.clone())],
-                        &mut msg,
-                    );
-                    if let Some(ctx) = context
-                        && !matches!(ctx, TypeCtx::Unspecified)
-                    {
-                        use std::fmt::Write;
-                        let _ = write!(msg, " ({ctx})");
-                    }
-                    if let Some(r) = reason {
-                        use std::fmt::Write;
-                        let _ = write!(msg, " — {r}");
-                    }
-                    msg.into()
-                } else {
-                    DiagMessage::Slug {
-                        slug: "type-mismatch",
-                        pairs: smallvec![("expected", expected.clone()), ("found", found.clone()),],
-                    }
-                };
+                let message = type_mismatch_message(&expected, &found, reason.as_ref(), context);
                 let mut labels = CovariantVec::new();
                 labels.push(Label::new(span, fluent::label_expected(expected).lift()));
                 if let Some(fs) = found_span {
@@ -815,32 +812,8 @@ impl<'src> DiagnosticKind<'src> {
                 span,
                 traceback,
             } => {
-                let message: DiagMessage = {
-                    let msg = comptime_message(&kind);
-                    if traceback.is_empty() {
-                        msg
-                    } else {
-                        let mut s = String::with_capacity(64 + traceback.len() * 64);
-                        msg.render_into_owned(&mut s);
-                        s.push('\n');
-                        s.push('\n');
-                        s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
-                        s.push('\n');
-                        for (i, (reason, sp)) in traceback.iter().enumerate() {
-                            if i > 0 {
-                                s.push('\n');
-                            }
-                            let reason_str = reason.as_str();
-                            match sp {
-                                Some(sp) => {
-                                    write!(s, "  · {reason_str} at offset {}", sp.start).ok()
-                                }
-                                None => write!(s, "  · {reason_str}").ok(),
-                            };
-                        }
-                        s.into()
-                    }
-                };
+                let message: DiagMessage<'src> =
+                    comptime_message_with_traceback(&kind, &traceback);
                 let mut labels = CovariantVec::new();
                 labels.push(Label::new(span, fluent::label_comptime_eval_error().lift()));
                 for (reason, tb_span) in &traceback {

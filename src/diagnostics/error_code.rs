@@ -1448,7 +1448,10 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
                 let mut from = 0;
                 while let Some(pos) = stripped[from..].find(callee) {
                     let after = from + pos + callee.len();
-                    let tail = &src[after..];
+                    // `stripped` preserves byte offsets, so comments between
+                    // the callee and `(` are blanked but the `(` position is
+                    // still valid in `src`.
+                    let tail = &stripped[after..];
                     let ws = tail.len() - tail.trim_start().len();
                     if tail.trim_start().starts_with('(') {
                         let open = after + ws;
@@ -1484,12 +1487,13 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let f = ErrCode::new(some_var);
             let g = ErrCode::new(/* "E998" */ "E001"); // "E999"
         "#;
+        let stripped = strip_non_code(src);
         let mut found = Vec::new();
         for callee in ["with_code_str", "ErrCode::new"] {
             let mut from = 0;
-            while let Some(pos) = src[from..].find(callee) {
+            while let Some(pos) = stripped[from..].find(callee) {
                 let after = from + pos + callee.len();
-                let tail = &src[after..];
+                let tail = &stripped[after..];
                 let ws = tail.len() - tail.trim_start().len();
                 if tail.trim_start().starts_with('(') {
                     let open = after + ws;

@@ -525,8 +525,12 @@ fn scan_url_path(s: &[u8]) -> (usize, usize) {
 
 fn encode_scanned_path(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
     out.reserve(s.len().saturating_add(unsafe_count.saturating_mul(2)));
-    let mut buf: Vec<u8> = Vec::with_capacity(s.len().saturating_add(unsafe_count.saturating_mul(2)));
-    buf.extend_from_slice(&s[..first_unsafe]);
+    // A safe byte is ASCII by construction (URL_SAFE only contains ASCII),
+    // so every safe run is valid UTF-8 and can be appended without a copy.
+    let push_safe = |out: &mut String, bytes: &[u8]| {
+        out.push_str(std::str::from_utf8(bytes).expect("URL-safe bytes are ASCII"));
+    };
+    push_safe(out, &s[..first_unsafe]);
     let mut i = first_unsafe;
     while i < s.len() {
         if is_url_safe(s[i]) {
@@ -534,21 +538,24 @@ fn encode_scanned_path(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_c
             while i < s.len() && is_url_safe(s[i]) {
                 i += 1;
             }
-            buf.extend_from_slice(&s[start..i]);
+            push_safe(out, &s[start..i]);
         } else {
             let b = s[i];
-            buf.push(b'%');
-            buf.push(HEX_UPPER[(b >> 4) as usize]);
-            buf.push(HEX_UPPER[(b & 0xF) as usize]);
+            out.push('%');
+            out.push(HEX_UPPER[(b >> 4) as usize] as char);
+            out.push(HEX_UPPER[(b & 0xF) as usize] as char);
             i += 1;
         }
     }
-    out.push_str(std::str::from_utf8(&buf).expect("encoded URL path is ASCII"));
 }
 
 fn encode_file_url_path_into(out: &mut String, s: &[u8]) {
     let (first_unsafe, unsafe_count) = scan_url_path(s);
-    encode_scanned_path(out, s, first_unsafe, unsafe_count);
+    if first_unsafe == s.len() {
+        out.push_str(std::str::from_utf8(s).expect("URL-safe bytes are ASCII"));
+    } else {
+        encode_scanned_path(out, s, first_unsafe, unsafe_count);
+    }
 }
 
 /// Percent-encode the bytes that are unsafe in a `file://` URL path.

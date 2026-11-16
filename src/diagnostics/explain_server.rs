@@ -2559,6 +2559,14 @@ fn serve_explain_persistent_epoll(
         for conn in conns.values() {
             wait = wait.min(conn.deadline.saturating_duration_since(now));
         }
+        if let Some(idle) = idle {
+            let until = if served_any {
+                last_served + idle
+            } else {
+                first_deadline
+            };
+            wait = wait.min(until.saturating_duration_since(now));
+        }
         let timeout_ms = wait.as_millis().min(5_000) as i32;
         let ready = unsafe {
             libc::epoll_wait(
@@ -2719,6 +2727,11 @@ fn serve_explain_persistent_epoll(
                 let mut eof = false;
                 loop {
                     let mut chunk = [0u8; 4096];
+                    if Instant::now() >= conn.deadline {
+                        // Leave the connection for the deadline sweep; a
+                        // peer that keeps sending must not pin the reactor.
+                        break;
+                    }
                     match conn.stream.read(&mut chunk) {
                         Ok(0) => {
                             eof = true;

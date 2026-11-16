@@ -99,9 +99,9 @@ impl DiagnosticLevel {
         }
     }
 
-    #[inline(always)]
-    pub const fn ansi_reset() -> &'static [u8; 4] {
-        b"\x1b[0m"
+    #[inline]
+    pub const fn ansi_reset() -> &'static str {
+        "\x1b[0m"
     }
 
     /// Localized human-readable label for this level.

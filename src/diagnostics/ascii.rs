@@ -882,17 +882,18 @@ mod neon {
 
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn is_printable_ascii(s: &[u8]) -> bool {
-        let sp = unsafe { vdupq_n_u8(0x20) };
+        let sp = unsafe { vdupq_n_s8(0x20) };
         let del = unsafe { vdupq_n_u8(0x7F) };
         let mut i = 0usize;
         while i + 32 <= s.len() {
             let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
             let b = unsafe { vld1q_u8(s.as_ptr().add(i + 16)) };
             let bad = |v: uint8x16_t| unsafe {
-                let lt = vcltq_u8(v, sp);
+                // Signed `< 0x20` also catches every high byte (negative as
+                // i8), replacing the separate unsigned `>= 0x80` test.
+                let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
                 let eq = vceqq_u8(v, del);
-                let high = vcgeq_u8(v, vdupq_n_u8(0x80));
-                vorrq_u8(vorrq_u8(lt, eq), high)
+                vorrq_u8(lt, eq)
             };
             if unsafe { any_nonzero(vorrq_u8(bad(a), bad(b))) } {
                 return false;
@@ -901,11 +902,9 @@ mod neon {
         }
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let lt = unsafe { vcltq_u8(v, sp) };
+            let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
             let eq = unsafe { vceqq_u8(v, del) };
-            let bad = unsafe { vorrq_u8(lt, eq) };
-            let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
-            if unsafe { any_nonzero(vorrq_u8(bad, high)) } {
+            if unsafe { any_nonzero(vorrq_u8(lt, eq)) } {
                 return false;
             }
             i += 16;
@@ -915,21 +914,20 @@ mod neon {
 
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn is_printable_ascii_multiline(s: &[u8]) -> bool {
-        let sp = unsafe { vdupq_n_u8(0x20) };
+        let sp = unsafe { vdupq_n_s8(0x20) };
         let del = unsafe { vdupq_n_u8(0x7F) };
         let tab_v = unsafe { vdupq_n_u8(0x09) };
         let nl_v = unsafe { vdupq_n_u8(0x0A) };
         let mut i = 0usize;
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let lt = unsafe { vcltq_u8(v, sp) };
+            let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
             let tab = unsafe { vceqq_u8(v, tab_v) };
             let nl = unsafe { vceqq_u8(v, nl_v) };
             let allowed = unsafe { vorrq_u8(tab, nl) };
             let off = unsafe { vbicq_u8(lt, allowed) };
             let eq = unsafe { vceqq_u8(v, del) };
-            let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
-            if unsafe { any_nonzero(vorrq_u8(vorrq_u8(eq, off), high)) } {
+            if unsafe { any_nonzero(vorrq_u8(eq, off)) } {
                 return false;
             }
             i += 16;
@@ -939,18 +937,17 @@ mod neon {
 
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
-        let sp = unsafe { vdupq_n_u8(0x20) };
+        let sp = unsafe { vdupq_n_s8(0x20) };
         let del = unsafe { vdupq_n_u8(0x7F) };
         let tab_v = unsafe { vdupq_n_u8(0x09) };
         let mut i = 0usize;
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let lt = unsafe { vcltq_u8(v, sp) };
+            let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
             let tab = unsafe { vceqq_u8(v, tab_v) };
             let off = unsafe { vbicq_u8(lt, tab) };
             let eq = unsafe { vceqq_u8(v, del) };
-            let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
-            if unsafe { any_nonzero(vorrq_u8(vorrq_u8(eq, off), high)) } {
+            if unsafe { any_nonzero(vorrq_u8(eq, off)) } {
                 return false;
             }
             i += 16;
@@ -960,19 +957,18 @@ mod neon {
 
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
-        let sp = unsafe { vdupq_n_u8(0x20) };
+        let sp = unsafe { vdupq_n_s8(0x20) };
         let del = unsafe { vdupq_n_u8(0x7F) };
         let tab_v = unsafe { vdupq_n_u8(0x09) };
         let mut saw_tab = false;
         let mut i = 0usize;
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let lt = unsafe { vcltq_u8(v, sp) };
+            let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
             let tab = unsafe { vceqq_u8(v, tab_v) };
             let off = unsafe { vbicq_u8(lt, tab) };
             let eq = unsafe { vceqq_u8(v, del) };
-            let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
-            if unsafe { any_nonzero(vorrq_u8(vorrq_u8(eq, off), high)) } {
+            if unsafe { any_nonzero(vorrq_u8(eq, off)) } {
                 return super::AsciiClass::Other;
             }
             saw_tab |= unsafe { any_nonzero(tab) };

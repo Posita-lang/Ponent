@@ -387,7 +387,7 @@ impl<'src> FixSet<'src> {
             anchor.is_none_or(|f| self.edits.iter().all(|e| e.span.file == f)),
             "FixSet::apply called on a multi-file set; use apply_for_file",
         );
-        self.apply_filtered(source, |e| anchor.is_none_or(|f| e.span.file == f))
+        self.apply_counted(source).0
     }
 
     /// Apply only the edits that target `file` to `source`, returning the
@@ -405,7 +405,7 @@ impl<'src> FixSet<'src> {
     /// edits) is materialized.
     #[must_use = "apply_for_file returns the rewritten source; write it out or the fix is lost"]
     pub fn apply_for_file<'s>(&self, source: &'s str, file: FileId) -> Cow<'s, str> {
-        self.apply_filtered(source, |e| e.span.file == file)
+        self.apply_for_file_counted(source, file).0
     }
 
     /// [`Self::apply`] plus the number of edits that actually spliced.
@@ -416,7 +416,10 @@ impl<'src> FixSet<'src> {
             anchor.is_none_or(|f| self.edits.iter().all(|e| e.span.file == f)),
             "FixSet::apply_counted called on a multi-file set; use apply_for_file_counted",
         );
-        self.apply_filtered_count(source, |e| anchor.is_none_or(|f| e.span.file == f))
+        match anchor {
+            Some(file) => self.apply_for_file_counted(source, file),
+            None => (Cow::Borrowed(source), 0),
+        }
     }
 
     /// [`Self::apply_for_file`] plus the number of edits that actually spliced.
@@ -426,28 +429,17 @@ impl<'src> FixSet<'src> {
         source: &'s str,
         file: FileId,
     ) -> (Cow<'s, str>, usize) {
-        self.apply_filtered_count(source, |e| e.span.file == file)
+        let lo = self.edits.partition_point(|e| e.span.file < file);
+        let hi = self.edits.partition_point(|e| e.span.file <= file);
+        self.apply_slice_count(source, &self.edits[lo..hi])
     }
 
-    /// The single-file forward pass shared by [`Self::apply`] and
-    /// [`Self::apply_for_file`], running only the edits for which `pred`
-    /// holds.  No allocation happens unless at least one edit actually
-    /// applies.
-    fn apply_filtered<'s>(
+    /// The single-file forward pass over an already-selected contiguous range.
+    /// No allocation happens unless at least one edit actually applies.
+    fn apply_slice_count<'s>(
         &self,
         source: &'s str,
-        pred: impl Fn(&FixEdit<'src>) -> bool,
-    ) -> Cow<'s, str> {
-        self.apply_filtered_count(source, pred).0
-    }
-
-    /// Same one-pass apply, additionally returning the number of edits that
-    /// actually spliced.  Malformed spans are skipped, so this can be smaller
-    /// than `filter(pred).count()`.
-    fn apply_filtered_count<'s>(
-        &self,
-        source: &'s str,
-        pred: impl Fn(&FixEdit<'src>) -> bool,
+        edits: &[FixEdit<'src>],
     ) -> (Cow<'s, str>, usize) {
         let mut applied = 0usize;
         // One pass: allocate only when the first applicable edit is seen, and
@@ -456,10 +448,7 @@ impl<'src> FixSet<'src> {
         // already the authoritative "did anything apply" test.
         let mut out: Option<String> = None;
         let mut last = 0usize;
-        for edit in self.edits.iter() {
-            if !pred(edit) {
-                continue;
-            }
+        for edit in edits {
             // `collect` sorts edits by `(file, start, end)` and drops
             // overlapping candidates within a file, so a single forward pass
             // builds the result in O(n + Σ|replacement|).
@@ -516,12 +505,7 @@ pub fn apply_fixes<'src, 's>(
     hints: FixHints,
 ) -> (Cow<'s, str>, usize) {
     let set = FixSet::collect(diags, hints);
-    let anchor = set.edits.first().map(|e| e.span.file);
-    debug_assert!(
-        anchor.is_none_or(|f| set.edits.iter().all(|e| e.span.file == f)),
-        "apply_fixes called on a multi-file set; use apply_fixes_for_file",
-    );
-    set.apply_filtered_count(source, |e| anchor.is_none_or(|f| e.span.file == f))
+    set.apply_counted(source)
 }
 
 /// Like [`apply_fixes`] but for an explicit file: apply and count only the
@@ -534,7 +518,7 @@ pub fn apply_fixes_for_file<'src, 's>(
     hints: FixHints,
 ) -> (Cow<'s, str>, usize) {
     let set = FixSet::collect(diags, hints);
-    set.apply_filtered_count(source, |e| e.span.file == file)
+    set.apply_for_file_counted(source, file)
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]

@@ -528,17 +528,18 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
     fn from(diags: Vec<Diagnostic<'src>>) -> Self {
         let mut errors = 0usize;
         let mut warnings = 0usize;
-        for d in &diags {
+        let mut first_unspanned = None;
+        for (i, d) in diags.iter().enumerate() {
             if d.is_error() {
                 errors += 1;
             } else if d.is_warning() {
                 warnings += 1;
             }
+            if first_unspanned.is_none() && d.source().is_none() {
+                first_unspanned = Some(i);
+            }
         }
-        let first_unspanned = diags
-            .iter()
-            .position(|d| d.source().is_none())
-            .unwrap_or(diags.len());
+        let first_unspanned = first_unspanned.unwrap_or(diags.len());
         DiagCtxt {
             diags: SmallVec::from_vec(diags),
             reported_len: 0,
@@ -563,6 +564,64 @@ impl<'src> IntoIterator for DiagCtxt<'src> {
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_source_advances_frontier_and_is_idempotent() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("a"));
+        c.attach_source("first");
+        assert!(c.iter().all(|d| d.source() == Some("first")));
+        // Idempotent: a second call does not change the recorded source.
+        c.attach_source("second");
+        assert!(c.iter().all(|d| d.source() == Some("first")));
+        // A later unspanned push must be patched, while the earlier one stays.
+        c.push(Diagnostic::error("b"));
+        c.attach_source("third");
+        assert_eq!(c.iter().nth(0).unwrap().source(), Some("first"));
+        assert_eq!(c.iter().nth(1).unwrap().source(), Some("third"));
+    }
+
+    #[test]
+    fn first_unspanned_does_not_advance_past_an_earlier_unspanned() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("a"));
+        c.push(Diagnostic::error("b").with_source("src"));
+        c.attach_source("src2");
+        assert_eq!(c.iter().nth(0).unwrap().source(), Some("src2"));
+        assert_eq!(c.iter().nth(1).unwrap().source(), Some("src"));
+    }
+
+    #[test]
+    fn errors_to_infos_updates_both_tallies() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("e"));
+        c.errors_to_infos();
+        assert_eq!(c.error_count(), 0);
+        assert_eq!(c.warning_count(), 0);
+        assert!(!c.has_unreported_errors());
+        assert!(!c.unreported()[0].is_error());
+    }
+
+    #[test]
+    fn warnings_to_infos_updates_warning_tally() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::warning("w"));
+        c.warnings_to_infos();
+        assert_eq!(c.warning_count(), 0);
+        assert!(!c.unreported()[0].is_warning());
+    }
+
+    #[test]
+    fn drain_reported_preserves_unreported_error_tally() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("a"));
+        c.mark_all_reported();
+        c.push(Diagnostic::error("b"));
+        let drained = c.drain_reported();
+        assert_eq!(drained.len(), 1);
+        assert!(c.has_unreported_errors());
+        assert_eq!(c.error_count(), 1);
+    }
 
     #[test]
     fn from_vec_initializes_tallies() {

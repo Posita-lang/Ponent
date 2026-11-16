@@ -329,6 +329,19 @@ type Prebuilt = (
     u64,
 );
 
+/// Full-content FNV-1a for the cross-batch line-table cache key.  The cheap
+/// `source_fingerprint` (first/last 8 + len) is fine for the debug ABA
+/// tripwire but not for a persistent cache: a middle-only edit preserves the
+/// old fingerprint and would reuse stale line starts.
+fn source_content_hash(s: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in s.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// One batch shared with resident workers.  No lifetime erasure: the
 /// diagnostics live behind `Mutex` cells, so Rust's borrow checker proves the
 /// exclusive access that the GLM plan obtained with unsafe raw pointers.
@@ -440,7 +453,7 @@ pub struct Emitter<R, M> {
     /// Rendered `String` buffers returned by earlier batches, reused by
     /// resident workers instead of a fresh allocation per diagnostic.
     string_pool: std::sync::Mutex<Vec<String>>,
-    /// Cross-batch line tables keyed by `(FileId, source_fingerprint)`.
+    /// Cross-batch line tables keyed by `(FileId, full-content hash)`.
     /// `Prebuilt` owns its `Arc` tables, so no source lifetime is captured.
     file_index_cache:
         std::cell::RefCell<crate::smallvec::SmallVec<[(crate::ast::FileId, u64, Prebuilt); 8]>>,
@@ -856,9 +869,10 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                     let file_id = diag.spans.primary_ref().first().map(|s| s.file);
                     let fingerprint =
                         crate::diagnostics::render::source_fingerprint(src);
+                    let content_hash = source_content_hash(src);
                     let cached = file_id.and_then(|id| {
                         self.file_index_cache.borrow().iter().find_map(|(f, h, p)| {
-                            (*f == id && *h == fingerprint).then(|| p.clone())
+                            (*f == id && *h == content_hash).then(|| p.clone())
                         })
                     });
                     if let Some(p) = cached {
@@ -880,7 +894,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                             if cache.len() >= 8 {
                                 cache.pop();
                             }
-                            cache.insert(0, (id, fingerprint, entry));
+                            cache.insert(0, (id, content_hash, entry));
                         }
                     }
                 }
@@ -953,7 +967,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             let mut buf = slot
                 .into_inner()
                 .unwrap_or_else(|e| e.into_inner())
-                .unwrap_or_else(|| RENDER_PANIC_PLACEHOLDER.to_string());
+                .expect("every claimed render slot must be filled before stitch");
             if buf.is_empty() {
                 continue;
             }
@@ -1115,6 +1129,45 @@ mod tests {
         let out = sink.into_string();
         assert!(out.contains("error number 95"), "{out}");
         assert!(!out.contains("error number 0 "), "{out}");
+    }
+
+    #[test]
+    fn cross_batch_cache_rebuilds_for_middle_line_shift() {
+        // Same FileId, same length, same first/last 8 bytes, but line starts
+        // differ: the old first/last-8 fingerprint reused a stale table.
+        let src1 = "HEADER00\na\nb\nTAIL0000";
+        let src2 = "HEADER00\nab\n\nTAIL0000";
+        assert_eq!(src1.len(), src2.len());
+        assert_eq!(source_content_hash(src1) == source_content_hash(src2), false);
+
+        let mk = |src: &'static str| -> Vec<Diagnostic<'static>> {
+            (0..64)
+                .map(|i| {
+                    Diagnostic::warning(format!("{i} {}", "x".repeat(64)))
+                        .with_span(Span::new(FileId::DUMMY, 11, 12))
+                        .with_source(src)
+                        .with_file_name("f.ps")
+                })
+                .collect()
+        };
+        let opts = DiagOpts::default();
+        let mut emitter = Emitter::new(JsonRenderer::new(false), string(), opts);
+        emitter.parallelism = 4;
+
+        let mut first = mk(src1);
+        let mut sink1 = StringSink::new();
+        emitter.emit_all_to(&mut first, &mut sink1).unwrap();
+        let out1 = sink1.into_string();
+        assert!(out1.contains("\"line\": 3"), "{out1}");
+
+        let mut second = mk(src2);
+        let mut sink2 = StringSink::new();
+        emitter.emit_all_to(&mut second, &mut sink2).unwrap();
+        let out2 = sink2.into_string();
+        assert!(
+            out2.contains("\"line\": 2"),
+            "stale cross-batch line table survived a middle edit: {out2}"
+        );
     }
 
     /// Renders the message for "real" diagnostics and *nothing* for messages

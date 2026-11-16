@@ -133,3 +133,33 @@ fold-marker-lines =
        *[other] { $gap } строки опущено
     }
 chain-header = ссылки из:
+html-doc-title = Диагностика компилятора Ponent
+html-h1 = Диагностика компилятора Ponent
+html-toggle-theme = Переключить тему
+html-summary =
+    { $errors ->
+        [one] { $errors } ошибка
+        [few] { $errors } ошибки
+        [many] { $errors } ошибок
+       *[other] { $errors } ошибки
+    }, { $warnings ->
+        [one] { $warnings } предупреждение
+        [few] { $warnings } предупреждения
+        [many] { $warnings } предупреждений
+       *[other] { $warnings } предупреждения
+    }
+html-summary-files =
+    { $files ->
+        [one] в { $files } файле
+        [few] в { $files } файлах
+        [many] в { $files } файлах
+       *[other] в { $files } файлах
+    }
+type-ctx-annotation = из аннотации типа
+type-ctx-return-type = из возвращаемого типа
+type-ctx-binop = из оператора
+type-ctx-function-arg = из аргумента функции
+type-ctx-field = из типа поля
+type-ctx-type-alias = из псевдонима типа
+type-ctx-contract = из контракта
+type-ctx-inference = из вывода типов

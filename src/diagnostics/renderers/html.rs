@@ -77,16 +77,39 @@ impl Default for HtmlRenderer {
     }
 }
 
+fn localized_slug(slug: &str) -> String {
+    let mut s = String::new();
+    crate::diagnostics::i18n::render_into(slug, &[], &mut s);
+    s
+}
+
+fn summary_inner(out: &mut String, errors: usize, warnings: usize, files: Option<usize>) {
+    crate::diagnostics::i18n::render_into(
+        "html-summary",
+        &[
+            ("errors", Cow::Owned(errors.to_string())),
+            ("warnings", Cow::Owned(warnings.to_string())),
+        ],
+        out,
+    );
+    if let Some(files) = files {
+        out.push(' ');
+        crate::diagnostics::i18n::render_into(
+            "html-summary-files",
+            &[("files", Cow::Owned(files.to_string()))],
+            out,
+        );
+    }
+}
+
 impl Renderer for HtmlRenderer {
     fn begin(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
-        out.write_str(
+        let template =
             "<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='utf-8'>\n\
-             <title>Ponent Compiler Diagnostics</title>\n\
-             <style>\n",
-        )?;
-        out.write_str(dark_css_min_cached())?;
-        out.write_str(
-            "\n\
+             <title>__PONENT_TITLE__</title>\n\
+             <style>\n";
+        let dark = dark_css_min_cached();
+        let rest = "\n\
              body { font-family: 'DejaVu Sans Mono', monospace; background: var(--bg); color: var(--fg); padding: 20px; }\n\
              #theme-toggle { position: fixed; top: 12px; right: 12px; z-index: 100; }\n\
              #theme-toggle button { background: var(--toggle-bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 0.85em; }\n\
@@ -136,7 +159,7 @@ impl Renderer for HtmlRenderer {
              })();\n\
              </script>\n\
              </head>\n<body>\n\
-             <div id='theme-toggle'><button id='theme-toggle-btn'>Toggle theme</button></div>\n\
+             <div id='theme-toggle'><button id='theme-toggle-btn'>__PONENT_TOGGLE__</button></div>\n\
              <script>\n\
              (function(){\n\
                function toggle() {\n\
@@ -152,8 +175,19 @@ impl Renderer for HtmlRenderer {
                });\n\
              })();\n\
              </script>\n\
-             <h1>Ponent Compiler Diagnostics</h1>\n",
-        )
+             <h1>__PONENT_H1__</h1>\n";
+        let mut page = String::with_capacity(template.len() + dark.len() + rest.len());
+        page.push_str(template);
+        page.push_str(dark);
+        page.push_str(rest);
+        let localized = page
+            .replace("__PONENT_TITLE__", &localized_slug("html-doc-title"))
+            .replace("__PONENT_H1__", &localized_slug("html-h1"))
+            .replace(
+                "__PONENT_TOGGLE__",
+                &localized_slug("html-toggle-theme"),
+            );
+        out.write_str(&localized)
     }
 
     fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
@@ -167,28 +201,17 @@ impl Renderer for HtmlRenderer {
     }
 
     fn render_summary(&self, errors: usize, warnings: usize) -> String {
-        format!(
-            "<div class='summary' role='status'>{} error{}, {} warning{}</div>\n",
-            errors,
-            if errors == 1 { "" } else { "s" },
-            warnings,
-            if warnings == 1 { "" } else { "s" },
-        )
+        let mut s = String::from("<div class='summary' role='status'>");
+        summary_inner(&mut s, errors, warnings, None);
+        s.push_str("</div>\n");
+        s
     }
 
     fn render_summary_full(&self, errors: usize, warnings: usize, files: usize) -> String {
-        if files <= 1 {
-            return self.render_summary(errors, warnings);
-        }
-        format!(
-            "<div class='summary' role='status'>{} error{}, {} warning{} in {} file{}</div>\n",
-            errors,
-            if errors == 1 { "" } else { "s" },
-            warnings,
-            if warnings == 1 { "" } else { "s" },
-            files,
-            if files == 1 { "" } else { "s" },
-        )
+        let mut s = String::from("<div class='summary' role='status'>");
+        summary_inner(&mut s, errors, warnings, (files > 1).then_some(files));
+        s.push_str("</div>\n");
+        s
     }
 
     fn end(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
@@ -196,10 +219,14 @@ impl Renderer for HtmlRenderer {
     }
 
     fn render_suppressed_note(&self, count: usize) -> String {
-        format!(
-            "<div class='summary' role='status'>{count} additional error{} suppressed</div>\n",
-            if count == 1 { "" } else { "s" }
-        )
+        let mut s = String::from("<div class='summary' role='status'>");
+        crate::diagnostics::i18n::render_into(
+            "suppressed-note",
+            &[("count", Cow::Owned(count.to_string()))],
+            &mut s,
+        );
+        s.push_str("</div>\n");
+        s
     }
 }
 
