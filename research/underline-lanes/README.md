@@ -35,6 +35,15 @@ The distributive-lattice route is closed: three interval-graph witnesses kill
 the pointwise lattice, the partition-refinement lattice, and any
 symmetry-invariant lattice order.  The surviving fragment is a disjoint union
 of distributive lattices indexed by acyclic orientations — real but
-exponentially large.  Engineering decision: keep the greedy χ-lane assignment
-plus the `O(n log n)` rearrangement post-pass; exact IGMRC is polynomial but
-not worth its machinery at `n ≤ ~50`, `χ ≤ ~5`.
+exponentially large.
+
+Complexity, as established in [`../igmrc/README.md`](../igmrc/README.md):
+exact IGMRC (exact-`χ` rank-1 lane assignment) is NP-hard in general, solvable
+in `O(n · k! · k)` (FPT in `k`), and polynomial only on fully saturated
+instances (every maximal clique of size `k`); the clique LP is not value-exact.
+Engineering decision: keep the greedy χ-lane assignment plus the
+`O(n log n)` rearrangement post-pass, which is optimal only among relabellings
+of the greedy colouring (it is *not* exact — minimal counterexample in
+[`no-distributive-lattice.md`](no-distributive-lattice.md) §2). The remaining
+corpus gap is unmeasured, and the exact engine is not worth its machinery at
+`n ≤ ~50`, `χ ≤ ~5`.

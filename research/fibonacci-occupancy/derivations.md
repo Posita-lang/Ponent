@@ -23,7 +23,9 @@ place (the φ-exponent indexing in §1/§2; the false 1/(2q_k²) lemma, the
 dimensional slip in η_k and the missing wrap branch in §2.3's Theorem 2.1;
 the bucket→pair correspondence in §2.2; the (35+36/64)/9 wall label in §3.2;
 the a₃ partial quotient and the [0;25,1,8] expansion in §4; the r∈{15,17}
-strand claim in §4).
+strand claim in §4; the "almost everywhere, 1 − e⁻¹" asymptotic and the
+average-case conclusion of §5.3 — the 1 − e⁻¹ law is the i.i.d. value, and
+the golden ratio is also optimal in the scale-invariant average).
 
 ---
 
@@ -472,11 +474,91 @@ continued fraction alone** decides Occ < 52. What survives:
 - **The golden ratio's role.** 1/φ is badly approximable (all partial
   quotients 1), maximizing min_{q≤64} ‖qα‖ = φ⁻¹⁰ ≈ 0.52 bucket widths —
   the worst-case-optimal property that makes the Knuth multiplier 0x9E3779B9
-  the right choice for `probe_start`. Asymptotically (n = m → ∞) this is an
-  almost-everywhere statement in reverse: for a.e. α the occupancy behaves
-  like m(1 − e⁻¹) ≈ 0.632m, and constants achieving O(1/n) discrepancy —
-  the golden ratio among them — live in a measure-zero exceptional set.
-  **Golden-ratio hashing buys a worst-case guarantee, not an average-case one.**
+  the right choice for `probe_start`. The asymptotics need care, because
+  `Occ(m, m, α)/m` has **no pointwise limit** for a fixed irrational α: at
+  every convergent denominator `Occ(q_k, q_k, α) = q_k` (§2.3), so
+  `limsup_m Occ(m,m,α)/m = 1` for *every* α. Two different averages are
+  therefore in play:
+  - **i.i.d. random keys** (α irrelevant): `⌊m(1 − e⁻¹)⌋ ≈ 40.6` at `m = 64`.
+  - **uniform α**: `E[Occ(64,64,α)] = 44.53395 = 0.6958·64`, the exact cell
+    average of §5.1 (numerically `≈ 1 − 3/π²`), *not* 40.6.
+
+  Under the scale-invariant (log-uniform `m`) measure the golden ratio is also
+  the **average-case optimum**: with `Φ(α) = lim_{M→∞} (1/ln M)
+  Σ_{m≤M} Occ(m,m,α)/m²`, one has `Φ(α₀) ≈ 0.8765` (arithmetic variant
+  0.8788) against `≈ 0.863` for the silver ratio, the supremum outside the
+  noble numbers equals `Φ(α₀)` and is approached but never attained, and the
+  ties are exactly the noble numbers (continued fractions ending in all 1s,
+  i.e. the GL₂(ℤ)-orbit of α₀). Worst-case optimality and scale-average
+  optimality are governed by the same continued-fraction tail here.
+  **Correction to an earlier draft:** "golden hashing buys a worst-case
+  guarantee, not an average-case one" is wrong under a scale-invariant
+  measure — it buys both. What it does not do is beat the i.i.d. model.
+
+### 5.4 The exact phase criterion, and the `q* ≥ m/2` theorem
+
+**Criterion.** With the `N` points sorted as `y_1 < … < y_N` and gaps
+`g_j = y_{j+1} − y_j` (indices circular, `y_{N+1} = y_1 + 1`), put
+
+```
+C_j = ⌊N y_{j+1}⌋ − ⌊N y_j⌋ ∈ {0,1,2,…},      Σ_j C_j = N .
+```
+
+`C_j = 0` iff the gap contains no grid line `k/N`; since `C_j ≥ 1` whenever
+`g_j ≥ 1/N`, only short gaps can contribute, and whether a short gap does
+contribute is exactly the **grid phase**. Equivalently
+
+```
+C_j = 0  ⟺  {N y_j} + N g_j < 1        ("phase-short").
+```
+
+Hence, with `Z = #{j : C_j = 0}` (the circular wrap pair can never qualify),
+
+```
+Occ(N, N, α) = N − Z ,      and      α ∈ L_N  ⟺  Z > N/2 .
+```
+
+This is the sharpened form of Theorem 2.3: `Z = S − C` there. Decidability:
+the gap word is a Sturmian/Christoffel word (three-gap theorem), so `Z` is a
+sum of `O(log N)` floor sums and can be evaluated in `O((log N)²)` arithmetic
+operations — provided α is known exactly (an algebraic number, or the finite
+continued-fraction prefix **plus** the complete quotient / grid phase). A
+finite CF prefix alone cannot decide `L_N`: it fixes the cyclic word of gap
+types but not which cyclic shift sits on the `1/N` grid, which is precisely
+the negative result of §5.3.
+
+**Theorem (`q* ≥ m/2` is sufficient, with no exceptions).** Let
+`q* = argmin_{1≤q≤m} ‖qα‖`, attained at the largest convergent denominator
+`q_k ≤ m`. If `q* ≥ m/2` then, using `q_k δ_{k−1} + q_{k−1} δ_k = 1`,
+
+```
+max three-distance gap ≤ δ_{k−1} < 1/q_k ≤ 2/m .
+```
+
+Two adjacent empty buckets would force an interval of length `2/m` free of the
+`m+1` points, and the wrap pair `(m−1, 0)` cannot both be empty because
+`{q_k α}` lies within `δ_k < 1/m` of an integer. Hence the empty buckets form
+an independent set on the `m`-cycle:
+
+```
+q* ≥ m/2   ⇒   Occ(m, m, α) ≥ ⌈m/2⌉ .
+```
+
+So the exception set `E_m = {q* ≥ m/2 ∧ Occ < m/2}` is **empty** — the
+m/2 criterion is a theorem, not a statistic. For even `m` the tight layer
+`Occ = m/2` has measure `2φ(m/2)/m²` (`φ` Euler's totient; `1/128` at
+`m = 64`, 32 cells), where α lies within `1/m²` of a reduced `p/(m/2)`.
+The *sharper* sufficient condition is `max gap < 2/m` (measure `0.5701` of
+α-space at `m = 64`, against `0.4624` for `q* ≥ 32`); 20584 cells have a gap
+`≥ 2/m` yet still `Occ ≥ 32`, so the max-gap condition is strictly stronger.
+
+**Threshold note.** This is the *`m/2`* threshold. §5.3's one-directional
+statistic uses the much higher threshold 52 and stays empirical; the two are
+not the same statement. The exact measure of `{q* ≥ 32}` depends on the
+convention for `q*`: `0.4624` summing over `q ≤ 64`, `0.4546` over `q ≤ 63`
+(the §5.3 convention). Our exhaustive scan reproduces `meas(Occ < 32) =
+0.179071`, `min Occ = 32` on `q* ≥ 32`, zero exceptions, and the `1/128`
+tight layer; see `verify_phase_criterion.py`.
 
 ---
 
@@ -499,6 +581,7 @@ English, Fraction-only).
 | wall table, pattern radius 9.4351785e-6, occupancy interval, α₁ both constants | `check_q3` |
 | α₂ = 37, strand set, a₃ = 7, 26δ < 1/64 | `check_q4` |
 | measure{Occ < 52} = 0.591789799172181 (exact fraction), E[Occ] ≈ 44.53, mode 54, q* predictors, S=39 range 25..64, Theorem 2.3 on all 80640 cells | `check_q5` / `scan_cells` |
+| phase criterion `Occ = N − Z` and `α ∈ L_N ⟺ Z > N/2` on all 80640 cells; `q* ≥ m/2 ⇒ Occ ≥ ⌈m/2⌉` with zero exceptions, tight layer 32 cells / measure 1/128 | `verify_phase_criterion.py` |
 
 Wall-count convention used throughout: 80641 distinct rationals including
 the endpoints 0 and 1 ⇒ 80639 interior walls ⇒ 80640 cells.

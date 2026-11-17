@@ -16,9 +16,10 @@ irrational `α` at its convergents.
 
 | Material | Location |
 |---|---|
-| Complete derivations (exact ℚ(√5) arithmetic, three-gap, Farey walls, corrected Theorem 2.1) | [`derivations.md`](derivations.md) |
+| Complete derivations (exact ℚ(√5) arithmetic, three-gap, Farey walls, corrected Theorem 2.1, phase criterion, `q* ≥ m/2` theorem) | [`derivations.md`](derivations.md) |
 | Exact occupancy arithmetic; `--measure` runs the full Farey scan | [`scripts/golden_ratio_occupancy.py`](scripts/golden_ratio_occupancy.py) |
 | Corrected Theorem 2.1, float-free | [`scripts/verify_convergent_occ_en.py`](scripts/verify_convergent_occ_en.py) |
+| Phase–short-gap criterion and the `q* ≥ m/2` theorem over all 80640 cells | [`scripts/verify_phase_criterion.py`](scripts/verify_phase_criterion.py) |
 | Consumer of these numbers | `src/hir/query/dep_graph.rs` |
 
 ## Reproduce
@@ -26,6 +27,7 @@ irrational `α` at its convergents.
 ```sh
 python3 research/fibonacci-occupancy/scripts/golden_ratio_occupancy.py --measure
 python3 research/fibonacci-occupancy/scripts/verify_convergent_occ_en.py
+python3 research/fibonacci-occupancy/scripts/verify_phase_criterion.py
 ```
 
 ## Outcome
@@ -35,3 +37,19 @@ The 64-slot occupancy is safe: both the mathematical `1/φ` and the truncated
 14, 56..58, 63` only rule out the naive “`Occ(n,n,1/φ) = q_k`” claim.  The
 corrected convergent theorem was verified over all cylinders, both signs of
 `ε`, including the wrap branch.
+
+Two further exact statements are pinned:
+
+- `Occ(N,N,α) = N − Z`, where `Z` counts the phase-short gaps (no grid line
+  inside); hence low occupancy is exactly "more than half the gaps are
+  phase-short", decidable in `O((log N)²)` *given the grid phase*, but not
+  from a finite continued-fraction prefix alone.
+- `q* ≥ m/2 ⇒ Occ ≥ ⌈m/2⌉` with no exception (the exceptional set is empty;
+  tight layer measure `1/128` at `m = 64`).  This is the `m/2` threshold; the
+  threshold-52 `q*` predictor of §5.3 is a different, empirical statement.
+
+Asymptotics are pointwise subtle: `Occ(m,m,α)/m` has no limit for a fixed
+irrational `α` (it equals 1 at convergent denominators), the `1 − e⁻¹` value
+is the i.i.d. random-key figure, the uniform-`α` mean is `44.53` at `m = 64`,
+and under a scale-invariant measure the golden ratio is the average-case
+optimum, tied exactly by the noble numbers.

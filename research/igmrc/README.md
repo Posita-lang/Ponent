@@ -128,6 +128,57 @@ gap and the problem is polynomial: solve the LP, or equivalently run a
 cannot be applied while keeping every maximal clique at size `k`; enlarging the
 hard core to enforce saturation transforms it into this flow problem.
 
+**Traceability caveat.** No primary source was located that states
+“every maximal clique has size `k` ⇒ the colouring LP is integral” in this
+form; the cumulative-variable argument above is what carries the claim, and it
+is conditional on the level systems really being network/TU polytopes (which is
+what “min-cost flow” means). Read the polynomiality of this subclass as
+**derived, not cited**. It is not conditional on the right-hand side being
+`b ≡ 1`: total unimodularity is a property of the matrix, so the tightened
+systems of §2.1 inherit it for any 0/1 right-hand side. If a hardness proof
+were ever found for a single deficient clique, this argument — not the LP
+counterexample of §3 — is what would have to fail.
+
+### 2.1 Partial saturation: the deficiency parameter `d`
+
+Let `𝒦` be the maximal cliques, `g_K = k − |K|` and `d = Σ_K g_K`. Summing the
+lane constraints of a clique and using `Σ_j x_{v,j} = 1` gives
+
+```
+Σ_j (1 − Σ_{v∈K} x_{v,j}) = k − |K| = g_K ,
+```
+
+so `d` is exactly the total number of **idle lane slots** in the LP, and for an
+integral colouring it is the number of absent colours summed over cliques.
+
+**Derived algorithm.** Enumerate, for each clique `K`, the `g_K` colours that
+are absent there — a pattern `b_{K,·} ∈ {0,1}^k` with `Σ_j b_{K,j} = |K|` —
+and replace every lane inequality at `K` by the equality
+`Σ_{v∈K} x_{v,j} = b_{K,j}`. By §2's TU/network argument the tightened system
+is integral, so each pattern costs one flow. There are at most
+
+```
+Π_K C(k, g_K)  ≤  k^d  ≤  n^d
+```
+
+patterns, hence `n^{O(d)}` — XP in `d`, polynomial for every constant `d`.
+For `d = 0` this is the fully saturated flow of §2; for `d = 1` (one clique of
+size `k−1`) it is polynomial: guess which single colour is absent there
+(at most `k ≤ n` flows).
+
+**What is and is not settled.**
+
+| question | status |
+|---|---|
+| every constant-`d` slice polynomial | **derived** (§2.1), so not para-NP-hard in `d` |
+| FPT in `d`, i.e. `f(d)·n^{O(1)}` | **open** — `k` is part of the input, so `k^d` is not `f(d)` alone |
+| parameter `Δ = max_K g_K` | `Δ = 1` does **not** bound `d` (`Θ(n)` cliques of size `k−1` give `d = Θ(n)`), so §2.1 says nothing; NP-hardness at fixed `Δ` is open |
+
+One trap: *physically* adding dummy intervals to fill a deficient clique is
+**not** a valid reduction for this objective. The dummies must take the free
+colours and are charged `w_v·c(v)`, which changes the optimum. The correct
+reduction is virtual — enumerate the absent-colour patterns and pay nothing.
+
 ---
 
 ## 3. The general clique LP is not value-exact
@@ -166,6 +217,56 @@ The fractional mass exists because only one maximal clique has size `k`; the
 unsaturated cliques let a lane split between two chains. This is the same
 mechanism that makes the general problem NP-hard.
 
+### 3.1 What stays true, and which proof routes are closed
+
+**Saturation lemma (rigorous).** For a maximum clique `K`, `|K| = k`, summing
+`Σ_j x_{v,j} = 1` over `v ∈ K` gives `k`, while each lane column satisfies
+`Σ_{v∈K} x_{v,j} ≤ 1`. All `k` columns are therefore tight, the `k×k` block
+`(x_{v,j})` is doubly stochastic, and with `μ_v = Σ_j j·x_{v,j}`:
+
+```
+Σ_{v∈K} μ_v = k(k+1)/2 ,     μ|_K ∈ Π(1,…,k)  (permutahedron),
+Σ_{v∈K\K'} x_{v,j} = Σ_{v∈K'\K} x_{v,j}       (consecutive maximum cliques).
+```
+
+This is real structure, but it is *local* and it is exactly what the
+counterexample lacks: only one of its six maximal cliques is maximum, so the
+lemma constrains nothing along the sweep.
+
+**Closed routes.** Each row below was falsified, not merely left unproven:
+
+| route | counter-evidence |
+|---|---|
+| LP value-exactness, equivalently the mean-colour identity `P_μ = Q` | §3: LP `<` IP by `1/2` on an `n = 9`, `k = 4` instance |
+| mean-level gluing (intersect local permutahedron constraints on `μ`) | strictly weaker than the LP; explicit `k = 5` vector, gap `1.3346` |
+| dual telescoping certificate `(⋆)` below | infeasible at the §3 instance, explicit Farkas certificate |
+| “negative cycle of the dual ⇒ improving Kempe swap” | the violating cycle closes through an *idle* lane slot, which has no Kempe counterpart |
+| nested max-weight `j`-colourable bounds `V(1..k−1)` | loose: bound 28 vs exact 29 |
+| layered “switching” flow LP | strictly cheaper than the optimum on 88/200 random families |
+| prefix / weight-ordered canonical DP states | 78/95 and 46/95 families have no optimal colouring of that form |
+
+**The dual certificate, and why it fails.** With `Λ_{t,j} = Σ_{s≤t} λ_{s,j}`
+over the sweep positions `t`, the LP dual collapses to
+
+```
+max_Λ  Σ_v min_j ( w_v·j + Λ_{r_v,j} − Λ_{ℓ_v−1,j} ) − Σ_j Λ_{T,j} ,
+```
+
+and LP `=` IP holds for a given optimal colouring `c*` iff there are
+`λ_{t,j} ≥ 0`, vanishing on every slot `(t,j)` that is idle in `c*`, with
+
+```
+Σ_{t=ℓ_v}^{r_v} ( λ_{t,j} − λ_{t,c*(v)} )  ≥  w_v ( c*(v) − j )     for all v, j.   (⋆)
+```
+
+At the §3 instance `(⋆)` is infeasible: six of its inequalities, each weighted
+`1/6`, have right-hand sides summing to `+1`, while their λ-terms telescope to
+`−(λ_{1,2} + λ_{2,4} + λ_{4,1} + λ_{5,3}) ≤ 0` because only those four slots
+are occupied by `c*`. The dual is therefore *not* integral on the rank-1 cone —
+objective-specific TDI fails, it is not merely unproven. The infeasibility
+certificate runs through an idle slot pinned by earlier prices, and `c*` is
+globally optimal, so no cyclic colour exchange explains it.
+
 ---
 
 ## 4. How large can the additive gap be?
@@ -177,7 +278,9 @@ unbounded.
 With normalized weights (e.g. `|w_v| ≤ 1`), the gap still grows at least
 linearly in `n`: take `m` vertex-disjoint copies of the `0.5`-gap gadget above.
 The LP and IP are additive across components, so the gap is `Ω(n)` while `k`
-stays 4. A trivial upper bound is `O(nK)` with `K ≤ 2k−1`, so `O(nk)`.
+stays 4. A trivial upper bound is `O(nK)` with `K ≤ 2k−1`, so `O(nk)`. At
+`k = 4` the sharp order is open: `Ω(n)` is unconditional (disjoint copies),
+`O(nk)` is the ceiling, and nothing separates `Θ(n)` from `Θ(nk)`.
 
 A uniform gap `< 1` is impossible unless P = NP: with integer weights the IP
 is integral, the fractional vertices are half-integral, and a gap below 1
@@ -226,13 +329,37 @@ applied to this connected gadget.
 
 ## 6. What to use
 
-- General instances: exact engine is the `O(n · k! · k)` sweep DP; for
-  `n ≤ 50`, `k ≤ 5` it is already linear in `n` with ≤ 120 states.
-- Fully saturated instances: the rank-1 LP / nested flow is exact and
-  polynomial; this is the tractable special case.
-- If an LP is used as a fast path, check integrality and **fall back to the DP
-  on any fractional optimum**. The LP alone is not a certificate of optimality
-  outside the fully saturated subclass.
+| instance | exact engine | cost |
+|---|---|---|
+| general | sweep DP over injective label states | `O(n · k! · k)`, FPT in `k`; `n ≤ 50`, `k ≤ 5` ⇒ ≤ 120 states |
+| fully saturated (every maximal clique size `k`) | rank-1 LP / nested flow | `poly(n,k)` (§2, derived not cited) |
+| bounded deficiency `d` | enumerate absent-colour patterns, one flow each | `n^{O(d)}` (XP); `d ≤ 1` polynomial (§2.1) |
+| any instance, LP first | solve the clique LP, fall back to the DP on a fractional optimum | exact unconditionally; the LP is only a fast path |
 
-`scripts/verify_counterexample.py` checks the explicit `-100.5 / -100`
-instance with only the Python standard library.
+Do **not** use the clique LP alone as a certificate of optimality: §3 is a
+concrete instance where its optimum lies strictly below every colouring. The
+greedy χ-lane sweep plus the `O(n log n)` weight-relabelling post-pass is a
+heuristic — optimal only among relabellings of the one colouring the greedy
+produced. That is what `src/diagnostics/glyph.rs` ships for the `n ≤ ~50`,
+`χ ≤ ~5` rows, and its corpus gap to exact IGMRC has not been measured.
+
+---
+
+## 7. Scripts
+
+All scripts are Python 3, standard library only, and print `ALL CHECKS PASSED`
+on success.
+
+| script | what it pins |
+|---|---|
+| `scripts/verify_counterexample.py` | the `-100.5 / -100` instance: LP feasibility in exact `Fraction` arithmetic, exhaustive integral optimum, gap `1/2` |
+| `scripts/verify_padding_reduction.py` | the NP-hardness gadget both ways — disjoint padding clique and the connected staggered bridge; checks connectivity, `χ = ω = p`, that the core stays unsaturated, and `OPT(G) = OPT(H) + const` by brute force (including mixed-sign weights) |
+| `scripts/verify_saturation_boundary.py` | the slack identity `Σ_j (1 − Σ_{v∈K} x_{v,j}) = k − |K|`; the two documented fractional points (fully saturated `k = 5`, and `d = 1` at `k = 4`); the pattern count `Π_K C(k, g_K) ≤ k^d` |
+| `scripts/verify_dual_certificate.py` | `(⋆)` infeasible at the counterexample, with the six-inequality Farkas certificate re-derived in exact arithmetic |
+
+```sh
+python3 research/igmrc/scripts/verify_counterexample.py
+python3 research/igmrc/scripts/verify_padding_reduction.py
+python3 research/igmrc/scripts/verify_saturation_boundary.py
+python3 research/igmrc/scripts/verify_dual_certificate.py
+```

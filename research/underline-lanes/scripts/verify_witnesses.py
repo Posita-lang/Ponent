@@ -332,6 +332,40 @@ for trial in range(300):
     bf,k1=igmrc_bruteforce(iv,w)
     dp,k2=igmrc_dp(iv,w)
     assert k1==k2 and bf==dp, (iv,w,bf,dp,k1,k2)
-print("\nIGMRC sweep DP == brute force on 300 random interval families  OK")
+# ---------- the greedy + relabelling post-pass is NOT exact ----------
+def greedy_relabel(iv, w):
+    """Greedy chi-lane sweep by start order, then descending-weight relabel.
+
+    This is the engineering baseline of no-distributive-lattice.md §2: it is
+    optimal among relabellings of the colouring the greedy produced, and
+    nothing more.
+    """
+    n = len(iv)
+    edges = edges_from_intervals(iv)
+    k = max(sum(1 for v in range(n) if iv[v][0] <= t <= iv[v][1])
+            for t in sorted({x for a in iv for x in a}))
+    c = [0]*n
+    for v in sorted(range(n), key=lambda v: (iv[v][0], iv[v][1])):
+        used = {c[u] for u in range(n) if c[u] and (u, v) in edges or c[u] and (v, u) in edges}
+        for q in range(1, k+1):
+            if q not in used:
+                c[v] = q
+                break
+    lane_w = [0]*(k+1)
+    for v, q in enumerate(c):
+        lane_w[q] += w[v]
+    rank = {old: i+1 for i, old in
+            enumerate(sorted(range(1, k+1), key=lambda q: -lane_w[q]))}
+    c = [rank[q] for q in c]
+    return sum(w[v]*c[v] for v in range(n)), c
+
+iv_g, w_g = [(0, 2), (0, 2), (3, 5)], [1, 2, 1]
+greedy_cost, greedy_c = greedy_relabel(iv_g, w_g)
+exact_cost, _ = igmrc_dp(iv_g, w_g)
+assert (greedy_cost, exact_cost) == (6, 5), (greedy_cost, exact_cost)
+assert is_proper(greedy_c, edges_from_intervals(iv_g))
+print(f"\ngreedy+relabel is not exact: {iv_g} w={w_g} -> "
+      f"{greedy_cost} (lanes {greedy_c}) vs optimum {exact_cost}  OK")
+
 print("\nALL CHECKS PASSED")
 

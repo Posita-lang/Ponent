@@ -7,8 +7,11 @@
 > `C = ⊔_D C_D`, a disjoint union of distributive lattices indexed by acyclic
 > orientations — real, but exponentially many, so industrially useless.
 > Engineering decision: keep the greedy χ-lane assignment plus the `O(n log n)`
-> rearrangement post-pass; exact IGMRC is polynomial but not worth the machinery
-> at `n ≤ ~50`, `χ ≤ ~5`.
+> rearrangement post-pass; exact IGMRC is NP-hard in general (FPT via the
+> `O(n · k! · k)` sweep DP, polynomial only on fully saturated instances), the
+> post-pass is exact only among relabellings of the greedy colouring, and the
+> exact machinery is not worth it at `n ≤ ~50`, `χ ≤ ~5`. Details and the
+> corrected complexity statement live in [`../igmrc/README.md`](../igmrc/README.md).
 
 ## 1. Context
 
@@ -46,9 +49,25 @@ The industrial fix does not search all colourings: it keeps the greedy
 colouring and relabels lanes by descending visual weight, which is the
 rearrangement-inequality optimum on the single colouring the greedy
 produced — an `O(n log n)` post-pass that strictly improves WDS whenever a
-later-opened lane outweighs an earlier one. IGMRC (§1) is polynomial on
-interval graphs (§9), but the machinery is not needed for the rows that occur
-here. This document only closes the distributive-lattice thread; the
+later-opened lane outweighs an earlier one. It is **not exact**: relabelling
+cannot change the partition the greedy chose, and that partition can be
+strictly suboptimal already at `χ = 2`. With
+
+```
+intervals (0,2) (0,2) (3,5),   w = (1, 2, 1),
+```
+
+the greedy takes `{v₁}`, `{v₂}`, then `v₃` joins the first lane, so the
+post-pass returns 6 (`Σ w·lane = 1·1 + 2·2 + 1·1`), while the colouring
+`v₂ ↦ 1, v₁ ↦ 2, v₃ ↦ 2` costs 5. Reassigning lanes inside a fixed
+colouring cannot repair this, so the post-pass is a heuristic with an
+unmeasured corpus gap (§9, pinned in `verify_witnesses.py`).
+
+On interval graphs with `χ = ω = k ≤ n` the exact problem is NP-hard in
+general (padding reduction, [`../igmrc/README.md`](../igmrc/README.md) §1)
+and FPT via the `O(n · k! · k)` sweep DP of §9; it is polynomial only on the
+fully saturated subclass. The machinery is not needed for the rows that
+occur here. This document only closes the distributive-lattice thread; the
 engineering decision is stated once, in §9.
 
 ## 3. Negative proposition
@@ -397,8 +416,15 @@ gauge, so the natural object is closer to a torsor than to a lattice.
 - **The distributive-lattice route is closed** (§§3–6): one cannot minimise WDS
   over all optimal colourings by riding a global lattice structure, because
   no such lattice exists in general.
-- **IGMRC is nevertheless polynomial on interval graphs** — via a sweep DP (or
-  the equivalent min-cost flow), not via lattice structure. Sweep the `2n`
+- **IGMRC is FPT, not polynomial** — the sweep DP below is the exact engine,
+  not lattice structure. With `k` part of the input the exact-`χ` rank-1
+  problem is NP-hard even with unit weights (padding reduction,
+  [`../igmrc/README.md`](../igmrc/README.md) §1), and the clique LP is not
+  value-exact (explicit `n = 9`, `k = 4` half-integral counterexample, gap
+  `1/2`), so there is no polynomial LP engine either. The polynomial case is
+  the **fully saturated** subclass (every maximal clique of size exactly `k`);
+  in the general case the DP runs in `O(n · k! · k)`, which is polynomial only
+  for fixed `k`. Sweep the `2n`
   endpoints in increasing order. At coordinate `t` the active set
   `A(t) = {v : s_v ≤ t ≤ e_v}` is a clique, so `|A(t)| ≤ k`; conversely, by
   Helly's property for intervals, every clique is contained in some `A(t)`, so
@@ -412,8 +438,15 @@ gauge, so the natural object is closer to a torsor than to a lattice.
   keeping the minimum accumulated cost. The DP enumerates exactly the proper
   `k`-colourings and returns `min WDS` in `O(n · k! · k)` time. It was
   cross-checked against brute force on 300 random interval families (§12).
-  The witnesses above do not contradict polynomiality; they block one
-  specific proof strategy.
+  The witnesses above are orthogonal to this: they block one proof strategy,
+  not the DP.
+- **"The equivalent min-cost flow" is not equivalent.** The classical interval
+  flow (Arkin–Silverberg 1987; Carlisle–Lloyd 1995) maximises the weight of a
+  `k`-colourable vertex *subset*; it returns a subset, not lane indices, so it
+  cannot evaluate `Σ_v w_v c(v)`. Any flow formulation that does evaluate it
+  is the DP's `k!`-state graph, i.e. a restatement of `O(n · k! · k)`, not a
+  new bound. Only on fully saturated instances does a nested-flow
+  (cumulative-variable) formulation of the colouring itself exist.
 - **The `C = ⊔_D C_D` decomposition is real but industrially useless**:
   optimising a linear objective inside a single `C_D` is polynomial (§7), but
   the number of acyclic orientations is `(-1)^n χ_G(-1)` — exponential — so
@@ -490,6 +523,17 @@ gauge, so the natural object is closer to a torsor than to a lattice.
 - D. R. Fulkerson and O. A. Gross, *Incidence matrices and interval
   graphs*, Pacific J. Math. **15**(3) (1965), 835–855 — the interval-graph
   characterisation behind the simplicial-vertex / chordality argument in §4.
+- D. Marx, *A short proof of the NP-completeness of minimum sum interval
+  coloring*, Oper. Res. Lett. **33**(4) (2005), 382–384,
+  doi:10.1016/j.orl.2004.07.006 — unit-weight NP-hardness of sum coloring on
+  interval graphs, hence of IGMRC after the exact-`χ` padding of
+  [`../igmrc/README.md`](../igmrc/README.md) §1.
+- E. M. Arkin and E. B. Silverberg, *Scheduling jobs with fixed start and end
+  times*, Discrete Appl. Math. **18**(1) (1987), 1–8, and R. E. Carlisle and
+  E. L. Lloyd, *On the k-coloring of intervals*, Discrete Appl. Math. **59**
+  (1995), 225–235 — the min-cost-flow algorithms cited in §9. Both compute a
+  maximum-weight `k`-colourable **subset**, not a colouring; see the §9
+  bullet on why that objective differs.
 
 ## 12. Witness tests
 

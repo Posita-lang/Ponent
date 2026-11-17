@@ -4516,12 +4516,18 @@ impl UnderlineLanes {
         // not a lattice in general, and for K₃ ⊔ K₃ admits no canonical
         // lattice order at all (witnesses plus the C = ⊔_D C_D
         // decomposition in
-        // research/underline-lanes/no-distributive-lattice.md). IGMRC is
-        // polynomial on interval graphs via min-cost flow, not via
-        // lattice structure, and not worth the machinery for the
-        // n ≤ ~50, χ ≤ ~5 rows here. Below we only relabel the greedy's
+        // research/underline-lanes/no-distributive-lattice.md).
+        // Exact IGMRC is NP-hard in general (exact-χ padding reduction)
+        // and FPT only via the O(n · k! · k) sweep DP; it is polynomial
+        // on the fully saturated subclass (every maximal clique of size
+        // χ), and the clique LP is not value-exact, so no LP/flow engine
+        // replaces the DP here. That machinery is not worth it for the
+        // n ≤ ~50, χ ≤ ~5 rows. Below we only relabel the greedy's
         // single colouring — the rearrangement-inequality optimum on
-        // that subgraph.
+        // that subgraph, which is a heuristic, not an exact optimum:
+        // e.g. [(0,2),(0,2),(3,5)] with w = (1,2,1) keeps cost 6 against
+        // an optimum of 5 (research/igmrc/README.md, §2 of the
+        // underline-lanes note).
         // ── Relabel lanes by descending visual weight ─────────────────
         // The greedy numbers lanes in opening order, which has nothing to
         // do with the visual weight each lane carries.  Under the
