@@ -490,13 +490,13 @@ impl GlyphRenderer {
     /// the gutter and misaligned wrapped continuation lines in non-English
     /// locales.
     fn prefix_cols(&self, level: DiagnosticLevel) -> usize {
-        self.prefix_base + visible_width(level.label().as_ref())
+        self.prefix_base + level_label_widths()[level.severity() as usize]
     }
 
     /// Upper bound for `context_lines`.  A CLI `--context 1e19` parses as
-/// `usize::MAX`; the window computations add it to a line number, which
-/// would overflow (panic in debug, wrap in release → wrong window).  No
-/// real render wants more than this many context rows.
+    /// `usize::MAX`; the window computations add it to a line number, which
+    /// would overflow (panic in debug, wrap in release → wrong window).  No
+    /// real render wants more than this many context rows.
     const MAX_CONTEXT_LINES: usize = 1 << 16;
 
     pub fn with_context_lines(mut self, n: usize) -> Self {
@@ -631,9 +631,8 @@ impl GlyphRenderer {
                             // Manual pushes, not `format!`: skips the
                             // `core::fmt` machinery per related error with a
                             // code (common in merged multi-error diagnostics).
-                            let mut s = String::with_capacity(
-                                rel.message.len() + code.code().len() + 4,
-                            );
+                            let mut s =
+                                String::with_capacity(rel.message.len() + code.code().len() + 4);
                             s.push_str(&rel.message);
                             s.push_str(" [");
                             s.push_str(code.code());
@@ -688,12 +687,10 @@ impl GlyphRenderer {
             // `suggestion_lines_buf` is taken inside the foreign gate below —
             // it is only read on the multi-file path, so the common
             // single-file case skips the take/restore entirely.
-            let mut section_label_lines =
-                std::mem::take(&mut section_scratch.section_label_lines);
+            let mut section_label_lines = std::mem::take(&mut section_scratch.section_label_lines);
             let mut section_label_sources =
                 std::mem::take(&mut section_scratch.section_label_sources);
-            let mut section_label_order =
-                std::mem::take(&mut section_scratch.section_label_order);
+            let mut section_label_order = std::mem::take(&mut section_scratch.section_label_order);
             let mut anchor_suggestion_lines =
                 std::mem::take(&mut section_scratch.anchor_suggestion_lines);
             // `merged_labels` borrows from both `diag.labels` and
@@ -713,19 +710,15 @@ impl GlyphRenderer {
             // merge predicate, fold counts and `group[0]` selection in release
             // builds.  Sorting a (typically ≤2-element) slice is cheap; do it
             // whenever the borrowed view is not already ordered.
-            let sorted_spans: Cow<'_, [Span]> =
-                if sorted_spans.windows(2).all(|w| w[0] <= w[1]) {
-                    sorted_spans
-                } else {
-                    debug_assert!(
-                        false,
-                        "MultiSpan::primary must be sorted by (file, start)"
-                    );
-                    let mut out: SmallVec<[Span; 2]> = sorted_spans.iter().copied().collect();
-                    out.sort_unstable();
-                    out.dedup();
-                    Cow::Owned(out.into_vec())
-                };
+            let sorted_spans: Cow<'_, [Span]> = if sorted_spans.windows(2).all(|w| w[0] <= w[1]) {
+                sorted_spans
+            } else {
+                debug_assert!(false, "MultiSpan::primary must be sorted by (file, start)");
+                let mut out: SmallVec<[Span; 2]> = sorted_spans.iter().copied().collect();
+                out.sort_unstable();
+                out.dedup();
+                Cow::Owned(out.into_vec())
+            };
 
             // Line index shared by every conversion in this render: each
             // lookup is O(log n) instead of rescanning the file.  The batch
@@ -810,26 +803,25 @@ impl GlyphRenderer {
             // whole file is never materialized as a `Vec<&str>` just to take
             // its length.
             let last_text_line = idx.text_line_count().saturating_sub(1);
-            let ranges: SmallVec<[((usize, usize), SourcePos, Span); 2]> =
-                sorted_spans
-                    .iter()
-                    .filter(|sp| anchor_file.is_none_or(|anchor| sp.file == anchor))
-                    .map(|&sp| {
-                        let start_pos = idx.to_linecol(sp.start_as_usize());
-                        let first = start_pos.line.saturating_sub(self.context_lines);
-                        // The window must end at the span's *last covered
-                        // line* plus `context_lines` — not at the exclusive
-                        // end offset's line plus one.  `span_lines` applies
-                        // the "end on a line start belongs to the previous
-                        // line" rule, so a span ending exactly at a newline
-                        // no longer drags one phantom row of context in
-                        // (with `context_lines = 0` the window previously
-                        // still showed one line below the span).
-                        let (_, sp_last) = idx.span_lines(sp);
-                        let last = std::cmp::min(sp_last + self.context_lines, last_text_line);
-                        ((first, last), start_pos, sp)
-                    })
-                    .collect();
+            let ranges: SmallVec<[((usize, usize), SourcePos, Span); 2]> = sorted_spans
+                .iter()
+                .filter(|sp| anchor_file.is_none_or(|anchor| sp.file == anchor))
+                .map(|&sp| {
+                    let start_pos = idx.to_linecol(sp.start_as_usize());
+                    let first = start_pos.line.saturating_sub(self.context_lines);
+                    // The window must end at the span's *last covered
+                    // line* plus `context_lines` — not at the exclusive
+                    // end offset's line plus one.  `span_lines` applies
+                    // the "end on a line start belongs to the previous
+                    // line" rule, so a span ending exactly at a newline
+                    // no longer drags one phantom row of context in
+                    // (with `context_lines = 0` the window previously
+                    // still showed one line below the span).
+                    let (_, sp_last) = idx.span_lines(sp);
+                    let last = std::cmp::min(sp_last + self.context_lines, last_text_line);
+                    ((first, last), start_pos, sp)
+                })
+                .collect();
 
             // Merge overlapping ranges. `ranges` is the upper bound on the
             // merged count, so reserve it once instead of regrowing.
@@ -838,9 +830,8 @@ impl GlyphRenderer {
             // location header and line range only.  The inner span list is a
             // `SmallVec<[Span; 2]>`: a merged group almost always has ≤2
             // spans, so the common case stays inline.
-            let mut merged: SmallVec<
-                [((usize, usize), SourcePos, SmallVec<[Span; 2]>); 2],
-            > = SmallVec::with_capacity(ranges.len());
+            let mut merged: SmallVec<[((usize, usize), SourcePos, SmallVec<[Span; 2]>); 2]> =
+                SmallVec::with_capacity(ranges.len());
             for (range, pos, sp) in &ranges {
                 if let Some(last) = merged.last_mut() {
                     // Merge only same-file ranges: line numbers collide
@@ -921,10 +912,10 @@ impl GlyphRenderer {
                 extras_labels.clear();
                 extras_labels.extend(group[1..].iter().map(|&sp| Label::new(sp, "")));
                 // Lines hidden between the previous section's window end and this
-        // section's window start. `None` (first section) draws no marker;
-        // `Some(n)` always has `n >= 1` — contiguous sections are merged by
-        // the predicate above, so the old "0 draws a bare `...`" state was
-        // unreachable (C8).
+                // section's window start. `None` (first section) draws no marker;
+                // `Some(n)` always has `n >= 1` — contiguous sections are merged by
+                // the predicate above, so the old "0 draws a bare `...`" state was
+                // unreachable (C8).
                 let folded_lines = i
                     .checked_sub(1)
                     .and_then(|prev_i| merged.get(prev_i))
@@ -975,152 +966,154 @@ impl GlyphRenderer {
             // foreign-file loop that reads every key once.
             let mut foreign_rendered_files: litemap::LiteMap<FileId, ()> = litemap::LiteMap::new();
             if let Some(foreign) = diag.foreign_sources.as_deref() {
-            let mut suggestion_lines_buf = std::mem::take(&mut section_scratch.suggestion_lines_buf);
-            let mut foreign_spans_by_file: litemap::LiteMap<FileId, SmallVec<[Span; 2]>> =
-                litemap::LiteMap::new();
-            for &sp in sorted_spans.iter() {
-                if Some(sp.file) != anchor_file {
-                    foreign_spans_by_file
-                        .entry(sp.file)
-                        .or_insert_with(SmallVec::new)
-                        .push(sp);
-                }
-            }
-            let mut foreign_labels_by_file: litemap::LiteMap<
-                FileId,
-                (SmallVec<[&Label<'src>; 4]>, SmallVec<[usize; 4]>),
-            > = litemap::LiteMap::new();
-            for (i, lbl) in merged_labels.iter().enumerate() {
-                if Some(lbl.span.file) != anchor_file {
-                    let entry = foreign_labels_by_file
-                        .entry(lbl.span.file)
-                        .or_insert_with(|| (SmallVec::new(), SmallVec::new()));
-                    entry.0.push(lbl);
-                    entry.1.push(i);
-                }
-            }
-            let mut foreign_suggestions_by_file: litemap::LiteMap<
-                FileId,
-                SmallVec<[(usize, Span); 4]>,
-            > = litemap::LiteMap::new();
-            for (i, sug) in diag.suggestions.iter().enumerate() {
-                if let Some(span) = sug.span {
-                    if Some(span.file) != anchor_file {
-                        foreign_suggestions_by_file
-                            .entry(span.file)
+                let mut suggestion_lines_buf =
+                    std::mem::take(&mut section_scratch.suggestion_lines_buf);
+                let mut foreign_spans_by_file: litemap::LiteMap<FileId, SmallVec<[Span; 2]>> =
+                    litemap::LiteMap::new();
+                for &sp in sorted_spans.iter() {
+                    if Some(sp.file) != anchor_file {
+                        foreign_spans_by_file
+                            .entry(sp.file)
                             .or_insert_with(SmallVec::new)
-                            .push((i, span));
+                            .push(sp);
                     }
                 }
-            }
-            // Reusable buffer for per-foreign-file suggestion line ranges.
-            // Entries are set for the current file and reset to None after the
-            // call, so no O(S) work happens per foreign file.  Capacity is
-            // taken from `section_scratch` and restored at the end of this
-            // block, so a batch of diagnostics sharing a suggestion count pays
-            // one allocation, not one per diagnostic.
-            suggestion_lines_buf.clear();
-            suggestion_lines_buf.resize(diag.suggestions.len(), None);
-
-            {
-                for (fid, fname, fsource) in foreign.iter() {
-                    if Some(*fid) == anchor_file {
-                        continue;
+                let mut foreign_labels_by_file: litemap::LiteMap<
+                    FileId,
+                    (SmallVec<[&Label<'src>; 4]>, SmallVec<[usize; 4]>),
+                > = litemap::LiteMap::new();
+                for (i, lbl) in merged_labels.iter().enumerate() {
+                    if Some(lbl.span.file) != anchor_file {
+                        let entry = foreign_labels_by_file
+                            .entry(lbl.span.file)
+                            .or_insert_with(|| (SmallVec::new(), SmallVec::new()));
+                        entry.0.push(lbl);
+                        entry.1.push(i);
                     }
-                    let f_primaries: &[Span] = foreign_spans_by_file
-                        .get(fid)
-                        .map(|v| v.as_slice())
-                        .unwrap_or(&[]);
-                    let (f_labels, f_label_sources): (&[&Label<'src>], &[usize]) =
-                        foreign_labels_by_file
-                            .get(fid)
-                            .map(|(l, s)| (l.as_slice(), s.as_slice()))
-                            .unwrap_or((&[], &[]));
-                    if f_primaries.is_empty() && f_labels.is_empty() {
-                        continue;
-                    }
-                    let Some(section_primary) = f_primaries
-                        .first()
-                        .copied()
-                        .or_else(|| f_labels.first().map(|l| l.span))
-                    else {
-                        continue;
-                    };
-                    let f_idx = match cx {
-                        Some(cx) => cx.line_index(fsource),
-                        None => LineIndex::new(fsource),
-                    };
-                    let f_start_pos = f_idx.to_linecol(section_primary.start_as_usize());
-                    let f_fname: &str = fname.as_ref();
-                    let f_sanitized = super::sanitize_filename(f_fname);
-                    let f_file_url: Option<Arc<str>> =
-                        if hyperlink_enabled && super::is_real_file_name(f_fname) {
-                            match cx {
-                                Some(cx) => Some(cx.file_url(f_fname)),
-                                None => Some(Arc::from(
-                                    path_to_file_url(std::path::Path::new(f_fname)).as_str(),
-                                )),
-                            }
-                        } else {
-                            None
-                        };
-                    let f_label_lines: SmallVec<[(usize, usize); 4]> =
-                        f_labels.iter().map(|l| f_idx.span_lines(l.span)).collect();
-                    // Populate the reusable suggestion-lines buffer only for
-                    // suggestions belonging to this foreign file; reset after
-                    // the call so the next file sees None for these entries.
-                    let mut set_indices: SmallVec<[usize; 4]> = SmallVec::new();
-                    if let Some(list) = foreign_suggestions_by_file.get(fid) {
-                        for &(i, span) in list {
-                            suggestion_lines_buf[i] = Some(f_idx.span_lines(span));
-                            set_indices.push(i);
+                }
+                let mut foreign_suggestions_by_file: litemap::LiteMap<
+                    FileId,
+                    SmallVec<[(usize, Span); 4]>,
+                > = litemap::LiteMap::new();
+                for (i, sug) in diag.suggestions.iter().enumerate() {
+                    if let Some(span) = sug.span {
+                        if Some(span.file) != anchor_file {
+                            foreign_suggestions_by_file
+                                .entry(span.file)
+                                .or_insert_with(SmallVec::new)
+                                .push((i, span));
                         }
                     }
-                    let extras: SmallVec<[Label<'src>; 2]> = f_primaries
-                        .iter()
-                        .skip(1)
-                        .map(|sp| Label::new(*sp, ""))
-                        .collect();
-                    let f_line_num_width = f_idx.text_line_count().checked_ilog10().unwrap_or(0) as usize + 1;
-                    let section_rendered = self.write_source_section(
-                        out,
-                        fsource,
-                        &f_idx,
-                        section_primary,
-                        f_start_pos,
-                        f_file_url.as_deref(),
-                        f_labels,
-                        &f_label_lines,
-                        &[],
-                        f_label_sources,
-                        &extras,
-                        section_scratch,
-                        f_sanitized.as_ref(),
-                        diag.level,
-                        None,
-                        true,
-                        &mut label_rendered,
-                        f_line_num_width,
-                        &diag.suggestions,
-                        &suggestion_lines_buf,
-                        &mut suggestion_rendered,
-                    );
-                    for i in set_indices {
-                        suggestion_lines_buf[i] = None;
-                    }
-                    // Only a section that actually drew the primary span
-                    // counts as "rendered" (1.2): an empty foreign source or
-                    // a primary past EOF must fall through to the
-                    // location-note fallbacks below, or its spans and labels
-                    // would be silently suppressed.
-                    if section_rendered.drew_primary {
-                        foreign_rendered_files.insert(*fid, ());
+                }
+                // Reusable buffer for per-foreign-file suggestion line ranges.
+                // Entries are set for the current file and reset to None after the
+                // call, so no O(S) work happens per foreign file.  Capacity is
+                // taken from `section_scratch` and restored at the end of this
+                // block, so a batch of diagnostics sharing a suggestion count pays
+                // one allocation, not one per diagnostic.
+                suggestion_lines_buf.clear();
+                suggestion_lines_buf.resize(diag.suggestions.len(), None);
+
+                {
+                    for (fid, fname, fsource) in foreign.iter() {
+                        if Some(*fid) == anchor_file {
+                            continue;
+                        }
+                        let f_primaries: &[Span] = foreign_spans_by_file
+                            .get(fid)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        let (f_labels, f_label_sources): (&[&Label<'src>], &[usize]) =
+                            foreign_labels_by_file
+                                .get(fid)
+                                .map(|(l, s)| (l.as_slice(), s.as_slice()))
+                                .unwrap_or((&[], &[]));
+                        if f_primaries.is_empty() && f_labels.is_empty() {
+                            continue;
+                        }
+                        let Some(section_primary) = f_primaries
+                            .first()
+                            .copied()
+                            .or_else(|| f_labels.first().map(|l| l.span))
+                        else {
+                            continue;
+                        };
+                        let f_idx = match cx {
+                            Some(cx) => cx.line_index(fsource),
+                            None => LineIndex::new(fsource),
+                        };
+                        let f_start_pos = f_idx.to_linecol(section_primary.start_as_usize());
+                        let f_fname: &str = fname.as_ref();
+                        let f_sanitized = super::sanitize_filename(f_fname);
+                        let f_file_url: Option<Arc<str>> =
+                            if hyperlink_enabled && super::is_real_file_name(f_fname) {
+                                match cx {
+                                    Some(cx) => Some(cx.file_url(f_fname)),
+                                    None => Some(Arc::from(
+                                        path_to_file_url(std::path::Path::new(f_fname)).as_str(),
+                                    )),
+                                }
+                            } else {
+                                None
+                            };
+                        let f_label_lines: SmallVec<[(usize, usize); 4]> =
+                            f_labels.iter().map(|l| f_idx.span_lines(l.span)).collect();
+                        // Populate the reusable suggestion-lines buffer only for
+                        // suggestions belonging to this foreign file; reset after
+                        // the call so the next file sees None for these entries.
+                        let mut set_indices: SmallVec<[usize; 4]> = SmallVec::new();
+                        if let Some(list) = foreign_suggestions_by_file.get(fid) {
+                            for &(i, span) in list {
+                                suggestion_lines_buf[i] = Some(f_idx.span_lines(span));
+                                set_indices.push(i);
+                            }
+                        }
+                        let extras: SmallVec<[Label<'src>; 2]> = f_primaries
+                            .iter()
+                            .skip(1)
+                            .map(|sp| Label::new(*sp, ""))
+                            .collect();
+                        let f_line_num_width =
+                            f_idx.text_line_count().checked_ilog10().unwrap_or(0) as usize + 1;
+                        let section_rendered = self.write_source_section(
+                            out,
+                            fsource,
+                            &f_idx,
+                            section_primary,
+                            f_start_pos,
+                            f_file_url.as_deref(),
+                            f_labels,
+                            &f_label_lines,
+                            &[],
+                            f_label_sources,
+                            &extras,
+                            section_scratch,
+                            f_sanitized.as_ref(),
+                            diag.level,
+                            None,
+                            true,
+                            &mut label_rendered,
+                            f_line_num_width,
+                            &diag.suggestions,
+                            &suggestion_lines_buf,
+                            &mut suggestion_rendered,
+                        );
+                        for i in set_indices {
+                            suggestion_lines_buf[i] = None;
+                        }
+                        // Only a section that actually drew the primary span
+                        // counts as "rendered" (1.2): an empty foreign source or
+                        // a primary past EOF must fall through to the
+                        // location-note fallbacks below, or its spans and labels
+                        // would be silently suppressed.
+                        if section_rendered.drew_primary {
+                            foreign_rendered_files.insert(*fid, ());
+                        }
                     }
                 }
-            }
-            // Restore the buffer while it is still in scope: both the take
-            // and the restore live inside the foreign gate.
-            section_scratch.suggestion_lines_buf = suggestion_lines_buf;
+                // Restore the buffer while it is still in scope: both the take
+                // and the restore live inside the foreign gate.
+                section_scratch.suggestion_lines_buf = suggestion_lines_buf;
             } // foreign_sources gate
             section_scratch.section_label_lines = section_label_lines;
             // ── Fallback: render labels not shown in any source section ──
@@ -1153,8 +1146,7 @@ impl GlyphRenderer {
                 // belongs to any label's file, so treat every label as
                 // foreign rather than resolving its offsets against a buffer
                 // that may be unrelated.
-                let foreign = anchor_file
-                    .is_none_or(|anchor| lbl.span.file != anchor);
+                let foreign = anchor_file.is_none_or(|anchor| lbl.span.file != anchor);
                 let pos = (!foreign).then(|| idx.to_linecol(lbl.span.start_as_usize()));
                 // B4: one canonical note path.  A locatable label gets
                 // `line:col`; a foreign/unlocatable one gets its byte range so
@@ -1241,10 +1233,7 @@ impl GlyphRenderer {
                 // C7: wrap the whole `message at location` through the shared
                 // note writer (localized label + pad-only continuations) so a
                 // long label cannot break the width contract on this path.
-                self.write_note_line(
-                    out,
-                    &format!("{} at {}", sanitized, loc),
-                );
+                self.write_note_line(out, &format!("{} at {}", sanitized, loc));
             }
         }
 
@@ -1388,60 +1377,60 @@ impl GlyphRenderer {
         // single code (or none → the `?` fallback), so it stays inline and
         // avoids a heap allocation per rendered diagnostic.  The related-error
         // branch spills to the heap only when ≥3 distinct codes appear.
-        let all_codes: SmallVec<[&crate::diagnostics::ErrCode; 2]> =
-            if diag.related_errors.is_empty() {
-                match diag.code.as_ref() {
-                    Some(c) => smallvec![c],
-                    None => smallvec![fallback_code
-                        .get_or_init(|| crate::diagnostics::ErrCode::unknown("?"))],
-                }
-            } else {
-                let mut codes: SmallVec<[&crate::diagnostics::ErrCode; 2]> = SmallVec::new();
-                if let Some(c) = diag.code.as_ref() {
+        let all_codes: SmallVec<[&crate::diagnostics::ErrCode; 2]> = if diag
+            .related_errors
+            .is_empty()
+        {
+            match diag.code.as_ref() {
+                Some(c) => smallvec![c],
+                None => smallvec![
+                    fallback_code.get_or_init(|| crate::diagnostics::ErrCode::unknown("?"))
+                ],
+            }
+        } else {
+            let mut codes: SmallVec<[&crate::diagnostics::ErrCode; 2]> = SmallVec::new();
+            if let Some(c) = diag.code.as_ref() {
+                codes.push(c);
+            }
+            // Dedup by code *string* without the O(R²) `codes.iter().any`
+            // scan: R ≤ 4 stays on an inline linear scan (the common
+            // one-or-two-related-errors shape pays no hash setup), and a
+            // diagnostic aggregating many related errors spills to a
+            // hash set — O(R) total instead of O(R²) string compares.
+            let mut seen: SmallVec<[&str; 4]> = SmallVec::new();
+            if let Some(c) = diag.code.as_ref() {
+                seen.push(c.canonical());
+            }
+            let mut spill: Option<rustc_hash::FxHashSet<&str>> = None;
+            for rel in &diag.related_errors {
+                let Some(c) = rel.code.as_ref() else {
+                    continue;
+                };
+                let code = c.canonical();
+                let dup = match &mut spill {
+                    Some(s) => !s.insert(code),
+                    None => seen.iter().any(|k| *k == code),
+                };
+                if !dup {
                     codes.push(c);
-                }
-                // Dedup by code *string* without the O(R²) `codes.iter().any`
-                // scan: R ≤ 4 stays on an inline linear scan (the common
-                // one-or-two-related-errors shape pays no hash setup), and a
-                // diagnostic aggregating many related errors spills to a
-                // hash set — O(R) total instead of O(R²) string compares.
-                let mut seen: SmallVec<[&str; 4]> = SmallVec::new();
-                if let Some(c) = diag.code.as_ref() {
-                    seen.push(c.canonical());
-                }
-                let mut spill: Option<rustc_hash::FxHashSet<&str>> = None;
-                for rel in &diag.related_errors {
-                    let Some(c) = rel.code.as_ref() else {
-                        continue;
-                    };
-                    let code = c.canonical();
-                    let dup = match &mut spill {
-                        Some(s) => !s.insert(code),
-                        None => seen.iter().any(|k| *k == code),
-                    };
-                    if !dup {
-                        codes.push(c);
-                        // Stop maintaining `seen` once the hash set has
-                        // spilled: from here the set alone answers the
-                        // dup test, and pushing into the (full) inline
-                        // buffer for every remaining unique code is pure
-                        // waste.
-                        if spill.is_none() {
-                            seen.push(code);
-                            if seen.len() == 4 {
-                                spill = Some(seen.iter().copied().collect());
-                            }
+                    // Stop maintaining `seen` once the hash set has
+                    // spilled: from here the set alone answers the
+                    // dup test, and pushing into the (full) inline
+                    // buffer for every remaining unique code is pure
+                    // waste.
+                    if spill.is_none() {
+                        seen.push(code);
+                        if seen.len() == 4 {
+                            spill = Some(seen.iter().copied().collect());
                         }
                     }
                 }
-                if codes.is_empty() {
-                    codes.push(
-                        fallback_code
-                            .get_or_init(|| crate::diagnostics::ErrCode::unknown("?")),
-                    );
-                }
-                codes
-            };
+            }
+            if codes.is_empty() {
+                codes.push(fallback_code.get_or_init(|| crate::diagnostics::ErrCode::unknown("?")));
+            }
+            codes
+        };
         // Sanitize each code once into an inline buffer (≤2 codes stay on
         // the stack), so the visible width and the comma-joined display form
         // can be derived without re-sanitizing and without building the
@@ -1608,8 +1597,7 @@ impl GlyphRenderer {
                 // call and three adds, versus a `format!` allocating a
                 // `String` per related error that was immediately measured
                 // and dropped.
-                let num_width =
-                    crate::diagnostics::renderers::fmt::dec_digits(num as u64);
+                let num_width = crate::diagnostics::renderers::fmt::dec_digits(num as u64);
                 let item_cols = BOX_VERT_WIDTH + indent_cols + num_width + 2;
                 let rel_msg = super::sanitize_for_terminal_multiline(&rel.message);
                 for (j, seg) in self.wrap_msg(&rel_msg, item_cols).iter().enumerate() {
@@ -1830,9 +1818,7 @@ impl GlyphRenderer {
         // cannot terminate the sequence early or inject further terminal
         // escapes.
         let hyperlink = matches!(file_url, Some(_) if show_filename);
-        if hyperlink
-            && let Some(url) = file_url
-        {
+        if hyperlink && let Some(url) = file_url {
             out.push_str("\x1b]8;;");
             out.push_str(url);
             out.push_str("\x1b\\");
@@ -1841,11 +1827,8 @@ impl GlyphRenderer {
             out.push_str(filename_display);
             out.push(':');
         }
-        let header_display_col = byte_offset_to_display(
-            idx.line(start_pos.line),
-            start_pos.col,
-            self.tab_width,
-        );
+        let header_display_col =
+            byte_offset_to_display(idx.line(start_pos.line), start_pos.col, self.tab_width);
         push_uint(out, start_pos.line as u64 + 1);
         out.push(':');
         push_uint(out, header_display_col as u64 + 1);
@@ -1931,7 +1914,11 @@ impl GlyphRenderer {
         // Depth-aware reset: `\x1b[49m` clears a background colour but NOT
         // SGR 7 (reverse video) — the 16-colour `highlight_bg` pairs with
         // `\x1b[27m` (see `Styles::highlight_reset`).
-        let highlight_off = if self.s.use_color { self.s.highlight_reset } else { "" };
+        let highlight_off = if self.s.use_color {
+            self.s.highlight_reset
+        } else {
+            ""
+        };
         let mut gutter_head = std::mem::take(&mut scratch.gutter_head);
         gutter_head.clear();
         gutter_head.push_str(self.s.dim);
@@ -1996,11 +1983,7 @@ impl GlyphRenderer {
                         done_buf,
                         active_buf,
                         tab_width: self.tab_width,
-                        content_start_col: BOX_VERT_WIDTH
-                            + line_num_width
-                            + 1
-                            + BOX_VERT_WIDTH
-                            + 1,
+                        content_start_col: BOX_VERT_WIDTH + line_num_width + 1 + BOX_VERT_WIDTH + 1,
                         append: true,
                     },
                     |out, s| out.push_str(s),
@@ -2107,10 +2090,7 @@ impl GlyphRenderer {
             if !label_window.active().is_empty() {
                 for &i in label_window.active() {
                     let (start, end) = label_line_ranges[i + 1];
-                    if line_idx <= start
-                        || line_idx >= end
-                        || all_labels[i].message.is_empty()
-                    {
+                    if line_idx <= start || line_idx >= end || all_labels[i].message.is_empty() {
                         continue;
                     }
                     let span_start = all_labels[i].span.start_as_usize();
@@ -2120,8 +2100,7 @@ impl GlyphRenderer {
                     // sits under the opening caret.
                     let start_line_idx = label_line_ranges[i + 1].0;
                     let start_line = idx.line(start_line_idx);
-                    let start_line_start =
-                        starts.get(start_line_idx).map_or(0, |&s| s as usize);
+                    let start_line_start = starts.get(start_line_idx).map_or(0, |&s| s as usize);
                     let start_off = span_start
                         .saturating_sub(start_line_start)
                         .min(start_line.len());
@@ -2189,9 +2168,7 @@ impl GlyphRenderer {
                     // The payload carries only the label index; the message
                     // resolves from the section's own `all_labels` (the
                     // synthetic primary has `None` and an empty message).
-                    .filter(|(_, _, _, li)| {
-                        li.is_some_and(|i| !all_labels[i].message.is_empty())
-                    })
+                    .filter(|(_, _, _, li)| li.is_some_and(|i| !all_labels[i].message.is_empty()))
                 {
                     let msg: &str = match label_idx {
                         Some(i) => all_labels[i].message.as_ref(),
@@ -2533,13 +2510,8 @@ impl GlyphRenderer {
             // the same, measured from the display column where the `- `/
             // `+ ` payload actually starts (gutter `│` + line number + space
             // + sub-bar `│` + space + glyph cell + the 2-column diff marker).
-            let diff_text_col = BOX_VERT_WIDTH
-                + line_num_width
-                + 1
-                + BOX_VERT_WIDTH
-                + 1
-                + glyph_rendered_width
-                + 2;
+            let diff_text_col =
+                BOX_VERT_WIDTH + line_num_width + 1 + BOX_VERT_WIDTH + 1 + glyph_rendered_width + 2;
             let old_display =
                 expand_tabs_from_col(old_display.as_ref(), self.tab_width, diff_text_col);
             let new_display =
@@ -2729,7 +2701,9 @@ impl GlyphRenderer {
         // comment above claiming otherwise — kept the per-message cost at
         // O(P·S), exactly what it said it removed.  With the table hoisted,
         // the per-message cost is O(P + S·log P + Σ overlap).
-        let acc = cum.last().map_or(0, |&off| off + parts[cum.len() - 1].content.len());
+        let acc = cum
+            .last()
+            .map_or(0, |&off| off + parts[cum.len() - 1].content.len());
         let mut rendered = String::with_capacity(seg.len() + 16);
         let mut first = cum.partition_point(|&off| off < start);
         // A part may *straddle* `start` (its offset is below `start` but its
@@ -2843,13 +2817,8 @@ impl GlyphRenderer {
             // old `into_owned()`/`to_string()` heap allocation.
             let msg: Cow<'_, str> = match styled_parts {
                 Some(parts) => {
-                    let (rendered, next) = self.styled_segment(
-                        parts,
-                        &cum,
-                        plain,
-                        seg.as_ref(),
-                        search_from,
-                    );
+                    let (rendered, next) =
+                        self.styled_segment(parts, &cum, plain, seg.as_ref(), search_from);
                     search_from = next;
                     rendered
                 }
@@ -2939,7 +2908,9 @@ impl GlyphRenderer {
                 push_spaces(out, prefix_cols - 1);
                 out.push_str(seg.as_ref());
             }
-            if i == last && let Some(suffix) = suffix {
+            if i == last
+                && let Some(suffix) = suffix
+            {
                 out.push_str(" at ");
                 out.push_str(suffix);
             }
@@ -3395,7 +3366,9 @@ pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
             // the first byte of the next line.
             let zero_end = line_starts
                 .get(line_idx + 1)
-                .map_or(source.len().saturating_sub(1), |&s| (s as usize).saturating_sub(1))
+                .map_or(source.len().saturating_sub(1), |&s| {
+                    (s as usize).saturating_sub(1)
+                })
                 .max(line_end);
             span_start >= line_start && span_start <= zero_end
         } else {
@@ -4372,10 +4345,7 @@ impl UnderlineLanes {
     /// character already render as a single fused row (contiguous runs are
     /// emitted back-to-back), so duplicates would only add a redundant
     /// stacked lane.
-    pub(crate) fn assign(
-        &mut self,
-        underlines: &[(usize, usize, char, Option<usize>)],
-    ) -> usize {
+    pub(crate) fn assign(&mut self, underlines: &[(usize, usize, char, Option<usize>)]) -> usize {
         let Self {
             lanes,
             active,
@@ -4457,12 +4427,13 @@ impl UnderlineLanes {
                 matches!(ch, '^' | '~' | '-' | ' '),
                 "unexpected underline char {ch:?}"
             );
-            let bit = 1u8 << match ch {
-                '^' => 0,
-                '~' => 1,
-                '-' => 2,
-                _ => 3,
-            };
+            let bit = 1u8
+                << match ch {
+                    '^' => 0,
+                    '~' => 1,
+                    '-' => 2,
+                    _ => 3,
+                };
             if chars_seen & bit != 0 {
                 continue;
             }
@@ -4540,20 +4511,19 @@ impl UnderlineLanes {
         // reduces the weighted depth sum whenever a later-opened lane ends
         // up heavier than an earlier one.
         if n > 1 {
-            weights.extend((0..n)
-                .map(|l| {
-                    let w: usize = lanes[l]
-                        .iter()
-                        .map(|&i| {
-                            let (_, ulen, _, label_idx) = underlines[i];
-                            // Width dominates; a labelled underline also
-                            // carries a rendered message, giving it slightly
-                            // more visual weight than a bare synthetic one.
-                            ulen + usize::from(label_idx.is_some())
-                        })
-                        .sum();
-                    (w, l)
-                }));
+            weights.extend((0..n).map(|l| {
+                let w: usize = lanes[l]
+                    .iter()
+                    .map(|&i| {
+                        let (_, ulen, _, label_idx) = underlines[i];
+                        // Width dominates; a labelled underline also
+                        // carries a rendered message, giving it slightly
+                        // more visual weight than a bare synthetic one.
+                        ulen + usize::from(label_idx.is_some())
+                    })
+                    .sum();
+                (w, l)
+            }));
             // Descending weight → heaviest first.  Tie-break on the original
             // lane index for deterministic output.
             weights.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -4977,6 +4947,29 @@ pub(crate) fn expand_tabs_from_col<'s>(
         col += w;
     }
     Cow::Owned(out)
+}
+
+/// Visible width of each [`DiagnosticLevel`]'s localized `label()`, cached per
+/// language.  Labels are Fluent strings, so the widths are language-dependent;
+/// keying the table by [`Lang::index`] keeps a mid-process language switch from
+/// serving a stale width.  `severity()` and `label()` use the same 0..6
+/// variant-index mapping in `level.rs`, so the lookup is one array read
+/// instead of re-walking the label's graphemes on every child/note/help line.
+fn level_label_widths() -> &'static [usize; 6] {
+    use crate::diagnostics::i18n::{Lang, N_LANGS};
+    static WIDTHS: [std::sync::OnceLock<[usize; 6]>; N_LANGS] =
+        [const { std::sync::OnceLock::new() }; N_LANGS];
+    let lang = Lang::current().index();
+    WIDTHS[lang].get_or_init(|| {
+        [
+            visible_width(DiagnosticLevel::Info.label()),
+            visible_width(DiagnosticLevel::Note.label()),
+            visible_width(DiagnosticLevel::Help.label()),
+            visible_width(DiagnosticLevel::Warning.label()),
+            visible_width(DiagnosticLevel::Error.label()),
+            visible_width(DiagnosticLevel::Fatal.label()),
+        ]
+    })
 }
 
 /// Visible display width of `s`, skipping CSI (`\x1b[…m`) and OSC
@@ -6216,11 +6209,7 @@ mod tests {
         meta: &[(char, Option<usize>)],
         highlight_on: &str,
         highlight_off: &str,
-    ) -> (
-        usize,
-        String,
-        Vec<(usize, usize, char, Option<usize>)>,
-    ) {
+    ) -> (usize, String, Vec<(usize, usize, char, Option<usize>)>) {
         let display_buf = byte_ranges_to_display(line, ranges, DEFAULT_TAB_WIDTH);
         let display_width = line_display_width(line, DEFAULT_TAB_WIDTH);
         let raw_underlines: Vec<(usize, usize, char, Option<usize>)> = display_buf
@@ -7730,10 +7719,8 @@ mod tests {
             // `assign` collapses identical `(start, ulen, char)` twins by
             // design (they render as one fused row), so compare against the
             // deduped input, not the raw count.
-            let mut distinct: Vec<(usize, usize, char)> = underlines
-                .iter()
-                .map(|&(c, w, ch, _)| (c, w, ch))
-                .collect();
+            let mut distinct: Vec<(usize, usize, char)> =
+                underlines.iter().map(|&(c, w, ch, _)| (c, w, ch)).collect();
             distinct.sort_unstable();
             distinct.dedup();
             let mut seen: SmallVec<[usize; 16]> = SmallVec::new();
@@ -7793,7 +7780,10 @@ mod tests {
         };
         let out = GlyphRenderer::with_opts(false, Some(&opts)).render_diagnostic(&diag);
         for want in ["three", "four", "five"] {
-            assert!(out.contains(want), "{want} (within 2 context) missing:\n{out}");
+            assert!(
+                out.contains(want),
+                "{want} (within 2 context) missing:\n{out}"
+            );
         }
         assert!(
             !out.contains("six"),
@@ -7879,10 +7869,7 @@ mod tests {
             .expect("middle source row missing");
         let connector = lines[bbb_row + 1..]
             .iter()
-            .find(|l| {
-                l.trim_end().ends_with('|')
-                    && !l.chars().any(|c| c.is_alphabetic())
-            })
+            .find(|l| l.trim_end().ends_with('|') && !l.chars().any(|c| c.is_alphabetic()))
             .expect("middle connector row missing");
         assert_eq!(
             connector.rfind('|').unwrap(),
@@ -7979,8 +7966,13 @@ mod tests {
             )
             .with_source(src);
         let out = GlyphRenderer::new(false).render_diagnostic(&diag);
-        assert!(out.contains("- \tset") == false, "raw tab in diff row:\n{out:?}");
-        let minus = out.lines().find(|l| l.contains("- ") && l.contains("set i"));
+        assert!(
+            out.contains("- \tset") == false,
+            "raw tab in diff row:\n{out:?}"
+        );
+        let minus = out
+            .lines()
+            .find(|l| l.contains("- ") && l.contains("set i"));
         let minus = minus.expect("diff - row missing");
         assert!(
             !minus.contains('\t'),
@@ -8009,10 +8001,7 @@ mod tests {
         // Absolute columns: main content starts at 5 (`│ 1 │ `), the diff
         // payload at 8 (gutter 5 + glyph 1 + `- ` 2); DEFAULT_TAB_WIDTH = 4.
         assert_eq!(m_ws, 3, "main row tab must stop-align from col 5:\n{out}");
-        assert_eq!(
-            d_ws, 4,
-            "diff row tab must stop-align from col 8:\n{out}"
-        );
+        assert_eq!(d_ws, 4, "diff row tab must stop-align from col 8:\n{out}");
     }
 
     /// F6: labels are not dropped when no source is attached — each label
@@ -8028,10 +8017,7 @@ mod tests {
             out.contains("previous definition here"),
             "label dropped with no source attached:\n{out}"
         );
-        assert!(
-            out.contains("at 10..14"),
-            "label locator missing:\n{out}"
-        );
+        assert!(out.contains("at 10..14"), "label locator missing:\n{out}");
         assert_eq!(
             out.matches("previous definition here").count(),
             1,
@@ -8099,7 +8085,9 @@ mod tests {
         // Every byte value, alone and in adversarial combinations, at every
         // start offset.
         let mut all: Vec<u8> = (0..=255).collect();
-        all.extend([b'a', b'A', b'_', b'"', b'\'', b'&', b'*', b'`', 0x7f, 0x80, 0xff]);
+        all.extend([
+            b'a', b'A', b'_', b'"', b'\'', b'&', b'*', b'`', 0x7f, 0x80, 0xff,
+        ]);
         for start in 0..all.len() {
             for end in start..=all.len() {
                 let window = &all[start..end];

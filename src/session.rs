@@ -230,9 +230,7 @@ impl<'a, 'input, 'src> CompilerSessionView<'input, 'src>
         self.resolution_map
     }
 
-    fn resolution_map_arc(
-        &self,
-    ) -> Option<std::sync::Arc<ResolutionMap<'input>>> {
+    fn resolution_map_arc(&self) -> Option<std::sync::Arc<ResolutionMap<'input>>> {
         Some(
             self.resolution_map_arc
                 .get_or_init(|| std::sync::Arc::new(self.resolution_map.clone()))

@@ -6639,10 +6639,7 @@ mod bench {
             STORM_DEPTH,
             storm / baseline
         );
-        println!(
-            "[bench_storm    ] gets={}",
-            (STORM_CHAINS - 1) as u64 * 5
-        );
+        println!("[bench_storm    ] gets={}", (STORM_CHAINS - 1) as u64 * 5);
     }
 
     // ── Wide fan-out publish probe ────────────────────────────────

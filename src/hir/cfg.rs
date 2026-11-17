@@ -3,8 +3,8 @@ use crate::ast::{Attribute, BinOp, Expr, Literal, UnaryOp};
 use crate::diagnostics::ErrCode;
 use crate::diagnostics::{DiagCtxt, Diagnostic};
 use crate::hir::target::Target;
-use crate::sat::puto::Solver;
 use crate::sat::SolveResult;
+use crate::sat::puto::Solver;
 use crate::symbol::Symbol;
 use std::collections::HashMap;
 

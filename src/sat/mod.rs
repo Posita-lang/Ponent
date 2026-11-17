@@ -358,7 +358,14 @@ pub fn solve_portfolio(num_vars: usize, clauses: &[Vec<i32>], limits: Limits) ->
                 // because each worker exclusively owns its solver; the only
                 // shared state is the cancel atomic.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_portfolio_worker(cfg, num_vars, clauses, limits_ref, Some(&cancel), Some(&learnt_share))
+                    run_portfolio_worker(
+                        cfg,
+                        num_vars,
+                        clauses,
+                        limits_ref,
+                        Some(&cancel),
+                        Some(&learnt_share),
+                    )
                 }))
                 .unwrap_or(SolveResult::Unknown);
                 let _ = tx.send(result);
@@ -833,7 +840,12 @@ pub(crate) mod tests {
         }
 
         if dpll_recursive(clauses, &mut assignment) {
-            Some(assignment[1..].iter().map(|&a| a.unwrap_or(false)).collect())
+            Some(
+                assignment[1..]
+                    .iter()
+                    .map(|&a| a.unwrap_or(false))
+                    .collect(),
+            )
         } else {
             None
         }
@@ -845,11 +857,7 @@ pub(crate) mod tests {
             c.iter().any(|&lit| {
                 let var = lit.unsigned_abs() as usize;
                 let val = model[var - 1];
-                if lit > 0 {
-                    val
-                } else {
-                    !val
-                }
+                if lit > 0 { val } else { !val }
             })
         })
     }
@@ -1049,7 +1057,10 @@ pub(crate) mod tests {
                 if k == 0 {
                     assert!(!sp, "n={n}: at-most-0 + at-least-one must be UNSAT");
                 } else {
-                    assert!(sp, "n={n} k={k}: puto says UNSAT for at-most-k + at-least-one");
+                    assert!(
+                        sp,
+                        "n={n} k={k}: puto says UNSAT for at-most-k + at-least-one"
+                    );
                 }
             }
         }
@@ -1120,8 +1131,16 @@ pub(crate) mod tests {
         let bodies: Vec<&str> = lines.collect();
         assert_eq!(bodies.len(), 2);
         for body in &bodies {
-            assert!(body.ends_with(" 0"), "clause line must end with 0: {body:?}");
-            for tok in body.trim_end().strip_suffix("0").unwrap().split_whitespace() {
+            assert!(
+                body.ends_with(" 0"),
+                "clause line must end with 0: {body:?}"
+            );
+            for tok in body
+                .trim_end()
+                .strip_suffix("0")
+                .unwrap()
+                .split_whitespace()
+            {
                 let n: i32 = tok.parse().expect("DIMACS literal must be an integer");
                 assert!((1..=2).contains(&n.abs()), "literal out of range: {n}");
             }

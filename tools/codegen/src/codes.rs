@@ -205,9 +205,7 @@ pub fn load_registry(dir: &Path) -> Registry {
                 let mut bad = false;
                 for item in items {
                     let Some(rel) = item.as_str() else {
-                        errors.push(format!(
-                            "{CTX}: [{code}] `related` entries must be strings"
-                        ));
+                        errors.push(format!("{CTX}: [{code}] `related` entries must be strings"));
                         bad = true;
                         break;
                     };
@@ -326,9 +324,7 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
         let _ = writeln!(rs, "        code: {:?},", e.code);
         let b = e.code.as_bytes();
         let prefix = if b[0] == b'E' { 0 } else { 1 };
-        let n = (b[1] - b'0') as usize * 100
-            + (b[2] - b'0') as usize * 10
-            + (b[3] - b'0') as usize;
+        let n = (b[1] - b'0') as usize * 100 + (b[2] - b'0') as usize * 10 + (b[3] - b'0') as usize;
         let _ = writeln!(rs, "        slot: {},", prefix * 1000 + n);
         let _ = writeln!(rs, "        title: {:?},", e.title);
         let _ = writeln!(
@@ -346,9 +342,10 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
         let _ = writeln!(rs, "],");
         let _ = write!(rs, "        siblings: &[");
         let mut first = true;
-        for other in entries.iter().filter(|other| {
-            other.category_variant == e.category_variant && other.code != e.code
-        }) {
+        for other in entries
+            .iter()
+            .filter(|other| other.category_variant == e.category_variant && other.code != e.code)
+        {
             if !first {
                 rs.push_str(", ");
             }
@@ -366,7 +363,7 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
     rs.push_str("];\n");
 
     // Generated "see also" data now lives inside each `CodeEntry.related`;
-// no separate lookup table is emitted.
+    // no separate lookup table is emitted.
 
     // Emit one `ErrCode` associated constant per entry so production call
     // sites write `ErrCode::E030` (a typo is a compile error) instead of

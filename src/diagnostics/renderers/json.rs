@@ -148,7 +148,10 @@ impl JsonRenderer {
             + diag.labels().len() * 128
             + diag.suggestions().len() * 96
             + diag.related_errors.len() * 96
-            + diag.call_chain.as_ref().map_or(0, |c| c.entries().len() * 80);
+            + diag
+                .call_chain
+                .as_ref()
+                .map_or(0, |c| c.entries().len() * 80);
         out.reserve(cap);
         let mut obj = JsonContainer::object(out, &ind0, &ind, self.pretty);
 
@@ -160,9 +163,9 @@ impl JsonRenderer {
         // file must not be mapped through this index.
         let anchor_file = diag.spans.first().map(|s| s.file);
         // Every index consumer (primary span, additional spans, related errors,
-// call chain) first requires an anchor file; labels/suggestions/children
-// never read line/col.  The old four extra disjuncts only forced an O(n)
-// line-index build for diagnostics that could not consume it.
+        // call chain) first requires an anchor file; labels/suggestions/children
+        // never read line/col.  The old four extra disjuncts only forced an O(n)
+        // line-index build for diagnostics that could not consume it.
         let needs_index = anchor_file.is_some();
         let idx = if needs_index {
             diag.source().map(|s| cx.line_index(s))
@@ -274,8 +277,7 @@ impl JsonRenderer {
                 {
                     // [1]17: clamp rather than omit for an EOF-crossing span;
                     // the primary path does the same.
-                    let (line, col) =
-                        idx.linecol_display(sp.start_as_usize().min(source.len()));
+                    let (line, col) = idx.linecol_display(sp.start_as_usize().min(source.len()));
                     flat_key(o, "line");
                     super::fmt::push_uint(o, (line + 1) as u64);
                     flat_key(o, "column");
@@ -413,18 +415,17 @@ impl JsonRenderer {
                         o.push('{');
                         flat_key0(o, "text");
                         Self::push_json_str(o, part.content.as_ref());
-                        flat_key(
-                            o,
-                            "highlighted",
+                        flat_key(o, "highlighted");
+                        o.push_str(
+                            if matches!(
+                                part.style,
+                                crate::diagnostics::StringPartStyle::Highlighted
+                            ) {
+                                "true"
+                            } else {
+                                "false"
+                            },
                         );
-                        o.push_str(if matches!(
-                            part.style,
-                            crate::diagnostics::StringPartStyle::Highlighted
-                        ) {
-                            "true"
-                        } else {
-                            "false"
-                        });
                         o.push('}');
                     }
                     o.push(']');
@@ -473,10 +474,7 @@ impl JsonRenderer {
                         flat_key(o, "message");
                         Self::push_json_str(o, &lbl.message);
                         flat_key(o, "kind");
-                        Self::push_json_str(
-                            o,
-                            crate::diagnostics::annotation_kind_name(lbl.kind),
-                        );
+                        Self::push_json_str(o, crate::diagnostics::annotation_kind_name(lbl.kind));
                         o.push('}');
                     }
                     o.push(']');
@@ -1019,15 +1017,17 @@ mod tests {
                     let input = format!("{}{ctrl}{structural}{}", "a".repeat(pad), "b".repeat(8));
                     let mut escaped = String::new();
                     JsonRenderer::push_json_str(&mut escaped, &input);
-                    let v: serde_json::Value = serde_json::from_str(&escaped)
-                        .unwrap_or_else(|e| panic!("invalid JSON ({ctrl:?} {structural:?} {pad}): {e}"));
+                    let v: serde_json::Value = serde_json::from_str(&escaped).unwrap_or_else(|e| {
+                        panic!("invalid JSON ({ctrl:?} {structural:?} {pad}): {e}")
+                    });
                     assert_eq!(v, serde_json::Value::String(input));
 
                     let input = format!("{}{structural}{ctrl}{}", "a".repeat(pad), "b".repeat(8));
                     let mut escaped = String::new();
                     JsonRenderer::push_json_str(&mut escaped, &input);
-                    let v: serde_json::Value = serde_json::from_str(&escaped)
-                        .unwrap_or_else(|e| panic!("invalid JSON ({structural:?} {ctrl:?} {pad}): {e}"));
+                    let v: serde_json::Value = serde_json::from_str(&escaped).unwrap_or_else(|e| {
+                        panic!("invalid JSON ({structural:?} {ctrl:?} {pad}): {e}")
+                    });
                     assert_eq!(v, serde_json::Value::String(input));
                 }
             }

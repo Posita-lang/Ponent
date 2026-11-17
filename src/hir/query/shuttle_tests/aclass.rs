@@ -101,8 +101,14 @@ fn d5_eval_always_concurrent_same_key_no_inflight_coalescing() {
         let b = shuttle::thread::spawn(move || {
             system.get::<D5C>(DKey(2), provider).map(|v| v.semantic)
         });
-        let va = a.join().expect("d5c requester A must not panic").expect("d5c get A ok");
-        let vb = b.join().expect("d5c requester B must not panic").expect("d5c get B ok");
+        let va = a
+            .join()
+            .expect("d5c requester A must not panic")
+            .expect("d5c get A ok");
+        let vb = b
+            .join()
+            .expect("d5c requester B must not panic")
+            .expect("d5c get B ok");
         assert_eq!(
             RUNS.load(Ordering::SeqCst),
             2,

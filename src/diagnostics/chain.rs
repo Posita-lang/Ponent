@@ -5,8 +5,8 @@ use super::glyph::visible_width;
 use super::renderers::fmt::{dec_digits, push_uint};
 
 use crate::ast::{FileId, Span};
-use crate::smallvec::SmallVec;
 use crate::diagnostics::i18n::{cached_label_static, fluent};
+use crate::smallvec::SmallVec;
 
 use super::LineIndex;
 use super::term::path_to_file_url;
@@ -81,7 +81,12 @@ impl<'a> ChainSuffix<'a> {
                 out.push(':');
                 push_uint(out, (*col).saturating_add(1) as u64);
             }
-            ChainSuffix::FileLineCol { file, line, col, url } => {
+            ChainSuffix::FileLineCol {
+                file,
+                line,
+                col,
+                url,
+            } => {
                 if let Some(url) = url {
                     // `render_into` already rejected URLs containing ESC or
                     // the ST terminator (an unconditional check, see C1);
@@ -194,20 +199,12 @@ impl ChainEntryKind {
         }
     }
 
-    /// Cached display width of [`Self::as_static_str`], computed once per
-    /// `(kind, lang)` alongside the label table.
+    /// Display width of [`Self::as_static_str`] in the **current** language.
+    /// Computing it at the suffix construction site (rather than caching a
+    /// lang-unaware `[usize; 4]`) makes `width` and `as_static_str` observe the
+    /// same language, so `cols()` cannot under/over-count after `Lang::set`.
     pub fn label_width(&self) -> usize {
-        static WIDTHS: std::sync::OnceLock<[usize; 4]> = std::sync::OnceLock::new();
-        let widths = WIDTHS.get_or_init(|| {
-            [
-                visible_width(ChainEntryKind::Call.as_static_str()),
-                visible_width(ChainEntryKind::Inlined.as_static_str()),
-                visible_width(ChainEntryKind::Reference.as_static_str()),
-                visible_width(ChainEntryKind::Defines.as_static_str()),
-            ]
-        });
-        let idx = self.index();
-        widths[idx]
+        visible_width(self.as_static_str())
     }
 }
 
@@ -290,9 +287,7 @@ impl<'src> CallChain<'src> {
     /// could overflow the stack on a hostile deep chain before the render
     /// cap ever applied.
     fn scan(&self) -> ChainFacts {
-        *self
-            .facts
-            .get_or_init(|| self.compute_facts())
+        *self.facts.get_or_init(|| self.compute_facts())
     }
 
     fn compute_facts(&self) -> ChainFacts {
@@ -397,8 +392,9 @@ impl<'src> CallChain<'src> {
         // entry is a deliberate over-estimate to avoid reallocation on the
         // coloured path.
         let facts = self.scan();
-        let mut out =
-            String::with_capacity(64 + facts.message_bytes + facts.indent_bytes + facts.entry_count * 64);
+        let mut out = String::with_capacity(
+            64 + facts.message_bytes + facts.indent_bytes + facts.entry_count * 64,
+        );
         self.render_into_with_facts(
             use_color, source, file_name, idx, max_width, tab_width, None, None, facts, &mut out,
         );
@@ -413,20 +409,14 @@ impl<'src> CallChain<'src> {
     ///
     /// # Same-file assumption
     ///
-    /// This renderer threads a single anchor (`file_name`, `source`, and the
-    /// optional [`LineIndex`]) through the whole chain and computes the
-    /// `(line, col)` of **every** entry span against that one source buffer.
-    /// A chain is emitted by the checker for one diagnostic in one file, so
-    /// every entry span is an offset into that same file in practice; an
-    /// entry whose span belonged to a *different* file would be located
-    /// against the anchor's line index and render bogus coordinates.
-    /// Foreign-file entries are not filtered out because the anchor's file
-    /// identity arrives here only as `file_name: &str` — the [`Span`]s
-    /// carry [`FileId`]s, but no `FileId` for the anchor is threaded in, so
-    /// there is nothing to compare against without an API change.  Callers
-    /// must only hand chains whose spans belong to `source`'s file; an
-    /// entry without a span falls back to its [`ChainEntryKind`] label and
-    /// is unaffected.
+    /// A chain is emitted for one diagnostic in one file, so every entry span is
+    /// normally an offset into that same file.  `anchor = Some(file)` makes
+    /// `render_entries` filter an entry whose `span.file` differs, falling
+    /// back to the kind label instead of rendering bogus coordinates against
+    /// the anchor's line index.  `anchor = None` retains the legacy
+    /// same-file assumption; `render`/`render_with_index` pass `None`.
+    /// An entry without a span always falls back to its [`ChainEntryKind`]
+    /// label and is unaffected.
     pub(crate) fn render_into(
         &self,
         use_color: bool,
@@ -496,9 +486,9 @@ impl<'src> CallChain<'src> {
         let file_url: Option<std::sync::Arc<str>> = if hyperlink_enabled {
             let candidate = match cx {
                 Some(cx) => cx.file_url(file_name),
-                None => std::sync::Arc::from(
-                    path_to_file_url(std::path::Path::new(file_name)).as_str(),
-                ),
+                None => {
+                    std::sync::Arc::from(path_to_file_url(std::path::Path::new(file_name)).as_str())
+                }
             };
             // C1: enforce the OSC 8 invariant unconditionally (not with a
             // debug_assert that disappears in release).  ESC and the ST
@@ -671,9 +661,7 @@ impl<'src> CallChain<'src> {
                     Self::expand_message_tabs(sanitized.as_ref(), tab_width, indent_cols)
                 };
             let suffix = match (source, entry.span, idx) {
-                (Some(_), Some(span), Some(idx))
-                    if anchor.map_or(true, |a| span.file == a) =>
-                {
+                (Some(_), Some(span), Some(idx)) if anchor.map_or(true, |a| span.file == a) => {
                     // `render_into` guarantees `source.is_some() => idx.is_some()`,
                     // so this arm covers every located entry; a caller that
                     // bypasses `render_into` with a source but no index falls
@@ -708,14 +696,12 @@ impl<'src> CallChain<'src> {
             // lines; tabs are measured from the real indent column.
             let fast_width = match class {
                 super::ascii::AsciiClass::Printable => Some(message.len()),
-                super::ascii::AsciiClass::PrintableOrTab => {
-                    Self::ascii_tabbed_width_capped(
-                        message.as_ref(),
-                        indent_cols,
-                        tab_width,
-                        max_width.saturating_sub(indent_cols.saturating_add(suffix_cols)),
-                    )
-                }
+                super::ascii::AsciiClass::PrintableOrTab => Self::ascii_tabbed_width_capped(
+                    message.as_ref(),
+                    indent_cols,
+                    tab_width,
+                    max_width.saturating_sub(indent_cols.saturating_add(suffix_cols)),
+                ),
                 super::ascii::AsciiClass::Other => None,
             };
             if fast_width.is_some_and(|width| {
@@ -1061,8 +1047,8 @@ mod tests {
         // measure, and a multi-character word would be split one grapheme per
         // line (correct, but it makes the line-count cap assertion useless).
         for _ in 0..70 {
-            let entry = ChainEntry::new(ChainEntryKind::Call, Some(span), "x")
-                .with_children(vec![inner]);
+            let entry =
+                ChainEntry::new(ChainEntryKind::Call, Some(span), "x").with_children(vec![inner]);
             inner = CallChain {
                 entries: vec![entry],
                 ..CallChain::new()
@@ -1074,7 +1060,10 @@ mod tests {
             1,
             "exactly one cap marker expected: {out}"
         );
-        assert!(out.lines().count() <= MAX_CHAIN_DEPTH + 4, "cap not applied");
+        assert!(
+            out.lines().count() <= MAX_CHAIN_DEPTH + 4,
+            "cap not applied"
+        );
         // The counting traversal must not under-reserve past the cap either:
         // `flattened_entry_count` stops at the same depth as the renderer.
         assert!(inner.flattened_entry_count() >= MAX_CHAIN_DEPTH);
@@ -1094,16 +1083,20 @@ mod tests {
             let mut chain = leaf();
             for _ in 0..=MAX_CHAIN_DEPTH {
                 chain = CallChain {
-                    entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")
-                        .with_children(vec![chain])],
+                    entries: vec![
+                        ChainEntry::new(ChainEntryKind::Call, Some(span), "x")
+                            .with_children(vec![chain]),
+                    ],
                     ..CallChain::new()
                 };
             }
             chain
         };
         let branch = CallChain {
-            entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "root")
-                .with_children(vec![deep(), deep()])],
+            entries: vec![
+                ChainEntry::new(ChainEntryKind::Call, Some(span), "root")
+                    .with_children(vec![deep(), deep()]),
+            ],
             ..CallChain::new()
         };
         let out = branch.render(false, Some("def main() {}"), "f.ps");
@@ -1194,11 +1187,7 @@ mod tests {
                     let s = ChainSuffix::LineCol { line, col };
                     let mut out = String::new();
                     s.write_into(&mut out);
-                    assert_eq!(
-                        visible_width(&out),
-                        s.cols(0),
-                        "line-col suffix {out:?}"
-                    );
+                    assert_eq!(visible_width(&out), s.cols(0), "line-col suffix {out:?}");
                 }
             }
         }

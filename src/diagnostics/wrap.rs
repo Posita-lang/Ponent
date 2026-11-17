@@ -67,7 +67,7 @@
 //! [`explain_error_code`]: crate::diagnostics::explain_error_code
 
 use super::ascii::is_printable_ascii;
-use super::glyph::{grapheme_width_cached, WidthCache, WIDTH_CACHE};
+use super::glyph::{WIDTH_CACHE, WidthCache, grapheme_width_cached};
 use crate::smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::ops::Range;
@@ -241,10 +241,7 @@ pub(crate) fn wrap_optimal<'a>(
     // representable.  The fallback is the same always-valid line preserving
     // layout the DP uses on a backtrack failure.
     if text.len() >= u32::MAX as usize / N_FITNESS {
-        return text
-            .split_terminator('\n')
-            .map(Cow::Borrowed)
-            .collect();
+        return text.split_terminator('\n').map(Cow::Borrowed).collect();
     }
     // The DP scratch lives in a per-thread `thread_local!` (mirroring
     // `WRAP_TABLES`): a diagnostic wraps a *dozen* labels/help/child
@@ -270,8 +267,8 @@ pub(crate) fn wrap_optimal<'a>(
     // long message pays the full-text hash on every miss and, on a miss, an
     // `Arc<str>` copy of the whole input; skipping it keeps the memo bounded
     // by `MEMO_MAX_TEXT * 256` bytes (128 KiB) instead of unbounded-by-bytes.
-    let memo_key = (text.len() <= MEMO_MAX_TEXT)
-        .then(|| (wrap_text_hash(text), max_width, tab_width));
+    let memo_key =
+        (text.len() <= MEMO_MAX_TEXT).then(|| (wrap_text_hash(text), max_width, tab_width));
     if let Some(key) = memo_key
         && let Some(hit) = wrap_memo_get(key, text)
     {
@@ -312,8 +309,7 @@ fn wrap_text_hash(s: &str) -> u64 {
 }
 
 /// Process-wide memo used while `render_parallel` is active.
-static SHARED_WRAP: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static SHARED_WRAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// RAII scope that switches wrap caches to shared mode for a parallel batch.
 pub(crate) struct SharedWrapGuard;
@@ -333,8 +329,10 @@ fn wrap_shared() -> bool {
     SHARED_WRAP.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
-type WrapMemoMap =
-    rustc_hash::FxHashMap<(u64, usize, usize), Vec<(std::sync::Arc<str>, SmallVec<[Range<usize>; 4]>)>>;
+type WrapMemoMap = rustc_hash::FxHashMap<
+    (u64, usize, usize),
+    Vec<(std::sync::Arc<str>, SmallVec<[Range<usize>; 4]>)>,
+>;
 
 thread_local! {
     static WRAP_MEMO: std::cell::RefCell<WrapMemoMap> =
@@ -570,7 +568,14 @@ fn collect_words(
 ) -> SmallVec<[Word; 16]> {
     let mut words: SmallVec<[Word; 16]> = SmallVec::new();
     let mut breaks: SmallVec<[usize; 16]> = SmallVec::new();
-    collect_words_into(text, max_width, tab_width, known_ascii, &mut words, &mut breaks);
+    collect_words_into(
+        text,
+        max_width,
+        tab_width,
+        known_ascii,
+        &mut words,
+        &mut breaks,
+    );
     words
 }
 
@@ -1123,10 +1128,7 @@ thread_local! {
 static SHARED_TABLES: std::sync::OnceLock<std::sync::RwLock<WrapTableSlot>> =
     std::sync::OnceLock::new();
 
-fn table_from_slot(
-    slot: &mut WrapTableSlot,
-    max_width: usize,
-) -> std::sync::Arc<WrapTables> {
+fn table_from_slot(slot: &mut WrapTableSlot, max_width: usize) -> std::sync::Arc<WrapTables> {
     // LRU-by-last-use: move a hit to the back so the widths that recur
     // within one render are the ones that survive eviction.
     if let Some(pos) = slot.iter().position(|t| t.max_width == max_width) {
@@ -1165,9 +1167,7 @@ fn wrap_tables(max_width: usize) -> Option<std::sync::Arc<WrapTables>> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Some(table_from_slot(&mut slot, max_width))
     } else {
-        Some(WRAP_TABLES.with(|cell| {
-            table_from_slot(&mut cell.borrow_mut(), max_width)
-        }))
+        Some(WRAP_TABLES.with(|cell| table_from_slot(&mut cell.borrow_mut(), max_width)))
     }
 }
 
@@ -1237,10 +1237,7 @@ fn wrap_dp(
             .map(|w| w.start as usize..w.end as usize)
             .collect()
     };
-    let Some(n_states) = n
-        .checked_add(1)
-        .and_then(|v| v.checked_mul(N_FITNESS))
-    else {
+    let Some(n_states) = n.checked_add(1).and_then(|v| v.checked_mul(N_FITNESS)) else {
         return per_word();
     };
     if n_states - 1 > u32::MAX as usize {
@@ -1371,7 +1368,11 @@ fn wrap_dp(
         {
             let (class, base) = if use_table && lw_lo <= max_width {
                 let c = class_tab[lw_lo] as usize;
-                let b = if is_last_line { 0.0 } else { badness_tab[lw_lo] };
+                let b = if is_last_line {
+                    0.0
+                } else {
+                    badness_tab[lw_lo]
+                };
                 (c, b)
             } else {
                 (
@@ -1396,7 +1397,10 @@ fn wrap_dp(
             // `lw`; the first candidate — which *can* be over-wide — is
             // handled separately before this loop).
             let lw = base_j - pws[i];
-            debug_assert!(lw <= max_width, "i_lo window must guarantee legal-width lines");
+            debug_assert!(
+                lw <= max_width,
+                "i_lo window must guarantee legal-width lines"
+            );
             let (class, base) = if use_table {
                 let c = class_tab[lw] as usize;
                 let b = if is_last_line { 0.0 } else { badness_tab[lw] };
@@ -1443,102 +1447,102 @@ fn wrap_dp(
                     best_src[j][class] = pi as u32;
                 }
             } else {
-            for class in 0..N_FITNESS {
-                let mut bc = f64::INFINITY;
-                let mut bp = 0u32;
-                for pc in 0..N_FITNESS {
-                    let pi = j0 + pc;
-                    let cost = dp[pi] + JUMP[class][pc];
-                    if cost < bc {
-                        bc = cost;
-                        bp = pi as u32;
+                for class in 0..N_FITNESS {
+                    let mut bc = f64::INFINITY;
+                    let mut bp = 0u32;
+                    for pc in 0..N_FITNESS {
+                        let pi = j0 + pc;
+                        let cost = dp[pi] + JUMP[class][pc];
+                        if cost < bc {
+                            bc = cost;
+                            bp = pi as u32;
+                        }
                     }
+                    best_cost[j][class] = bc;
+                    best_src[j][class] = bp;
                 }
-                best_cost[j][class] = bc;
-                best_src[j][class] = bp;
-            }
             }
         }
-            //
-            // The argument for pruning only bounds the *jump* term:
-            // `JUMP[class][pc]` is zero for `|class - pc| ≤ 1` and
-            // ≥ FITNESS_STEP_DEMERIT otherwise. But the minimised quantity
-            // is `dp[j][pc] + JUMP[class][pc]`, and `dp[j][pc]` is not
-            // comparable across classes. Witness with `class = 0` (Tight)
-            // and FITNESS_STEP_DEMERIT = 1/16:
-            //
-            //     pc   class      dp[j][pc]   JUMP[0][pc]    total
-            //     0    Tight      0.20        0.0           0.20
-            //     1    Normal     0.18        0.0           0.18
-            //     2    Loose      0.05        0.0625        0.1125  ← min
-            //     3    VeryLoose  0.03        0.125         0.155
-            //
-            // `pc = 2` is two classes away from `class = 0` and pays a
-            // non-zero jump, yet wins because `dp[j][2]` is far cheaper
-            // than `dp[j][0]` or `dp[j][1]`. An adjacent-only band discards
-            // the true optimum.
-            //
-            // Reachability of the witness: `dp[j][0]` (last line Tight)
-            // can carry a large accumulated cost if reaching Tight required
-            // jumping out of a Loose/VeryLoose predecessor earlier, while
-            // `dp[j][2]` (last line Loose) can be cheaper if reached
-            // smoothly. Cumulative cost is unbounded in `n`, so the spread
-            // `dp[j][0] - dp[j][2]` can exceed `2·FITNESS_STEP_DEMERIT =
-            // 0.125` — no invariant bounds the cross-class gap. The only
-            // universal lower bound is `dp[j][class] ≥ intrinsic(last line
-            // of that class)`, and it goes the wrong way (Tight has the
-            // smallest intrinsic cost), so it cannot rescue pruning.
-            //
-            // The `adjacent_lines_resist_a_jagged_edge` test pins this
-            // tradeoff: the DP picks a slightly worse-intrinsic layout
-            // because the smoother jump sequence wins, and that decision
-            // depends on evaluating cross-class predecessors.
-            //
-            // Cost of the 4×4: ~16 adds + 12 compares per `j` (≈28 ops),
-            // dominated by the O(n·k) `(i, j)` transition for realistic `n`.
-            // (Monge/SMAWK note, since the structure is real and the
-            // pruning temptation above sometimes mutates into a SMAWK
-            // suggestion: for a fixed class `c` the `(i, j)` transition
-            // matrix is `M[i][j] = best_cost[i][c] + g(base_j - pws[i])`
-            // with `g` convex. Per-row offsets *preserve* Monge —
-            // `A[i] + A[i+1]` cancels exactly in the Monge inequality — so
-            // `best_cost[i][c]` being an arbitrary function of `i` does not
-            // break the structure, and `g`'s convexity (both branches, with
-            // `g'(M-) = g'(M+) = 0`) makes `C` Monge. SMAWK therefore
-            // applies in principle, but the matrix is revealed online —
-            // row `i` is only evaluable once `dp[i]` is finalised — so the
-            // applicable variant is Larmore-Schieber at O(n·α(n)), not
-            // classic offline SMAWK. The blocker is the constant factor:
-            // Larmore-Schieber's per-comparison cost is ~30-50 ops versus
-            // the current monotone-`i_lo` window's ~10-15, and for the
-            // `n ≈ 5-50`, `k ≈ 5-20` of diagnostic wrapping the asymptotic
-            // win is eaten by constants. The cheap middle ground — a
-            // monotone argmin pointer `max(i_lo, i_star_{j-1})` — is valid
-            // (column argmin of a Monge matrix is monotone in `j`, and the
-            // proof uses only the Monge condition, so the per-row offset
-            // does not break it) but gains nothing in practice: on a
-            // non-last line the optimum is the most-filled legal line,
-            // `i*(j) ≈ i_lo(j)`, so the pointer sits at `i_lo` and skips
-            // nothing. Larmore-Schieber does win decisively once
-            // `n ≳ 500` and `k ≳ 15` — roughly a 3-5× speedup — which
-            // the current `perf_wrap_optimal` long-prose case (~130
-            // words) does not yet reach. Realistic triggers:
-            // `explain_error_code` wrapping a multi-KB explanation body,
-            // a diagnostic whose message is a long prose paragraph of
-            // short 2-3-char words (large `n` and large `k` at once), or
-            // a future caller that wraps a whole file's contents.)
-            //
-            // Decision (recorded so this does not get "optimised" back):
-            // keep the naive monotone window.  Crossover is
-            // `n* ≈ 2·c_LS·α(n)/c_scan` ≈ 10-15 for the mid constants
-            // (c_scan 10-15, c_LS 30-50, α≈1-2), and the pointer pins to
-            // `i_lo` in this workload, so LS would pay its bookkeeping and
-            // prune nothing.  Revisit only with a measured `n ≳ 10²-10³`
-            // unclosed-window workload; the block-matrix LS variant is
-            // additionally invalid for a general jump matrix `J` (the
-            // lexicographic block order is Monge only for an additively
-            // separable `J`), so a future attempt must keep the 4 classes
-            // as 4 independent per-class recurrences.
+        //
+        // The argument for pruning only bounds the *jump* term:
+        // `JUMP[class][pc]` is zero for `|class - pc| ≤ 1` and
+        // ≥ FITNESS_STEP_DEMERIT otherwise. But the minimised quantity
+        // is `dp[j][pc] + JUMP[class][pc]`, and `dp[j][pc]` is not
+        // comparable across classes. Witness with `class = 0` (Tight)
+        // and FITNESS_STEP_DEMERIT = 1/16:
+        //
+        //     pc   class      dp[j][pc]   JUMP[0][pc]    total
+        //     0    Tight      0.20        0.0           0.20
+        //     1    Normal     0.18        0.0           0.18
+        //     2    Loose      0.05        0.0625        0.1125  ← min
+        //     3    VeryLoose  0.03        0.125         0.155
+        //
+        // `pc = 2` is two classes away from `class = 0` and pays a
+        // non-zero jump, yet wins because `dp[j][2]` is far cheaper
+        // than `dp[j][0]` or `dp[j][1]`. An adjacent-only band discards
+        // the true optimum.
+        //
+        // Reachability of the witness: `dp[j][0]` (last line Tight)
+        // can carry a large accumulated cost if reaching Tight required
+        // jumping out of a Loose/VeryLoose predecessor earlier, while
+        // `dp[j][2]` (last line Loose) can be cheaper if reached
+        // smoothly. Cumulative cost is unbounded in `n`, so the spread
+        // `dp[j][0] - dp[j][2]` can exceed `2·FITNESS_STEP_DEMERIT =
+        // 0.125` — no invariant bounds the cross-class gap. The only
+        // universal lower bound is `dp[j][class] ≥ intrinsic(last line
+        // of that class)`, and it goes the wrong way (Tight has the
+        // smallest intrinsic cost), so it cannot rescue pruning.
+        //
+        // The `adjacent_lines_resist_a_jagged_edge` test pins this
+        // tradeoff: the DP picks a slightly worse-intrinsic layout
+        // because the smoother jump sequence wins, and that decision
+        // depends on evaluating cross-class predecessors.
+        //
+        // Cost of the 4×4: ~16 adds + 12 compares per `j` (≈28 ops),
+        // dominated by the O(n·k) `(i, j)` transition for realistic `n`.
+        // (Monge/SMAWK note, since the structure is real and the
+        // pruning temptation above sometimes mutates into a SMAWK
+        // suggestion: for a fixed class `c` the `(i, j)` transition
+        // matrix is `M[i][j] = best_cost[i][c] + g(base_j - pws[i])`
+        // with `g` convex. Per-row offsets *preserve* Monge —
+        // `A[i] + A[i+1]` cancels exactly in the Monge inequality — so
+        // `best_cost[i][c]` being an arbitrary function of `i` does not
+        // break the structure, and `g`'s convexity (both branches, with
+        // `g'(M-) = g'(M+) = 0`) makes `C` Monge. SMAWK therefore
+        // applies in principle, but the matrix is revealed online —
+        // row `i` is only evaluable once `dp[i]` is finalised — so the
+        // applicable variant is Larmore-Schieber at O(n·α(n)), not
+        // classic offline SMAWK. The blocker is the constant factor:
+        // Larmore-Schieber's per-comparison cost is ~30-50 ops versus
+        // the current monotone-`i_lo` window's ~10-15, and for the
+        // `n ≈ 5-50`, `k ≈ 5-20` of diagnostic wrapping the asymptotic
+        // win is eaten by constants. The cheap middle ground — a
+        // monotone argmin pointer `max(i_lo, i_star_{j-1})` — is valid
+        // (column argmin of a Monge matrix is monotone in `j`, and the
+        // proof uses only the Monge condition, so the per-row offset
+        // does not break it) but gains nothing in practice: on a
+        // non-last line the optimum is the most-filled legal line,
+        // `i*(j) ≈ i_lo(j)`, so the pointer sits at `i_lo` and skips
+        // nothing. Larmore-Schieber does win decisively once
+        // `n ≳ 500` and `k ≳ 15` — roughly a 3-5× speedup — which
+        // the current `perf_wrap_optimal` long-prose case (~130
+        // words) does not yet reach. Realistic triggers:
+        // `explain_error_code` wrapping a multi-KB explanation body,
+        // a diagnostic whose message is a long prose paragraph of
+        // short 2-3-char words (large `n` and large `k` at once), or
+        // a future caller that wraps a whole file's contents.)
+        //
+        // Decision (recorded so this does not get "optimised" back):
+        // keep the naive monotone window.  Crossover is
+        // `n* ≈ 2·c_LS·α(n)/c_scan` ≈ 10-15 for the mid constants
+        // (c_scan 10-15, c_LS 30-50, α≈1-2), and the pointer pins to
+        // `i_lo` in this workload, so LS would pay its bookkeeping and
+        // prune nothing.  Revisit only with a measured `n ≳ 10²-10³`
+        // unclosed-window workload; the block-matrix LS variant is
+        // additionally invalid for a general jump matrix `J` (the
+        // lexicographic block order is Monge only for an additively
+        // separable `J`), so a future attempt must keep the 4 classes
+        // as 4 independent per-class recurrences.
     }
 
     // Cheapest terminal state, then walk the `prev` links back to the
@@ -1614,7 +1618,12 @@ fn badness(prev_class: Option<u8>, line_width: usize, max_width: usize, is_last_
 /// the slack ratio becomes a multiply, so both the table build and the
 /// over-`MAX_TABLE_WIDTH` fallback are divide-free.
 #[inline]
-fn intrinsic_badness(line_width: usize, max_width: usize, inv_measure: f64, is_last_line: bool) -> f64 {
+fn intrinsic_badness(
+    line_width: usize,
+    max_width: usize,
+    inv_measure: f64,
+    is_last_line: bool,
+) -> f64 {
     if line_width <= max_width {
         if is_last_line {
             0.0
@@ -1875,7 +1884,12 @@ mod tests {
                             continue;
                         }
                         let mut scratch = WrapScratch::new();
-                        for r in wrap_dp(&words, max_width, wrap_tables(max_width).as_deref(), &mut scratch) {
+                        for r in wrap_dp(
+                            &words,
+                            max_width,
+                            wrap_tables(max_width).as_deref(),
+                            &mut scratch,
+                        ) {
                             want.push(&para[r]);
                         }
                     }

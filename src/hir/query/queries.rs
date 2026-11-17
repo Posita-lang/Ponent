@@ -46,13 +46,13 @@ use super::{
     Arena, BodyWorkerSlot, ContentClass, DefaultCache, Owned, Query, QueryDescriptor,
     QueryProvider, Scheduler, StableHash, Stored, TaggedQueryKey,
 };
-use as_variant::as_variant;
 use crate::ast::FileId;
 use crate::ast::{Item, Stmt};
 use crate::hir::polonius::{count_return_refs_ast, extract_borrow_signature, signature_facts};
 use crate::hir::symbol::TypeKind;
 use crate::hir::types::{DefId, SignatureFacts, TypeId};
 use crate::symbol::Symbol;
+use as_variant::as_variant;
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
@@ -433,8 +433,7 @@ pub struct FnBodyCheck<'input> {
     /// `BTreeMap`, not `HashMap`: iteration is deterministic by construction,
     /// so `stable_hash` needs no per-call sort and no future reader can
     /// accidentally iterate it in an unspecified order.
-    pub function_finally:
-        std::collections::BTreeMap<Symbol, Vec<crate::hir::hir::HirStmt<'input>>>,
+    pub function_finally: std::collections::BTreeMap<Symbol, Vec<crate::hir::hir::HirStmt<'input>>>,
     pub pending_gadt: Vec<crate::hir::checker::PendingGadtConstruct>,
     pub residual_obligations: Vec<(
         crate::ast::Span,
@@ -1189,7 +1188,11 @@ fn hash_ast_stmt(h: &mut FxHasher, s: &crate::ast::Stmt<'_>) {
             hash_opt(h, invariant, hash_ast_expr);
             hash_opt(h, decreases, hash_ast_expr);
         }
-        S::Loop { label, body, span: _ } => {
+        S::Loop {
+            label,
+            body,
+            span: _,
+        } => {
             h.write_u8(8);
             hash_opt(h, label, |h, l| l.hash(h));
             hash_ast_stmts(h, body);
@@ -1362,7 +1365,11 @@ fn hash_ast_expr(h: &mut FxHasher, e: &crate::ast::Expr<'_>) {
             hash_opt(h, end, |h, e| hash_ast_expr(h, e));
             h.write_u8(*inclusive as u8);
         }
-        E::StructLit { path, fields, span: _ } => {
+        E::StructLit {
+            path,
+            fields,
+            span: _,
+        } => {
             h.write_u8(11);
             hash_seq(h, path, |h, s| s.hash(h));
             hash_seq(h, fields, |h, (name, e)| {
@@ -2591,40 +2598,40 @@ impl<'input> StableHash for FnBodyCheck<'input> {
             let mut h = FxHasher::default();
             hash_stmt(&mut h, &self.hir);
             hash_seq(&mut h, &self.runtime_checks, |h, (name, checks)| {
-            name.hash(&mut *h);
-            hash_stmts(&mut *h, checks);
-        });
-        // `function_finally` is a `BTreeMap`, so iteration order is
-        // deterministic by construction — no sort, no SmallVec.
-        h.write_usize(self.function_finally.len());
-        for (k, checks) in &self.function_finally {
-            k.hash(&mut h);
-            hash_stmts(&mut h, checks);
-        }
-        hash_seq(&mut h, &self.pending_gadt, |h, g| {
-            // Struct-pattern destructuring: a new field on
-            // `PendingGadtConstruct` becomes a compile error here rather
-            // than a silently unhashed semantic input.  `span` is trivia.
-            let crate::hir::checker::PendingGadtConstruct {
-                enum_ty,
-                variant,
-                span: _,
-            } = g;
-            enum_ty.hash(&mut *h);
-            variant.hash(&mut *h);
-        });
-        hash_seq(&mut h, &self.residual_obligations, |h, (_, pred)| {
-            pred.hash(&mut *h)
-        });
-        hash_seq(&mut h, &self.trait_obligations, |h, (_, pred)| {
-            pred.hash(&mut *h)
-        });
-        hash_seq(&mut h, &self.diagnostics, |h, d| {
-            h.write_u8(d.level() as u8);
-            d.message_unchecked().hash(&mut *h);
-            hash_opt(&mut *h, &d.code().map(|c| c.code()), |h, c| c.hash(h));
-        });
-        h.finish()
+                name.hash(&mut *h);
+                hash_stmts(&mut *h, checks);
+            });
+            // `function_finally` is a `BTreeMap`, so iteration order is
+            // deterministic by construction — no sort, no SmallVec.
+            h.write_usize(self.function_finally.len());
+            for (k, checks) in &self.function_finally {
+                k.hash(&mut h);
+                hash_stmts(&mut h, checks);
+            }
+            hash_seq(&mut h, &self.pending_gadt, |h, g| {
+                // Struct-pattern destructuring: a new field on
+                // `PendingGadtConstruct` becomes a compile error here rather
+                // than a silently unhashed semantic input.  `span` is trivia.
+                let crate::hir::checker::PendingGadtConstruct {
+                    enum_ty,
+                    variant,
+                    span: _,
+                } = g;
+                enum_ty.hash(&mut *h);
+                variant.hash(&mut *h);
+            });
+            hash_seq(&mut h, &self.residual_obligations, |h, (_, pred)| {
+                pred.hash(&mut *h)
+            });
+            hash_seq(&mut h, &self.trait_obligations, |h, (_, pred)| {
+                pred.hash(&mut *h)
+            });
+            hash_seq(&mut h, &self.diagnostics, |h, d| {
+                h.write_u8(d.level() as u8);
+                d.message_unchecked().hash(&mut *h);
+                hash_opt(&mut *h, &d.code().map(|c| c.code()), |h, c| c.hash(h));
+            });
+            h.finish()
         })
     }
 }
@@ -2665,10 +2672,7 @@ pub(crate) fn fn_body_compute_mark() -> usize {
 /// reset — take a fresh mark afterwards.
 #[cfg(test)]
 pub(crate) fn clear_fn_body_compute_log() {
-    FN_BODY_COMPUTE_LOG
-        .lock()
-        .map(|mut log| log.clear())
-        .ok();
+    FN_BODY_COMPUTE_LOG.lock().map(|mut log| log.clear()).ok();
 }
 
 /// Test-only helper: number of `CheckFnBody` computes logged for the
@@ -2830,10 +2834,7 @@ impl<'q, 'src: 'q> Query<'q, 'src> for CheckFnBody {
         // would alias the stale pool stamp — exactly the address-as-identity
         // failure class `NEXT_SYSTEM_ID` / `NEXT_STAT_ARENA_ID` exist to ban.
         let pool_stamp = (ctx_borrow.session_id, view.program_epoch());
-        let pool_slot = provider
-            .query_system()
-            .body_worker_pool
-            .get_or_default();
+        let pool_slot = provider.query_system().body_worker_pool.get_or_default();
         let (mut wctx, mut env) = {
             let mut slot = pool_slot.borrow_mut();
             match slot.as_mut() {
@@ -3535,10 +3536,7 @@ mod stable_hash_tests {
                     span: sp(2),
                 }],
                 contracts: vec![Contract::Requires(
-                    crate::ast::Expr::Literal(
-                        Literal::Int(crate::ast::IntLit::Small(1)),
-                        sp(3),
-                    ),
+                    crate::ast::Expr::Literal(Literal::Int(crate::ast::IntLit::Small(1)), sp(3)),
                     sp(4),
                 )],
                 doc: None,

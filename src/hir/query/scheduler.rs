@@ -189,9 +189,7 @@ impl TestScheduler {
                 gates: Mutex::new(Vec::new()),
                 open_cv: Condvar::new(),
                 state_cv: Condvar::new(),
-                park_timeout_ms: AtomicU64::new(
-                    PARK_TIMEOUT_MS_DEFAULT
-                ),
+                park_timeout_ms: AtomicU64::new(PARK_TIMEOUT_MS_DEFAULT),
                 degraded_count: AtomicU64::new(0),
             }),
         }
@@ -215,10 +213,7 @@ impl TestScheduler {
     /// The effective park deadline as an `Instant` offset from now.
     #[cfg(not(feature = "shuttle"))]
     fn park_deadline(&self) -> Instant {
-        Instant::now()
-            + Duration::from_millis(
-                self.inner.park_timeout_ms.load(Ordering::Acquire),
-            )
+        Instant::now() + Duration::from_millis(self.inner.park_timeout_ms.load(Ordering::Acquire))
     }
 
     /// How many parks were released by DEADLINE EXPIRY (degrade) instead
@@ -481,9 +476,9 @@ impl Scheduler for TestScheduler {
                 return;
             }
             if !matched {
-                matched = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                    || gates.iter().any(|gate| (gate.pred)(&point)),
-                )) {
+                matched = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gates.iter().any(|gate| (gate.pred)(&point))
+                })) {
                     Ok(m) => m,
                     Err(payload) => {
                         if counted {
@@ -653,7 +648,6 @@ mod tests {
             p.join().unwrap();
         });
     }
-
 
     /// OS-thread twin above.  Under `feature = "shuttle"` `PlanInner`'s
     /// `Mutex`/`Condvar` come from `crate::sync`, i.e. shuttle's, and they

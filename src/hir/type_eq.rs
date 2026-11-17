@@ -5,12 +5,12 @@
 //! checker from reaching back into the resolver (layering), giving the
 //! comparison family a single authoritative home.
 
-use as_variant::as_variant;
 use crate::ast::FileId;
 use crate::hir::octagon::Dbm;
 use crate::hir::symbol::*;
 use crate::hir::types::DefId;
 use crate::symbol::Symbol;
+use as_variant::as_variant;
 
 /// Structural equality of AST types IGNORING source spans: two `Int<32>`
 /// written at different positions are the same type. Used by the E065

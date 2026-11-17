@@ -267,10 +267,10 @@ impl QueryLatch {
             "job.latch.wait_on",
         );
         // The waiter count lives in its own atomic, so this RAII guard needs
-// no raw pointer and does not borrow `park` across `cv.wait(&mut park)`
-//.  A leaked increment would make every future
-// `set`/`poison` take the notify path forever; the guard decrements on
-// every exit path, including unwind.
+        // no raw pointer and does not borrow `park` across `cv.wait(&mut park)`
+        //.  A leaked increment would make every future
+        // `set`/`poison` take the notify path forever; the guard decrements on
+        // every exit path, including unwind.
         // The waiter count is NOT a free-floating hint.  Consider a waiter that increments,
         // takes the park lock and observes LATCH_WAITING BEFORE the
         // resolver's CAS: if the resolver's subsequent `waiters` load does

@@ -90,13 +90,14 @@ pub fn validate_locales(dir: &Path) -> Locales {
                 None => errors.push(format!(
                     "locales/{file}: orphan message {slug:?} (not defined in en.ftl)"
                 )),
-                Some(en_vars) if {
-                    // Order differs by design (each locale's first-appearance
-                    // order); the placeholder contract is set equality.
-                    let en_set: BTreeSet<&str> = en_vars.iter().map(String::as_str).collect();
-                    let loc_set: BTreeSet<&str> = vars.iter().map(String::as_str).collect();
-                    en_set != loc_set
-                } =>
+                Some(en_vars)
+                    if {
+                        // Order differs by design (each locale's first-appearance
+                        // order); the placeholder contract is set equality.
+                        let en_set: BTreeSet<&str> = en_vars.iter().map(String::as_str).collect();
+                        let loc_set: BTreeSet<&str> = vars.iter().map(String::as_str).collect();
+                        en_set != loc_set
+                    } =>
                 {
                     let en_set: BTreeSet<&str> = en_vars.iter().map(String::as_str).collect();
                     let loc_set: BTreeSet<&str> = vars.iter().map(String::as_str).collect();
@@ -185,11 +186,7 @@ fn messages<'a>(res: &'a ast::Resource<&'a str>) -> BTreeMap<&'a str, Vec<String
     out
 }
 
-fn pattern_vars(
-    pattern: &ast::Pattern<&str>,
-    out: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-) {
+fn pattern_vars(pattern: &ast::Pattern<&str>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     for element in &pattern.elements {
         if let ast::PatternElement::Placeable { expression } = element {
             expr_vars(expression, out, seen);
@@ -454,12 +451,13 @@ pub fn generate_fluent_functions(dir: &Path) -> String {
     // formats through the bundle; every later call is one array read and
     // returns `Cow::Borrowed` — zero allocation, zero formatting.  This
     // generalizes the hand-rolled `cached_label!` tables to every slug.
-    let zero_arg: Vec<&str> =
-        msgs.iter().filter(|(_, v)| v.is_empty()).map(|(s, _)| *s).collect();
+    let zero_arg: Vec<&str> = msgs
+        .iter()
+        .filter(|(_, v)| v.is_empty())
+        .map(|(s, _)| *s)
+        .collect();
     if !zero_arg.is_empty() {
-        rs.push_str(
-            "static ZERO_ARG_TABLE: [[std::sync::OnceLock<String>; 3]; ",
-        );
+        rs.push_str("static ZERO_ARG_TABLE: [[std::sync::OnceLock<String>; 3]; ");
         rs.push_str(&zero_arg.len().to_string());
         rs.push_str("] = [const { [const { std::sync::OnceLock::new() }; 3] }; ");
         rs.push_str(&zero_arg.len().to_string());
@@ -539,7 +537,8 @@ fn escape_kw(name: &str) -> String {
         "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
         "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
         "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
-        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "gen",
+        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+        "gen",
     ];
     if KEYWORDS.contains(&name) {
         format!("{name}_")

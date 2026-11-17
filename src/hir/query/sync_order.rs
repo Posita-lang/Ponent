@@ -522,8 +522,7 @@ mod tests {
             static FLAG: AtomicBool = AtomicBool::new(false);
             let mut config = shuttle::Config::default();
             config.stack_size = 2 * 1024 * 1024;
-            let runner =
-                shuttle::Runner::new(shuttle::scheduler::PctScheduler::new(8, 50), config);
+            let runner = shuttle::Runner::new(shuttle::scheduler::PctScheduler::new(8, 50), config);
             runner.run(|| {
                 // PctScheduler only counts STEPS when >1 task is runnable —
                 // spawn+immediate-join never overlaps, so the child must

@@ -214,6 +214,8 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     let deadline = Instant::now() + ACCEPT_BUDGET;
     let mut idle_deadline: Option<Instant> = None;
     let mut served = false;
+    #[cfg(unix)]
+    let delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(not(unix))]
     let mut first_error: Option<std::io::Error> = None;
 
@@ -238,6 +240,10 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
         let mut accept_errors = 0u32;
         while Instant::now() < deadline || idle_deadline.is_some() {
             let now = Instant::now();
+            if !served && delivered.load(Ordering::Acquire) {
+                served = true;
+                idle_deadline = Some(now + POST_SERVE_IDLE);
+            }
             if idle_deadline.is_some_and(|idle| now >= idle) {
                 break;
             }
@@ -284,14 +290,10 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             // Poll for the whole remaining budget (M2): the fd set is
             // level-triggered and nothing in the loop is time-driven except
             // the deadline, so a fixed 100 ms tick only burns wakeups.
-            let ms = remaining
-                .as_millis()
-                .min(i32::MAX as u128)
-                .max(1) as i32;
+            let ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
             // SAFETY: `fds` is a live, correctly sized array of `pollfd`; the
             // count is exactly its length.
-            let rc =
-                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
             if rc < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() == std::io::ErrorKind::Interrupted {
@@ -385,8 +387,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                                     action = Some(PendingAction::Serve);
                                     break;
                                 }
-                                HeaderProgress::TooLargeHeader
-                                | HeaderProgress::TooLargeLine => {
+                                HeaderProgress::TooLargeHeader | HeaderProgress::TooLargeLine => {
                                     action = Some(PendingAction::TooLarge);
                                     break;
                                 }
@@ -408,8 +409,14 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 }
             }
 
-            let mut handoff: SmallVec<[(TcpStream, SmallVec<[u8; 512]>, PendingAction, Option<RequestHead>); 8]> =
-                SmallVec::new();
+            let mut handoff: SmallVec<
+                [(
+                    TcpStream,
+                    SmallVec<[u8; 512]>,
+                    PendingAction,
+                    Option<RequestHead>,
+                ); 8],
+            > = SmallVec::new();
             for &(i, action) in remove.iter().rev() {
                 let p = pending.swap_remove(i);
                 if action == PendingAction::Close {
@@ -428,17 +435,18 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             if !handoff.is_empty() {
                 for (mut stream, buf, action, head) in handoff.drain(..) {
                     if action == PendingAction::TooLarge {
-                        let handle = std::thread::Builder::new()
-                            .stack_size(64 * 1024)
-                            .spawn(move || {
-                                if stream.set_nonblocking(false).is_err() {
-                                    let _ = stream.shutdown(Shutdown::Both);
-                                    return;
-                                }
-                                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                                let _ = write_header_too_large(&mut stream);
-                                linger_after_half_close(&mut stream);
-                            });
+                        let handle =
+                            std::thread::Builder::new()
+                                .stack_size(64 * 1024)
+                                .spawn(move || {
+                                    if stream.set_nonblocking(false).is_err() {
+                                        let _ = stream.shutdown(Shutdown::Both);
+                                        return;
+                                    }
+                                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                                    let _ = write_header_too_large(&mut stream);
+                                    linger_after_half_close(&mut stream);
+                                });
                         if let Ok(handle) = handle {
                             workers.push(handle);
                         }
@@ -446,28 +454,29 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                     }
                     let html = std::sync::Arc::clone(&html);
                     let expected = std::sync::Arc::clone(&expected_path);
-                    let handle = std::thread::Builder::new()
-                        .stack_size(64 * 1024)
-                        .spawn(move || {
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                serve_page_after_prefix(
-                                    &mut stream,
-                                    html.as_ref(),
-                                    Some(expected.as_ref()),
-                                    &buf,
-                                    head,
-                                )
-                            }));
-                        });
+                    let delivered = std::sync::Arc::clone(&delivered);
+                    let handle =
+                        std::thread::Builder::new()
+                            .stack_size(64 * 1024)
+                            .spawn(move || {
+                                let r =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        serve_page_after_prefix(
+                                            &mut stream,
+                                            html.as_ref(),
+                                            Some(expected.as_ref()),
+                                            &buf,
+                                            head,
+                                        )
+                                    }));
+                                if matches!(r, Ok(Ok(true))) {
+                                    delivered.store(true, Ordering::Release);
+                                }
+                            });
                     if let Ok(handle) = handle {
                         workers.push(handle);
                     }
                 }
-                // Every handoff is a target request; the worker writes
-                // idempotently.  Keeping the accept loop free lets a second
-                // tab/pipeline be served without waiting for the first linger.
-                served = true;
-                idle_deadline = Some(Instant::now() + POST_SERVE_IDLE);
             }
         }
         for p in pending.drain(..) {
@@ -487,24 +496,22 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             break;
         }
         match listener.accept() {
-            Ok((mut stream, _)) => match serve_page_expected(
-                &mut stream,
-                html.as_ref(),
-                Some(expected_path.as_ref()),
-            )
-            {
-                Ok(true) => {
-                    served = true;
-                    idle_deadline = Some(now + POST_SERVE_IDLE);
-                }
-                Ok(false) => continue,
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
+            Ok((mut stream, _)) => {
+                match serve_page_expected(&mut stream, html.as_ref(), Some(expected_path.as_ref()))
+                {
+                    Ok(true) => {
+                        served = true;
+                        idle_deadline = Some(now + POST_SERVE_IDLE);
                     }
-                    continue;
+                    Ok(false) => continue,
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                        continue;
+                    }
                 }
-            },
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -563,6 +570,11 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
         }
     }
 
+    workers.join_all();
+    #[cfg(unix)]
+    if !served && delivered.load(Ordering::Acquire) {
+        served = true;
+    }
     let result = if served {
         Ok(())
     } else {
@@ -612,16 +624,28 @@ const ONE_SHOT_LINGER: Duration = Duration::from_millis(150);
 struct JoinWorkers(Vec<std::thread::JoinHandle<()>>);
 
 impl JoinWorkers {
+    const MAX_WORKERS: usize = 8;
+
     fn push(&mut self, handle: std::thread::JoinHandle<()>) {
+        while self.0.len() >= Self::MAX_WORKERS {
+            let Some(oldest) = self.0.drain(..1).next() else {
+                break;
+            };
+            let _ = oldest.join();
+        }
         self.0.push(handle);
+    }
+
+    fn join_all(&mut self) {
+        for handle in self.0.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
 impl Drop for JoinWorkers {
     fn drop(&mut self) {
-        for handle in self.0.drain(..) {
-            let _ = handle.join();
-        }
+        self.join_all();
     }
 }
 const MAX_REQUEST_LINE: usize = 8 * 1024;
@@ -727,10 +751,8 @@ impl HeaderScan {
 /// accepting both CRLFCRLF and bare LFLF.  The thread path is deliberately
 /// LF-lenient; the reactor must not reject a request the thread path serves.
 fn header_end(buf: &[u8]) -> Option<usize> {
-    static CRLF: std::sync::OnceLock<memchr::memmem::Finder<'static>> =
-        std::sync::OnceLock::new();
-    static LF: std::sync::OnceLock<memchr::memmem::Finder<'static>> =
-        std::sync::OnceLock::new();
+    static CRLF: std::sync::OnceLock<memchr::memmem::Finder<'static>> = std::sync::OnceLock::new();
+    static LF: std::sync::OnceLock<memchr::memmem::Finder<'static>> = std::sync::OnceLock::new();
     let crlf = CRLF
         .get_or_init(|| memchr::memmem::Finder::new(b"\r\n\r\n"))
         .find(buf)
@@ -811,10 +833,7 @@ fn scan_framing(headers: &[u8]) -> HeaderFraming {
             framing.ambiguous = true;
             continue;
         }
-        if name_raw
-            .last()
-            .is_some_and(|&b| b == b' ' || b == b'\t')
-        {
+        if name_raw.last().is_some_and(|&b| b == b' ' || b == b'\t') {
             // RFC 7230 §3.2.4: whitespace before the colon is forbidden.
             framing.ambiguous = true;
             continue;
@@ -854,8 +873,6 @@ fn scan_framing(headers: &[u8]) -> HeaderFraming {
     }
     framing
 }
-
-
 
 /// How completely a request was drained from the socket.
 ///
@@ -1200,7 +1217,6 @@ fn drain_residual(stream: &mut TcpStream) {
     drain_until_eof(stream, Duration::from_millis(20), false);
 }
 
-
 /// Short first-read timeout for [`serve_page`]: distinguishes a browser
 /// preconnect (silent socket) from a real request cheaply, without spending
 /// the full drain timeout of the accept budget on a socket that will never
@@ -1291,9 +1307,8 @@ fn render_head(status: &str, extra_headers: &str, body_len: usize) -> String {
 }
 
 fn http_date_header() -> std::sync::Arc<str> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::RwLock<(u64, std::sync::Arc<str>)>,
-    > = std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<(u64, std::sync::Arc<str>)>> =
+        std::sync::OnceLock::new();
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1602,12 +1617,7 @@ fn serve_page_after_prefix(
         let end = head.head_end.min(first.len());
         let mut leftover: SmallVec<[u8; 512]> = SmallVec::new();
         leftover.extend_from_slice(&first[end..]);
-        let drain = drain_after_head(
-            stream,
-            head.framing,
-            leftover.len(),
-            Duration::from_secs(1),
-        );
+        let drain = drain_after_head(stream, head.framing, leftover.len(), Duration::from_secs(1));
         (head.line, leftover, Some(drain))
     } else if expected_path.is_some() {
         let mut too_large = false;
@@ -1635,11 +1645,7 @@ fn serve_page_after_prefix(
         }
     } else {
         // Test-only `serve_page`: keep the method-agnostic drain path.
-        (
-            CompactString::new(""),
-            SmallVec::from_slice(first),
-            None,
-        )
+        (CompactString::new(""), SmallVec::from_slice(first), None)
     };
     let prefix: &[u8] = &leftover;
 
@@ -1678,9 +1684,8 @@ fn serve_page_after_prefix(
             let raw = target.split('?').next().unwrap_or("/");
             let alt = format!("{expected}/");
             let canonical = canonical_path_code(target);
-            let matches = canonical.as_deref() == Some(expected_code)
-                || raw == expected
-                || raw == alt;
+            let matches =
+                canonical.as_deref() == Some(expected_code) || raw == expected || raw == alt;
             if !matches {
                 // See-also navigation: a registered code is a real page even
                 // when it is not this one-shot's initial target.  Only an
@@ -1801,8 +1806,6 @@ fn serve_page_after_prefix(
         }
     }
 }
-
-
 
 /// Decode and normalize a request target to a canonical error code.
 ///
@@ -2323,10 +2326,7 @@ fn serve_explain_persistent_impl(
                 last_activity = now;
             }
             if let Some(idle) = idle {
-                if !served_any
-                    && now >= first_deadline
-                    && active.load(Ordering::Relaxed) == 0
-                {
+                if !served_any && now >= first_deadline && active.load(Ordering::Relaxed) == 0 {
                     terminal_error = Some(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "explain server: no client connected before the first-request deadline",
@@ -2355,7 +2355,10 @@ fn serve_explain_persistent_impl(
                         // browsers retry.  The accept loop stall drops to ~0.1 s.
                         // if the short read timeout cannot be installed, a blocking drain
                         // would stall the accept loop, so close immediately.
-                        if stream.set_read_timeout(Some(Duration::from_millis(100))).is_err() {
+                        if stream
+                            .set_read_timeout(Some(Duration::from_millis(100)))
+                            .is_err()
+                        {
                             let _ = stream.shutdown(Shutdown::Both);
                             continue;
                         }
@@ -2459,8 +2462,7 @@ fn serve_explain_persistent_impl(
                     #[cfg(not(unix))]
                     let transient = matches!(
                         e.kind(),
-                        std::io::ErrorKind::ConnectionAborted
-                            | std::io::ErrorKind::ConnectionReset
+                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
                     );
                     match e.kind() {
                         std::io::ErrorKind::Interrupted => {}
@@ -2614,9 +2616,7 @@ fn serve_explain_persistent_epoll(
                     "explain server: no client connected before the first-request deadline",
                 ));
             }
-            if served_any
-                && conns.is_empty()
-                && now.saturating_duration_since(last_served) >= idle
+            if served_any && conns.is_empty() && now.saturating_duration_since(last_served) >= idle
             {
                 return Ok(());
             }
@@ -2634,14 +2634,8 @@ fn serve_explain_persistent_epoll(
             wait = wait.min(until.saturating_duration_since(now));
         }
         let timeout_ms = wait.as_millis().min(5_000) as i32;
-        let ready = unsafe {
-            libc::epoll_wait(
-                epfd,
-                events.as_mut_ptr(),
-                MAX_EVENTS as i32,
-                timeout_ms,
-            )
-        };
+        let ready =
+            unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -2686,8 +2680,7 @@ fn serve_explain_persistent_epoll(
                                             state: READING,
                                             keep_alive: false,
                                             consumed: 0,
-                                            deadline: Instant::now()
-                                                + FIRST_BYTE_READ_TIMEOUT,
+                                            deadline: Instant::now() + FIRST_BYTE_READ_TIMEOUT,
                                             header_deadline: None,
                                             header_scan: HeaderScan::new(),
                                             overload: true,
@@ -2724,23 +2717,27 @@ fn serve_explain_persistent_epoll(
                                 },
                                 u64: conn_fd as u64,
                             };
-                            if epoll_ctl_checked(epfd, libc::EPOLL_CTL_ADD, conn_fd, &mut conn_event).is_err() {
+                            if epoll_ctl_checked(
+                                epfd,
+                                libc::EPOLL_CTL_ADD,
+                                conn_fd,
+                                &mut conn_event,
+                            )
+                            .is_err()
+                            {
                                 if let Some(conn) = conns.remove(&conn_fd) {
                                     let _ = conn.stream.shutdown(Shutdown::Both);
                                 }
                             }
                         }
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            continue;
+                        }
                         Err(error)
                             if matches!(
                                 error.raw_os_error(),
-                                Some(
-                                    libc::EMFILE
-                                        | libc::ENFILE
-                                        | libc::ENOBUFS
-                                        | libc::ENOMEM
-                                )
+                                Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
                             ) =>
                         {
                             // Match the thread path: fd/memory exhaustion is
@@ -2811,7 +2808,9 @@ fn serve_explain_persistent_epoll(
                                 }
                             }
                         }
-                        Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            continue;
+                        }
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(_) => {
                             eof = true;
@@ -2842,7 +2841,9 @@ fn serve_explain_persistent_epoll(
                             break;
                         }
                         Ok(read) => conn.buf.extend_from_slice(&chunk[..read]),
-                        Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            continue;
+                        }
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(_) => {
                             eof = true;
@@ -2911,9 +2912,12 @@ fn serve_explain_persistent_epoll(
                     conn.buf.clear();
                     conn.buf.shrink_to_fit();
                     let page = shed_page();
-                    let response =
-                        HttpResponse::from_cache("503 Service Unavailable", "", page);
-                    conn.response = Some(if is_head { response.as_head() } else { response });
+                    let response = HttpResponse::from_cache("503 Service Unavailable", "", page);
+                    conn.response = Some(if is_head {
+                        response.as_head()
+                    } else {
+                        response
+                    });
                     conn.conn_hdr = b"Connection: close\r\n\r\n";
                     conn.keep_alive = false;
                     conn.consumed = head_end;
@@ -2977,17 +2981,15 @@ fn serve_explain_persistent_epoll(
                     )
                 };
                 let already_read = conn.buf.len().saturating_sub(head_end);
-                conn.body_remaining = if framing.has_transfer_encoding
-                    || framing.ambiguous
-                    || framing.oversized
-                {
-                    usize::MAX
-                } else {
-                    framing
-                        .content_length
-                        .unwrap_or(0)
-                        .saturating_sub(already_read)
-                };
+                conn.body_remaining =
+                    if framing.has_transfer_encoding || framing.ambiguous || framing.oversized {
+                        usize::MAX
+                    } else {
+                        framing
+                            .content_length
+                            .unwrap_or(0)
+                            .saturating_sub(already_read)
+                    };
                 let keep = response_allows_keep_alive(response.status)
                     && !framing.has_transfer_encoding
                     && !framing.ambiguous
@@ -3016,8 +3018,8 @@ fn serve_explain_persistent_epoll(
                     u64: fd as u64,
                 };
                 if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event).is_err() {
-                            close.push(fd);
-                        }
+                    close.push(fd);
+                }
             }
 
             if conn.state == WRITING {
@@ -3111,7 +3113,9 @@ fn serve_explain_persistent_epoll(
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,
                         };
-                        if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event).is_err() {
+                        if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event)
+                            .is_err()
+                        {
                             close.push(fd);
                         }
                     } else {
@@ -3131,7 +3135,9 @@ fn serve_explain_persistent_epoll(
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,
                         };
-                        if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event).is_err() {
+                        if epoll_ctl_checked(epfd, libc::EPOLL_CTL_MOD, fd, &mut conn_event)
+                            .is_err()
+                        {
                             close.push(fd);
                         }
                     }
@@ -3229,12 +3235,7 @@ fn handle_persistent_connection(
             && tail_len == 0
             && !wants_close;
         // : write the pre-rendered head + body — no per-request formatting.
-        write_prepared_conn(
-            stream,
-            response.head_parts(),
-            response.body(),
-            keep_alive,
-        )?;
+        write_prepared_conn(stream, response.head_parts(), response.body(), keep_alive)?;
         served.fetch_add(1, Ordering::Relaxed);
         if keep_alive {
             // Do NOT `drain_residual`: bytes arriving after this response
@@ -3381,11 +3382,7 @@ fn read_request_line(
                     // arrived past the newline and the kernel may hold more;
                     // drain both before returning so closing does not reset
                     // the connection under the client.
-                    let _ = drain_request(
-                        stream,
-                        &chunk[nl + 1..],
-                        Duration::from_millis(100),
-                    );
+                    let _ = drain_request(stream, &chunk[nl + 1..], Duration::from_millis(100));
                     return None;
                 }
                 line.extend_from_slice(&chunk[..nl]);
@@ -3571,11 +3568,7 @@ impl HttpResponse {
     }
 
     fn body(&self) -> &str {
-        if self.head_only {
-            ""
-        } else {
-            self.page.body()
-        }
+        if self.head_only { "" } else { self.page.body() }
     }
 }
 
@@ -3669,18 +3662,18 @@ fn dispatch_request_meta(request_line: &str) -> (HttpResponse, bool) {
     if raw == "/" {
         let response = HttpResponse::from_cache("200 OK", "", build_index_page());
         return (
-            if head_only { response.as_head() } else { response },
+            if head_only {
+                response.as_head()
+            } else {
+                response
+            },
             http11,
         );
     }
     let response = match canonical_path_code(target) {
         Some(code) => match explain_page_cached(code) {
             Some(page) => HttpResponse::from_cache("200 OK", "", page),
-            None => HttpResponse::from_owned(
-                "404 Not Found",
-                "",
-                not_found_page_cached(code),
-            ),
+            None => HttpResponse::from_owned("404 Not Found", "", not_found_page_cached(code)),
         },
         None => {
             let decoded = percent_decode(raw);
@@ -3692,11 +3685,14 @@ fn dispatch_request_meta(request_line: &str) -> (HttpResponse, bool) {
             HttpResponse::from_owned("404 Not Found", "", not_found_page_cached(key))
         }
     };
-    (if head_only {
-        response.as_head()
-    } else {
-        response
-    }, http11)
+    (
+        if head_only {
+            response.as_head()
+        } else {
+            response
+        },
+        http11,
+    )
 }
 
 /// Decode one ASCII hex digit.  Unlike `u8::from_str_radix`, this rejects a
@@ -3798,9 +3794,7 @@ fn build_index_page_uncached() -> String {
 
 fn build_not_found_page(code: &str) -> String {
     let mut out = page_head("Not found — Ponent", "");
-    out.push_str(
-        "<h1>404 — not found</h1>\n<p>No error code <code>",
-    );
+    out.push_str("<h1>404 — not found</h1>\n<p>No error code <code>");
     // O5: filter control characters and escape HTML in one pass straight into
     // the destination — no intermediate `sanitized` String and no collected
     // positions for this untrusted-input path.
@@ -3870,8 +3864,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         map: rustc_hash::FxHashMap<CompactString, std::sync::Arc<Entry>>,
         ring: std::collections::VecDeque<std::sync::Arc<Entry>>,
     }
-    static CACHE: std::sync::OnceLock<Box<[std::sync::Mutex<Shard>]>> =
-        std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<Box<[std::sync::Mutex<Shard>]>> = std::sync::OnceLock::new();
     let build = |code: &str| {
         let body = build_not_found_page(code);
         let head = render_head("404 Not Found", "", body.len());
@@ -3909,9 +3902,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         }
         let entry = std::sync::Arc::clone(entry);
         drop(guard);
-        return std::sync::Arc::clone(entry.page.get_or_init(|| {
-            std::sync::Arc::new(build(code))
-        }));
+        return std::sync::Arc::clone(entry.page.get_or_init(|| std::sync::Arc::new(build(code))));
     }
     if guard.map.len() >= PER_SHARD_CAP {
         // Bound the sweep per shard; if every entry is referenced, evict the
@@ -3967,9 +3958,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     guard.map.insert(key, std::sync::Arc::clone(&entry));
     guard.ring.push_back(std::sync::Arc::clone(&entry));
     drop(guard);
-    std::sync::Arc::clone(entry.page.get_or_init(|| {
-        std::sync::Arc::new(build(code))
-    }))
+    std::sync::Arc::clone(entry.page.get_or_init(|| std::sync::Arc::new(build(code))))
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]
@@ -4026,10 +4015,7 @@ mod tests {
 
     #[test]
     fn head_error_responses_are_bodyless() {
-        for line in [
-            "HEAD /E030 HTTP/2",
-            "HEAD E030 HTTP/1.1",
-        ] {
+        for line in ["HEAD /E030 HTTP/2", "HEAD E030 HTTP/1.1"] {
             let response = dispatch_request(line);
             assert_eq!(response.status, "400 Bad Request", "line {line:?}");
             assert!(
@@ -4078,10 +4064,7 @@ mod tests {
 
     #[test]
     fn escape_html_covers_every_character() {
-        assert_eq!(
-            escape_html("<&>\"'").as_ref(),
-            "&lt;&amp;&gt;&quot;&#39;"
-        );
+        assert_eq!(escape_html("<&>\"'").as_ref(), "&lt;&amp;&gt;&quot;&#39;");
         assert_eq!(escape_html("plain").as_ref(), "plain");
     }
 
@@ -4314,7 +4297,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let server = std::thread::spawn(move || handle_persistent_connection(&mut server, &AtomicUsize::new(0)));
+        let server = std::thread::spawn(move || {
+            handle_persistent_connection(&mut server, &AtomicUsize::new(0))
+        });
         client
             .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
@@ -4507,7 +4492,8 @@ mod tests {
 
         // The real request arrives on a second connection.
         let mut real = TcpStream::connect(addr).unwrap();
-        real.write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        real.write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
         let mut response = Vec::new();
         let _ = real.read_to_end(&mut response);
         assert!(
@@ -4564,9 +4550,7 @@ mod tests {
             .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\n")
             .unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        client
-            .write_all(b"Connection: close\r\n\r\n")
-            .unwrap();
+        client.write_all(b"Connection: close\r\n\r\n").unwrap();
         let mut response = Vec::new();
         let _ = client.read_to_end(&mut response);
         server.join().unwrap().unwrap();
@@ -4672,10 +4656,8 @@ mod tests {
         });
 
         let mut slow = TcpStream::connect(addr).unwrap();
-        slow.write_all(
-            b"GET /E030 HTTP/1.1\r\nHost: x\r\nContent-Length: 100000000\r\n\r\n",
-        )
-        .unwrap();
+        slow.write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nContent-Length: 100000000\r\n\r\n")
+            .unwrap();
         let mut slow_writer = slow.try_clone().unwrap();
         let writer = std::thread::spawn(move || {
             let chunk = [b'x'; 8192];
@@ -4688,8 +4670,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         let mut fast = TcpStream::connect(addr).unwrap();
-        fast.set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+        fast.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         fast.write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
         let mut response = Vec::new();
@@ -4735,7 +4716,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let server = std::thread::spawn(move || handle_persistent_connection(&mut server, &AtomicUsize::new(0)));
+        let server = std::thread::spawn(move || {
+            handle_persistent_connection(&mut server, &AtomicUsize::new(0))
+        });
         client
             .write_all(b"GET /E030 HTTP/1.1\nHost: x\nConnection: close\n\n")
             .unwrap();
@@ -4782,7 +4765,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let server = std::thread::spawn(move || handle_persistent_connection(&mut server, &AtomicUsize::new(0)));
+        let server = std::thread::spawn(move || {
+            handle_persistent_connection(&mut server, &AtomicUsize::new(0))
+        });
         let mut request = b"GET /E030 HTTP/1.1\r\nHost: x\r\nCookie: ".to_vec();
         request.extend(std::iter::repeat(b'a').take(12 * 1024));
         request.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
@@ -4832,7 +4817,11 @@ mod tests {
         ] {
             assert!(response_allows_keep_alive(status), "{status}");
         }
-        for status in ["500 Internal Server Error", "503 Service Unavailable", "431 ..."] {
+        for status in [
+            "500 Internal Server Error",
+            "503 Service Unavailable",
+            "431 ...",
+        ] {
             assert!(!response_allows_keep_alive(status), "{status}");
         }
     }
@@ -4848,7 +4837,9 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             let (mut server, _) = listener.accept().unwrap();
-            let server = std::thread::spawn(move || handle_persistent_connection(&mut server, &AtomicUsize::new(0)));
+            let server = std::thread::spawn(move || {
+                handle_persistent_connection(&mut server, &AtomicUsize::new(0))
+            });
             client.write_all(request).unwrap();
             let mut response = Vec::new();
             let _ = client.read_to_end(&mut response);
@@ -4911,18 +4902,21 @@ mod tests {
 
             let thread_response = thread_exchange(request);
             assert!(
-                reactor_response.starts_with(b"HTTP/1.1 ") && thread_response.starts_with(b"HTTP/1.1 "),
+                reactor_response.starts_with(b"HTTP/1.1 ")
+                    && thread_response.starts_with(b"HTTP/1.1 "),
                 "backend produced no HTTP status"
             );
             let reactor_status = &reactor_response[9..12];
             let thread_status = &thread_response[9..12];
             assert_eq!(
-                reactor_status, thread_status,
+                reactor_status,
+                thread_status,
                 "backends disagree for request: {:?}",
                 String::from_utf8_lossy(&request[..request.len().min(32)])
             );
             assert_eq!(
-                reactor_status, status,
+                reactor_status,
+                status,
                 "unexpected status for case: {:?}",
                 String::from_utf8_lossy(&request[..request.len().min(32)])
             );
@@ -5005,5 +4999,4 @@ mod tests {
         assert!(date.starts_with("Date: "));
         assert!(date.ends_with(" GMT\r\n"));
     }
-
 }

@@ -1,5 +1,5 @@
-use as_variant::as_variant;
 use crate::sync::RwLock;
+use as_variant::as_variant;
 use rustc_hash::FxHashMap as HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -756,9 +756,8 @@ impl<'input> TypeContext<'input> {
         self.region_subtype_outlives.clear();
         self.region_subtype_collect = false;
         self.current_unify_span = None;
-        self.current_coercion_ctx = std::sync::atomic::AtomicU8::new(
-            CoercionContext::Structural.to_u8(),
-        );
+        self.current_coercion_ctx =
+            std::sync::atomic::AtomicU8::new(CoercionContext::Structural.to_u8());
         self.seal_violations = 0;
         self.auto_ro = false;
         self.auto_coerce = false;

@@ -14,11 +14,7 @@ fn real_repo_collects_clean() {
 
     assert_eq!(outcome.coverage.len(), 3, "expected en, ru, zh");
     for row in &outcome.coverage {
-        assert_eq!(
-            row.present, row.total,
-            "locale {} incomplete",
-            row.locale
-        );
+        assert_eq!(row.present, row.total, "locale {} incomplete", row.locale);
     }
 
     let includes = outcome.generated.matches("include_str!").count();

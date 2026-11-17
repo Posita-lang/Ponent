@@ -369,11 +369,7 @@ fn normalize_clause(clause: &[i32]) -> Option<Vec<i32>> {
 /// Sort-based normalisation for long clauses: dedup and tautology detection
 /// in O(k log k) rather than the quadratic scan used for short clauses.
 fn normalize_long_clause(clause: &[i32]) -> Option<Vec<i32>> {
-    let mut sorted: Vec<i32> = clause
-        .iter()
-        .copied()
-        .filter(|&lit| lit != 0)
-        .collect();
+    let mut sorted: Vec<i32> = clause.iter().copied().filter(|&lit| lit != 0).collect();
     for &lit in &sorted {
         debug_assert_ne!(lit, i32::MIN, "literal i32::MIN cannot be negated");
     }
@@ -967,11 +963,8 @@ impl Solver {
                                 self.trail_limits.push(self.trail.len());
                                 let other = !val_tried;
                                 self.assign(var, other, self.current_level);
-                                self.trail.push(if other {
-                                    var as i32
-                                } else {
-                                    -(var as i32)
-                                });
+                                self.trail
+                                    .push(if other { var as i32 } else { -(var as i32) });
                                 stack.push((level, var, other, false));
                                 break; // resume main loop
                             }
@@ -1013,7 +1006,8 @@ impl Solver {
             self.trail_limits.push(self.trail.len());
             let val = self.phase[var];
             self.assign(var, val, self.current_level);
-            self.trail.push(if val { var as i32 } else { -(var as i32) });
+            self.trail
+                .push(if val { var as i32 } else { -(var as i32) });
             stack.push((level, var, val, true));
         }
     }
@@ -1199,7 +1193,10 @@ impl Solver {
     /// Assign a variable at the given decision level and record its phase.
     fn assign(&mut self, var: usize, val: bool, level: usize) {
         debug_assert!(var < self.assignment.len());
-        debug_assert!(self.assignment[var].is_none(), "double assignment of var {var}");
+        debug_assert!(
+            self.assignment[var].is_none(),
+            "double assignment of var {var}"
+        );
         self.assignment[var] = Some(val);
         self.decision_level[var] = level;
         self.phase[var] = val; // phase saving
@@ -2202,7 +2199,11 @@ mod tests {
         // previously-bumped variables would come back strictly smaller.
         solver.add_clause(&[x, -x]); // tautology, removed
         let _ = solver.solve();
-        for (i, (&after, &before)) in solver.activity.iter().zip(activity_before.iter()).enumerate()
+        for (i, (&after, &before)) in solver
+            .activity
+            .iter()
+            .zip(activity_before.iter())
+            .enumerate()
         {
             assert!(
                 after >= before,
@@ -2269,7 +2270,10 @@ mod tests {
         if let SolveResult::Sat(model) = result {
             // d=true would force g=true → conflict; solver must recover via
             // the d=false sibling.
-            assert!(!model[0], "d must be false after rewinding the d=true subtree");
+            assert!(
+                !model[0],
+                "d must be false after rewinding the d=true subtree"
+            );
             assert!(model[1], "e must be true");
         }
     }
@@ -2305,11 +2309,7 @@ mod tests {
             c.iter().any(|&lit| {
                 let var = lit.unsigned_abs() as usize;
                 let val = model[var - 1];
-                if lit > 0 {
-                    val
-                } else {
-                    !val
-                }
+                if lit > 0 { val } else { !val }
             })
         })
     }

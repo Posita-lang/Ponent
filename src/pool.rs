@@ -116,7 +116,11 @@ impl BatchWait<'_> {
     pub(crate) fn wait(self) {
         let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
         while state.remaining != 0 {
-            state = self.core.done.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self
+                .core
+                .done
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
         }
         state.jobs = None;
     }
@@ -196,7 +200,11 @@ mod tests {
             }),
         ];
         pool.submit(jobs).wait();
-        assert_eq!(ran.load(Ordering::Relaxed), 2, "panic must not skip the other job");
+        assert_eq!(
+            ran.load(Ordering::Relaxed),
+            2,
+            "panic must not skip the other job"
+        );
     }
 
     #[test]

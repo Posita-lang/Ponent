@@ -275,11 +275,7 @@ fn normalize_clause(clause: &[i32]) -> Option<Vec<i32>> {
 /// drop adjacent duplicates and reject a variable appearing in both
 /// polarities. O(k log k).
 fn normalize_long_clause(clause: &[i32]) -> Option<Vec<i32>> {
-    let mut sorted: Vec<i32> = clause
-        .iter()
-        .copied()
-        .filter(|&lit| lit != 0)
-        .collect();
+    let mut sorted: Vec<i32> = clause.iter().copied().filter(|&lit| lit != 0).collect();
     for &lit in &sorted {
         debug_assert_ne!(lit, i32::MIN, "literal i32::MIN cannot be negated");
     }
@@ -653,7 +649,9 @@ impl Solver {
     /// Set the Luby base restart interval (portfolio knob).
     pub fn set_restart_base(&mut self, base: usize) {
         self.restart_base = base.max(1);
-        self.restart_budget = self.restart_base.saturating_mul(luby_pow2(self.restart_seq));
+        self.restart_budget = self
+            .restart_base
+            .saturating_mul(luby_pow2(self.restart_seq));
     }
 
     /// Set the per-conflict VSIDS decay factor (portfolio knob). Must be in
@@ -1169,8 +1167,7 @@ impl Solver {
                 // only the variables its probes touched.
                 if self.phase_journaling {
                     if self.phase_journal_mark.len() < self.assignment.len() {
-                        self.phase_journal_mark
-                            .resize(self.assignment.len(), false);
+                        self.phase_journal_mark.resize(self.assignment.len(), false);
                     }
                     if !self.phase_journal_mark[var] {
                         self.phase_journal_mark[var] = true;
@@ -1197,7 +1194,10 @@ impl Solver {
         // point implies `lvl < trail_lim.len()`. The fallback is belt-and-
         // braces for a future refactor — it must never drop level-0 facts,
         // which are permanent by the solver's own contract, hence the assert.
-        debug_assert!(lvl < self.trail_lim.len(), "level/trail_lim invariant broken");
+        debug_assert!(
+            lvl < self.trail_lim.len(),
+            "level/trail_lim invariant broken"
+        );
         let target = if lvl < self.trail_lim.len() {
             self.trail_lim[lvl]
         } else {
@@ -1398,9 +1398,9 @@ impl Solver {
         let mut confl = confl_cid;
 
         // Reusable scratch (B1). Allocating `seen` per conflict was the classic
-// CDCL killer: at a 500k-conflict budget on a 100k-var formula it is tens
-// of GB of cumulative memset. The buffers are moved out of `self` so
-// `&mut self` calls (`bump_activity`, `lit_redundant`) stay borrowable.
+        // CDCL killer: at a 500k-conflict budget on a 100k-var formula it is tens
+        // of GB of cumulative memset. The buffers are moved out of `self` so
+        // `&mut self` calls (`bump_activity`, `lit_redundant`) stay borrowable.
         let mut seen = std::mem::take(&mut self.analyze_seen);
         let mut seen_list = std::mem::take(&mut self.analyze_marks);
         let mut levels = std::mem::take(&mut self.analyze_levels);
@@ -1560,16 +1560,9 @@ impl Solver {
                         let ov = lit_var(other);
                         self.level[ov] == 0
                             || seen[ov]
-                            || self.lit_redundant(
-                                q,
-                                &mut seen,
-                                &mut seen_list,
-                                abstract_levels,
-                            )
+                            || self.lit_redundant(q, &mut seen, &mut seen_list, abstract_levels)
                     }
-                    Some(_) => {
-                        self.lit_redundant(q, &mut seen, &mut seen_list, abstract_levels)
-                    }
+                    Some(_) => self.lit_redundant(q, &mut seen, &mut seen_list, abstract_levels),
                     None => false,
                 };
                 if !redundant {
@@ -1762,7 +1755,8 @@ impl Solver {
     fn reduce_db(&mut self) {
         // Learnts may have been tombstoned by on-the-fly subsumption; drop
         // their ids so the length reflects the live database.
-        self.learnts.retain(|&cid| !self.clauses[cid as usize].deleted);
+        self.learnts
+            .retain(|&cid| !self.clauses[cid as usize].deleted);
         if self.learnts.len() < 2 {
             return;
         }
@@ -1809,8 +1803,8 @@ impl Solver {
         }
 
         // Grow the high-water mark (C6/A9): scale with the *cumulative* conflict
-// count (per-solve `stats.conflicts` resets each solve) and clamp to the
-// configurable cap.
+        // count (per-solve `stats.conflicts` resets each solve) and clamp to the
+        // configurable cap.
         let dynamic = MAX_LEARNTS_BASE + self.total_conflicts / 2;
         self.max_learnts = dynamic.min(self.max_learnts_cap);
     }
@@ -1916,7 +1910,9 @@ impl Solver {
         self.restart_seq += 1;
         // Advance the cached Luby budget once per restart instead of
         // recomputing it on every search iteration.
-        self.restart_budget = self.restart_base.saturating_mul(luby_pow2(self.restart_seq));
+        self.restart_budget = self
+            .restart_base
+            .saturating_mul(luby_pow2(self.restart_seq));
         self.stats.restarts += 1;
         // C4: at decision level 0, drop clauses satisfied by a permanent fact
         // every few restarts. Long single solves previously never
@@ -1959,9 +1955,9 @@ impl Solver {
     /// portfolio's decisive result by the whole pass.
     #[inline]
     fn cancelled(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|f| {
-            f.load(std::sync::atomic::Ordering::Relaxed)
-        })
+        self.cancel
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Check the decision/conflict limits (every iteration) and the
@@ -2010,7 +2006,10 @@ impl Solver {
 
                     // Short-window conflict-interval EMA for the restart gate
                     // (C5), plus the lazy VSIDS decay.
-                    let gap = self.stats.decisions.saturating_sub(self.last_conflict_decisions);
+                    let gap = self
+                        .stats
+                        .decisions
+                        .saturating_sub(self.last_conflict_decisions);
                     self.last_conflict_decisions = self.stats.decisions;
                     self.conflict_ema = Some(match self.conflict_ema {
                         Some(prev) => 0.99 * prev + 0.01 * gap as f64,
@@ -2018,7 +2017,7 @@ impl Solver {
                     });
 
                     // Lazy VSIDS decay (A5). Both increments decay together so their relative
-// scale is preserved, but each table rescales only with its own increment.
+                    // scale is preserved, but each table rescales only with its own increment.
                     self.var_inc /= self.var_decay;
                     self.cla_inc /= self.var_decay;
                     if self.var_inc > ACTIVITY_RESCALE {
@@ -2214,9 +2213,7 @@ impl Solver {
             if norm.contains(&-a) {
                 self.stats.elapsed_micros = start.elapsed().as_micros() as u64;
                 self.solve_start = None;
-                return SolveResult::Unsat {
-                    core: vec![a, -a],
-                };
+                return SolveResult::Unsat { core: vec![a, -a] };
             }
             norm.push(a);
         }
@@ -2433,8 +2430,8 @@ impl Solver {
     /// mentions an eliminated variable, it is resurrected (its clauses
     /// re-added), which restores the original constraints soundly.
     /// Strengthen a live clause to the given (strictly shorter) literal slice,
-/// rewiring its watch entries. The caller guarantees `new_lits.len() >= 2`
-/// and that `new_lits` is a prefix of the old clause.
+    /// rewiring its watch entries. The caller guarantees `new_lits.len() >= 2`
+    /// and that `new_lits` is a prefix of the old clause.
     fn strengthen_clause(&mut self, cid: u32, new_lits: &[i32]) {
         debug_assert!(new_lits.len() >= 2);
         let (old_w0, old_w1) = {
@@ -2458,13 +2455,12 @@ impl Solver {
     }
 
     /// Start journaling phase changes (B4). Only variables `enqueue` touches
-/// during the journal window are recorded, so `end_phase_journal` restores in
-/// O(touched) instead of cloning the whole `saved_phase` vector.
+    /// during the journal window are recorded, so `end_phase_journal` restores in
+    /// O(touched) instead of cloning the whole `saved_phase` vector.
     fn begin_phase_journal(&mut self) {
         self.phase_journal.clear();
         if self.phase_journal_mark.len() < self.assignment.len() {
-            self.phase_journal_mark
-                .resize(self.assignment.len(), false);
+            self.phase_journal_mark.resize(self.assignment.len(), false);
         }
         self.phase_journaling = true;
     }
@@ -2553,9 +2549,7 @@ impl Solver {
             .iter()
             .enumerate()
             .filter(|(_, c)| {
-                !c.deleted
-                    && !c.learnt
-                    && (3..=VIVIFY_MAX_LEN).contains(&c.lits.len())
+                !c.deleted && !c.learnt && (3..=VIVIFY_MAX_LEN).contains(&c.lits.len())
             })
             .map(|(i, _)| i as u32)
             .collect();
@@ -2701,9 +2695,12 @@ impl Solver {
         // against a mostly-stable formula) this front-loads the work that can
         // actually pay off.
         let mut order_vars: Vec<usize> = Vec::with_capacity(self.vars.len());
-        order_vars.extend(self.touched_vars.iter().copied().filter(|&v| {
-            v >= 1 && v < self.vars.len()
-        }));
+        order_vars.extend(
+            self.touched_vars
+                .iter()
+                .copied()
+                .filter(|&v| v >= 1 && v < self.vars.len()),
+        );
         for v in 1..self.vars.len() {
             if !self.touched_flag.get(v).copied().unwrap_or(false) {
                 order_vars.push(v);
@@ -3026,11 +3023,7 @@ impl Solver {
                 .filter(|&&l| lit_var(l) != v) // strip v / ¬v — v is being decided
                 .any(|&l| {
                     let val = model[lit_var(l) - 1];
-                    if l > 0 {
-                        val
-                    } else {
-                        !val
-                    }
+                    if l > 0 { val } else { !val }
                 })
         }
         for &(v, ref pos, ref neg) in self.elim_order.iter().rev() {
@@ -3056,11 +3049,7 @@ impl Solver {
     fn verify_model(&self, model: &[bool]) -> bool {
         let val = |lit: i32| {
             let v = model[lit_var(lit) - 1];
-            if lit > 0 {
-                v
-            } else {
-                !v
-            }
+            if lit > 0 { v } else { !v }
         };
         let db_ok = self
             .clauses
@@ -3371,7 +3360,10 @@ mod tests {
         s.add_clause(&[a, b, c]); // exact duplicate — skipped
         s.add_clause(&[a, b]); // subsumes the first — first deleted
         let after = s.num_clauses();
-        assert_eq!(after, 1, "duplicate + subsumed clause must collapse: {before} → {after}");
+        assert_eq!(
+            after, 1,
+            "duplicate + subsumed clause must collapse: {before} → {after}"
+        );
         assert!(s.solve().is_sat());
     }
 
@@ -3394,7 +3386,11 @@ mod tests {
                 let r = s.solve();
                 (r.is_sat(), r.is_unsat())
             };
-            assert_eq!(verdict(true), verdict(false), "BVE changed the verdict, seed {seed}");
+            assert_eq!(
+                verdict(true),
+                verdict(false),
+                "BVE changed the verdict, seed {seed}"
+            );
         }
     }
 
@@ -3421,11 +3417,7 @@ mod tests {
                     assert!(
                         c.iter().any(|&l| {
                             let v = model[lit_var(l) - 1];
-                            if l > 0 {
-                                v
-                            } else {
-                                !v
-                            }
+                            if l > 0 { v } else { !v }
                         }),
                         "seed {seed}: clause {i} {:?} violated by reconstructed model",
                         c
@@ -3498,7 +3490,10 @@ mod tests {
         }
         s.add_unit(lits[0]);
         let r = s.solve();
-        assert!(r.is_unknown(), "propagation limit must be Unknown, got {r:?}");
+        assert!(
+            r.is_unknown(),
+            "propagation limit must be Unknown, got {r:?}"
+        );
     }
 
     #[test]
@@ -3574,12 +3569,19 @@ mod tests {
         let before = s.clauses.len();
         let reused = s.add_learnt_clause(vec![1, 2, 3, 4], 4);
         assert_eq!(reused, base);
-        assert_eq!(s.clauses.len(), before, "subsumed learnt must not be inserted");
+        assert_eq!(
+            s.clauses.len(),
+            before,
+            "subsumed learnt must not be inserted"
+        );
 
         // A strictly stronger learnt tombstones the weaker one it subsumes.
         let stronger = s.add_learnt_clause(vec![1, 2], 2);
         assert_eq!(stronger, before as u32);
-        assert!(s.clauses[base as usize].deleted, "subsumed learnt must be tombstoned");
+        assert!(
+            s.clauses[base as usize].deleted,
+            "subsumed learnt must be tombstoned"
+        );
     }
 
     #[test]
@@ -3628,9 +3630,7 @@ mod tests {
     fn test_luby_sequence_golden() {
         // E1: MiniSat's luby(2, x) = 1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, 1, …
         // The missing `seq -= 1` produced 1, 2, 2, 4, 4, 4, 4, 8, … instead.
-        let expected = [
-            1usize, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, 1,
-        ];
+        let expected = [1usize, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, 1];
         for (i, &want) in expected.iter().enumerate() {
             assert_eq!(luby_pow2(i), want, "luby_pow2({i})");
         }
@@ -3651,7 +3651,10 @@ mod tests {
         s.clauses[cid as usize].w1 = 2;
 
         let reused = s.add_learnt_clause(vec![2, 3, 4], 3);
-        assert_eq!(reused, cid, "the learnt must be subsumed by the existing clause");
+        assert_eq!(
+            reused, cid,
+            "the learnt must be subsumed by the existing clause"
+        );
         assert_eq!(
             s.clauses[reused as usize].w0, 3,
             "precondition: the reused clause's w0 is not the asserting literal"
@@ -3737,7 +3740,10 @@ mod tests {
                             let v = l.unsigned_abs() as usize;
                             if l > 0 { model[v - 1] } else { !model[v - 1] }
                         });
-                        assert!(sat, "model violates original clause {c:?} under assumption {a}");
+                        assert!(
+                            sat,
+                            "model violates original clause {c:?} under assumption {a}"
+                        );
                     }
                 }
                 SolveResult::Unsat { .. } => {} // acceptable for some assumptions
@@ -3784,7 +3790,10 @@ mod tests {
             s.var_inc, var_inc,
             "clause rescale must leave the variable increment untouched"
         );
-        assert!(s.cla_inc < ACTIVITY_RESCALE, "clause increment must rescale");
+        assert!(
+            s.cla_inc < ACTIVITY_RESCALE,
+            "clause increment must rescale"
+        );
     }
 
     /// Vivification must leave the occurrence lists consistent — every

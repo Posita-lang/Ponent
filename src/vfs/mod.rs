@@ -173,8 +173,7 @@ impl VfsBackend for FsBackend {
     }
 
     fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError<'static>> {
-        std::fs::read(path)
-            .map_err(|e| VfsError::Io(format!("failed to read '{}': {}", path, e)))
+        std::fs::read(path).map_err(|e| VfsError::Io(format!("failed to read '{}': {}", path, e)))
     }
 
     fn read_file_bytes_with_mtime(

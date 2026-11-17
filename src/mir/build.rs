@@ -11,11 +11,11 @@ use super::{
     AggregateKind, BasicBlock, BlockId, BorrowKind, Callee, CastKind, LocalDecl, LocalId, MirBody,
     MirConst, Operand, Place, Rvalue, Statement, SwitchTarget, Terminator,
 };
-use as_variant::as_variant;
 use crate::ast::{BinOp, Literal, Span, UnaryOp};
 use crate::hir::hir::{HirExpr, HirMatchArm, HirPattern, HirStmt};
 use crate::hir::types::TypeId;
 use crate::symbol::Symbol;
+use as_variant::as_variant;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------

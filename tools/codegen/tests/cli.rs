@@ -37,10 +37,7 @@ fn check_passes_on_the_real_repo() {
             "locale {locale} does not cover every message: {line:?}"
         );
     }
-    assert!(
-        stdout.contains("codegen check OK ("),
-        "stdout:\n{stdout}"
-    );
+    assert!(stdout.contains("codegen check OK ("), "stdout:\n{stdout}");
 }
 
 #[test]

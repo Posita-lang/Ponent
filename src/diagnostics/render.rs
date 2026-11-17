@@ -6,9 +6,9 @@
 //! emitter stays format-agnostic.
 
 use crate::ast::FileId;
+use crate::diagnostics::glyph::SectionScratch;
 use crate::diagnostics::sink::DiagnosticSink;
 use crate::diagnostics::term::path_to_file_url;
-use crate::diagnostics::glyph::SectionScratch;
 use crate::diagnostics::{DiagOpts, Diagnostic, LineIndex};
 use crate::smallvec::SmallVec;
 use rustc_hash::FxHashMap;
@@ -39,11 +39,8 @@ const _: () = assert!(PRELOAD_SLOTS <= CACHE_SLOTS);
 
 /// One `OnceLock` per file name (2.1): concurrent workers racing on the same
 /// name pay one `canonicalize`, not one each.
-pub(crate) type FileUrlMap = Arc<
-    std::sync::RwLock<
-        FxHashMap<String, Arc<std::sync::OnceLock<Arc<str>>>>,
-    >,
->;
+pub(crate) type FileUrlMap =
+    Arc<std::sync::RwLock<FxHashMap<String, Arc<std::sync::OnceLock<Arc<str>>>>>>;
 
 /// One cached per-line sparse table plus its last-access timestamp.
 ///
@@ -58,9 +55,7 @@ pub(crate) struct CharPrefixEntry {
 }
 
 impl CharPrefixEntry {
-    pub(crate) fn new(
-        table: Option<(Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>,
-    ) -> Self {
+    pub(crate) fn new(table: Option<(Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>) -> Self {
         Self {
             table,
             last_used: std::sync::atomic::AtomicU64::new(next_char_prefix_tick()),
@@ -68,8 +63,10 @@ impl CharPrefixEntry {
     }
 
     pub(crate) fn touch(&self) {
-        self.last_used
-            .store(next_char_prefix_tick(), std::sync::atomic::Ordering::Relaxed);
+        self.last_used.store(
+            next_char_prefix_tick(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn last_used(&self) -> u64 {
@@ -77,8 +74,7 @@ impl CharPrefixEntry {
     }
 }
 
-static CHAR_PREFIX_TICK: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static CHAR_PREFIX_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn next_char_prefix_tick() -> u64 {
     CHAR_PREFIX_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -88,8 +84,7 @@ fn next_char_prefix_tick() -> u64 {
 /// [`LineIndex::char_prefixes_arc`]): per-line tables behind an atomic hint,
 /// so a racy store can only cost a re-anchor, never a wrong answer.
 /// `Send + Sync`, so the parallel path shares one map across workers.
-pub(crate) type CharPrefixMap =
-    std::sync::RwLock<FxHashMap<usize, CharPrefixEntry>>;
+pub(crate) type CharPrefixMap = std::sync::RwLock<FxHashMap<usize, CharPrefixEntry>>;
 
 /// One cached line index, keyed by source identity `(ptr, len)`.
 struct CachedSourceIndex {
@@ -160,6 +155,17 @@ pub(crate) fn source_fingerprint(s: &str) -> u64 {
     h
 }
 
+#[derive(Clone)]
+pub(crate) struct PreloadedSource {
+    pub ptr: usize,
+    pub len: usize,
+    pub starts: Arc<[u32]>,
+    pub ascii: bool,
+    pub char_prefixes: Arc<CharPrefixMap>,
+    pub generation: u64,
+    pub fingerprint: u64,
+}
+
 /// The line-table half of a [`CachedSourceIndex`], shareable across the
 /// workers of one parallel batch.
 #[derive(Clone)]
@@ -168,6 +174,8 @@ struct SharedSourceIndex {
     ascii: bool,
     char_prefixes: Arc<CharPrefixMap>,
     generation: u64,
+    #[cfg(debug_assertions)]
+    fingerprint: u64,
 }
 
 /// Cross-worker share of line tables for one parallel batch.
@@ -185,26 +193,18 @@ pub(crate) struct SharedSources {
 impl SharedSources {
     /// Build from pre-scanned `(ptr, len, starts, ascii, char_prefixes)`
     /// entries (the shape [`LineIndex::new`] + the accessors produce).
-    pub(crate) fn from_entries(
-        entries: &[(
-            usize,
-            usize,
-            Arc<[u32]>,
-            bool,
-            Arc<CharPrefixMap>,
-            u64,
-            u64,
-        )],
-    ) -> Arc<Self> {
+    pub(crate) fn from_entries(entries: &[PreloadedSource]) -> Arc<Self> {
         let mut map = FxHashMap::default();
-        for &(ptr, len, ref starts, ascii, ref prefixes, generation, _fingerprint) in entries {
+        for e in entries {
             map.insert(
-                (ptr, len),
+                (e.ptr, e.len),
                 SharedSourceIndex {
-                    starts: Arc::clone(starts),
-                    ascii,
-                    char_prefixes: Arc::clone(prefixes),
-                    generation,
+                    starts: Arc::clone(&e.starts),
+                    ascii: e.ascii,
+                    char_prefixes: Arc::clone(&e.char_prefixes),
+                    generation: e.generation,
+                    #[cfg(debug_assertions)]
+                    fingerprint: e.fingerprint,
                 },
             );
         }
@@ -371,6 +371,18 @@ impl<'a> RenderCtx<'a> {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&(ptr, len))
             {
+                #[cfg(debug_assertions)]
+                let fingerprint = {
+                    let fp = source_fingerprint(source);
+                    if e.fingerprint != 0 {
+                        debug_assert_eq!(
+                            e.fingerprint, fp,
+                            "SharedSources entry belongs to a different source — \
+                             batch-scoped lifetime violated"
+                        );
+                    }
+                    fp
+                };
                 let mut cache = self.source_index.borrow_mut();
                 if cache.len() >= CACHE_SLOTS {
                     cache.pop();
@@ -436,6 +448,8 @@ impl<'a> RenderCtx<'a> {
                 ascii: idx.ascii(),
                 char_prefixes: Arc::clone(idx.char_prefixes_arc()),
                 generation: idx.generation(),
+                #[cfg(debug_assertions)]
+                fingerprint: source_fingerprint(source),
             });
             (
                 Arc::clone(&e.starts),
@@ -509,7 +523,7 @@ impl<'a> RenderCtx<'a> {
         uri: Option<&'a str>,
         shared_sources: Arc<SharedSources>,
         file_urls: FileUrlMap,
-        preload: &[(usize, usize, Arc<[u32]>, bool, Arc<CharPrefixMap>, u64, u64)],
+        preload: &[PreloadedSource],
     ) -> Self {
         let mut cx = Self::new(opts, uri);
         cx.set_shared_sources(shared_sources);
@@ -521,10 +535,7 @@ impl<'a> RenderCtx<'a> {
     /// Replace the `file://` URL cache with a caller-supplied (shared) map —
     /// used by the parallel render path so all workers share one
     /// `canonicalize` per file per batch.
-    pub(crate) fn set_file_urls(
-        &mut self,
-        urls: FileUrlMap,
-    ) {
+    pub(crate) fn set_file_urls(&mut self, urls: FileUrlMap) {
         self.file_urls = urls;
     }
 
@@ -547,26 +558,23 @@ impl<'a> RenderCtx<'a> {
     /// (not `&self`) makes a mid-batch reseed a compile error — the pop-tail
     /// eviction below is live, so reseeding between renders would silently
     /// evict warm tables.
-    pub(crate) fn preload_line_index(
-        &mut self,
-        entries: &[(usize, usize, Arc<[u32]>, bool, Arc<CharPrefixMap>, u64, u64)],
-    ) {
+    pub(crate) fn preload_line_index(&mut self, entries: &[PreloadedSource]) {
         let mut cache = self.source_index.borrow_mut();
-        for &(ptr, len, ref starts, ascii, ref prefixes, generation, fingerprint) in entries.iter().rev() {
+        for e in entries.iter().rev() {
             if cache.len() >= CACHE_SLOTS {
                 cache.pop();
             }
             cache.insert(
                 0,
                 CachedSourceIndex {
-                    ptr,
-                    len,
-                    starts: Arc::clone(starts),
-                    ascii,
-                    char_prefixes: Arc::clone(prefixes),
-                    generation,
+                    ptr: e.ptr,
+                    len: e.len,
+                    starts: Arc::clone(&e.starts),
+                    ascii: e.ascii,
+                    char_prefixes: Arc::clone(&e.char_prefixes),
+                    generation: e.generation,
                     #[cfg(debug_assertions)]
-                    fingerprint,
+                    fingerprint: e.fingerprint,
                 },
             );
         }
@@ -584,25 +592,19 @@ impl<'a> RenderCtx<'a> {
         // `canonicalize`; the per-name `OnceLock` serializes the expensive
         // syscall so a batch with W workers and F files pays F calls, not W·F.
         let slot = {
-            let map = self
-                .file_urls
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
+            let map = self.file_urls.read().unwrap_or_else(|e| e.into_inner());
             map.get(name).map(Arc::clone)
         };
         let slot = match slot {
             Some(slot) => slot,
             None => {
-                let mut map = self
-                    .file_urls
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut map = self.file_urls.write().unwrap_or_else(|e| e.into_inner());
                 Arc::clone(map.entry(name.to_string()).or_default())
             }
         };
-        Arc::clone(slot.get_or_init(|| {
-            Arc::from(path_to_file_url(std::path::Path::new(name)).as_str())
-        }))
+        Arc::clone(
+            slot.get_or_init(|| Arc::from(path_to_file_url(std::path::Path::new(name)).as_str())),
+        )
     }
 }
 

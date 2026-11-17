@@ -514,11 +514,18 @@ impl ErrCode {
     /// dynamically-constructed code strings (e.g. `Diagnostic::with_code_str`).
     pub(crate) fn unknown(code: impl Into<CompactString>) -> Self {
         let raw = code.into();
-        // Resolve once here instead of on every `eq`/`hash`: an untrusted
-        // spelling such as `e030` must still compare/hash as `E030`, but the
-        // table walk is a construction cost, not a per-comparison one.
+        // Exact canonical spelling: `Known` is observationally identical and
+        // avoids an `Arc<OtherCode>` allocation on the per-coded-diagnostic
+        // path.  Non-canonical spellings still need `Other` to preserve the
+        // verbatim echo in `code()`/URL link text.
+        if let Some(e) = lookup(&raw) {
+            return ErrCode(ErrCodeRepr::Known(e));
+        }
         let canonical = resolve(&raw);
-        ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode { raw, canonical })))
+        ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode {
+            raw,
+            canonical,
+        })))
     }
 
     /// The code string, e.g. "E030" or "W113".
@@ -549,10 +556,7 @@ impl ErrCode {
     pub(crate) fn canonical(&self) -> &str {
         match &self.0 {
             ErrCodeRepr::Known(e) => e.code,
-            ErrCodeRepr::Other(o) => o
-                .canonical
-                .map(|e| e.code)
-                .unwrap_or(o.raw.as_str()),
+            ErrCodeRepr::Other(o) => o.canonical.map(|e| e.code).unwrap_or(o.raw.as_str()),
         }
     }
 
@@ -633,28 +637,28 @@ impl ErrCode {
     }
 
     fn url_for_slot(&self, slot: Option<u16>) -> std::sync::Arc<str> {
+        self.url_for_slot_with_port(slot, EXPLAIN_PORT.get().copied())
+    }
+
+    fn url_for_slot_with_port(&self, slot: Option<u16>, port: Option<u16>) -> std::sync::Arc<str> {
         // Canonical spelling, not the verbatim echo: `unknown("e030")` resolves
         // to the E030 entry (title/category/explain all do), so its URL must be
         // the registered `/E030` — not a `/e030` the doc site 404s — and it
         // must hit the per-slot cache like any other spelling of that code.
         let code = self.canonical();
         let Some(slot) = slot else {
-            return explain_url(code).into();
+            return explain_url_with_port(code, port).into();
         };
-        if EXPLAIN_PORT.get().is_some() {
+        if let Some(port) = port {
             // Two disjoint caches (port set / port unset) mirror `url_ansi`'s
             // split so a later `set_explain_port` can never observe a stale
             // doc-URL host.
             static URL_CACHE: SlotCache = SlotCache::new();
-            cached_slot_string(&URL_CACHE, slot, || explain_url(code))
+            cached_slot_string(&URL_CACHE, slot, || explain_url_with_port(code, Some(port)))
         } else {
             // No explain server: the doc URL depends only on the code.
-            // Disjoint from the port cache (this branch is taken only while
-            // the port is unset, and the port is set-once).
             static DOC_URL_CACHE: SlotCache = SlotCache::new();
-            cached_slot_string(&DOC_URL_CACHE, slot, || {
-                explain_url_with_port(code, None)
-            })
+            cached_slot_string(&DOC_URL_CACHE, slot, || explain_url_with_port(code, None))
         }
     }
 
@@ -677,49 +681,51 @@ impl ErrCode {
             // `None` (unregistered but shape-valid, e.g. E999) keeps the
             // historical slot-cache behavior; only a non-canonical spelling
             // must bypass the cache.
-            ErrCodeRepr::Other(o) => o
-                .canonical
-                .is_none_or(|e| e.code == o.raw.as_str()),
+            ErrCodeRepr::Other(o) => o.canonical.is_none_or(|e| e.code == o.raw.as_str()),
         }
     }
 
     pub fn url_ansi(&self) -> std::sync::Arc<str> {
+        let port = EXPLAIN_PORT.get().copied();
         let Some(slot) = self.slot() else {
-            return self.url_ansi_build().into();
+            return self.url_ansi_build(None, port).into();
         };
         // The cached string embeds the *visible* spelling, not the canonical
         // one.  Letting `unknown("e030")` populate slot 30 would make a later
         // canonical `E030` render the wrong link text.
         if !self.ansi_cacheable() {
-            return self.url_ansi_build().into();
+            return self.url_ansi_build(Some(slot), port).into();
         }
-        if EXPLAIN_PORT.get().is_some() {
+        if port.is_some() {
             static URL_ANSI_CACHE: SlotCache = SlotCache::new();
-            cached_slot_string(&URL_ANSI_CACHE, slot, || self.url_ansi_build())
+            cached_slot_string(&URL_ANSI_CACHE, slot, || {
+                self.url_ansi_build(Some(slot), port)
+            })
         } else {
             // No explain server: memoize the OSC 8 form of the doc URL, the
             // same way the doc URL itself is memoized in `url`.  Disjoint
             // from the port cache, so a later `set_explain_port` cannot
             // return a stale doc host.
             static DOC_URL_ANSI_CACHE: SlotCache = SlotCache::new();
-            cached_slot_string(&DOC_URL_ANSI_CACHE, slot, || self.url_ansi_build())
+            cached_slot_string(&DOC_URL_ANSI_CACHE, slot, || {
+                self.url_ansi_build(Some(slot), port)
+            })
         }
     }
 
     /// Uncached core of [`url_ansi`](Self::url_ansi): build the OSC 8 hyperlink
     /// from the (uncached) [`url`](Self::url) and the sanitized code.  Separated
     /// so the cache path can `set` without holding a borrow across the build.
-    fn url_ansi_build(&self) -> CompactString {
+    fn url_ansi_build(&self, slot: Option<u16>, port: Option<u16>) -> CompactString {
         // E6: build the URL exactly once. The old `format_compact!(self.url())`
         // allocated an `Arc<str>` for unknown codes (no registry slot → no
         // cache) only to format it again; assemble straight into the result.
-        let slot = self.slot();
         let mut out = CompactString::default();
         out.push_str("\x1b]8;;");
         if slot.is_some() {
-            out.push_str(&self.url_for_slot(slot));
+            out.push_str(&self.url_for_slot_with_port(slot, port));
         } else {
-            out.push_str(&explain_url(self.canonical()));
+            out.push_str(&explain_url_with_port(self.canonical(), port));
         }
         out.push_str("\x1b\\");
         let visible: std::borrow::Cow<'_, str> = if self.is_known() {
@@ -854,7 +860,12 @@ pub(crate) fn code_entries_by_category() -> &'static [(ErrorCategory, Vec<&'stat
         }
         order
             .into_iter()
-            .map(|cat| (cat, buckets.remove(&cat).unwrap_or_default()))
+            .map(|cat| {
+                let bucket = buckets
+                    .remove(&cat)
+                    .expect("category in order must have a bucket");
+                (cat, bucket)
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice()
     })
@@ -900,19 +911,22 @@ mod tests {
         let upper = category_siblings_of("E030", 4);
         let lower = category_siblings_of("e030", 4);
         assert!(!upper.is_empty(), "E030 has category siblings");
-        assert_eq!(lower, upper, "lowercase input returned a different (empty) list");
+        assert_eq!(
+            lower, upper,
+            "lowercase input returned a different (empty) list"
+        );
         // And the case spellings share one cache entry (canonical key).
         assert_eq!(category_siblings_of("E030", 2).len(), 2);
         assert_eq!(category_siblings_of("e030", 2).len(), 2);
     }
 
     /// E3: `EXPLAIN_PORT` is process-global, and Cargo runs tests in parallel
-/// threads within one binary. Serialize every test that mutates it or reads a
-/// URL derived from it, so a future explicit host assertion cannot flake on
-/// test ordering.
-static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// threads within one binary. Serialize every test that mutates it or reads a
+    /// URL derived from it, so a future explicit host assertion cannot flake on
+    /// test ordering.
+    static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A second `set_explain_port` must be observable rather than silently
+    /// A second `set_explain_port` must be observable rather than silently
     /// discarded.  `EXPLAIN_PORT` is a process-global `OnceLock`, so this test
     /// deliberately owns it (no other test sets it).
     #[test]
@@ -1113,7 +1127,7 @@ static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// Return the argument text of the parenthesised call whose `(` is at
     /// `open_idx`, skipping nested parens, string literals, and comments.
     /// Skip a raw string starting at the `r` of `r#"…"#` (or `br#"…"#`),
-/// returning the index just past the closing delimiter (or `len`).
+    /// returning the index just past the closing delimiter (or `len`).
     fn skip_raw_string(bytes: &[u8], r: usize) -> Option<usize> {
         let mut h = r + 1;
         while h < bytes.len() && bytes[h] == b'#' {

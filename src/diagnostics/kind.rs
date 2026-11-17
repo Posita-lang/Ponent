@@ -362,9 +362,7 @@ fn comptime_message<'a>(kind: &ComptimeErrorKind) -> DiagMessage<'a> {
     }
 }
 
-fn name_not_found_help<'src>(
-    suggestions: &[Cow<'src, str>],
-) -> Option<Cow<'src, str>> {
+fn name_not_found_help<'src>(suggestions: &[Cow<'src, str>]) -> Option<Cow<'src, str>> {
     if suggestions.is_empty() {
         None
     } else {
@@ -458,10 +456,7 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 ..
             } => DiagMessage::Slug {
                 slug: "field-not-found",
-                pairs: smallvec![
-                    ("field", field_name.clone()),
-                    ("type", type_name.clone()),
-                ],
+                pairs: smallvec![("field", field_name.clone()), ("type", type_name.clone()),],
             },
             DiagnosticKind::ArgumentTypeMismatch {
                 callee,
@@ -811,8 +806,7 @@ impl<'src> DiagnosticKind<'src> {
                 span,
                 traceback,
             } => {
-                let message: DiagMessage<'src> =
-                    comptime_message_with_traceback(&kind, &traceback);
+                let message: DiagMessage<'src> = comptime_message_with_traceback(&kind, &traceback);
                 let mut labels = CovariantVec::new();
                 labels.push(Label::new(span, fluent::label_comptime_eval_error().lift()));
                 for (reason, tb_span) in &traceback {
@@ -940,7 +934,11 @@ mod humanizer_differential_tests {
     }
 
     fn label_key(l: &Label<'_>) -> (usize, usize, String) {
-        (l.span.start_as_usize(), l.span.end_as_usize(), l.message.to_string())
+        (
+            l.span.start_as_usize(),
+            l.span.end_as_usize(),
+            l.message.to_string(),
+        )
     }
 
     /// The borrowing `Humanizer` impl and the consuming `humanize_into`

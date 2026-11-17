@@ -169,12 +169,16 @@ impl<'src> FixSet<'src> {
         // Stable sort is load-bearing: zero-length dedup and the DP
         // `include > exclude` tiebreak preserve diagnostic input order for
         // equal keys.  Do not swap for `sort_unstable_by_key`.
-        if !candidates.is_sorted_by_key(|e| {
-            (e.span.file, e.span.start_as_usize(), e.span.end_as_usize())
-        }) {
-            candidates.sort_by_key(|e| {
-                (e.span.file, e.span.start_as_usize(), e.span.end_as_usize())
-            });
+        if !candidates
+            .is_sorted_by_key(|e| (e.span.file, e.span.start_as_usize(), e.span.end_as_usize()))
+        {
+            candidates
+                .sort_by_key(|e| (e.span.file, e.span.start_as_usize(), e.span.end_as_usize()));
+        }
+        // A single valid edit cannot overlap anything; skip the dedup/group/DP
+        // machinery entirely (the common one-fix batch).
+        if candidates.len() <= 1 {
+            return FixSet { edits: candidates };
         }
         // Drop overlapping candidates by maximum total applicability weight.
         FixSet {
@@ -193,67 +197,65 @@ impl<'src> FixSet<'src> {
     /// but an insertion at a replacement's boundary is disjoint and survives.
     fn resolve_overlaps(candidates: Vec<FixEdit<'src>>) -> Vec<FixEdit<'src>> {
         // Candidates arrive sorted by `(file, start, end)`, so duplicate
-        // zero-length runs are adjacent.  Work through `Option` slots so the
-        // chosen edit can be moved out instead of cloning its `Cow` payload.
-        let mut candidates: Vec<Option<FixEdit<'src>>> =
-            candidates.into_iter().map(Some).collect();
-        let mut deduped = Vec::with_capacity(candidates.len());
-        let mut i = 0;
-        while i < candidates.len() {
-            let (file, start, end) = {
-                let edit = candidates[i].as_ref().expect("candidate slot filled");
-                (
-                    edit.span.file,
-                    edit.span.start_as_usize(),
-                    edit.span.end_as_usize(),
-                )
-            };
-            if start == end {
-                let mut best = i;
-                let mut j = i + 1;
-                while j < candidates.len() {
-                    let other = candidates[j].as_ref().expect("candidate slot filled");
-                    if other.span.file != file
-                        || other.span.start_as_usize() != start
-                        || other.span.end_as_usize() != start
-                    {
-                        break;
-                    }
-                    let best_weight = applicability_weight(
-                        candidates[best]
-                            .as_ref()
-                            .expect("candidate slot filled")
-                            .applicability,
-                    );
-                    // Strict `>` preserves diagnostic input order on equal weight; the
-                    // stable sort makes that deterministic for a fixed batch.
-                    if applicability_weight(other.applicability) > best_weight {
-                        best = j;
-                    }
-                    j += 1;
-                }
-                deduped.push(candidates[best].take().expect("candidate slot filled"));
-                i = j;
-            } else {
-                deduped.push(candidates[i].take().expect("candidate slot filled"));
-                i += 1;
+        // zero-length runs are adjacent.  A peekable consuming iterator moves
+        // each chosen edit out exactly once — no `Vec<Option<..>>` shadow
+        // allocation and no per-element `take().expect()`.
+        let key = |e: &FixEdit<'src>| (e.span.file, e.span.start_as_usize(), e.span.end_as_usize());
+        let mut iter = candidates.into_iter().peekable();
+        let mut deduped = Vec::with_capacity(iter.len());
+        while let Some(edit) = iter.next() {
+            let (file, start, end) = key(&edit);
+            if start != end {
+                deduped.push(edit);
+                continue;
             }
+            // Zero-length run: keep the heaviest applicability.  Strict `>`
+            // preserves diagnostic input order on equal weight; the stable
+            // sort makes that deterministic for a fixed batch.
+            let mut best = edit;
+            let mut best_weight = applicability_weight(best.applicability);
+            while let Some(next) = iter.peek() {
+                let (f, s, e) = key(next);
+                if f != file || s != start || e != start {
+                    break;
+                }
+                let next = iter.next().expect("peeked candidate");
+                let weight = applicability_weight(next.applicability);
+                if weight > best_weight {
+                    best = next;
+                    best_weight = weight;
+                }
+            }
+            deduped.push(best);
         }
 
-        let mut by_file: std::collections::BTreeMap<FileId, Vec<FixEdit<'src>>> =
-            std::collections::BTreeMap::new();
-        for edit in deduped {
-            by_file.entry(edit.span.file).or_default().push(edit);
-        }
         let mut result = Vec::new();
         let mut scratch = ResolveScratch::default();
-        for (_file, group) in by_file {
+        let mut group: Vec<FixEdit<'src>> = Vec::new();
+        let mut last_file: Option<FileId> = None;
+        for edit in deduped {
+            if last_file == Some(edit.span.file) {
+                group.push(edit);
+                continue;
+            }
+            if !group.is_empty() {
+                let start = result.len();
+                Self::resolve_file(std::mem::take(&mut group), &mut result, &mut scratch);
+                debug_assert!(
+                    result[start..]
+                        .is_sorted_by_key(|e| { (e.span.start_as_usize(), e.span.end_as_usize()) }),
+                    "resolve_file must emit non-overlapping edits in source order"
+                );
+            }
+            last_file = Some(edit.span.file);
+            group.push(edit);
+        }
+        if !group.is_empty() {
             let start = result.len();
             Self::resolve_file(group, &mut result, &mut scratch);
             debug_assert!(
-                result[start..].is_sorted_by_key(|e| {
-                    (e.span.start_as_usize(), e.span.end_as_usize())
-                }),
+                result[start..]
+                    .is_sorted_by_key(|e| { (e.span.start_as_usize(), e.span.end_as_usize()) }),
                 "resolve_file must emit non-overlapping edits in source order"
             );
         }
@@ -291,8 +293,7 @@ impl<'src> FixSet<'src> {
         // p[i] = number of earlier edits compatible with i.
         // `Option` slots let the backtrack move the chosen edit out instead
         // of cloning its `Cow` payload a second time.
-        let mut group: Vec<Option<FixEdit<'src>>> =
-            group.into_iter().map(Some).collect();
+        let mut group: Vec<Option<FixEdit<'src>>> = group.into_iter().map(Some).collect();
         scratch.p.clear();
         scratch.p.resize(n, 0);
         let p = &mut scratch.p;
@@ -383,16 +384,6 @@ impl<'src> FixSet<'src> {
     /// order).
     #[must_use = "apply returns the rewritten source; write it out or the fix is lost"]
     pub fn apply<'s>(&self, source: &'s str) -> Cow<'s, str> {
-        // Anchor on the first edit's file and apply only that file's edits.
-        // A multi-file set must never splice another file's byte offsets into
-        // this buffer; previously only a debug build caught the mistake, and
-        // release builds silently corrupted it.  Dropping the foreign edits is
-        // the safe degradation; `apply_for_file` is the explicit per-file API.
-        let anchor = self.edits.first().map(|e| e.span.file);
-        debug_assert!(
-            anchor.is_none_or(|f| self.edits.iter().all(|e| e.span.file == f)),
-            "FixSet::apply called on a multi-file set; use apply_for_file",
-        );
         self.apply_counted(source).0
     }
 
@@ -514,9 +505,11 @@ pub fn apply_fixes<'src, 's>(
     set.apply_counted(source)
 }
 
-/// Like [`apply_fixes`] but for an explicit file: apply and count only the
-/// edits targeting `file`.  This is the correct entry point for a driver that
-/// writes fixes back per file.
+/// Single-file convenience: collects once, then applies one file.
+///
+/// A driver writing several files should instead collect **once** and call
+/// [`FixSet::apply_for_file_counted`] per file — this function re-collects on
+/// every call, so using it in a per-file loop is O(files × diagnostics).
 pub fn apply_fixes_for_file<'src, 's>(
     diags: &[Diagnostic<'src>],
     source: &'s str,
@@ -941,8 +934,8 @@ mod tests {
             "hidden suggestions must not be collected"
         );
         // The visible control is still collected (same applicability).
-        let visible = Diagnostic::error("boom")
-            .with_suggestions(vec![mk(SuggestionStyle::ShowAlways)]);
+        let visible =
+            Diagnostic::error("boom").with_suggestions(vec![mk(SuggestionStyle::ShowAlways)]);
         let set = FixSet::collect(&[visible], FixHints::Auto);
         assert_eq!(set.len(), 1);
         assert_eq!(set.apply("dem x"), "XXX x");

@@ -81,8 +81,7 @@ fn run_check_swept<F: Fn() + Send + Sync + 'static>(f: F) {
         let mut config = shuttle::Config::default();
         config.stack_size = 2 * 1024 * 1024;
         config.failure_persistence = shuttle::FailurePersistence::File(None);
-        let runner =
-            shuttle::Runner::new(shuttle::scheduler::PctScheduler::new(seed, 50), config);
+        let runner = shuttle::Runner::new(shuttle::scheduler::PctScheduler::new(seed, 50), config);
         runner.run(move || f());
     }
 }

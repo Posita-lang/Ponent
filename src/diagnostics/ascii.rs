@@ -29,6 +29,10 @@ impl AllowedControls {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+fn x86_level_for(len: usize) -> u8 {
+    if len < 32 { 0 } else { x86_level() }
+}
+
 fn x86_level() -> u8 {
     if swar_forced() {
         return 0;
@@ -83,10 +87,14 @@ fn swar_forced() -> bool {
 /// is sound across chunk boundaries: a top-lane borrow-out implies the top
 /// lane flagged, implies `return false` already happened, so a leak can never
 /// produce a false *reject* of the next chunk.
+///
+/// On x86_64/aarch64/wasm32 the `u128` SWAR body below only handles the
+/// final <16 bytes (SIMD takes over at 16); it is the main body only on
+/// targets without a vector backend.
 #[inline]
 pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    let level = x86_level();
+    let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
     if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_avx512(s) };
@@ -172,7 +180,7 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 #[inline]
 pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    let level = x86_level();
+    let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
     if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_multiline_avx512(s) };
@@ -258,7 +266,7 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
 #[inline]
 pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
-    let level = x86_level();
+    let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
     if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::is_printable_ascii_or_tab_avx512(s) };
@@ -361,7 +369,7 @@ pub(crate) enum AsciiClass {
 #[inline]
 pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     #[cfg(target_arch = "x86_64")]
-    let level = x86_level();
+    let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
     if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::classify_ascii_avx512(s) };
@@ -437,7 +445,7 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 #[inline]
 pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
-    let level = x86_level();
+    let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
     if s.len() >= AVX512_MIN_LEN && level >= 3 {
         return unsafe { x86_64::next_non_ascii_byte_avx512(s) };
@@ -506,12 +514,10 @@ mod x86_64 {
         while i + 64 <= s.len() {
             let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
             let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
-            let bad_a = unsafe {
-                _mm256_or_si256(_mm256_cmpgt_epi8(sp, a), _mm256_cmpeq_epi8(a, del))
-            };
-            let bad_b = unsafe {
-                _mm256_or_si256(_mm256_cmpgt_epi8(sp, b), _mm256_cmpeq_epi8(b, del))
-            };
+            let bad_a =
+                unsafe { _mm256_or_si256(_mm256_cmpgt_epi8(sp, a), _mm256_cmpeq_epi8(a, del)) };
+            let bad_b =
+                unsafe { _mm256_or_si256(_mm256_cmpgt_epi8(sp, b), _mm256_cmpeq_epi8(b, del)) };
             if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad_a, bad_b)) } != 0 {
                 return false;
             }
@@ -661,19 +667,13 @@ mod x86_64 {
                 _mm256_movemask_epi8(_mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i))
             };
             let m1 = unsafe {
-                _mm256_movemask_epi8(_mm256_loadu_si256(
-                    s.as_ptr().add(i + 32) as *const __m256i
-                ))
+                _mm256_movemask_epi8(_mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i))
             };
             let m2 = unsafe {
-                _mm256_movemask_epi8(_mm256_loadu_si256(
-                    s.as_ptr().add(i + 64) as *const __m256i
-                ))
+                _mm256_movemask_epi8(_mm256_loadu_si256(s.as_ptr().add(i + 64) as *const __m256i))
             };
             let m3 = unsafe {
-                _mm256_movemask_epi8(_mm256_loadu_si256(
-                    s.as_ptr().add(i + 96) as *const __m256i
-                ))
+                _mm256_movemask_epi8(_mm256_loadu_si256(s.as_ptr().add(i + 96) as *const __m256i))
             };
             if (m0 | m1 | m2 | m3) != 0 {
                 for (off, mask) in [(0, m0), (32, m1), (64, m2), (96, m3)] {
@@ -883,10 +883,8 @@ mod x86_64 {
         while i + 32 <= s.len() {
             let a = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
             let b = unsafe { _mm_loadu_si128(s.as_ptr().add(i + 16) as *const __m128i) };
-            let bad_a =
-                unsafe { _mm_or_si128(_mm_cmpgt_epi8(sp, a), _mm_cmpeq_epi8(a, del)) };
-            let bad_b =
-                unsafe { _mm_or_si128(_mm_cmpgt_epi8(sp, b), _mm_cmpeq_epi8(b, del)) };
+            let bad_a = unsafe { _mm_or_si128(_mm_cmpgt_epi8(sp, a), _mm_cmpeq_epi8(a, del)) };
+            let bad_b = unsafe { _mm_or_si128(_mm_cmpgt_epi8(sp, b), _mm_cmpeq_epi8(b, del)) };
             if unsafe { _mm_movemask_epi8(_mm_or_si128(bad_a, bad_b)) } != 0 {
                 return false;
             }
@@ -976,9 +974,8 @@ mod x86_64 {
     pub(super) unsafe fn next_non_ascii_byte_sse2(s: &[u8]) -> Option<usize> {
         let mut i = 0usize;
         while i + 64 <= s.len() {
-            let m0 = unsafe {
-                _mm_movemask_epi8(_mm_loadu_si128(s.as_ptr().add(i) as *const __m128i))
-            };
+            let m0 =
+                unsafe { _mm_movemask_epi8(_mm_loadu_si128(s.as_ptr().add(i) as *const __m128i)) };
             let m1 = unsafe {
                 _mm_movemask_epi8(_mm_loadu_si128(s.as_ptr().add(i + 16) as *const __m128i))
             };
@@ -1012,6 +1009,26 @@ mod x86_64 {
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use std::arch::wasm32::*;
+
+    #[inline]
+    unsafe fn andnot(a: v128, b: v128) -> v128 {
+        unsafe { v128_and(a, v128_not(b)) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::arch::wasm32::*;
+
+        use super::andnot;
+
+        #[test]
+        fn andnot_is_a_and_not_b() {
+            let a = u8x16_splat(0xF0);
+            let b = u8x16_splat(0x0F);
+            assert_eq!(unsafe { u8x16_bitmask(andnot(a, b)) }, u16::MAX);
+            assert_eq!(unsafe { u8x16_bitmask(andnot(b, a)) }, 0);
+        }
+    }
 
     #[inline]
     unsafe fn any(v: v128) -> bool {
@@ -1054,7 +1071,7 @@ mod wasm {
             let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
             let bad = |v: v128| unsafe {
                 let lt = i8x16_lt(v, sp);
-                let off = v128_andnot(lt, v128_or(u8x16_eq(v, tab), u8x16_eq(v, nl)));
+                let off = andnot(lt, v128_or(u8x16_eq(v, tab), u8x16_eq(v, nl)));
                 v128_or(u8x16_eq(v, del), off)
             };
             if unsafe { any(v128_or(bad(a), bad(b))) } {
@@ -1065,7 +1082,7 @@ mod wasm {
         while i + 16 <= s.len() {
             let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
             let lt = unsafe { i8x16_lt(v, sp) };
-            let off = unsafe { v128_andnot(lt, v128_or(u8x16_eq(v, tab), u8x16_eq(v, nl))) };
+            let off = unsafe { andnot(lt, v128_or(u8x16_eq(v, tab), u8x16_eq(v, nl))) };
             if unsafe { any(v128_or(u8x16_eq(v, del), off)) } {
                 return false;
             }
@@ -1084,7 +1101,7 @@ mod wasm {
             let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
             let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
             let bad = |v: v128| unsafe {
-                v128_or(u8x16_eq(v, del), v128_andnot(i8x16_lt(v, sp), u8x16_eq(v, tab)))
+                v128_or(u8x16_eq(v, del), andnot(i8x16_lt(v, sp), u8x16_eq(v, tab)))
             };
             if unsafe { any(v128_or(bad(a), bad(b))) } {
                 return false;
@@ -1093,9 +1110,8 @@ mod wasm {
         }
         while i + 16 <= s.len() {
             let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
-            let bad = unsafe {
-                v128_or(u8x16_eq(v, del), v128_andnot(i8x16_lt(v, sp), u8x16_eq(v, tab)))
-            };
+            let bad =
+                unsafe { v128_or(u8x16_eq(v, del), andnot(i8x16_lt(v, sp), u8x16_eq(v, tab))) };
             if unsafe { any(bad) } {
                 return false;
             }
@@ -1117,7 +1133,7 @@ mod wasm {
             let classify = |v: v128| unsafe {
                 let tabm = u8x16_eq(v, tab);
                 (
-                    v128_or(u8x16_eq(v, del), v128_andnot(i8x16_lt(v, sp), tabm)),
+                    v128_or(u8x16_eq(v, del), andnot(i8x16_lt(v, sp), tabm)),
                     u8x16_bitmask(tabm),
                 )
             };
@@ -1132,7 +1148,7 @@ mod wasm {
         while i + 16 <= s.len() {
             let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
             let tabm = unsafe { u8x16_eq(v, tab) };
-            let bad = unsafe { v128_or(u8x16_eq(v, del), v128_andnot(i8x16_lt(v, sp), tabm)) };
+            let bad = unsafe { v128_or(u8x16_eq(v, del), andnot(i8x16_lt(v, sp), tabm)) };
             if unsafe { any(bad) } {
                 return super::AsciiClass::Other;
             }

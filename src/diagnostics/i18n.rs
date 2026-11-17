@@ -146,27 +146,28 @@ fn bundles() -> &'static [Bundle; N_LANGS] {
 fn make_bundle(lang: LanguageIdentifier, src: &'static str) -> Bundle {
     // Locales are validated by `validate_locales` at build time, so parse
     // errors should not occur; keep the (recoverable) resource if they do.
-    let res: &'static FluentResource = Box::leak(Box::new(match FluentResource::try_new(src.to_owned()) {
-        Ok(r) => r,
-        Err((r, _)) => r,
-    }));
+    let res: &'static FluentResource =
+        Box::leak(Box::new(match FluentResource::try_new(src.to_owned()) {
+            Ok(r) => r,
+            Err((r, _)) => r,
+        }));
     let mut bundle = fluent_bundle::concurrent::FluentBundle::new_concurrent(vec![lang]);
     bundle.set_use_isolating(false);
-    bundle.add_resource(res).expect("conflicting Fluent message ids");
+    bundle
+        .add_resource(res)
+        .expect("conflicting Fluent message ids");
     bundle
 }
 
-fn bundle_for_in(lang: &LanguageIdentifier) -> &'static Bundle {
-    let bundles = bundles();
-    // Matches the `language` subtag only: a `zh-Hant` identifier resolves to
-    // the `zh` (Simplified) bundle, and `en-GB` to `en`.  That is correct for
-    // the `Lang` enum path (only `Zh` exists) but would silently serve the
-    // wrong script for an arbitrary `format_slug(langid!("zh-Hant"), …)`; add
-    // a `ZhHant` locale + a script-aware match before exposing that.
-    bundles
-        .iter()
-        .find(|b| b.locales[0].language == lang.language)
-        .unwrap_or(&bundles[0])
+fn bundle_index_for(lang: &LanguageIdentifier) -> usize {
+    // Matches the `language` subtag only: `zh-Hant` resolves to the `zh`
+    // (Simplified) bundle, `en-GB` to `en`.  Adding a locale must update
+    // `LANG_*`/`N_LANGS` and this table together.
+    match lang.language.as_str() {
+        "ru" => 1,
+        "zh" => 2,
+        _ => 0,
+    }
 }
 
 /// Resolve + format `slug` in `lang`'s bundle, falling back to the `en`
@@ -176,11 +177,7 @@ fn bundle_for_in(lang: &LanguageIdentifier) -> &'static Bundle {
 ///
 /// Not test-only: the generated `fluent_gen.rs` calls `super::format_slug`
 /// for the typed zero/one-arg accessors.
-fn format_slug(
-    lang: &LanguageIdentifier,
-    slug: &str,
-    args: Option<&FluentArgs>,
-) -> Option<String> {
+fn format_slug(lang: &LanguageIdentifier, slug: &str, args: Option<&FluentArgs>) -> Option<String> {
     let mut out = String::new();
     format_slug_into(lang, slug, args, &mut out).then_some(out)
 }
@@ -198,7 +195,13 @@ fn format_slug_into(
     out: &mut String,
 ) -> bool {
     let bundles = bundles();
-    format_slug_in_into(bundle_for_in(lang), &bundles[0], slug, args, out)
+    format_slug_in_into(
+        &bundles[bundle_index_for(lang)],
+        &bundles[0],
+        slug,
+        args,
+        out,
+    )
 }
 
 fn format_slug_in_into(
@@ -208,7 +211,6 @@ fn format_slug_in_into(
     args: Option<&FluentArgs>,
     out: &mut String,
 ) -> bool {
-
     // Hoisted out of `try_bundle`: a fresh `Vec::new()` per attempt is free
     // on the success path (lazy allocation) but pays a fresh `Drop` per
     // bundle attempt on the fallback path; one buffer reused across the
@@ -228,8 +230,7 @@ fn format_slug_in_into(
         }
     };
 
-    let chain = std::iter::once(primary)
-        .chain((!std::ptr::eq(primary, en)).then_some(en));
+    let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
     for b in chain {
         if try_bundle(b, out) {
             return true;
@@ -358,16 +359,32 @@ impl Lang {
 }
 
 fn detect_from_env() -> Lang {
-    let explicit = std::env::var("PONENT_LANG").ok();
-    let fallback = std::env::var("LANG").ok();
-    detect_from_pair(explicit.as_deref(), fallback.as_deref())
+    detect_from_values(
+        std::env::var("PONENT_LANG").ok(),
+        std::env::var("LC_ALL").ok(),
+        std::env::var("LC_MESSAGES").ok(),
+        std::env::var("LANG").ok(),
+    )
+}
+
+fn detect_from_values(
+    explicit: Option<String>,
+    lc_all: Option<String>,
+    lc_messages: Option<String>,
+    lang: Option<String>,
+) -> Lang {
+    let explicit = explicit.as_deref().filter(|s| !s.is_empty());
+    let fallback = [lc_all, lc_messages, lang]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty());
+    detect_from_pair(explicit, fallback.as_deref())
 }
 
 fn detect_from_pair(explicit: Option<&str>, fallback: Option<&str>) -> Lang {
-    match (explicit, fallback) {
-        (Some(p), _) => detect_from_str(p),
-        (None, Some(l)) => detect_from_str(l),
-        (None, None) => Lang::En,
+    match explicit.filter(|s| !s.is_empty()) {
+        Some(p) => detect_from_str(p),
+        None => fallback.map(detect_from_str).unwrap_or(Lang::En),
     }
 }
 
@@ -518,40 +535,33 @@ fn try_fluent_into<'msg, 'src>(
         return format_slug_into(lang, msg, None, out);
     }
     // Single-pass resolve+format: walk the bundle chain once.  The argument
-    // map is built eagerly once; this path is already past `is_ftl_slug`, and
-    // the map is tiny (≤4 entries).
+    // map is built lazily, only after a bundle actually has the message.
     let bundles = bundles();
-    let primary = bundle_for_in(lang);
+    let primary = &bundles[bundle_index_for(lang)];
     let en = &bundles[0];
-    // Build the argument map once for the whole fallback chain.
-    let mut args = FluentArgs::new();
-    pairs.iter().for_each(|(k, v)| {
-        // `v.clone()` — not `FluentValue::String(v)` by value. `pairs`
-        // arrives as `&[...]` borrowed from `DiagMessage::render_into(&self)`,
-        // so `v` is behind a shared reference and cannot be moved (E0507).
-        // Taking `pairs` by value would force `render_into` to own its
-        // message, breaking the `&self` API (a diagnostic may render more
-        // than once) and rippling through every caller. Under `&self`,
-        // `clone` is the cheapest legal option: `Cow::Borrowed` copies a
-        // pointer (zero heap, the common `&str`-arg path); only `Cow::Owned`
-        // deep-copies — unavoidable without ownership.
-        let value = make_value(v.clone(), k);
-        args.set(*k, value);
-    });
+    let mut built_args: Option<FluentArgs> = None;
     // P2: resolve each bundle in turn and *retry formatting* on the next one
     // when a bundle has the message but fails to format it (a broken
     // translation, a missing argument in a translation, or a malformed
-    // pattern).  The old `find_map` stopped at the first bundle with the
-    // message, so one bad localized translation fell all the way back to the
-    // raw slug even when `en` would have formatted cleanly.
+    // pattern).
     let mut errors = Vec::new();
     let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
     for b in chain {
         let Some(pattern) = b.get_message(msg).and_then(|m| m.value()) else {
             continue;
         };
+        let args = built_args.get_or_insert_with(|| {
+            let mut args = FluentArgs::new();
+            pairs.iter().for_each(|(k, v)| {
+                // `pairs` is borrowed, so `v.clone()` is the cheapest legal
+                // move (Borrowed = pointer copy; Owned = deep copy).
+                let value = make_value(v.clone(), k);
+                args.set(*k, value);
+            });
+            args
+        });
         errors.clear();
-        let val = b.format_pattern(pattern, Some(&args), &mut errors);
+        let val = b.format_pattern(pattern, Some(args), &mut errors);
         if errors.is_empty() {
             out.push_str(&val);
             return true;
@@ -621,7 +631,7 @@ fn try_fluent_owned_into<'msg, 'src>(
     // the message is found — `pairs` is consumed, so the build cannot sit
     // inside the loop.
     let bundles = bundles();
-    let primary = bundle_for_in(lang);
+    let primary = &bundles[bundle_index_for(lang)];
     let en = &bundles[0];
     let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
     // Retry formatting on the next bundle when this one has the message but
@@ -767,21 +777,21 @@ mod tests {
     }
 
     /// A slug that is known but whose arguments are missing (or an unknown
-/// slug) must report failure and leave `out` untouched — the caller then
-/// falls back to the verbatim message instead of rendering a bare slug or
-/// partial text.
-#[test]
-fn format_slug_into_degrades_without_touching_out() {
-    let en = lang_id_at(0);
-    let mut out = String::from("prefix");
-    assert!(!format_slug_into(en, "no-such-slug", None, &mut out));
-    assert_eq!(out, "prefix");
-    // `type-mismatch` needs two args; formatting without them fails.
-    assert!(!format_slug_into(en, "type-mismatch", None, &mut out));
-    assert_eq!(out, "prefix");
-}
+    /// slug) must report failure and leave `out` untouched — the caller then
+    /// falls back to the verbatim message instead of rendering a bare slug or
+    /// partial text.
+    #[test]
+    fn format_slug_into_degrades_without_touching_out() {
+        let en = lang_id_at(0);
+        let mut out = String::from("prefix");
+        assert!(!format_slug_into(en, "no-such-slug", None, &mut out));
+        assert_eq!(out, "prefix");
+        // `type-mismatch` needs two args; formatting without them fails.
+        assert!(!format_slug_into(en, "type-mismatch", None, &mut out));
+        assert_eq!(out, "prefix");
+    }
 
-#[test]
+    #[test]
     fn detect_from_str_uses_primary_subtag_exactly() {
         // Documented inputs resolve identically.
         assert_eq!(detect_from_str("en"), Lang::En);
@@ -798,11 +808,37 @@ fn format_slug_into_degrades_without_touching_out() {
         assert_eq!(detect_from_str(""), Lang::En);
         assert_eq!(detect_from_str("C"), Lang::En);
 
-        // PONENT_LANG wins even when empty (explicit En); absent falls to LANG.
+        // PONENT_LANG wins; empty means unset and falls through.
         assert_eq!(detect_from_pair(Some("ru"), Some("zh_TW")), Lang::Ru);
         assert_eq!(detect_from_pair(None, Some("zho_CN")), Lang::Zh);
-        assert_eq!(detect_from_pair(Some(""), Some("ru")), Lang::En);
+        assert_eq!(detect_from_pair(Some(""), Some("ru")), Lang::Ru);
         assert_eq!(detect_from_pair(None, None), Lang::En);
+        // POSIX precedence inside the fallback chain.
+        assert_eq!(
+            detect_from_values(
+                None,
+                Some("zh_TW".into()),
+                Some("ru_RU".into()),
+                Some("en".into())
+            ),
+            Lang::Zh
+        );
+        assert_eq!(
+            detect_from_values(None, None, Some("ru_RU".into()), Some("en".into())),
+            Lang::Ru
+        );
+        assert_eq!(
+            detect_from_values(None, None, None, Some("ru_RU".into())),
+            Lang::Ru
+        );
+        assert_eq!(
+            detect_from_values(Some("en".into()), Some("ru".into()), None, None),
+            Lang::En
+        );
+        assert_eq!(
+            detect_from_values(Some(String::new()), None, None, Some("ru".into())),
+            Lang::Ru
+        );
     }
 
     /// The zero-arg slug cache must be language-aware: fetching under `En`,

@@ -306,7 +306,9 @@ fn main() {
             let mut outcome = run_check(&file, &opts, &session_sync_arena);
             // `--fix` applies machine-applicable suggestions to the source file
             // in place, then re-runs the check to confirm the fix.
-            if cli.fix && let Err(ref diags) = outcome {
+            if cli.fix
+                && let Err(ref diags) = outcome
+            {
                 // Only fix what the user would actually see: the old code
                 // applied suggestions from diagnostics `--allow`/`--only-*`
                 // had filtered out.
@@ -446,7 +448,11 @@ fn run_lex(file: &str) -> Result<(), Vec<Diagnostic<'static>>> {
             Err(()) => errors.push(Diagnostic::error("invalid token")),
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Parse a file, and unless `--ast` was given, resolve and type-check it.
@@ -920,11 +926,11 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 #[cfg(target_os = "windows")]
 fn open_browser(url: &str) -> std::io::Result<()> {
     std::process::Command::new("cmd")
-                // `start`'s first quoted argument is the window *title*, so an
-                // empty title must be passed explicitly before the URL; otherwise
-                // Windows opens an empty console instead of the page.
-                .args(["/c", "start", "", url])
-                .spawn?;
+        // `start`'s first quoted argument is the window *title*, so an
+        // empty title must be passed explicitly before the URL; otherwise
+        // Windows opens an empty console instead of the page.
+        .args(["/c", "start", "", url])
+        .spawn?;
     Ok(())
 }
 

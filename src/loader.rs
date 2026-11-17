@@ -341,9 +341,9 @@ pub fn resolve_and_check(
                 if let Some(items) = &site.items
                     && let Some(prog) = by_id.get(&to)
                 {
-                    let names = export_names.entry(to).or_insert_with(|| {
-                        prog.items.iter().filter_map(item_name).collect()
-                    });
+                    let names = export_names
+                        .entry(to)
+                        .or_insert_with(|| prog.items.iter().filter_map(item_name).collect());
                     for item in items {
                         if names.contains(item) {
                             continue;
@@ -354,10 +354,7 @@ pub fn resolve_and_check(
                         ))
                         .with_code_str("E-import-no-item")
                         .with_span(site.span)
-                        .with_help(format!(
-                            "`{target}` does not export `{}`",
-                            item.as_str()
-                        ));
+                        .with_help(format!("`{target}` does not export `{}`", item.as_str()));
                         if let Some(near) = closest_item(*item, names) {
                             diag = diag.with_suggestion(format!(
                                 "a similarly named item exists: `{near}` — did you mean it?"
@@ -537,8 +534,7 @@ fn cycles_in(edges: &[(FileId, FileId, &ImportSite)]) -> Vec<Vec<ImportSite>> {
             }
             // Borrow the adjacency slice: cloning it on every pop made the
             // DFS O(V·E) worst case with one allocation per pop.
-            let children: &[(FileId, &ImportSite)] =
-                adj.get(&v).map(Vec::as_slice).unwrap_or(&[]);
+            let children: &[(FileId, &ImportSite)] = adj.get(&v).map(Vec::as_slice).unwrap_or(&[]);
             let mut recursed = false;
             while ci < children.len() {
                 let (w, _) = children[ci];
@@ -947,9 +943,10 @@ mod tests {
             diags
         );
         assert!(
-            diags
+            diags.iter().any(|d| d
+                .suggestions()
                 .iter()
-                .any(|d| d.suggestions().iter().any(|s| format!("{s:?}").contains("add"))),
+                .any(|s| format!("{s:?}").contains("add"))),
             "did-you-mean for the item missing: {:?}",
             diags
         );

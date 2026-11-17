@@ -290,8 +290,10 @@ impl DiagFilter {
         let only_categories: rustc_hash::FxHashSet<ErrorCategory> =
             opts.only_categories.iter().copied().collect();
         let only_files = opts.only_files.clone();
-        let is_empty =
-            allow_codes.is_empty() && only_codes.is_empty() && only_categories.is_empty() && only_files.is_empty();
+        let is_empty = allow_codes.is_empty()
+            && only_codes.is_empty()
+            && only_categories.is_empty()
+            && only_files.is_empty();
         DiagFilter {
             allow_codes,
             only_codes,
@@ -1095,21 +1097,21 @@ impl<'src> Diagnostic<'src> {
     }
 
     /// A deterministic identifier derived from `(code, first primary span,
-        /// message, file_name)`, for tools to deduplicate / track diagnostics
-        /// across runs.  `file_name` participates so identical code/spans/messages
-        /// in different files do not collide.
-        ///
-        /// Computed once with FNV-1a and cached in an [`AtomicU64`]; when the
-        /// inputs are unchanged, a second call is just a relaxed load. Every
-        /// entry point that can mutate the fields above
-        /// ([`with_code`](Self::with_code), [`with_code_str`](Self::with_code_str),
-        /// [`with_span`](Self::with_span), [`with_additional_span`](Self::with_additional_span),
-        /// [`augment`](Self::augment), [`humanize`](Self::humanize),
-        /// [`set_file_name`](Self::set_file_name), and
-        /// [`adorn_with_span`](Self::adorn_with_span)) clears the cache via
-        /// [`invalidate_stable_id`](Self::invalidate_stable_id), so callers
-        /// always see a value consistent with the current inputs.
-        pub fn stable_id(&self) -> u64 {
+    /// message, file_name)`, for tools to deduplicate / track diagnostics
+    /// across runs.  `file_name` participates so identical code/spans/messages
+    /// in different files do not collide.
+    ///
+    /// Computed once with FNV-1a and cached in an [`AtomicU64`]; when the
+    /// inputs are unchanged, a second call is just a relaxed load. Every
+    /// entry point that can mutate the fields above
+    /// ([`with_code`](Self::with_code), [`with_code_str`](Self::with_code_str),
+    /// [`with_span`](Self::with_span), [`with_additional_span`](Self::with_additional_span),
+    /// [`augment`](Self::augment), [`humanize`](Self::humanize),
+    /// [`set_file_name`](Self::set_file_name), and
+    /// [`adorn_with_span`](Self::adorn_with_span)) clears the cache via
+    /// [`invalidate_stable_id`](Self::invalidate_stable_id), so callers
+    /// always see a value consistent with the current inputs.
+    pub fn stable_id(&self) -> u64 {
         let cached = self.stable_id_cache.load(Ordering::Relaxed);
         if cached != 0 {
             return cached;
@@ -1830,7 +1832,7 @@ impl<'src> Diagnostic<'src> {
                 fn key<'a, 'src>(l: &'a Label<'src>) -> (FileId, u32, u32, &'a str) {
                     (l.span.file, l.span.start, l.span.end, &l.message)
                 }
-                let mut seen: std::collections::HashSet<(FileId, u32, u32, &str)> =
+                let mut seen: rustc_hash::FxHashSet<(FileId, u32, u32, &str)> =
                     self.labels.iter().map(key).collect();
                 for lbl in &other.labels {
                     if seen.insert(key(lbl)) {
@@ -2216,7 +2218,11 @@ fn osa_dist_le_1(a: &str, b: &str) -> Option<usize> {
     if a == b {
         return Some(0);
     }
-    let (s, l) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    let (s, l) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     match l.len() - s.len() {
         0 => {
             // Same length: either one substitution or one adjacent
@@ -2239,11 +2245,7 @@ fn osa_dist_le_1(a: &str, b: &str) -> Option<usize> {
             }
             match n {
                 1 => Some(1), // substitution
-                2
-                    if d1 == d0 + 1
-                        && s[d0] == l[d1]
-                        && s[d1] == l[d0] =>
-                {
+                2 if d1 == d0 + 1 && s[d0] == l[d1] && s[d1] == l[d0] => {
                     Some(1) // transposition
                 }
                 _ => None,
@@ -2256,11 +2258,7 @@ fn osa_dist_le_1(a: &str, b: &str) -> Option<usize> {
             while i < s.len() && s[i] == l[i] {
                 i += 1;
             }
-            if l[i + 1..] == s[i..] {
-                Some(1)
-            } else {
-                None
-            }
+            if l[i + 1..] == s[i..] { Some(1) } else { None }
         }
         _ => None,
     }
@@ -2288,21 +2286,26 @@ fn known_code_ranges() -> &'static str {
 /// [`known_code_ranges`]).  Split out so the ordering can be tested with
 /// synthetic codes the current table does not contain.
 fn format_code_ranges(codes: &[&str]) -> String {
-    let mut keyed: Vec<(u8, u32, &str)> = codes
+    let mut keyed: Vec<(u8, u64, &str)> = codes
         .iter()
         .map(|&c| {
             (
                 c.as_bytes().first().copied().unwrap_or(b'?'),
                 c.get(1..)
                     .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(u32::MAX),
+                    .map(u64::from)
+                    .unwrap_or(u64::MAX),
                 c,
             )
         })
         .collect();
     keyed.sort_unstable();
     let codes: Vec<&str> = keyed.into_iter().map(|(_, _, c)| c).collect();
-    let numeric = |c: &str| c.get(1..).and_then(|s| s.parse::<u32>().ok());
+    let numeric = |c: &str| {
+        c.get(1..)
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(u64::from)
+    };
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
     while i < codes.len() {
@@ -2315,7 +2318,7 @@ fn format_code_ranges(codes: &[&str]) -> String {
                 break;
             }
             match (numeric(end), numeric(next)) {
-                (Some(a), Some(b)) if b == a + 1 => {
+                (Some(a), Some(b)) if a.checked_add(1) == Some(b) => {
                     end = next;
                     i += 1;
                 }
@@ -2428,13 +2431,15 @@ fn suggest_code(input: &str, use_color: bool) -> CompactString {
         if use_color {
             format_compact!(
                 "\x1b[1;34m{help_label}\x1b[0m: {valid_codes} — \n       {hint}",
-                valid_codes = crate::diagnostics::i18n::fluent::help_valid_codes(known_code_ranges()),
+                valid_codes =
+                    crate::diagnostics::i18n::fluent::help_valid_codes(known_code_ranges()),
                 hint = crate::diagnostics::i18n::fluent::run_explain_hint_example(),
             )
         } else {
             format_compact!(
                 "{help_label}: {valid_codes} — \n       {hint}",
-                valid_codes = crate::diagnostics::i18n::fluent::help_valid_codes(known_code_ranges()),
+                valid_codes =
+                    crate::diagnostics::i18n::fluent::help_valid_codes(known_code_ranges()),
                 hint = crate::diagnostics::i18n::fluent::run_explain_hint_example(),
             )
         }
@@ -2723,11 +2728,8 @@ pub fn list_error_codes(use_color: bool) -> String {
 /// Diagnostics are humanized at the emitter's render boundary, so their
 /// i18n language resolves against the current `Lang` at emit time.
 pub fn emit_diagnostics(diags: &mut [Diagnostic<'_>], use_color: bool) {
-    let opts = DiagOpts {
-        use_color,
-        ..Default::default()
-    };
-
+    let mut opts = DiagOpts::detect();
+    opts.use_color = use_color;
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
 
@@ -2739,10 +2741,8 @@ pub fn emit_diagnostics(diags: &mut [Diagnostic<'_>], use_color: bool) {
 /// Takes `&mut` because the emitter humanizes each diagnostic at its
 /// render boundary (see [`Diagnostic`]'s lazy-humanization contract).
 pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
-    let opts = DiagOpts {
-        use_color,
-        ..Default::default()
-    };
+    let mut opts = DiagOpts::detect();
+    opts.use_color = use_color;
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
     let _ = emitter.emit_all_iter(collector.iter_mut().map(|h| h.into_diagnostic()));
@@ -2765,10 +2765,8 @@ where
     I: IntoIterator<Item = &'r mut Diagnostic<'src>>,
     I::IntoIter: DoubleEndedIterator,
 {
-    let opts = DiagOpts {
-        use_color,
-        ..Default::default()
-    };
+    let mut opts = DiagOpts::detect();
+    opts.use_color = use_color;
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
     emitter.emit_all_iter(diags)
@@ -2903,8 +2901,8 @@ pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>
     // [`sanitize_filename`] and the source-row renderer: they carry no
     // content, only rendering direction, so replacement would just inject
     // noise while `\n`/`\r`/`\t` survive for the flattening caller.
-    if has_bidi_override_bytes(bytes) {
-        return (Cow::Owned(s.chars()
+    let owned: String = if has_bidi_override_bytes(bytes) {
+        s.chars()
             .filter(|c| !is_bidi_override(*c))
             .map(|c| {
                 if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
@@ -2913,17 +2911,23 @@ pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>
                     c
                 }
             })
-            .collect()), break_at);
-    }
-    (Cow::Owned(s.chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
-        .collect()), break_at)
+            .collect()
+    } else {
+        s.chars()
+            .map(|c| {
+                if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+    // `first_break` was measured in the original bytes; bidi removal and
+    // U+FFFD growth shift it.  The consumer wants the first break in the
+    // *sanitized* string, so recompute (memchr3 is one SIMD pass, rare path).
+    let break_at = memchr::memchr3(b'\n', b'\r', b'\t', owned.as_bytes());
+    (Cow::Owned(owned), break_at)
 }
 
 /// Replace control characters with U+FFFD so external text cannot inject
@@ -3052,9 +3056,7 @@ fn c1_in_chunk(s: &[u8], base: usize, x: u64) -> bool {
     while mask != 0 {
         let lane = (mask.trailing_zeros() / 8) as usize;
         let k = base + lane;
-        if s.get(k) == Some(&0xC2)
-            && s.get(k + 1).is_some_and(|b| (0x80..=0x9F).contains(b))
-        {
+        if s.get(k) == Some(&0xC2) && s.get(k + 1).is_some_and(|b| (0x80..=0x9F).contains(b)) {
             return true;
         }
         mask &= mask - 1;
@@ -3065,6 +3067,7 @@ fn c1_in_chunk(s: &[u8], base: usize, x: u64) -> bool {
 /// Whether `s` contains a C1 control sequence (`0xC2` followed by
 /// `0x80..=0x9F`) — the UTF-8 encoding of Unicode category `Cc` above DEL.
 /// Only worth calling when the slice is known to contain high bytes.
+#[cfg_attr(not(test), allow(dead_code))]
 fn has_c1_sequence(s: &[u8]) -> bool {
     let mut j = 0;
     while let Some(off) = memchr::memchr(0xC2, &s[j..]) {
@@ -3168,9 +3171,10 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, Option<us
         // then minus the layout bytes `push_flattened` consumes.
         let lt20 = !((x | HI).wrapping_sub(SP)) & HI & !(x & HI);
         if lt20 != 0 {
-            let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI;
-            let nl = !(((x ^ NL) | HI).wrapping_sub(ONES)) & HI;
-            let cr = !(((x ^ CR) | HI).wrapping_sub(ONES)) & HI;
+            let xh = x & HI;
+            let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI & !xh;
+            let nl = !(((x ^ NL) | HI).wrapping_sub(ONES)) & HI & !xh;
+            let cr = !(((x ^ CR) | HI).wrapping_sub(ONES)) & HI & !xh;
             let breaks = tab | nl | cr;
             if first_break.is_none() && breaks != 0 {
                 first_break = Some(i + breaks.trailing_zeros() as usize / 8);
@@ -3198,7 +3202,9 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, Option<us
 /// the surrounding display text — a path like `evil.cod\u{202E}exe` can
 /// render with a spoofed extension.
 pub(crate) fn is_bidi_override(c: char) -> bool {
-    ('\u{202A}'..='\u{202E}').contains(&c) || ('\u{2066}'..='\u{2069}').contains(&c)
+    ('\u{200E}'..='\u{200F}').contains(&c)
+        || ('\u{202A}'..='\u{202E}').contains(&c)
+        || ('\u{2066}'..='\u{2069}').contains(&c)
 }
 
 /// Byte-level precheck for [`is_bidi_override`]: every bidi override/isolate
@@ -3213,7 +3219,8 @@ pub(crate) fn has_bidi_override_bytes(s: &[u8]) -> bool {
         if j + 2 < s.len() {
             let b1 = s[j + 1];
             let b2 = s[j + 2];
-            let is_override = (b1 == 0x80 && (0xAA..=0xAE).contains(&b2))
+            let is_override = (b1 == 0x80 && (0x8E..=0x8F).contains(&b2))
+                || (b1 == 0x80 && (0xAA..=0xAE).contains(&b2))
                 || (b1 == 0x81 && (0xA6..=0xA9).contains(&b2));
             if is_override {
                 return true;
@@ -3488,9 +3495,7 @@ thread_local! {
     > = const { std::cell::RefCell::new(None) };
 }
 
-fn cap_char_prefixes(
-    cache: &mut FxHashMap<usize, crate::diagnostics::render::CharPrefixEntry>,
-) {
+fn cap_char_prefixes(cache: &mut FxHashMap<usize, crate::diagnostics::render::CharPrefixEntry>) {
     if cache.len() >= CHAR_PREFIXES_CAP {
         let mut victims: Vec<(usize, u64)> = cache
             .iter()
@@ -3566,9 +3571,7 @@ impl<'a> LineIndex<'a> {
     /// prefixes instead of rebuilding them per render.  The cache is
     /// `Send + Sync` (the hint is an `AtomicUsize`, the map behind a
     /// `RwLock`), so the parallel render path shares one map across workers.
-    pub(crate) fn char_prefixes_arc(
-        &self,
-    ) -> &Arc<crate::diagnostics::render::CharPrefixMap> {
+    pub(crate) fn char_prefixes_arc(&self) -> &Arc<crate::diagnostics::render::CharPrefixMap> {
         &self.char_prefixes
     }
 
@@ -3663,11 +3666,13 @@ impl<'a> LineIndex<'a> {
                         && *slen == source_len
                         && *g == generation
                         && *l == line_idx =>
-                match table {
-                    // ASCII line: char col == byte col.
-                    None => Some(b),
-                    Some(t) => Some(char_col_from_sparse_hint_mut(t, hint, b)),
-                },
+                {
+                    match table {
+                        // ASCII line: char col == byte col.
+                        None => Some(b),
+                        Some(t) => Some(char_col_from_sparse_hint_mut(t, hint, b)),
+                    }
+                }
                 _ => None,
             }
         });
@@ -3682,7 +3687,10 @@ impl<'a> LineIndex<'a> {
         // The map is behind a `RwLock` (shared across parallel workers); the
         // read lock is uncontended for the per-thread render shape.
         {
-            let cache = self.char_prefixes.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cache = self
+                .char_prefixes
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(entry) = cache.get(&line_idx) {
                 entry.touch();
                 let answer = match entry.table.as_ref() {
@@ -3704,13 +3712,7 @@ impl<'a> LineIndex<'a> {
                     None => {
                         LAST_CHAR_COL.with(|cell| {
                             *cell.borrow_mut() = Some((
-                                index_id,
-                                source_id,
-                                source_len,
-                                generation,
-                                line_idx,
-                                None,
-                                0,
+                                index_id, source_id, source_len, generation, line_idx, None, 0,
                             ));
                         });
                         b // ASCII line — char col == byte col
@@ -3771,8 +3773,9 @@ impl<'a> LineIndex<'a> {
             );
             drop(cache);
             LAST_CHAR_COL.with(|cell| {
-                *cell.borrow_mut() =
-                    Some((index_id, source_id, source_len, generation, line_idx, None, 0))
+                *cell.borrow_mut() = Some((
+                    index_id, source_id, source_len, generation, line_idx, None, 0,
+                ))
             });
             return b;
         }
@@ -3895,7 +3898,11 @@ mod tests {
     fn stable_id_and_filter_use_canonical_code() {
         let known = Diagnostic::error("same").with_code(ErrCode::new("e030"));
         let verbatim = Diagnostic::error("same").with_code(ErrCode::unknown("e030"));
-        assert_eq!(known.code(), verbatim.code(), "unknown() must echo verbatim");
+        assert_eq!(
+            known.code(),
+            verbatim.code(),
+            "unknown() must echo verbatim"
+        );
         assert_eq!(
             known.stable_id(),
             verbatim.stable_id(),
@@ -4254,6 +4261,12 @@ mod tests {
     }
 
     #[test]
+    fn code_ranges_do_not_overflow_at_u32_max() {
+        let ranges = format_code_ranges(&["E4294967295", "E004294967295"]);
+        assert!(ranges.contains("E4294967295"), "{ranges}");
+    }
+
+    #[test]
     fn code_ranges_sort_numerically_within_prefix() {
         // A 4-digit code would sort BEFORE E999 lexicographically; the
         // numeric-aware key keeps numeric order (E1000 after E999), and
@@ -4563,20 +4576,12 @@ mod tests {
 
     #[test]
     fn char_prefix_lru_evicts_least_recently_used() {
-        let mut cache: FxHashMap<
-            usize,
-            crate::diagnostics::render::CharPrefixEntry,
-        > = FxHashMap::default();
+        let mut cache: FxHashMap<usize, crate::diagnostics::render::CharPrefixEntry> =
+            FxHashMap::default();
         for i in 0..CHAR_PREFIXES_CAP {
-            cache.insert(
-                i,
-                crate::diagnostics::render::CharPrefixEntry::new(None),
-            );
+            cache.insert(i, crate::diagnostics::render::CharPrefixEntry::new(None));
         }
-        cache
-            .get(&1)
-            .expect("entry 1 present")
-            .touch();
+        cache.get(&1).expect("entry 1 present").touch();
         cap_char_prefixes(&mut cache);
         assert!(!cache.contains_key(&0), "oldest entry must be evicted");
         assert!(cache.contains_key(&1), "touched entry must survive");
@@ -4643,9 +4648,9 @@ mod tests {
         // (start_byte, cumulative_extra) for chars that are 2–4 bytes wide,
         // interleaved with ASCII gaps.
         let table: &[(u32, u32)] = &[
-            (2, 1),   // 2-byte char at byte 2
-            (5, 3),   // 2-byte char at 5 (+1), then 4-byte (+3)
-            (12, 4),  // another 2-byte char
+            (2, 1),  // 2-byte char at byte 2
+            (5, 3),  // 2-byte char at 5 (+1), then 4-byte (+3)
+            (12, 4), // another 2-byte char
             (20, 6),
         ];
         let hint = std::sync::atomic::AtomicUsize::new(0);
@@ -5155,10 +5160,7 @@ mod tests {
         assert_eq!(&*out, "abcde");
         // i18n text without bidi/controls still borrows.
         let clean = "тип: тип（中文）";
-        assert!(matches!(
-            sanitize_for_terminal(clean),
-            Cow::Borrowed(_)
-        ));
+        assert!(matches!(sanitize_for_terminal(clean), Cow::Borrowed(_)));
         assert!(matches!(
             sanitize_for_terminal_multiline(clean),
             Cow::Borrowed(_)
@@ -5178,17 +5180,11 @@ mod tests {
     #[test]
     fn flatten_scan_borrows_layout_only_controls() {
         for s in ["a\nb\rc\td", "\n\r\t", "line one\nline two\r\n\tthree"] {
-            assert!(matches!(
-                sanitize_for_terminal_flatten(s),
-                Cow::Borrowed(_)
-            ));
+            assert!(matches!(sanitize_for_terminal_flatten(s), Cow::Borrowed(_)));
         }
         // Still replaced: DEL, VT, ESC, C1.
         for s in ["a\x7Fb", "a\x0Bb", "a\x1Bb", "a\u{0085}b"] {
-            assert!(matches!(
-                sanitize_for_terminal_flatten(s),
-                Cow::Owned(_)
-            ));
+            assert!(matches!(sanitize_for_terminal_flatten(s), Cow::Owned(_)));
         }
         // Regression: C1 in the SIMD/SWAR body (not just the scalar tail).
         // The u64 kernel previously XORed with 0x02 instead of 0xC2, so a
@@ -5207,6 +5203,24 @@ mod tests {
             s.iter()
                 .any(|&b| (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F)
         };
+        // Poison bytes that previously aliased tab/nl/cr in the SWAR mask:
+        // U+0089/U+008A/U+008D are 2-byte UTF-8 and must not report a break.
+        for s in ["CAFÉ", "ĉ", "‽"] {
+            assert_eq!(
+                scan_terminal_control_flags_flatten(s.as_bytes()).3,
+                None,
+                "{s:?}"
+            );
+            assert!(matches!(
+                sanitize_for_terminal_flatten_with_break(s),
+                (Cow::Borrowed(_), None)
+            ));
+        }
+        // Owned path: break offset is in the sanitized string, after U+FFFD
+        // growth. "a\x07b\tc" → "a�b\tc", tab at byte 5.
+        let (owned, break_at) = sanitize_for_terminal_flatten_with_break("a\x07b\tc");
+        assert!(matches!(owned, Cow::Owned(_)));
+        assert_eq!(break_at, owned.find('\t'));
         let mut seed: u64 = 0xDEAD_BEEF_CAFE_0001;
         let mut next = || {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(7);
@@ -5224,9 +5238,13 @@ mod tests {
                     }
                 })
                 .collect();
-            let (has_high, dirty, _has_c1, _break_at) = scan_terminal_control_flags_flatten(&bytes);
+            let (has_high, dirty, _has_c1, break_at) = scan_terminal_control_flags_flatten(&bytes);
             let _ = has_high;
             assert_eq!(dirty, reference(&bytes), "{bytes:?}");
+            let want_break = bytes
+                .iter()
+                .position(|&b| matches!(b, b'\t' | b'\n' | b'\r'));
+            assert_eq!(break_at, want_break, "{bytes:?}");
         }
     }
 

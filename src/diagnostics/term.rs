@@ -103,8 +103,7 @@ impl TermCaps {
             unicode: unicode_decision_os(locale.as_deref(), term_dumb),
             width: width_decision(
                 columns.as_deref().and_then(OsStr::to_str),
-                terminal_size::terminal_size_of(io::stderr())
-                    .map(|(Width(w), _)| w as usize),
+                terminal_size::terminal_size_of(io::stderr()).map(|(Width(w), _)| w as usize),
             ),
         }
     }
@@ -119,7 +118,10 @@ pub fn detect_color_caps() -> ColorCaps {
 /// ASCII-only, allocation-free case-insensitive substring test.
 fn contains_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> bool {
     needle.is_empty()
-        || (hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle)))
+        || (hay.len() >= needle.len()
+            && hay
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle)))
 }
 
 /// ASCII-only, allocation-free case-insensitive suffix test.
@@ -147,7 +149,11 @@ fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
 
 /// `FORCE_COLOR=0`/`false` is a *hard off* in the Node/chalk convention (not
 /// merely "don't force"): a CI script silencing colour must not get colour on
-/// a TTY.
+/// a TTY.  Non-canonical non-numeric values (`"abc"`, `"FALSE"`, `"-1"`,
+/// overflow) are deliberately treated as "force on" — the older Node
+/// convention — because they are not an explicit off request.  This differs
+/// from `Math.min(parseInt(v), 3)` on garbage; the behavior is pinned by
+/// `force_color_noncanonical_values_force_on`.
 fn force_color_is_off(v: &OsStr) -> bool {
     let Some(s) = v.to_str().map(str::trim) else {
         return false;
@@ -201,28 +207,24 @@ pub(crate) fn color_depth_decision_with_terminal(
     if let Some(tp) = term_program {
         // Exact, case-insensitive values only: `contains` treated
         // "not-iTerm.app" or "vscode-fork" as truecolor terminals.
-        if [
-            "iTerm.app",
-            "WezTerm",
-            "vscode",
-            "WarpTerminal",
-            "Warp",
-        ]
-        .iter()
-        .any(|n| tp.eq_ignore_ascii_case(n))
+        if ["iTerm.app", "WezTerm", "vscode", "WarpTerminal", "Warp"]
+            .iter()
+            .any(|n| tp.eq_ignore_ascii_case(n))
         {
             return ColorDepth::TrueColor;
         }
     }
     if let Some(ct) = colorterm {
         let ct = ct.as_bytes();
-        if contains_ignore_ascii_case(ct, b"truecolor") || contains_ignore_ascii_case(ct, b"24bit") {
+        if contains_ignore_ascii_case(ct, b"truecolor") || contains_ignore_ascii_case(ct, b"24bit")
+        {
             return ColorDepth::TrueColor;
         }
     }
     if let Some(t) = term {
         let t = t.as_bytes();
-        if ends_with_ignore_ascii_case(t, b"truecolor") || ends_with_ignore_ascii_case(t, b"direct") {
+        if ends_with_ignore_ascii_case(t, b"truecolor") || ends_with_ignore_ascii_case(t, b"direct")
+        {
             return ColorDepth::TrueColor;
         }
         if ends_with_ignore_ascii_case(t, b"256color") {
@@ -451,7 +453,10 @@ pub fn supports_hyperlinks() -> bool {
         if no_hyperlink {
             false
         } else {
-            hyperlink_decision(false, supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr))
+            hyperlink_decision(
+                false,
+                supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr),
+            )
         }
     })
 }
@@ -538,23 +543,28 @@ fn scan_url_path(s: &[u8]) -> (usize, usize) {
     (first_unsafe, unsafe_count)
 }
 
-fn wsl_distro_name() -> Option<String> {
-    let name = std::env::var("WSL_DISTRO_NAME")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    #[cfg(target_os = "linux")]
-    {
-        // SSH/CI can forward WSL_DISTRO_NAME to a native Linux host.  Only
-        // translate when the kernel also identifies as WSL; if /proc cannot
-        // be read, keep the env-only fallback.
-        if let Ok(version) = std::fs::read_to_string("/proc/version") {
-            let lower = version.to_ascii_lowercase();
-            if !lower.contains("microsoft") && !lower.contains("wsl") {
-                return None;
+fn wsl_distro_name() -> Option<&'static str> {
+    static WSL_DISTRO: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    WSL_DISTRO
+        .get_or_init(|| {
+            let name = std::env::var("WSL_DISTRO_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())?;
+            #[cfg(target_os = "linux")]
+            {
+                // SSH/CI can forward WSL_DISTRO_NAME to a native Linux host.
+                // Only translate when the kernel also identifies as WSL; if
+                // /proc cannot be read, keep the env-only fallback.
+                if let Ok(version) = std::fs::read_to_string("/proc/version") {
+                    let lower = version.to_ascii_lowercase();
+                    if !lower.contains("microsoft") && !lower.contains("wsl") {
+                        return None;
+                    }
+                }
             }
-        }
-    }
-    Some(name)
+            Some(name)
+        })
+        .as_deref()
 }
 
 fn encode_scanned_path(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
@@ -711,7 +721,7 @@ pub fn path_to_file_url(path: &std::path::Path) -> String {
     };
 
     let distro = wsl_distro_name();
-    format_file_url(&bytes, distro.as_deref())
+    format_file_url(&bytes, distro)
 }
 
 fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
@@ -801,7 +811,14 @@ mod tests {
 
     #[test]
     fn no_color_beats_everything() {
-        assert!(!color(true, None, Some("1"), Some("1"), Some("xterm-256color"), true));
+        assert!(!color(
+            true,
+            None,
+            Some("1"),
+            Some("1"),
+            Some("xterm-256color"),
+            true
+        ));
         assert!(!color(true, None, None, None, None, true));
     }
 
@@ -842,9 +859,23 @@ mod tests {
         }
         // `0`/`false` is a hard off — even on a TTY.
         assert!(!color(false, None, None, Some("0"), Some("xterm"), true));
-        assert!(!color(false, None, None, Some("false"), Some("xterm"), true));
+        assert!(!color(
+            false,
+            None,
+            None,
+            Some("false"),
+            Some("xterm"),
+            true
+        ));
         // CLICOLOR_FORCE takes precedence over FORCE_COLOR.
-        assert!(color(false, None, Some("1"), Some("0"), Some("dumb"), false));
+        assert!(color(
+            false,
+            None,
+            Some("1"),
+            Some("0"),
+            Some("dumb"),
+            false
+        ));
         // NO_COLOR still wins over FORCE_COLOR.
         assert!(!color(true, None, None, Some("3"), Some("xterm"), true));
     }
@@ -854,7 +885,14 @@ mod tests {
         assert!(!color(false, Some("0"), None, None, Some("xterm"), true));
         assert!(color(false, Some("1"), None, None, Some("xterm"), true));
         // CLICOLOR_FORCE overrides CLICOLOR=0.
-        assert!(color(false, Some("0"), Some("1"), None, Some("xterm"), false));
+        assert!(color(
+            false,
+            Some("0"),
+            Some("1"),
+            None,
+            Some("xterm"),
+            false
+        ));
     }
 
     #[test]
@@ -896,7 +934,10 @@ mod tests {
     #[test]
     fn width_is_capped_to_u16_max() {
         // An unbounded COLUMNS must not poison downstream arithmetic.
-        assert_eq!(width_decision(Some("18446744073709551615"), None), u16::MAX as usize);
+        assert_eq!(
+            width_decision(Some("18446744073709551615"), None),
+            u16::MAX as usize
+        );
         assert_eq!(width_decision(Some("65536"), None), u16::MAX as usize);
     }
 
@@ -916,7 +957,13 @@ mod tests {
         }
         // An unrelated TERM_PROGRAM must not upgrade the depth.
         assert_eq!(
-            color_depth_decision_with_terminal(None, Some("xterm"), None, false, Some("Apple_Terminal")),
+            color_depth_decision_with_terminal(
+                None,
+                Some("xterm"),
+                None,
+                false,
+                Some("Apple_Terminal")
+            ),
             ColorDepth::Sixteen
         );
     }
@@ -932,6 +979,21 @@ mod tests {
                 "FORCE_COLOR={v:?}"
             );
         }
+    }
+
+    #[test]
+    fn force_color_noncanonical_values_force_on() {
+        for v in ["abc", "FALSE", "-1", "18446744073709551616"] {
+            assert!(!force_color_is_off(OsStr::new(v)), "{v}");
+            assert!(
+                color(false, None, None, Some(v), Some("dumb"), false),
+                "{v} should force color on"
+            );
+        }
+        assert_eq!(
+            force_color_level(OsStr::new("256")),
+            Some(ColorDepth::TrueColor)
+        );
     }
 
     #[test]
@@ -979,7 +1041,13 @@ mod tests {
             ColorDepth::TwoFiftySix
         );
         // Modern 24-bit TERM conventions.
-        for term in ["iterm2-direct", "xterm-direct", "st-direct", "foot-direct", "xterm-truecolor"] {
+        for term in [
+            "iterm2-direct",
+            "xterm-direct",
+            "st-direct",
+            "foot-direct",
+            "xterm-truecolor",
+        ] {
             assert_eq!(
                 color_depth_decision(None, Some(term), None),
                 ColorDepth::TrueColor,
@@ -1001,9 +1069,18 @@ mod tests {
 
     #[test]
     fn force_color_level_clamps_and_trims() {
-        assert_eq!(force_color_level(OsStr::new("4")), Some(ColorDepth::TrueColor));
-        assert_eq!(force_color_level(OsStr::new(" 2")), Some(ColorDepth::TwoFiftySix));
-        assert_eq!(force_color_level(OsStr::new("03")), Some(ColorDepth::TrueColor));
+        assert_eq!(
+            force_color_level(OsStr::new("4")),
+            Some(ColorDepth::TrueColor)
+        );
+        assert_eq!(
+            force_color_level(OsStr::new(" 2")),
+            Some(ColorDepth::TwoFiftySix)
+        );
+        assert_eq!(
+            force_color_level(OsStr::new("03")),
+            Some(ColorDepth::TrueColor)
+        );
         assert_eq!(force_color_level(OsStr::new("0")), None);
         assert!(force_color_is_off(OsStr::new(" false ")));
     }
@@ -1124,8 +1201,13 @@ mod tests {
             format_file_url(b"/home/user/file.rs", Some("Ubuntu 20.04")),
             "file://wsl.localhost/Ubuntu%2020.04/home/user/file.rs"
         );
-        // A POSIX directory named `c:/x` is not a Windows drive.
-        assert_eq!(format_file_url(b"c:/x", None), "file://c:/x");
+        // A POSIX directory named `c:/x` is not a Windows drive; on Windows the
+        // same bytes are a drive path and must gain the third slash.
+        if cfg!(windows) {
+            assert_eq!(format_file_url(b"c:/x", None), "file:///c:/x");
+        } else {
+            assert_eq!(format_file_url(b"c:/x", None), "file://c:/x");
+        }
     }
 
     #[test]

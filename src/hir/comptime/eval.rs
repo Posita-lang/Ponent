@@ -1,5 +1,4 @@
 use crate::ast::FileId;
-use std::borrow::Cow;
 use crate::ast::IntLit;
 use crate::diagnostics::DiagCtxt;
 use crate::diagnostics::kind::{ComptimeErrorKind, ComptimeReason, DiagnosticKind, maybe_span};
@@ -7,6 +6,7 @@ use crate::hir::hir::{HirExpr, HirMatchArm, HirPattern, HirProgram, HirStmt};
 use crate::hir::symbol::SymbolTable;
 use crate::hir::types::{TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
+use std::borrow::Cow;
 
 use super::error::ComptimeError;
 use super::value::{ComptimeValue, SlotId};
@@ -409,7 +409,9 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
             ComptimeError::StepLimitExceeded => ComptimeErrorKind::StepLimitExceeded,
             ComptimeError::DivisionByZero => ComptimeErrorKind::DivisionByZero,
             ComptimeError::Overflow => ComptimeErrorKind::Overflow,
-            ComptimeError::TypeError(s) => ComptimeErrorKind::TypeError(std::sync::Arc::from(s.as_str())),
+            ComptimeError::TypeError(s) => {
+                ComptimeErrorKind::TypeError(std::sync::Arc::from(s.as_str()))
+            }
             ComptimeError::AssertionFailed(s) => {
                 ComptimeErrorKind::AssertionFailed(std::sync::Arc::from(s.as_str()))
             }
@@ -426,7 +428,9 @@ impl<'a, 'src, 'input> ComptimeEvalContext<'a, 'src, 'input> {
             ComptimeError::MemoryLimitExceeded(s) => {
                 ComptimeErrorKind::MemoryLimitExceeded(std::sync::Arc::from(s.as_str()))
             }
-            ComptimeError::Internal(s) => ComptimeErrorKind::Internal(std::sync::Arc::from(s.as_str())),
+            ComptimeError::Internal(s) => {
+                ComptimeErrorKind::Internal(std::sync::Arc::from(s.as_str()))
+            }
         };
         // Merge outer traceback (from checker's region_tree) with inner call stack.
         let mut traceback = self.outer_traceback.clone();

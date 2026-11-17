@@ -3,7 +3,6 @@ use super::{
     did_you_mean_suggestion, typing_context_to_type_ctx,
 };
 use crate::ast::FileId;
-use as_variant::as_variant;
 use crate::ast::ast_type_display;
 use crate::ast::visit::replace_ident_in_expr;
 use crate::ast::{Attribute, BinOp, Expr, GenericArg, Literal, Pattern, Span, Stmt, Type, UnaryOp};
@@ -15,6 +14,7 @@ use crate::hir::infer::{Constraint, InferenceContext, TypeVariableKind, VarOrigi
 use crate::hir::symbol::{FunctionSignature, TypeBinding, TypeKind};
 use crate::hir::types::{Characteristic, DefId, Rigidity, Subst, TypeContext, TypeData, TypeId};
 use crate::symbol::Symbol;
+use as_variant::as_variant;
 use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -1858,7 +1858,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             // assumes Set semantics for μ/ν (initial/final algebras) — see
             // the semantic-model note in the same module.
             let char = self.checker.ctx.characteristic(resolved_scrut_ty);
-            let total_count_from_char = as_variant!(char, Characteristic::FiniteExhaustible(n) => n);
+            let total_count_from_char =
+                as_variant!(char, Characteristic::FiniteExhaustible(n) => n);
             let inferred_count: Option<usize> = match self.checker.ctx.get(resolved_scrut_ty) {
                 TypeData::InferVar { id, .. } => match self.checker.infer.get_var_kind(*id) {
                     Some(TypeVariableKind::Bool) => Some(2),
@@ -2353,7 +2354,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 // suspended-constraint discipline for why speculative
                 // inference must be transactional.
                 let base_ty = match &hir {
-                    HirExpr::Call { callee, .. } => as_variant!(callee.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty()),
+                    HirExpr::Call { callee, .. } => {
+                        as_variant!(callee.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty())
+                    }
                     _ => None,
                 };
                 match base_ty {
@@ -2582,7 +2585,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 // (OutsideIn(X) constraint-generation/solving separation;
                 // OmniML suspended-constraint discipline).
                 let base_ty = match &expr_hir {
-                    HirExpr::Call { callee, .. } => as_variant!(callee.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty()),
+                    HirExpr::Call { callee, .. } => {
+                        as_variant!(callee.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty())
+                    }
                     _ => None,
                 };
                 match base_ty {
@@ -4292,7 +4297,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         // id's meta.  Using `get_raw` keeps the binder consistent with the
         // invariant it belongs to (the alpha-rename below must rewrite the
         // invariant's OWN binder name).
-        let Some(binder) = as_variant!(self.checker.ctx.get_raw(expected_ty), TypeData::Exists { name, .. } => *name) else {
+        let Some(binder) = as_variant!(self.checker.ctx.get_raw(expected_ty), TypeData::Exists { name, .. } => *name)
+        else {
             return;
         };
         let Some(base_ty) = self.checker.ctx.base_of_exists(expected_ty) else {

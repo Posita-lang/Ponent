@@ -33,9 +33,7 @@
 /// Stand-in for the crate-root `sync` module (default build: plain
 /// parking_lot re-exports; the bench never runs under `--features shuttle`).
 mod sync {
-    pub use parking_lot::{
-        Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-    };
+    pub use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 }
 
 use std::ops::Deref;

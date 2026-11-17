@@ -198,9 +198,10 @@ impl FilesSeen {
                 };
                 seen[pos] = FileKey::Id(id);
                 last_index = pos;
-                if !id_names.iter().any(|(known_id, known_name)| {
-                    *known_id == id && known_name == name
-                }) {
+                if !id_names
+                    .iter()
+                    .any(|(known_id, known_name)| *known_id == id && known_name == name)
+                {
                     id_names.push((id, CompactString::from(name)));
                 }
             }
@@ -224,9 +225,10 @@ impl FilesSeen {
     fn add_id_name(&mut self, id: crate::ast::FileId, name: &str) {
         match &mut self.seen {
             FilesSeenInner::Small { id_names, .. } => {
-                if !id_names.iter().any(|(known_id, known_name)| {
-                    *known_id == id && known_name == name
-                }) {
+                if !id_names
+                    .iter()
+                    .any(|(known_id, known_name)| *known_id == id && known_name == name)
+                {
                     id_names.push((id, CompactString::from(name)));
                 }
             }
@@ -248,9 +250,9 @@ impl FilesSeen {
             FilesSeenInner::Small { id_names, .. } => id_names
                 .iter()
                 .any(|(known_id, known_name)| *known_id == id && known_name == name),
-            FilesSeenInner::Large { names, .. } => names
-                .id_names
-                .contains(&(id, CompactString::from(name))),
+            FilesSeenInner::Large { names, .. } => {
+                names.id_names.contains(&(id, CompactString::from(name)))
+            }
         }
     }
 
@@ -318,15 +320,7 @@ struct BatchScratch {
 }
 
 /// Prebuilt line-table entry shared by all workers.
-type Prebuilt = (
-    usize,
-    usize,
-    std::sync::Arc<[u32]>,
-    bool,
-    std::sync::Arc<CharPrefixMap>,
-    u64,
-    u64,
-);
+type Prebuilt = crate::diagnostics::render::PreloadedSource;
 
 /// Full-content FNV-1a for the cross-batch line-table cache key.  The cheap
 /// `source_fingerprint` (first/last 8 + len) is fine for the debug ABA
@@ -388,8 +382,7 @@ fn worker_render_dynamic<R: Renderer>(
             break;
         }
         let orig = shared.order[claim];
-        let mut buf = shared
-            .string_pools[worker_idx % shared.string_pools.len()]
+        let mut buf = shared.string_pools[worker_idx % shared.string_pools.len()]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop()
@@ -397,9 +390,7 @@ fn worker_render_dynamic<R: Renderer>(
         buf.clear();
         let buf = match &cx {
             Some(cx) => {
-                let mut guard = shared.cells[orig]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut guard = shared.cells[orig].lock().unwrap_or_else(|e| e.into_inner());
                 let diag: &mut Diagnostic<'_> = &mut **guard;
                 let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     diag.humanize();
@@ -418,9 +409,7 @@ fn worker_render_dynamic<R: Renderer>(
                 buf
             }
         };
-        *shared.slots[orig]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some((buf, worker_idx));
+        *shared.slots[orig].lock().unwrap_or_else(|e| e.into_inner()) = Some((buf, worker_idx));
         if shared.streaming {
             shared.slot_cv.notify_all();
         }
@@ -453,7 +442,7 @@ pub struct Emitter<R, M> {
     /// Reused across batch emits: weights and claim order.
     batch: BatchScratch,
     /// One reusable `String` pool per resident worker.  Workers only ever push
-/// into and pop from their own pool, so the old single hot mutex is gone.
+    /// into and pop from their own pool, so the old single hot mutex is gone.
     string_pools: Vec<std::sync::Mutex<Vec<String>>>,
     /// Cross-batch line tables keyed by `(FileId, full-content hash)`.
     /// `Prebuilt` owns its `Arc` tables, so no source lifetime is captured.
@@ -670,8 +659,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let mut batch = std::mem::take(&mut self.batch);
         batch.weights.clear();
         batch.weights.reserve(cap);
-        let mut filtered: SmallVec<[&'r mut Diagnostic<'src>; 64]> =
-            SmallVec::with_capacity(cap);
+        let mut filtered: SmallVec<[&'r mut Diagnostic<'src>; 64]> = SmallVec::with_capacity(cap);
         // Cheap render-cost proxy summed over the batch.  The parallel
         // decision gates on this as well as the count: 64 one-line notes cost
         // less to render than the ~50 µs/thread spawn, so they stay serial.
@@ -863,8 +851,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         filtered: &[&mut Diagnostic<'_>],
         weights: &[usize],
     ) -> (Vec<Prebuilt>, std::sync::Arc<SharedSources>) {
-        let mut seen: rustc_hash::FxHashSet<(usize, usize)> =
-            rustc_hash::FxHashSet::default();
+        let mut seen: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
         let mut out: Vec<Prebuilt> = Vec::new();
         let mut source_weight: rustc_hash::FxHashMap<(usize, usize), usize> =
             rustc_hash::FxHashMap::default();
@@ -874,8 +861,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 *source_weight.entry(key).or_default() += weights[i];
                 if seen.insert(key) {
                     let file_id = diag.spans.primary_ref().first().map(|s| s.file);
-                    let fingerprint =
-                        crate::diagnostics::render::source_fingerprint(src);
+                    let fingerprint = crate::diagnostics::render::source_fingerprint(src);
                     let content_hash = source_content_hash(src);
                     let cached = file_id.and_then(|id| {
                         self.file_index_cache.borrow().iter().find_map(|(f, h, p)| {
@@ -883,18 +869,18 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                         })
                     });
                     if let Some(p) = cached {
-                        out.push((key.0, key.1, p.2, p.3, p.4, p.5, fingerprint));
+                        out.push(Prebuilt { fingerprint, ..p });
                     } else {
                         let idx = LineIndex::new(src);
-                        let entry = (
-                            key.0,
-                            key.1,
-                            std::sync::Arc::clone(idx.starts_arc()),
-                            idx.ascii(),
-                            std::sync::Arc::clone(idx.char_prefixes_arc()),
-                            idx.generation(),
+                        let entry = Prebuilt {
+                            ptr: key.0,
+                            len: key.1,
+                            starts: std::sync::Arc::clone(idx.starts_arc()),
+                            ascii: idx.ascii(),
+                            char_prefixes: std::sync::Arc::clone(idx.char_prefixes_arc()),
+                            generation: idx.generation(),
                             fingerprint,
-                        );
+                        };
                         out.push(entry.clone());
                         if let Some(id) = file_id {
                             let mut cache = self.file_index_cache.borrow_mut();
@@ -908,7 +894,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             }
         }
         out.sort_by_key(|entry| {
-            std::cmp::Reverse(*source_weight.get(&(entry.0, entry.1)).unwrap_or(&0))
+            std::cmp::Reverse(*source_weight.get(&(entry.ptr, entry.len)).unwrap_or(&0))
         });
         let shared = SharedSources::from_entries(&out);
         (out, shared)
@@ -934,9 +920,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         scratch.order.clear();
         scratch.order.extend(0..n);
         let weights = &scratch.weights;
-        scratch.order.sort_unstable_by(|&a, &b| {
-            weights[b].cmp(&weights[a]).then(a.cmp(&b))
-        });
+        scratch
+            .order
+            .sort_unstable_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
         let cells: Vec<std::sync::Mutex<&mut Diagnostic<'_>>> = filtered
             .iter_mut()
             .map(|diag| std::sync::Mutex::new(&mut **diag))
@@ -1057,10 +1043,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 while slot.is_none() {
-                    slot = shared
-                        .slot_cv
-                        .wait(slot)
-                        .unwrap_or_else(|e| e.into_inner());
+                    slot = shared.slot_cv.wait(slot).unwrap_or_else(|e| e.into_inner());
                 }
                 slot.take().expect("slot filled")
             };
@@ -1089,7 +1072,6 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         wait.wait();
         result
     }
-
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]
@@ -1148,7 +1130,10 @@ mod tests {
         let src1 = "HEADER00\na\nb\nTAIL0000";
         let src2 = "HEADER00\nab\n\nTAIL0000";
         assert_eq!(src1.len(), src2.len());
-        assert_eq!(source_content_hash(src1) == source_content_hash(src2), false);
+        assert_eq!(
+            source_content_hash(src1) == source_content_hash(src2),
+            false
+        );
 
         let mk = |src: &'static str| -> Vec<Diagnostic<'static>> {
             (0..64)
@@ -1228,13 +1213,10 @@ mod tests {
         let mk = || -> Vec<Diagnostic<'static>> {
             (0..N)
                 .map(|i| {
-                    Diagnostic::error(format!(
-                        "error {i} {}",
-                        "x".repeat(96)
-                    ))
-                    .with_code_str("E030")
-                    .with_span(Span::new(FileId::DUMMY, 0, 1))
-                    .with_source("fn main() { let x = 1; }\n")
+                    Diagnostic::error(format!("error {i} {}", "x".repeat(96)))
+                        .with_code_str("E030")
+                        .with_span(Span::new(FileId::DUMMY, 0, 1))
+                        .with_source("fn main() { let x = 1; }\n")
                 })
                 .collect()
         };
@@ -1286,9 +1268,7 @@ mod tests {
 
         let mut parallel_diags = alternating_diags(N);
         let mut sink = StringSink::new();
-        emitter
-            .emit_all_to(&mut parallel_diags, &mut sink)
-            .unwrap();
+        emitter.emit_all_to(&mut parallel_diags, &mut sink).unwrap();
         let parallel = sink.into_string();
 
         if emitter.parallelism > 1 {
@@ -1403,26 +1383,23 @@ mod tests {
             max_errors: Some(1),
             ..DiagOpts::default()
         };
-        let mut diags = [
-            Diagnostic::error("first"),
-            Diagnostic::error("second"),
-        ];
+        let mut diags = [Diagnostic::error("first"), Diagnostic::error("second")];
         let mut sink = StringSink::new();
         Emitter::new(EveryOtherEmpty, string(), opts)
             .emit_all_to(&mut diags, &mut sink)
             .unwrap();
         let out = sink.into_string();
-        assert_eq!(out, "first", "quiet must suppress the note and summary:\n{out}");
+        assert_eq!(
+            out, "first",
+            "quiet must suppress the note and summary:\n{out}"
+        );
 
         let opts = DiagOpts {
             quiet: false,
             max_errors: Some(1),
             ..DiagOpts::default()
         };
-        let mut diags = [
-            Diagnostic::error("first"),
-            Diagnostic::error("second"),
-        ];
+        let mut diags = [Diagnostic::error("first"), Diagnostic::error("second")];
         let mut sink = StringSink::new();
         Emitter::new(EveryOtherEmpty, string(), opts)
             .emit_all_to(&mut diags, &mut sink)
@@ -1481,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-#[test]
+    #[test]
     fn files_seen_large_spill_preserves_last_and_claim() {
         let mut seen = FilesSeen::new();
         for i in 1..=6u32 {

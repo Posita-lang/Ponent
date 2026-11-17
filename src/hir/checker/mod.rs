@@ -1,4 +1,3 @@
-use as_variant::as_variant;
 use crate::ast::FileId;
 use crate::ast::{
     Attribute, BinOp, Contract, Expr, GenericArg, Item, Literal, Pattern, Program, Span, Stmt,
@@ -29,7 +28,7 @@ use crate::hir::types::{
 };
 use crate::symbol::Symbol;
 use arrayvec::ArrayVec;
-use std::sync::Arc;
+use as_variant::as_variant;
 use num_bigint::BigInt;
 use num_traits::Zero;
 use small_map::FxSmallMap;
@@ -42,6 +41,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::mem;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 pub mod autoderef;
@@ -3397,7 +3397,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             }
             Stmt::GhostVariableDef { inner, span } => {
                 // Extract the variable name from the inner `set mut? name = ...`.
-                let var_name = as_variant!(inner, crate::ast::Stmt::VariableDef { name: Some(n), .. } => *n);
+                let var_name =
+                    as_variant!(inner, crate::ast::Stmt::VariableDef { name: Some(n), .. } => *n);
                 if let Some(name) = var_name {
                     // Push to the current (topmost) scope, or create one.
                     // The fallback is unreachable in practice: `VarScopeGuard`
@@ -4461,7 +4462,9 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     // the receiver type's impl blocks (mirror of the
                     // `Expr::Try` path).
                     let base_ty = value_hir.as_ref().and_then(|vh| match vh {
-                        HirExpr::Call { callee: c, .. } => as_variant!(c.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty()),
+                        HirExpr::Call { callee: c, .. } => {
+                            as_variant!(c.as_ref(), HirExpr::FieldAccess { base, .. } => base.ty())
+                        }
                         _ => None,
                     });
                     base_ty.map_or(false, |base_ty| {

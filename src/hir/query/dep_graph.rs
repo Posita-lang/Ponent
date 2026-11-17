@@ -563,11 +563,7 @@ impl TaskDeps {
     /// serialization boundary if deterministic order is ever needed.
     pub fn into_reads_with_epochs(
         self,
-    ) -> (
-        SmallVec<[DepNodeIndex; 8]>,
-        SmallVec<[u64; 8]>,
-        ReadsIndex,
-    ) {
+    ) -> (SmallVec<[DepNodeIndex; 8]>, SmallVec<[u64; 8]>, ReadsIndex) {
         // The two vectors are POSITIONAL by construction (every `read`
         // pushes both in lockstep) and `sort_reads_by_shard` swaps them in
         // lockstep — a length drift would mispair the finish-side epoch
@@ -759,8 +755,7 @@ impl VisitedBitmap {
             self.bits.resize(w + 1, 0);
             // New words are stamped with the PREVIOUS generation so their
             // first touch this walk clears them.
-            self.stamps
-                .resize(w + 1, self.current.wrapping_sub(1));
+            self.stamps.resize(w + 1, self.current.wrapping_sub(1));
         }
         if self.stamps[w] != self.current {
             self.bits[w] = 0;
@@ -821,10 +816,7 @@ impl VerifyScratch {
                         std::mem::take(&mut b.0),
                         std::mem::take(&mut b.1),
                         std::mem::take(&mut b.2),
-                        std::mem::replace(
-                            &mut b.3,
-                            std::array::from_fn(|_| SmallVec::new()),
-                        ),
+                        std::mem::replace(&mut b.3, std::array::from_fn(|_| SmallVec::new())),
                     )
                 })
             })
@@ -855,12 +847,7 @@ impl Drop for VerifyScratch {
         }
         // 2 bits per node (bits + level/stamp words) — compare the byte
         // footprint against the same cap the HashSet version used.
-        let level_cap = self
-            .level
-            .iter()
-            .map(|v| v.capacity())
-            .max()
-            .unwrap_or(0);
+        let level_cap = self.level.iter().map(|v| v.capacity()).max().unwrap_or(0);
         if self.visited.bits.len() * 16 > VERIFY_SCRATCH_CAP
             || level_cap > VERIFY_SCRATCH_CAP
             || self.to_stamp.capacity() > VERIFY_SCRATCH_CAP
@@ -1063,8 +1050,7 @@ impl RevEdges {
                     return;
                 }
                 if list.len() >= REV_INLINE_LIMIT {
-                    let mut set: HashSet<DepNodeIndex> =
-                        list.iter().copied().collect();
+                    let mut set: HashSet<DepNodeIndex> = list.iter().copied().collect();
                     set.insert(v);
                     *self = RevEdges::Spilled(set);
                     return;
@@ -1317,11 +1303,7 @@ impl ShardLog {
     /// buffer.  The pooled [`with_readers`](Self::with_readers) path uses it
     /// so a node with more than 8 direct readers no longer mallocs on every
     /// republish — the exact hot path memoization exists for.
-    fn collect_readers_into(
-        &self,
-        node: DepNodeIndex,
-        readers: &mut SmallVec<[DepNodeIndex; 8]>,
-    ) {
+    fn collect_readers_into(&self, node: DepNodeIndex, readers: &mut SmallVec<[DepNodeIndex; 8]>) {
         readers.clear();
         // `load()` takes a debt guard instead of `load_full()`'s refcount
         // pair on a shared line that every reader of every shard contends
@@ -1346,8 +1328,7 @@ impl ShardLog {
         }
         // Apply the log tail on top, IN ORDER: a Tombstone after an Insert
         // must win, and vice versa.
-        let _tw_rev_log =
-            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.collect");
+        let _tw_rev_log = sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.collect");
         let log = self.log.lock();
         if let Some(positions) = log.by_slot.get(slot_of(node)) {
             if prefer_set_path(positions.len(), readers.len()) {
@@ -1423,8 +1404,7 @@ impl ShardLog {
     /// finishing flag does NOT repair: the missed reader may have finished
     /// long ago).
     fn compact(&self) {
-        let _tw_rev_log =
-            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.compact");
+        let _tw_rev_log = sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.compact");
         let guard = self.index.load();
         let mut log = self.log.lock();
         if log.ops.is_empty() {
@@ -1461,8 +1441,7 @@ impl ShardLog {
     /// Reset: clear both log (with its per-slot index) and index. Quiesced
     /// (called from `reset`).
     fn reset(&self) {
-        let _tw_rev_log =
-            sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.reset");
+        let _tw_rev_log = sync_order::Acquired::acquire(sync_order::Fam::RevLog, "rev_log.reset");
         let mut log = self.log.lock();
         log.ops.clear();
         log.by_slot.clear();
@@ -1494,10 +1473,7 @@ fn reconcile_forward_edges(
     list: &mut SmallVec<[DepNodeIndex; 4]>,
     reads: &[DepNodeIndex],
     reads_index: &ReadsIndex,
-) -> (
-    SmallVec<[DepNodeIndex; 4]>,
-    SmallVec<[DepNodeIndex; 8]>,
-) {
+) -> (SmallVec<[DepNodeIndex; 4]>, SmallVec<[DepNodeIndex; 8]>) {
     // NO dedup pass: `reads` arrives ALREADY deduplicated, in first-read
     // order — `TaskDeps::read` guarantees it (linear `contains` up to
     // `LINEAR_DEDUP_MAX`, a `HashSet` past it).  The first version of this
@@ -1534,16 +1510,15 @@ fn reconcile_forward_edges(
     // membership scan runs on the changed path, not on every recompute; the
     // unchanged-set case is already covered by the memcmp fast path above,
     // and equal-length/no-removal means the two sets are identical.
-    let added: SmallVec<[DepNodeIndex; 8]> =
-        if removed.is_empty() && list.len() == reads.len() {
-            SmallVec::new()
-        } else {
-            reads
-                .iter()
-                .copied()
-                .filter(|read| !list.contains(read))
-                .collect()
-        };
+    let added: SmallVec<[DepNodeIndex; 8]> = if removed.is_empty() && list.len() == reads.len() {
+        SmallVec::new()
+    } else {
+        reads
+            .iter()
+            .copied()
+            .filter(|read| !list.contains(read))
+            .collect()
+    };
     // Reuse the old list's allocation instead of replacing it: when the
     // read set is larger than the four inline slots the SmallVec is on
     // the heap, and copying into its existing capacity allocates
@@ -2490,7 +2465,9 @@ impl<S: Scheduler> DepGraph<S> {
                     }))
                 })
                 .collect(),
-            rev_logs: (0..DEP_SHARDS).map(|_| CachePadded(ShardLog::new())).collect(),
+            rev_logs: (0..DEP_SHARDS)
+                .map(|_| CachePadded(ShardLog::new()))
+                .collect(),
             grow_lock: Mutex::new(()),
             dirty: ArcSwap::from_pointee((0..DIRTY_INIT_BLOCKS).map(|_| zero_block()).collect()),
             epochs: ArcSwap::from_pointee(
@@ -2635,9 +2612,7 @@ impl<S: Scheduler> DepGraph<S> {
         // then hit the pre-growth table via its TLS snapshot — the
         // consumer-side skew that fired spurious `BUG` reports.
         self.covered_upto.store(
-            dirty_new_len
-                .min(epoch_new_len)
-                .min(stamp_new_len) as u32,
+            dirty_new_len.min(epoch_new_len).min(stamp_new_len) as u32,
             Ordering::Release,
         );
 
@@ -2702,7 +2677,8 @@ impl<S: Scheduler> DepGraph<S> {
     /// the allocator, so a plain CAS-store cannot race a real conflict.
     pub(crate) fn set_node_durability(&self, node: DepNodeIndex, d: Durability) {
         debug_assert_ne!(
-            node.0, DepNodeIndex::ZERO.0,
+            node.0,
+            DepNodeIndex::ZERO.0,
             "set_node_durability called with DepNodeIndex::ZERO — index 0 is the \
              DefaultCache 'no node' sentinel and is never allocated"
         );
@@ -3095,12 +3071,10 @@ impl<S: Scheduler> DepGraph<S> {
         // cell's tuple type; the two `Ref`s coexist legally.)
         if let Ok(r) = cell.try_borrow() {
             if r.0 == tbl_gen {
-                let dirty_ref =
-                    std::cell::Ref::filter_map(std::cell::Ref::clone(&r), |t| {
-                        t.1.as_ref().map(|a| &**a)
-                    });
-                let stamp_ref =
-                    std::cell::Ref::filter_map(r, |t| t.3.as_ref().map(|a| &**a));
+                let dirty_ref = std::cell::Ref::filter_map(std::cell::Ref::clone(&r), |t| {
+                    t.1.as_ref().map(|a| &**a)
+                });
+                let stamp_ref = std::cell::Ref::filter_map(r, |t| t.3.as_ref().map(|a| &**a));
                 if let (Ok(d), Ok(s)) = (dirty_ref, stamp_ref) {
                     return (DirtySnap::Cached(d), StampSnap::Cached(s));
                 }
@@ -3124,12 +3098,10 @@ impl<S: Scheduler> DepGraph<S> {
             .get_or(|| std::cell::RefCell::new((u64::MAX, None, None, None)));
         if let Ok(r) = cell.try_borrow() {
             if r.0 == tbl_gen {
-                let dirty_ref =
-                    std::cell::Ref::filter_map(std::cell::Ref::clone(&r), |t| {
-                        t.1.as_ref().map(|a| &**a)
-                    });
-                let epoch_ref =
-                    std::cell::Ref::filter_map(r, |t| t.2.as_ref().map(|a| &**a));
+                let dirty_ref = std::cell::Ref::filter_map(std::cell::Ref::clone(&r), |t| {
+                    t.1.as_ref().map(|a| &**a)
+                });
+                let epoch_ref = std::cell::Ref::filter_map(r, |t| t.2.as_ref().map(|a| &**a));
                 if let (Ok(d), Ok(e)) = (dirty_ref, epoch_ref) {
                     return (DirtySnap::Cached(d), EpochSnap::Cached(e));
                 }
@@ -3144,7 +3116,8 @@ impl<S: Scheduler> DepGraph<S> {
     #[inline]
     pub(crate) fn green_with_epoch(&self, node: DepNodeIndex) -> (bool, u64) {
         debug_assert_ne!(
-            node.0, DepNodeIndex::ZERO.0,
+            node.0,
+            DepNodeIndex::ZERO.0,
             "green_with_epoch called with DepNodeIndex::ZERO"
         );
         let (dirty, epochs) = self.dirty_epochs_snapshot();
@@ -3152,9 +3125,9 @@ impl<S: Scheduler> DepGraph<S> {
             .get(block_of(node.0))
             .map(|b| b[epoch_word_of(node.0)].load(Ordering::Acquire) & EPOCH_MASK)
             .unwrap_or(0);
-        let green = dirty.get(block_of(node.0)).is_none_or(|b| {
-            b[word_of(node.0)].load(Ordering::Acquire) & mask_of(node.0) == 0
-        });
+        let green = dirty
+            .get(block_of(node.0))
+            .is_none_or(|b| b[word_of(node.0)].load(Ordering::Acquire) & mask_of(node.0) == 0);
         (green, epoch)
     }
 
@@ -3260,7 +3233,8 @@ impl<S: Scheduler> DepGraph<S> {
         node: DepNodeIndex,
     ) {
         debug_assert_ne!(
-            node.0, DepNodeIndex::ZERO.0,
+            node.0,
+            DepNodeIndex::ZERO.0,
             "mark_dirty called with DepNodeIndex::ZERO — index 0 is the \
              DefaultCache 'no node' sentinel and is never allocated; marking \
              it would set a phantom bit nothing can clear"
@@ -3498,7 +3472,8 @@ impl<S: Scheduler> DepGraph<S> {
         // tail (one loop, `first` folded back in).
         for node in std::iter::once(first).chain(readers) {
             debug_assert_ne!(
-                node.0, DepNodeIndex::ZERO.0,
+                node.0,
+                DepNodeIndex::ZERO.0,
                 "mark_dirty_batch called with DepNodeIndex::ZERO — index 0 is \
                  the DefaultCache 'no node' sentinel and is never allocated"
             );
@@ -3596,7 +3571,8 @@ impl<S: Scheduler> DepGraph<S> {
     #[inline]
     fn clear_dirty_on(&self, dirty_snap: &DirtySnap<'_>, node: DepNodeIndex) {
         debug_assert_ne!(
-            node.0, DepNodeIndex::ZERO.0,
+            node.0,
+            DepNodeIndex::ZERO.0,
             "clear_dirty called with DepNodeIndex::ZERO"
         );
         if let Some(block) = dirty_snap.get(block_of(node.0)) {
@@ -3672,11 +3648,7 @@ impl<S: Scheduler> DepGraph<S> {
         let prev = self
             .next_index
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if cur >= u32::MAX {
-                    None
-                } else {
-                    Some(cur + 1)
-                }
+                if cur >= u32::MAX { None } else { Some(cur + 1) }
             })
             .unwrap_or_else(|cur| {
                 panic!("DepNodeIndex address space exhausted (next_index = {cur})")
@@ -3719,7 +3691,8 @@ impl<S: Scheduler> DepGraph<S> {
     /// classic sentinel-aliasing bug, so make it loud in debug builds.
     pub fn class_of(&self, node: DepNodeIndex) -> Option<ContentClass> {
         debug_assert_ne!(
-            node.0, DepNodeIndex::ZERO.0,
+            node.0,
+            DepNodeIndex::ZERO.0,
             "class_of called with DepNodeIndex::ZERO — index 0 is the \
              'no node' sentinel and never allocated"
         );
@@ -4027,12 +4000,7 @@ impl<S: Scheduler> DepGraph<S> {
                 let (reads, epochs, index) = t.into_reads_with_epochs();
                 (Some(node), reads, epochs, index)
             }
-            None => (
-                None,
-                SmallVec::new(),
-                SmallVec::new(),
-                ReadsIndex::Empty,
-            ),
+            None => (None, SmallVec::new(), SmallVec::new(), ReadsIndex::Empty),
         };
 
         // The popped frame MUST belong to `node`: the fused section below
@@ -4407,8 +4375,9 @@ impl<S: Scheduler> DepGraph<S> {
         // where a reader that flushed after the old pre-lock collect but
         // re-checked before the bump stayed green-stale.
         if changed_in_section {
-            self.rev_logs[shard_of(node)]
-                .with_readers(node, |readers| self.mark_dirty_batch(readers.iter().copied()));
+            self.rev_logs[shard_of(node)].with_readers(node, |readers| {
+                self.mark_dirty_batch(readers.iter().copied())
+            });
         }
 
         // ---- reverse-edge flush for this task's reads: one lock per
@@ -4617,8 +4586,9 @@ impl<S: Scheduler> DepGraph<S> {
         // (index snapshot + short log mutex, released before the marks);
         // the dirty marks themselves need no shard lock (seqlock-guarded
         // atomics).
-        self.rev_logs[shard_of(node)]
-            .with_readers(node, |readers| self.mark_dirty_batch(readers.iter().copied()));
+        self.rev_logs[shard_of(node)].with_readers(node, |readers| {
+            self.mark_dirty_batch(readers.iter().copied())
+        });
     }
 
     /// Like [`DepGraph::dirty_readers`], but marks only the DIRECT
@@ -4779,26 +4749,19 @@ impl<S: Scheduler> DepGraph<S> {
             // the dirty/epoch swap below already uses.  `with_shard_w`
             // returns the taken vectors, so the guard is released before
             // the loop-end `drop`.
-            let (
-                (
-                    taken_edges,
-                    taken_fp,
-                    taken_classes,
-                    taken_digests,
-                ),
-                _t,
-            ) = self.with_shard_w(i, self.ticket(), |sh| {
-                (
-                    std::mem::take(&mut sh.edges),
-                    std::mem::take(&mut sh.fingerprints),
-                    std::mem::take(&mut sh.classes),
-                    // Digest gate state dies with everything else: a reused node
-                    // index must not inherit a pre-reset digest (it would let the
-                    // gate skip an invalidation for content that never fed the
-                    // old node's value).
-                    std::mem::take(&mut sh.digests),
-                )
-            });
+            let ((taken_edges, taken_fp, taken_classes, taken_digests), _t) =
+                self.with_shard_w(i, self.ticket(), |sh| {
+                    (
+                        std::mem::take(&mut sh.edges),
+                        std::mem::take(&mut sh.fingerprints),
+                        std::mem::take(&mut sh.classes),
+                        // Digest gate state dies with everything else: a reused node
+                        // index must not inherit a pre-reset digest (it would let the
+                        // gate skip an invalidation for content that never fed the
+                        // old node's value).
+                        std::mem::take(&mut sh.digests),
+                    )
+                });
             drop((taken_edges, taken_fp, taken_classes, taken_digests));
             // Clear the reverse-edge log + index (log rework #10). `reset`
             // runs under quiescence, so no reader holds a log guard or an
@@ -4909,12 +4872,11 @@ impl<S: Scheduler> DepGraph<S> {
     #[cfg(test)]
     pub(crate) fn verified_gen_of(&self, node: DepNodeIndex) -> u64 {
         let snap = self.stamps_snapshot();
-        snap.get(block_of(node.0))
-            .map_or(0, |b| {
-                b[stamp_word_of(node.0)]
-                    .verified_gen
-                    .load(Ordering::Acquire)
-            })
+        snap.get(block_of(node.0)).map_or(0, |b| {
+            b[stamp_word_of(node.0)]
+                .verified_gen
+                .load(Ordering::Acquire)
+        })
     }
 
     /// Test-only view of a per-level mark counter.
@@ -4927,12 +4889,11 @@ impl<S: Scheduler> DepGraph<S> {
     #[cfg(test)]
     pub(crate) fn verified_lvl_of(&self, node: DepNodeIndex) -> u64 {
         let snap = self.stamps_snapshot();
-        snap.get(block_of(node.0))
-            .map_or(0, |b| {
-                b[stamp_word_of(node.0)]
-                    .verified_lvl
-                    .load(Ordering::Acquire)
-            })
+        snap.get(block_of(node.0)).map_or(0, |b| {
+            b[stamp_word_of(node.0)]
+                .verified_lvl
+                .load(Ordering::Acquire)
+        })
     }
 
     /// Test hook for the cross-system leak regression: the forward edges
@@ -4964,7 +4925,8 @@ impl<S: Scheduler> DepGraph<S> {
     #[inline]
     pub fn is_green(&self, node: DepNodeIndex) -> bool {
         debug_assert_ne!(
-            node.0, DepNodeIndex::ZERO.0,
+            node.0,
+            DepNodeIndex::ZERO.0,
             "is_green called with DepNodeIndex::ZERO — index 0 is the \
              DefaultCache 'no node' sentinel; block 0 bit 0 would report a \
              phantom green"
@@ -5005,9 +4967,8 @@ impl<S: Scheduler> DepGraph<S> {
     /// argument first.
     #[inline]
     fn is_green_on(snap: &DirtySnap<'_>, node: DepNodeIndex) -> bool {
-        snap.get(block_of(node.0)).is_none_or(|b| {
-            b[word_of(node.0)].load(Ordering::Acquire) & mask_of(node.0) == 0
-        })
+        snap.get(block_of(node.0))
+            .is_none_or(|b| b[word_of(node.0)].load(Ordering::Acquire) & mask_of(node.0) == 0)
     }
 
     /// Mark a node as re-computed (green again).  Lock-free: the bitmap
@@ -5303,13 +5264,7 @@ impl<S: Scheduler> DepGraph<S> {
             d.clear();
         }
         let stamps = buf.cleared();
-        let clean = self.verify_inner(
-            node,
-            false,
-            stamps,
-            dirty_out.as_deref_mut(),
-            None,
-        );
+        let clean = self.verify_inner(node, false, stamps, dirty_out.as_deref_mut(), None);
         if clean {
             self.flush_stamps(stamps);
             return true;
@@ -5470,9 +5425,7 @@ impl<S: Scheduler> DepGraph<S> {
                 // failed.  Reading rev[0] here would only duplicate that
                 // verdict.
                 let vl = slot.map_or(0, |s| s.verified_lvl.load(Ordering::Acquire));
-                if dur != Durability::LOW
-                    && vl >= self.rev[dur as usize].load(Ordering::Acquire)
-                {
+                if dur != Durability::LOW && vl >= self.rev[dur as usize].load(Ordering::Acquire) {
                     // Re-certify at the CURRENT generation.
                     // The level stamp proves the closure is unaffected by
                     // the lower-durability marks that bumped
@@ -5838,8 +5791,7 @@ mod tests {
 
         // 2. Mark a scattered subset dirty; the collect must report it
         //    exactly (as a set).
-        let subset: Vec<DepNodeIndex> =
-            leaves.iter().step_by(3).copied().collect();
+        let subset: Vec<DepNodeIndex> = leaves.iter().step_by(3).copied().collect();
         for &l in &subset {
             dg.invalidate(l, &q());
         }
@@ -5852,7 +5804,10 @@ mod tests {
         got.sort_by_key(|n| n.0);
         let mut want: Vec<DepNodeIndex> = subset.clone();
         want.sort_by_key(|n| n.0);
-        assert_eq!(got, want, "collect-all must report exactly the marked subset");
+        assert_eq!(
+            got, want,
+            "collect-all must report exactly the marked subset"
+        );
 
         // 3. Re-request = republish each dirty leaf with its UNCHANGED
         //    fingerprint (changed == false ⇒ the leaf is cleared, the
@@ -6684,8 +6639,7 @@ mod tests {
             "only the genuinely new dependency is added"
         );
         // Idempotent: reconciling the same read set again is a no-op.
-        let (removed2, added2) =
-            super::reconcile_forward_edges(&mut list, &reads, &index);
+        let (removed2, added2) = super::reconcile_forward_edges(&mut list, &reads, &index);
         assert_eq!(
             removed2.to_vec(),
             vec![],

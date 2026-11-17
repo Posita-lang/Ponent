@@ -1668,7 +1668,7 @@ impl InferenceContext {
 /// Binary Lifting max levels: 2^20 ≈ 10^6, far beyond any real nesting depth.
 const MAX_LOG: usize = 20;
 
-    /// Observability counter: number of times `lift` clamped a
+/// Observability counter: number of times `lift` clamped a
 /// depth >= 2^20 query to the root.  A non-zero count in CI is a bug signal
 /// (region nesting should stay far below the table capacity).
 static REGION_LIFT_CLAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

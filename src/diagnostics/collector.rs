@@ -103,6 +103,10 @@ impl<'src> DiagCtxt<'src> {
     pub fn set_can_emit_warnings(&mut self, enabled: bool) {
         self.can_emit_warnings = enabled;
     }
+
+    pub fn can_emit_warnings(&self) -> bool {
+        self.can_emit_warnings
+    }
     pub fn new() -> Self {
         DiagCtxt {
             diags: SmallVec::new(),
@@ -154,10 +158,19 @@ impl<'src> DiagCtxt<'src> {
         self.push(Diagnostic::warning(msg))
     }
 
-    /// Create and push an error with a formatted message.
-    pub fn error_fmt(&mut self, msg: impl Into<Cow<'src, str>>, code: &str) -> EmissionGuarantee {
+    /// Create and push an error with an attached error code.
+    pub fn error_with_code(
+        &mut self,
+        msg: impl Into<Cow<'src, str>>,
+        code: &str,
+    ) -> EmissionGuarantee {
         let diag = Diagnostic::error(msg).with_code_str(code);
         self.push(diag)
+    }
+
+    #[deprecated(note = "use error_with_code")]
+    pub fn error_fmt(&mut self, msg: impl Into<Cow<'src, str>>, code: &str) -> EmissionGuarantee {
+        self.error_with_code(msg, code)
     }
 
     /// Extend `unreported` with a batch of diagnostics.
@@ -283,6 +296,8 @@ impl<'src> DiagCtxt<'src> {
         self.first_unspanned = self.first_unspanned.min(self.diags.len());
     }
 
+    /// Reset diagnostic data but **preserve** `can_emit_warnings`, which is
+    /// configuration rather than data.
     pub fn clear(&mut self) {
         self.diags.clear();
         self.reported_len = 0;
@@ -334,11 +349,17 @@ impl<'src> DiagCtxt<'src> {
 
     /// Iterate over all error-level diagnostics without allocating.
     pub fn for_each_error<F: FnMut(&Diagnostic<'src>)>(&self, mut f: F) {
+        if self.errors == 0 {
+            return;
+        }
         self.iter().filter(|d| d.is_error()).for_each(f)
     }
 
     /// Iterate over all warning-level diagnostics without allocating.
     pub fn for_each_warning<F: FnMut(&Diagnostic<'src>)>(&self, mut f: F) {
+        if self.warnings == 0 {
+            return;
+        }
         self.iter().filter(|d| d.is_warning()).for_each(f)
     }
 
@@ -443,6 +464,7 @@ impl<'src> DiagCtxt<'src> {
         let mut errors = 0usize;
         let mut warnings = 0usize;
         let mut unreported_errors = 0usize;
+        let mut first_unspanned = None;
         for (i, d) in self.diags.iter().enumerate() {
             if d.is_error() {
                 errors += 1;
@@ -452,15 +474,14 @@ impl<'src> DiagCtxt<'src> {
             } else if d.is_warning() {
                 warnings += 1;
             }
+            if first_unspanned.is_none() && d.source().is_none() {
+                first_unspanned = Some(i);
+            }
         }
         self.errors = errors;
         self.warnings = warnings;
         self.unreported_errors = unreported_errors;
-        self.first_unspanned = self
-            .diags
-            .iter()
-            .position(|d| d.source().is_none())
-            .unwrap_or(self.diags.len());
+        self.first_unspanned = first_unspanned.unwrap_or(self.diags.len());
     }
 
     /// Drain the unreported list and return it.
@@ -528,28 +549,40 @@ impl<'src> DiagCtxt<'src> {
 
     // ── Severity downgrades (inspired by Lean 4's MessageLog) ───────
 
-    /// Downgrade all **unreported** error-level diagnostics to warnings.
+    /// Downgrade all unreported **Error** diagnostics to warnings.
     ///
-    /// This is the inverse of `--warn-as-error`: it can be used to forgive
-    /// certain categories of errors (e.g. in a REPL or after a config change).
+    /// `Fatal` is deliberately excluded: fatalness can carry abort/exit
+    /// semantics upstream, and "forgive errors" must not silently forgive a
+    /// non-recoverable diagnostic.
+    ///
+    /// Respects the push-time `can_emit_warnings` gate: when warnings are
+    /// disabled, the conversion is a no-op rather than injecting warnings
+    /// that `emit` would then print.
     pub fn errors_to_warnings(&mut self) {
+        if self.unreported_errors == 0 || !self.can_emit_warnings {
+            return;
+        }
         let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
-            if diag.is_error() {
+            if diag.level() == super::DiagnosticLevel::Error {
                 diag.set_level(super::DiagnosticLevel::Warning);
                 moved += 1;
             }
         }
         self.errors = self.errors.saturating_sub(moved);
-        self.warnings += moved;
+        self.warnings = self.warnings.saturating_add(moved);
         self.unreported_errors = self.unreported_errors.saturating_sub(moved);
     }
 
-    /// Downgrade all **unreported** error-level diagnostics to information.
+    /// Downgrade all unreported **Error** diagnostics to information.
+    /// `Fatal` is excluded for the same reason as [`errors_to_warnings`].
     pub fn errors_to_infos(&mut self) {
+        if self.unreported_errors == 0 {
+            return;
+        }
         let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
-            if diag.is_error() {
+            if diag.level() == super::DiagnosticLevel::Error {
                 diag.set_level(super::DiagnosticLevel::Info);
                 moved += 1;
             }
@@ -558,8 +591,11 @@ impl<'src> DiagCtxt<'src> {
         self.unreported_errors = self.unreported_errors.saturating_sub(moved);
     }
 
-    /// Downgrade all **unreported** warning-level diagnostics to information.
+    /// Downgrade all unreported warning-level diagnostics to information.
     pub fn warnings_to_infos(&mut self) {
+        if self.warnings == 0 {
+            return;
+        }
         let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
             if diag.is_warning() {
@@ -902,5 +938,52 @@ mod tests {
         c.emit(&mut emitter).unwrap();
         let rendered = out.borrow();
         assert_eq!(rendered.matches("boom").count(), 1, "out: {rendered}");
+    }
+
+    #[test]
+    fn fatal_is_not_downgraded() {
+        let mut c = DiagCtxt::new();
+        let mut d = Diagnostic::error("fatal-boom");
+        d.set_level(crate::diagnostics::DiagnosticLevel::Fatal);
+        c.push(d);
+        c.errors_to_warnings();
+        assert_eq!(
+            c.iter().next().unwrap().level(),
+            crate::diagnostics::DiagnosticLevel::Fatal
+        );
+        assert_eq!(c.warning_count(), 0);
+        c.errors_to_infos();
+        assert_eq!(
+            c.iter().next().unwrap().level(),
+            crate::diagnostics::DiagnosticLevel::Fatal
+        );
+    }
+
+    #[test]
+    fn errors_to_warnings_respects_disabled_gate() {
+        let mut c = DiagCtxt::new();
+        c.set_can_emit_warnings(false);
+        c.push(Diagnostic::error("e"));
+        c.errors_to_warnings();
+        assert_eq!(c.error_count(), 1);
+        assert_eq!(c.warning_count(), 0);
+        assert_eq!(
+            c.iter().next().unwrap().level(),
+            crate::diagnostics::DiagnosticLevel::Error
+        );
+    }
+
+    #[test]
+    fn zero_tallies_skip_filter_scans() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::note("n"));
+        let mut called = false;
+        c.for_each_error(|_| called = true);
+        c.for_each_warning(|_| called = true);
+        c.errors_to_warnings();
+        c.errors_to_infos();
+        assert!(!called);
+        assert_eq!(c.error_count(), 0);
+        assert_eq!(c.warning_count(), 0);
     }
 }

@@ -176,9 +176,5 @@ pub fn push_fold_marker(out: &mut String, gap: usize) {
 /// the loop it replaces is up to 20 divisions.  Still `const fn`.
 #[inline]
 pub const fn dec_digits(n: u64) -> usize {
-    if n == 0 {
-        1
-    } else {
-        n.ilog10() as usize + 1
-    }
+    if n == 0 { 1 } else { n.ilog10() as usize + 1 }
 }
