@@ -29,10 +29,24 @@
 use std::fmt;
 use std::io::{self, Write};
 
+mod sealed {
+    /// Sealing marker: only the sinks in this module (and the blanket
+    /// `impl<W: Write>`) may implement [`DiagnosticSink`].
+    ///
+    /// Without it, the blanket `impl<W: Write>` makes it impossible for ANY
+    /// future type that also implements `Write` to provide its own sink impl
+    /// (`E0119`), and no new trait method could ship with a sensible default
+    /// without breaking external impls.  Types that want to be sinks either
+    /// implement `Write` or use a provided sink.
+    pub trait Sealed {}
+}
+
 /// A destination for rendered diagnostic text.
 ///
 /// Implementors decide what "writing" means: appending to a buffer, sending
-/// over a channel, or calling a foreign callback.
+/// over a channel, or calling a foreign callback.  The trait is **sealed**:
+/// every `io::Write` is already a sink through the blanket impl, and new
+/// capabilities can then be added without breaking downstream impls.
 ///
 /// A sink is created by [`MakeSink::make`] and dropped inside a single
 /// `Emitter` batch method, so it never crosses a thread boundary and is
@@ -41,23 +55,25 @@ use std::io::{self, Write};
 /// `io::StderrLock` is `!Send`, but it is only ever used on the thread that
 /// created it.  Sinks that *are* `Send` (channels, strings) still work; the
 /// emitter remains `Send` whenever its renderer and factory are.
-pub trait DiagnosticSink {
+pub trait DiagnosticSink: sealed::Sealed {
     /// Write a string slice to the sink.
     fn write_str(&mut self, s: &str) -> io::Result<()>;
 
     /// Write formatted arguments to the sink.
     ///
-    /// The default allocates a temporary `String`; override it to stream
-    /// directly (as the `Write`, `StringSink`, and `ChannelSink` impls do).
-    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
-        self.write_str(&args.to_string())
-    }
+    /// Required, not defaulted: the old default built a temporary `String` per
+    /// formatted write, which is never the right behaviour for a sink that
+    /// cares about allocation — and a future sink that forgot to override it
+    /// would pay that silently.
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()>;
 
     /// Flush any buffered output.  Defaults to a no-op.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
+
+impl<W: Write> sealed::Sealed for W {}
 
 // Any `Write` is automatically a sink.
 impl<W: Write> DiagnosticSink for W {
@@ -80,9 +96,37 @@ pub struct StringSink {
     buf: String,
 }
 
+impl sealed::Sealed for StringSink {}
+
 impl StringSink {
     pub fn new() -> Self {
-        StringSink { buf: String::new() }
+        StringSink {
+            buf: String::new(),
+        }
+    }
+
+    /// Start with `capacity` bytes reserved — one allocation for a
+    /// few-KB diagnostic instead of the 2–3 amortized doublings a fresh
+    /// `String` pays.
+    pub fn with_capacity(capacity: usize) -> Self {
+        StringSink {
+            buf: String::with_capacity(capacity),
+        }
+    }
+
+    /// Borrow the accumulated output without consuming the sink.
+    pub fn as_str(&self) -> &str {
+        &self.buf
+    }
+
+    /// Reset the buffer, keeping its capacity for the next batch.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    /// Reserved capacity of the backing buffer (for reuse assertions).
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
     }
 
     /// Consume the sink and return the accumulated output.
@@ -105,9 +149,14 @@ impl DiagnosticSink for StringSink {
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
         use std::fmt::Write as _;
-        // Write straight into the internal buffer, avoiding a temporary `String`.
-        let _ = self.buf.write_fmt(args);
-        Ok(())
+        // Write straight into the internal buffer, avoiding a temporary
+        // `String`.  `String`'s `fmt::Write` cannot fail (it aborts on OOM
+        // rather than returning `Err`), but a silent `let _ =` would hide a
+        // future buffer swap that *can* fail — so the arm is explicit.
+        match self.buf.write_fmt(args) {
+            Ok(()) => Ok(()),
+            Err(e) => unreachable!("String::write_fmt is infallible: {e}"),
+        }
     }
 }
 
@@ -136,15 +185,28 @@ pub fn stderr() -> impl MakeSink<Sink = io::StderrLock<'static>> {
     || io::stderr().lock()
 }
 
-/// Like [`stderr`], but batches writes through a [`BufWriter`].
+/// Like [`stderr`], but batches small writes through a [`BufWriter`].
 ///
 /// `io::stderr()` is unbuffered in Rust: every `write_str` is a `write(2)`
 /// syscall.  A batch of N diagnostics therefore costs ~2N syscalls; the
-/// buffered factory collapses them into 1–2.  The emitter calls
+/// buffered factory collapses small writes into 1–2.  The emitter calls
 /// `sink.flush()` at the end of every batch, so buffered output is never
 /// left behind on the happy path.
+///
+/// Note that `BufWriter` BYPASSES its buffer for a single `write_all` larger
+/// than the remaining capacity (fill, flush, write the remainder directly).
+/// A diagnostic whose rendered form exceeds the buffer therefore costs one
+/// direct `write(2)` — correct, just not batched; use [`stderr_buffered_with`]
+/// to raise the capacity for unusually large renders.
 pub fn stderr_buffered() -> impl MakeSink<Sink = io::BufWriter<io::StderrLock<'static>>> {
-    || io::BufWriter::with_capacity(16 * 1024, io::stderr().lock())
+    stderr_buffered_with(16 * 1024)
+}
+
+/// [`stderr_buffered`] with a caller-chosen buffer capacity.
+pub fn stderr_buffered_with(
+    capacity: usize,
+) -> impl MakeSink<Sink = io::BufWriter<io::StderrLock<'static>>> {
+    move || io::BufWriter::with_capacity(capacity, io::stderr().lock())
 }
 
 /// Test sink factory: produce a fresh [`StringSink`] per batch.
@@ -152,21 +214,36 @@ pub fn string() -> impl MakeSink<Sink = StringSink> {
     StringSink::new
 }
 
+/// Like [`string`], with the batch buffer pre-sized.
+pub fn string_with_capacity(capacity: usize) -> impl MakeSink<Sink = StringSink> {
+    move || StringSink::with_capacity(capacity)
+}
+
 /// LSP sink: forward rendered chunks over an mpsc channel.
+///
+/// Each `write_str` costs exactly one allocation (the owned `String` that goes
+/// over the channel) — per-chunk streaming is the intended LSP semantics, not
+/// an oversight.  Callers that want fewer allocations and can tolerate larger
+/// messages should batch on their side.
 pub struct ChannelSink(crossbeam_channel::Sender<String>);
+
+/// Payload-free `BrokenPipe`: recurring sends after the receiver dropped must
+/// not allocate a fresh `Box<dyn Error>` each time.
+#[inline]
+fn broken_pipe() -> io::Error {
+    io::Error::from(io::ErrorKind::BrokenPipe)
+}
+
+impl sealed::Sealed for ChannelSink {}
 
 impl DiagnosticSink for ChannelSink {
     fn write_str(&mut self, s: &str) -> io::Result<()> {
-        self.0
-            .send(s.to_owned())
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+        self.0.send(s.to_owned()).map_err(|_| broken_pipe())
     }
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
         // Exactly one allocation: the formatted string sent over the channel.
-        self.0
-            .send(args.to_string())
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+        self.0.send(args.to_string()).map_err(|_| broken_pipe())
     }
 }
 
@@ -223,7 +300,75 @@ mod tests {
         // Disambiguate: `BufWriter` implements both `Write` and (via the
         // blanket impl) `DiagnosticSink`, each with its own `flush`.
         Write::flush(&mut buffered).unwrap();
+        // The `DiagnosticSink` flush path (what the emitter calls) must forward
+        // to `Write::flush`, not be a separate no-op.
+        DiagnosticSink::flush(&mut buffered).unwrap();
 
         assert_eq!(direct, buffered.into_inner().unwrap());
+    }
+
+    /// A single `write_all` larger than the buffer capacity takes the
+    /// documented bypass path (fill, flush, write the remainder directly) and
+    /// must still preserve every byte.
+    #[test]
+    fn buffered_writer_bypasses_oversized_write_without_loss() {
+        let mut direct = Vec::new();
+        let mut buffered = io::BufWriter::with_capacity(8, Vec::new());
+        let big = "0123456789abcdefghijklmnopqrstuvwxyz";
+        direct.write_all(big.as_bytes()).unwrap();
+        buffered.write_all(big.as_bytes()).unwrap();
+        Write::flush(&mut buffered).unwrap();
+        assert_eq!(direct, buffered.into_inner().unwrap());
+    }
+
+    /// Every sink must produce identical bytes for the same interleaving of
+    /// `write_str` / `write_fmt`; a `write_fmt` implementation that drifts from
+    /// its `write_str` partner is the class of bug this pins.
+    #[test]
+    fn sinks_agree_on_byte_content() {
+        let mut string_sink = StringSink::new();
+        let mut direct: Vec<u8> = Vec::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut channel_sink = ChannelSink(tx);
+        let mut channel_out = String::new();
+
+        for (i, chunk) in ["a", "beta\n", "γ"] .iter().enumerate() {
+            string_sink.write_str(chunk).unwrap();
+            DiagnosticSink::write_str(&mut direct, chunk).unwrap();
+            channel_sink.write_str(chunk).unwrap();
+            channel_out.push_str(&rx.recv().unwrap());
+            string_sink.write_fmt(format_args!("[{i}]")).unwrap();
+            DiagnosticSink::write_fmt(&mut direct, format_args!("[{i}]")).unwrap();
+            channel_sink.write_fmt(format_args!("[{i}]")).unwrap();
+            channel_out.push_str(&rx.recv().unwrap());
+        }
+
+        let expected = string_sink.into_string();
+        assert_eq!(String::from_utf8(direct).unwrap(), expected);
+        assert_eq!(channel_out, expected);
+    }
+
+    /// A receiver that drops mid-batch yields `BrokenPipe` and keeps the
+    /// chunks already delivered; later writes keep returning `Err` rather than
+    /// panicking or silently succeeding.
+    #[test]
+    fn channel_sink_reports_broken_pipe_after_receiver_drop() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut sink = ChannelSink(tx);
+        sink.write_str("kept").unwrap();
+        drop(rx);
+        let err = sink.write_str("lost").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(sink.write_fmt(format_args!("x")).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn string_sink_reuses_capacity() {
+        let mut sink = StringSink::with_capacity(4096);
+        sink.write_str("abc").unwrap();
+        assert_eq!(sink.as_str(), "abc");
+        sink.clear();
+        assert_eq!(sink.as_str(), "");
+        assert!(sink.capacity() >= 4096);
     }
 }

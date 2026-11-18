@@ -222,7 +222,7 @@ pub struct CallChain<'src> {
     facts: std::sync::OnceLock<ChainFacts>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChainFacts {
     any_spanned: bool,
     entry_count: usize,
@@ -247,6 +247,40 @@ struct RenderEnv<'a> {
     tab_width: usize,
     file_cols: usize,
     anchor: Option<FileId>,
+    /// `(label, display width)` for each [`ChainEntryKind`], resolved once per
+    /// render.  The language is fixed for the whole call, so re-resolving the
+    /// Fluent label and rescanning its width per entry was pure repetition —
+    /// the same consistency argument `label_width` already makes.
+    kind_labels: [(&'static str, usize); 4],
+}
+
+/// Iterative teardown.  The derived drop glue recurses one stack frame per
+/// nesting level, so a hostile 100k-deep chain (trivially built iteratively
+/// with `with_children`) would overflow the stack on scope exit — precisely
+/// where the render caps claim to defend.  Move every nested `entries` vector
+/// onto one worklist and leave each child chain empty before its own glue
+/// runs, so the compiler's field-drop never walks a nested chain.
+///
+/// `Clone` remains the derived, structurally recursive implementation: it is
+/// only reachable by an explicit clone of a hostile chain (not by any drop
+/// path), and an iterative tree-clone would need a bottom-up rebuild for no
+/// additional safety on the paths this type actually takes.  Callers that
+/// duplicate untrusted chains must bound their depth (the same
+/// `MAX_CHAIN_DEPTH` contract the renderer enforces).
+impl Drop for CallChain<'_> {
+    fn drop(&mut self) {
+        let mut work: Vec<ChainEntry<'_>> = std::mem::take(&mut self.entries);
+        while let Some(mut entry) = work.pop() {
+            if let Some(children) = entry.children.take() {
+                for mut child in Vec::from(children) {
+                    // Move the child's entries onto the shared worklist; the
+                    // child is then dropped with an empty `entries`, so its
+                    // own `Drop` invocation cannot recurse.
+                    work.append(&mut child.entries);
+                }
+            }
+        }
+    }
 }
 
 impl<'src> CallChain<'src> {
@@ -287,7 +321,23 @@ impl<'src> CallChain<'src> {
     /// could overflow the stack on a hostile deep chain before the render
     /// cap ever applied.
     fn scan(&self) -> ChainFacts {
-        *self.facts.get_or_init(|| self.compute_facts())
+        let facts = *self.facts.get_or_init(|| self.compute_facts());
+        // Memo canary: the soundness of this cache rests on three unstated
+        // preconditions (`entries` stays private, `children` is immutable, and
+        // `ChainEntry`'s public fields cannot be mutated after `push`).  If a
+        // future mutation path is added without invalidating the memo,
+        // `any_spanned` would silently gate hyperlinks wrongly and the reserve
+        // estimate would go stale; recompute in debug builds so the first
+        // render fails loudly instead.
+        #[cfg(debug_assertions)]
+        {
+            let fresh = self.compute_facts();
+            debug_assert_eq!(
+                facts, fresh,
+                "stale chain facts: a mutation path bypassed CallChain::push"
+            );
+        }
+        facts
     }
 
     fn compute_facts(&self) -> ChainFacts {
@@ -316,9 +366,25 @@ impl<'src> CallChain<'src> {
                 stack.push((chain, depth, next + 1));
             }
             visited += 1;
+            let indent = 4 + depth * 4;
             indent_bytes = indent_bytes
-                .saturating_add(4 + depth * 4)
+                .saturating_add(indent)
                 .min(MAX_RESERVE_MESSAGE_BYTES);
+            // The renderer pushes `indent` spaces on EVERY row, not once per
+            // entry: a wrapped or multiline message renders `1 + newlines`
+            // (plus wrapped) rows, so the old per-entry term under-reserved by
+            // the whole indent-per-row factor — a 1 MiB message at a 40-column
+            // measure reserved ~8 bytes for ~200 KB of actual spaces.  Hard
+            // newlines are counted exactly (memchr is SIMD); wrapped rows are
+            // estimated from message length at ~64 bytes/row, which is
+            // render-parameter independent (a memo precondition) and monotone.
+            let newlines = memchr::memchr_iter(b'\n', entry.message.as_bytes()).count();
+            let extra_rows = newlines.saturating_add(entry.message.len() / 64);
+            if extra_rows > 0 {
+                indent_bytes = indent_bytes
+                    .saturating_add(indent.saturating_mul(extra_rows))
+                    .min(MAX_RESERVE_MESSAGE_BYTES);
+            }
             any_spanned = any_spanned || entry.span.is_some();
             message_bytes = message_bytes
                 .saturating_add(entry.message.len())
@@ -396,9 +462,48 @@ impl<'src> CallChain<'src> {
             64 + facts.message_bytes + facts.indent_bytes + facts.entry_count * 64,
         );
         self.render_into_with_facts(
-            use_color, source, file_name, idx, max_width, tab_width, None, None, facts, &mut out,
+            use_color,
+            source,
+            file_name,
+            idx,
+            max_width,
+            tab_width,
+            None,
+            // Derive the anchor instead of assuming every span belongs to
+            // `file_name`: a foreign span then falls back to its kind label
+            // rather than printing this file's name with another file's
+            // line/column (the legacy `anchor = None` hazard).
+            self.first_spanned_file(),
+            facts,
+            &mut out,
         );
         out
+    }
+
+    /// `FileId` of the first spanned entry in pre-order (same depth cap as
+    /// [`Self::scan`]).  Used by [`Self::render_with_index`] to derive the
+    /// anchor rather than assuming every span belongs to `file_name`.
+    fn first_spanned_file(&self) -> Option<FileId> {
+        let mut stack: SmallVec<[(&CallChain<'src>, usize, usize); 8]> = SmallVec::new();
+        stack.push((self, 0, 0));
+        while let Some((chain, depth, next)) = stack.pop() {
+            if depth > MAX_CHAIN_DEPTH || next >= chain.entries.len() {
+                continue;
+            }
+            let entry = &chain.entries[next];
+            if let Some(span) = entry.span {
+                return Some(span.file);
+            }
+            if next + 1 < chain.entries.len() {
+                stack.push((chain, depth, next + 1));
+            }
+            if let Some(children) = &entry.children {
+                for child in children.iter().rev() {
+                    stack.push((child, depth + 1, 0));
+                }
+            }
+        }
+        None
     }
 
     /// Render the chain into an existing buffer.
@@ -479,7 +584,12 @@ impl<'src> CallChain<'src> {
         // The URL is consumed only by a spanned entry; a kind-only chain would
         // otherwise pay a `canonicalize` syscall chain for output that never
         // uses it.  Gate on whether any entry anywhere carries a span.
+        // The URL is consumed only by a spanned entry whose suffix renders
+        // `FileLineCol`; with no source every entry falls back to its kind
+        // label, so paying `path_to_file_url` (canonicalize syscalls) plus the
+        // byte-validation scan there is pure waste.
         let hyperlink_enabled = use_color
+            && source.is_some()
             && super::term::supports_hyperlinks()
             && super::is_real_file_name(file_name)
             && facts.any_spanned;
@@ -513,6 +623,19 @@ impl<'src> CallChain<'src> {
         let file_cols = visible_width(&sanitized);
         let capped = std::cell::Cell::new(false);
         let rendered = std::cell::Cell::new(0usize);
+        // Resolve the four kind labels once: the language cannot change inside
+        // one render, and `label_width` would otherwise re-resolve the Fluent
+        // label and rescan its graphemes for every entry.
+        let kind_labels = [
+            ChainEntryKind::Call,
+            ChainEntryKind::Inlined,
+            ChainEntryKind::Reference,
+            ChainEntryKind::Defines,
+        ]
+        .map(|k| {
+            let label = k.as_static_str();
+            (label, super::glyph::visible_width(label))
+        });
         self.render_entries(
             &RenderEnv {
                 use_color,
@@ -524,6 +647,7 @@ impl<'src> CallChain<'src> {
                 tab_width,
                 file_cols,
                 anchor,
+                kind_labels,
             },
             0,
             out,
@@ -605,6 +729,7 @@ impl<'src> CallChain<'src> {
             tab_width,
             file_cols,
             anchor,
+            kind_labels,
         } = *env;
         // Bound the recursion: a pathological/fuzzer-generated chain thousands
         // of levels deep must not overflow the stack.  Real chains are shallow.
@@ -679,10 +804,12 @@ impl<'src> CallChain<'src> {
                         }
                     }
                 }
-                _ => ChainSuffix::Kind {
-                    kind: entry.kind.as_static_str(),
-                    width: entry.kind.label_width(),
-                },
+                _ => {
+                    // One array read replaces a Fluent label resolution plus a
+                    // grapheme-width rescan per entry.
+                    let (kind, width) = kind_labels[entry.kind.index()];
+                    ChainSuffix::Kind { kind, width }
+                }
             };
             let suffix_cols = suffix.cols(file_cols);
             // Wrap to the full measure first (the suffix only rides the last
@@ -764,6 +891,17 @@ impl<'src> CallChain<'src> {
                 // exactly one empty segment (`""`); `saturating_sub` keeps the
                 // suffix logic correct (and debug builds panic-free) even if
                 // an empty list ever escapes.
+                // Degenerate measure: `narrow.max(1)` already floors the
+                // re-wrap, and when the suffix ALONE is as wide as the content
+                // measure (`suffix_cols >= avail_full`) no single-row
+                // arrangement can satisfy `max_width` — the indent plus the
+                // unbreakable suffix token already exceeds it.  Emitting the
+                // suffix on a continuation line was tried and rejected: for a
+                // deep chain (`avail_full` floored at 1) it doubles the row
+                // count, producing a visible cascade and violating the
+                // renderer's line-count contract.  The width invariant therefore
+                // holds for every entry whose `suffix_cols < avail_full`, which
+                // is the regime the contract test pins.
                 let last = segs.len().saturating_sub(1);
                 for (i, seg) in segs.iter().enumerate() {
                     super::renderers::fmt::push_spaces(out, indent_cols);
@@ -1033,6 +1171,28 @@ mod tests {
         );
     }
 
+    /// Hostile-depth teardown: `Drop` must not recurse.  10k levels is far
+    /// past any real chain and would overflow the default test stack with the
+    /// derived (structurally recursive) glue — the exact class the render caps
+    /// claim to defend.
+    #[test]
+    fn deep_chain_drops_without_recursion() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        let mut chain = CallChain {
+            entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")],
+            facts: std::sync::OnceLock::new(),
+        };
+        for _ in 0..10_000 {
+            let entry =
+                ChainEntry::new(ChainEntryKind::Call, Some(span), "x").with_children(vec![chain]);
+            chain = CallChain {
+                entries: vec![entry],
+                facts: std::sync::OnceLock::new(),
+            };
+        }
+        drop(chain);
+    }
+
     #[test]
     fn deep_chain_is_capped_consistently() {
         // Build 70 nested levels: the renderer/flatteners cap at
@@ -1041,7 +1201,7 @@ mod tests {
         let span = Span::new(FileId::DUMMY, 0, 3);
         let mut inner = CallChain {
             entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")],
-            ..CallChain::new()
+            facts: std::sync::OnceLock::new(),
         };
         // Single-character messages: at depth ≥ 64 the indent exceeds the
         // measure, and a multi-character word would be split one grapheme per
@@ -1051,7 +1211,7 @@ mod tests {
                 ChainEntry::new(ChainEntryKind::Call, Some(span), "x").with_children(vec![inner]);
             inner = CallChain {
                 entries: vec![entry],
-                ..CallChain::new()
+                facts: std::sync::OnceLock::new(),
             };
         }
         let out = inner.render(false, Some("def main() {}"), "f.ps");
@@ -1074,7 +1234,7 @@ mod tests {
         let span = Span::new(FileId::DUMMY, 0, 3);
         let leaf = || CallChain {
             entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")],
-            ..CallChain::new()
+            facts: std::sync::OnceLock::new(),
         };
         // Two identical linear branches that both cross the cap.  The old
         // recursion emitted one `...` per branch; the contract is one marker
@@ -1087,7 +1247,7 @@ mod tests {
                         ChainEntry::new(ChainEntryKind::Call, Some(span), "x")
                             .with_children(vec![chain]),
                     ],
-                    ..CallChain::new()
+                    facts: std::sync::OnceLock::new(),
                 };
             }
             chain
@@ -1097,7 +1257,7 @@ mod tests {
                 ChainEntry::new(ChainEntryKind::Call, Some(span), "root")
                     .with_children(vec![deep(), deep()]),
             ],
-            ..CallChain::new()
+            facts: std::sync::OnceLock::new(),
         };
         let out = branch.render(false, Some("def main() {}"), "f.ps");
         assert_eq!(
@@ -1119,7 +1279,7 @@ mod tests {
                 Some(Span::new(FileId::DUMMY, 0, 3)),
                 "leaf",
             )],
-            ..CallChain::new()
+            facts: std::sync::OnceLock::new(),
         };
         let parent = ChainEntry::new(
             ChainEntryKind::Call,
@@ -1129,7 +1289,7 @@ mod tests {
         .with_children(vec![leaf]);
         let chain = CallChain {
             entries: vec![parent],
-            ..CallChain::new()
+            facts: std::sync::OnceLock::new(),
         };
         let out = chain.render(false, Some("def main() {}"), "f.ps");
         let parent_line = out.lines().find(|l| l.contains("parent")).unwrap();

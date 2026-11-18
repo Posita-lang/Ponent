@@ -5,10 +5,15 @@
 /// key (`type-mismatch`) through the active language's bundle — with
 /// `en.ftl` as fallback — and returns any other key verbatim.
 ///
-/// Language selection (in priority order):
+/// Language selection (in priority order, POSIX precedence):
 ///   1. `PONENT_LANG` environment variable (e.g. `en`, `ru`, `zh`)
-///   2. `LANG` environment variable (system locale, e.g. `en_US.UTF-8`)
-///   3. English (default)
+///   2. `LC_ALL`
+///   3. `LC_MESSAGES`
+///   4. `LANG` (system locale, e.g. `en_US.UTF-8`)
+///   5. English (default)
+///
+/// A variable set to the empty string is treated as unset, and a language
+/// without a bundle (`de_DE`) falls back to English rather than failing.
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::OnceLock;
@@ -106,7 +111,7 @@ pub trait LiftCow<'a> {
     fn lift(self) -> Cow<'a, str>;
 }
 
-impl<'a> LiftCow<'a> for Cow<'static, str> {
+impl<'a, 'src: 'a> LiftCow<'a> for Cow<'src, str> {
     fn lift(self) -> Cow<'a, str> {
         match self {
             Cow::Borrowed(s) => Cow::Borrowed(s),
@@ -144,13 +149,23 @@ fn bundles() -> &'static [Bundle; N_LANGS] {
 }
 
 fn make_bundle(lang: LanguageIdentifier, src: &'static str) -> Bundle {
-    // Locales are validated by `validate_locales` at build time, so parse
-    // errors should not occur; keep the (recoverable) resource if they do.
-    let res: &'static FluentResource =
-        Box::leak(Box::new(match FluentResource::try_new(src.to_owned()) {
-            Ok(r) => r,
-            Err((r, _)) => r,
-        }));
+    // Locales are validated by `validate_locales` at build time, so a parse
+    // error here means the validator and the runtime disagree (version drift,
+    // a validator bug, a build.rs bypass).  Fluent is error-RECOVERING: the
+    // broken message is dropped from the resource, `add_resource` still
+    // succeeds, and every render of that slug silently falls back to English.
+    // Keep the recovered errors and fail loudly in debug builds instead of
+    // letting a language quietly lose a message.
+    let (res, errors) = match FluentResource::try_new(src.to_owned()) {
+        Ok(r) => (r, Vec::new()),
+        Err((r, e)) => (r, e),
+    };
+    debug_assert!(
+        errors.is_empty(),
+        "locale {}: Fluent parse errors that `validate_locales` missed: {errors:?}",
+        lang
+    );
+    let res: &'static FluentResource = Box::leak(Box::new(res));
     let mut bundle = fluent_bundle::concurrent::FluentBundle::new_concurrent(vec![lang]);
     bundle.set_use_isolating(false);
     bundle
@@ -421,6 +436,15 @@ pub fn render<'msg, 'src>(
         // Zero-arg slug: build-time cached, returns borrowed — no formatting
         // and no allocation after the first call per (slug, lang).
         if let Some(c) = fluent::zero_arg_slug(msg) {
+            // The generator classifies a slug as zero-arg from `en.ftl`; a
+            // caller passing arguments to it would be silently ignored — the
+            // worst kind of bug in a diagnostics engine (plausible but wrong
+            // text).  Fail loudly in debug builds.
+            debug_assert!(
+                pairs.is_empty(),
+                "slug {msg:?} is zero-arg but was passed {} argument(s)",
+                pairs.len()
+            );
             return c;
         }
         if let Some(s) = try_fluent(msg, pairs) {
@@ -438,6 +462,11 @@ pub fn render_into<'msg, 'src>(
 ) {
     if is_ftl_slug(msg) {
         if let Some(c) = fluent::zero_arg_slug(msg) {
+            debug_assert!(
+                pairs.is_empty(),
+                "slug {msg:?} is zero-arg but was passed {} argument(s)",
+                pairs.len()
+            );
             out.push_str(&c);
             return;
         }
@@ -496,9 +525,8 @@ fn lang_id() -> &'static LanguageIdentifier {
 /// locale message introducing a differently-named plural key cannot
 /// silently fall to the `other` CLDR branch — the build regenerates the
 /// list from the source of truth on every compile.
-use fluent::is_numeric_arg_key;
-
 fn make_value<'s>(v: Cow<'s, str>, key: &str) -> FluentValue<'s> {
+    use fluent::is_numeric_arg_key;
     if !is_numeric_arg_key(key) {
         return FluentValue::String(v);
     }
@@ -528,17 +556,22 @@ fn try_fluent_into<'msg, 'src>(
     pairs: &[(&'static str, Cow<'src, str>)],
     out: &mut String,
 ) -> bool {
-    let lang = lang_id();
+    // `Lang::index()` names the bundle directly.  The old
+    // `lang_id()` -> `bundle_index_for(langid)` round trip recovered the same
+    // index through a string match (and eagerly initialized the langid table
+    // the render path never needed), so the render choice could in principle
+    // disagree with `Lang::index()`.
+    let lang_idx = Lang::current().index();
+    let bundles = bundles();
+    let primary = &bundles[lang_idx];
+    let en = &bundles[0];
     if pairs.is_empty() {
         // Zero-argument fast path: one lookup per bundle attempt, no
         // argument map.
-        return format_slug_into(lang, msg, None, out);
+        return format_slug_in_into(primary, en, msg, None, out);
     }
     // Single-pass resolve+format: walk the bundle chain once.  The argument
     // map is built lazily, only after a bundle actually has the message.
-    let bundles = bundles();
-    let primary = &bundles[bundle_index_for(lang)];
-    let en = &bundles[0];
     let mut built_args: Option<FluentArgs> = None;
     // P2: resolve each bundle in turn and *retry formatting* on the next one
     // when a bundle has the message but fails to format it (a broken
@@ -556,6 +589,10 @@ fn try_fluent_into<'msg, 'src>(
                 // `pairs` is borrowed, so `v.clone()` is the cheapest legal
                 // move (Borrowed = pointer copy; Owned = deep copy).
                 let value = make_value(v.clone(), k);
+                // `FluentArgs::set` replaces: a caller assembling pairs from
+                // two sources would otherwise silently lose the first value.
+                let key: &str = *k;
+                debug_assert!(args.get(key).is_none(), "duplicate tr! argument {key:?}");
                 args.set(*k, value);
             });
             args
@@ -590,6 +627,11 @@ pub fn render_into_owned<'msg, 'src>(
 ) {
     if is_ftl_slug(msg) {
         if let Some(c) = fluent::zero_arg_slug(msg) {
+            debug_assert!(
+                pairs.is_empty(),
+                "slug {msg:?} is zero-arg but was passed {} argument(s)",
+                pairs.len()
+            );
             out.push_str(&c);
             return;
         }
@@ -622,17 +664,17 @@ fn try_fluent_owned_into<'msg, 'src>(
     pairs: SmallVec<[(&'static str, Cow<'src, str>); 4]>,
     out: &mut String,
 ) -> bool {
-    let lang = lang_id();
+    let lang_idx = Lang::current().index();
+    let bundles = bundles();
+    let primary = &bundles[lang_idx];
+    let en = &bundles[0];
     if pairs.is_empty() {
-        return format_slug_into(lang, msg, None, out);
+        return format_slug_in_into(primary, en, msg, None, out);
     }
     // Single-pass resolve (see `try_fluent`): one `get_message` hash lookup
     // per bundle.  The argument map is built once, only after a bundle with
     // the message is found — `pairs` is consumed, so the build cannot sit
     // inside the loop.
-    let bundles = bundles();
-    let primary = &bundles[bundle_index_for(lang)];
-    let en = &bundles[0];
     let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
     // Retry formatting on the next bundle when this one has the message but
     // fails to format it (see `try_fluent_into`).  `pairs` is consumed to
@@ -658,6 +700,7 @@ fn try_fluent_owned_into<'msg, 'src>(
                     // borrowed path (`try_number` is `parse::<FluentNumber>` with
                     // a `String` fallback).
                     let value = make_value(v, &k);
+                    debug_assert!(args.get(k).is_none(), "duplicate tr! argument {k:?}");
                     args.set(k, value);
                 });
             args
@@ -692,21 +735,16 @@ macro_rules! cached_label {
         variant = $variant:expr,
         init = [$($init:expr),+ $(,)?],
     ) => {{
-        static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] =
-            [const { ::std::sync::OnceLock::new() }; $crate::diagnostics::i18n::N_LANGS];
-        let lang_idx = $crate::diagnostics::i18n::Lang::current().index();
-        // `Lang` starts at discriminant 1 (`LANG_EN = 1`), so the index is
-        // `discriminant - 1` and must stay in `0..3`.  A new variant with
-        // discriminant 0 would wrap to `usize::MAX`; the debug assert names
-        // that, and in release the bounds check below panics loudly rather
-        // than silently serving the wrong language (the old `.min(2)` coerced
-        // a bad index to Chinese — strictly worse than a panic).
-        debug_assert!(
-            lang_idx < $crate::diagnostics::i18n::N_LANGS,
-            "Lang discriminant out of the cached range"
-        );
-        let table = CACHES[lang_idx].get_or_init(|| [$($init),+]);
-        ::std::borrow::Cow::Borrowed(&table[$variant])
+        // `cached_label_static!` is the single source of truth: it owns the
+        // `OnceLock<[String; N]>` table, the index derivation, and the
+        // loud-failure assert.  `Cow::Borrowed` over its `'static` table entry
+        // is sound, so this used to duplicate ~30 lines of invariant code that
+        // then drifted.
+        ::std::borrow::Cow::Borrowed($crate::diagnostics::i18n::cached_label_static!(
+            n = $n,
+            variant = $variant,
+            init = [$($init),+],
+        ))
     }};
 }
 pub(crate) use cached_label;
@@ -844,6 +882,16 @@ mod tests {
     /// The zero-arg slug cache must be language-aware: fetching under `En`,
     /// switching to `Zh`, and fetching again must change the output.  If the
     /// generated table ever latched a single language, this fails.
+    #[test]
+    fn bundle_registry_mappings_agree() {
+        // `bundle_index_for`, `lang_id_at` and the `bundles()` array order must
+        // agree: a stale index compiles fine and silently serves the wrong
+        // locale, which is exactly the bug class `N_LANGS`'s doc records.
+        for i in 0..N_LANGS {
+            assert_eq!(bundle_index_for(lang_id_at(i)), i);
+        }
+    }
+
     #[test]
     fn zero_arg_slug_is_language_aware() {
         let _lang_guard = acquire_test_lang_lock();

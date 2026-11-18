@@ -23,11 +23,14 @@ use std::io;
 ///   checkpointed (e.g. saved to a snapshot for incremental compilation).
 ///
 /// This layout makes [`mark_all_reported`](Self::mark_all_reported) a single
-/// index update, and [`into_inner`](Self::into_inner) / [`into_iter`](Self::into_iter)
-/// zero-cost (no `extend` move), which matters on the per-function-body-check
-/// hot path.  [`drain_unreported`](Self::drain_unreported) is `split_off`
-/// (O(n) + one alloc) — it has no callers today, so the trade-off favours the
-/// hot `into_inner`.
+/// index update.  [`into_inner`](Self::into_inner) moves the `SmallVec` out
+/// without an `extend` pass, but note that `SmallVec::into_vec` still
+/// allocates and copies when the diagnostics are inline (the zero/one-diag
+/// case) — the claim is "no per-element move through an intermediate
+/// `extend`", not "no allocation".  [`into_iter`](Self::into_iter) is the
+/// genuinely zero-cost consuming path (it reuses the inline buffer).
+/// [`drain_unreported`](Self::drain_unreported) is one in-place `SmallVec`
+/// drain plus one allocation for the returned `Vec`.
 ///
 /// `'src` is the lifetime of the source buffer the contained diagnostics may
 /// borrow (see [`Diagnostic`]).
@@ -62,6 +65,10 @@ pub struct DiagCtxt<'src> {
     /// Errors in the unreported suffix; kept in lockstep with `errors` so
     /// `has_unreported_errors` is O(1) on the per-module path.
     unreported_errors: usize,
+    /// Warnings in the unreported suffix — the symmetric counter that lets
+    /// `warnings_to_infos` and `for_each_warning` gate and skip the reported
+    /// prefix in O(1) instead of scanning the suffix to find out.
+    unreported_warnings: usize,
 }
 
 /// The inline `SmallVec<[Diagnostic; 2]>` is what keeps a zero/one-diagnostic
@@ -116,6 +123,7 @@ impl<'src> DiagCtxt<'src> {
             errors: 0,
             warnings: 0,
             unreported_errors: 0,
+            unreported_warnings: 0,
         }
     }
 
@@ -132,6 +140,7 @@ impl<'src> DiagCtxt<'src> {
                     return EmissionGuarantee::suppressed();
                 }
                 self.warnings += 1;
+                self.unreported_warnings += 1;
             }
             _ => {}
         }
@@ -184,9 +193,14 @@ impl<'src> DiagCtxt<'src> {
         // loop below must do it explicitly or a batch of N reallocates
         // O(log N) times.  A warning-filtered batch may reserve slightly
         // more than it keeps; that is cheaper than growing repeatedly.
-        let (lower, _) = iter.size_hint();
-        if lower > 0 {
-            self.diags.reserve(lower);
+        let (lower, upper) = iter.size_hint();
+        // Reserve from the UPPER bound: an exact-size producer (`Vec`, slice,
+        // most in-tree iterators) reports `Some(exact)`, and using only the
+        // lower bound reintroduced the O(log N) growth this reserve exists to
+        // avoid on filtered batches.
+        let hint = upper.unwrap_or(lower);
+        if hint > 0 {
+            self.diags.reserve(hint);
         }
         for diag in iter {
             self.push(diag);
@@ -197,9 +211,11 @@ impl<'src> DiagCtxt<'src> {
     /// not already carry one.  Called at a producer's boundary so downstream
     /// emitters can render snippets without cloning the source buffer.
     ///
-    /// The reported region is included on purpose: a caller may re-inspect
-    /// already-emitted diagnostics (e.g. to render them elsewhere), and source
-    /// attachment is idempotent.  It is not re-rendered in place.
+    /// The reported prefix is touched only when some reported diagnostic still
+    /// lacks source (`first_unspanned <= reported_len`); diags before the
+    /// frontier already carry source by invariant and are not revisited.
+    /// Re-attaching a *different* source to already-spanned diagnostics is not
+    /// supported by this API — it is idempotent by design.
     pub fn attach_source(&mut self, source: &'src str) {
         debug_assert!(self.first_unspanned <= self.diags.len());
         let start = self.first_unspanned.min(self.diags.len());
@@ -226,10 +242,13 @@ impl<'src> DiagCtxt<'src> {
         self.diags.iter()
     }
 
-    /// Iterate mutably over all diagnostics (reported first, then
-    /// unreported) — the feed for [`Emitter::emit_all_iter`], which
-    /// humanizes each diagnostic at its render boundary.
-    pub(crate) fn iter_mut(
+    /// Iterate mutably over ALL diagnostics (reported first, then
+    /// unreported).  The name states the region explicitly: `emit` covers only
+    /// the unreported suffix, so a caller that pairs this iterator with an
+    /// emitter must intend a full re-render (the `emit_all_iter` contract),
+    /// not a checkpoint emit.  `HumanizeOnly` still restricts mutation to
+    /// humanization.
+    pub(crate) fn iter_all_mut(
         &mut self,
     ) -> impl DoubleEndedIterator<Item = HumanizeOnly<'_, 'src>> + ExactSizeIterator {
         self.diags.iter_mut().map(HumanizeOnly)
@@ -289,6 +308,7 @@ impl<'src> DiagCtxt<'src> {
                     self.unreported_errors = self.unreported_errors.saturating_sub(1);
                 } else if d.is_warning() {
                     self.warnings = self.warnings.saturating_sub(1);
+                    self.unreported_warnings = self.unreported_warnings.saturating_sub(1);
                 }
             }
             self.diags.truncate(keep);
@@ -305,6 +325,7 @@ impl<'src> DiagCtxt<'src> {
         self.errors = 0;
         self.warnings = 0;
         self.unreported_errors = 0;
+        self.unreported_warnings = 0;
     }
 
     /// Emit all unreported diagnostics via the given emitter.
@@ -320,12 +341,17 @@ impl<'src> DiagCtxt<'src> {
         &mut self,
         emitter: &mut Emitter<R, M>,
     ) -> io::Result<()> {
+        debug_assert!(
+            self.reported_len <= self.diags.len(),
+            "reported_len desynchronized from the diagnostic vector"
+        );
         if self.reported_len == self.diags.len() {
             return Ok(());
         }
         emitter.emit_all(&mut self.diags[self.reported_len..])?;
         self.reported_len = self.diags.len();
         self.unreported_errors = 0;
+        self.unreported_warnings = 0;
         Ok(())
     }
 
@@ -352,12 +378,28 @@ impl<'src> DiagCtxt<'src> {
         if self.errors == 0 {
             return;
         }
+        if self.errors == self.unreported_errors {
+            // Every error lives in the unreported suffix — skip the reported
+            // prefix entirely (the tally proves it holds none).
+            self.diags[self.reported_len..]
+                .iter()
+                .filter(|d| d.is_error())
+                .for_each(f);
+            return;
+        }
         self.iter().filter(|d| d.is_error()).for_each(f)
     }
 
     /// Iterate over all warning-level diagnostics without allocating.
     pub fn for_each_warning<F: FnMut(&Diagnostic<'src>)>(&self, mut f: F) {
         if self.warnings == 0 {
+            return;
+        }
+        if self.warnings == self.unreported_warnings {
+            self.diags[self.reported_len..]
+                .iter()
+                .filter(|d| d.is_warning())
+                .for_each(f);
             return;
         }
         self.iter().filter(|d| d.is_warning()).for_each(f)
@@ -464,6 +506,7 @@ impl<'src> DiagCtxt<'src> {
         let mut errors = 0usize;
         let mut warnings = 0usize;
         let mut unreported_errors = 0usize;
+        let mut unreported_warnings = 0usize;
         let mut first_unspanned = None;
         for (i, d) in self.diags.iter().enumerate() {
             if d.is_error() {
@@ -473,6 +516,9 @@ impl<'src> DiagCtxt<'src> {
                 }
             } else if d.is_warning() {
                 warnings += 1;
+                if i >= self.reported_len {
+                    unreported_warnings += 1;
+                }
             }
             if first_unspanned.is_none() && d.source().is_none() {
                 first_unspanned = Some(i);
@@ -481,6 +527,7 @@ impl<'src> DiagCtxt<'src> {
         self.errors = errors;
         self.warnings = warnings;
         self.unreported_errors = unreported_errors;
+        self.unreported_warnings = unreported_warnings;
         self.first_unspanned = first_unspanned.unwrap_or(self.diags.len());
     }
 
@@ -492,19 +539,19 @@ impl<'src> DiagCtxt<'src> {
     /// `drain_unreported_leaves_reported`, so it is not unowned maintenance
     /// debt.
     pub fn drain_unreported(&mut self) -> Vec<Diagnostic<'src>> {
-        // `SmallVec` here has no `split_off`, so drain through `into_vec`:
-        // the take still avoids a per-element copy, and the split is a Vec
-        // move. This path runs at most once per batch.
-        let mut all = std::mem::take(&mut self.diags).into_vec();
         if self.reported_len == 0 {
             self.errors = 0;
             self.warnings = 0;
             self.unreported_errors = 0;
+            self.unreported_warnings = 0;
             self.first_unspanned = 0;
-            return all;
+            return std::mem::take(&mut self.diags).into_vec();
         }
-        let unreported = all.split_off(self.reported_len);
-        for d in &unreported {
+        // One allocation, no `into_vec` + `split_off` pair: `SmallVec::drain`
+        // removes the suffix in place and the collect moves exactly those
+        // elements out.  The retained prefix never leaves the inline buffer.
+        let drained: Vec<Diagnostic<'src>> = self.diags.drain(self.reported_len..).collect();
+        for d in &drained {
             if d.is_error() {
                 self.errors = self.errors.saturating_sub(1);
             } else if d.is_warning() {
@@ -512,39 +559,31 @@ impl<'src> DiagCtxt<'src> {
             }
         }
         self.unreported_errors = 0;
-        // Put the still-reported prefix back: `split_off` left it in `all`.
-        self.diags = SmallVec::from_vec(all);
+        self.unreported_warnings = 0;
         self.first_unspanned = self.first_unspanned.min(self.diags.len());
-        unreported
+        drained
     }
 
     /// Drain the reported list and return it.
     pub fn drain_reported(&mut self) -> Vec<Diagnostic<'src>> {
-        if self.reported_len == 0 {
+        let reported_len = self.reported_len;
+        if reported_len == 0 {
             return Vec::new();
         }
-        let reported_len = self.reported_len;
-        let mut all = std::mem::take(&mut self.diags).into_vec();
-        if reported_len == all.len() {
-            self.reported_len = 0;
-            self.errors = 0;
-            self.warnings = 0;
-            self.unreported_errors = 0;
-            self.first_unspanned = 0;
-            return all;
-        }
-        let unreported = all.split_off(reported_len);
-        for d in &all {
+        // Symmetric to `drain_unreported`: one in-place drain, one allocation.
+        let drained: Vec<Diagnostic<'src>> = self.diags.drain(..reported_len).collect();
+        for d in &drained {
             if d.is_error() {
                 self.errors = self.errors.saturating_sub(1);
             } else if d.is_warning() {
                 self.warnings = self.warnings.saturating_sub(1);
             }
         }
-        self.diags = SmallVec::from_vec(unreported);
+        // The drained region was reported by construction, so the
+        // unreported counters are untouched.
         self.reported_len = 0;
         self.first_unspanned = self.first_unspanned.saturating_sub(reported_len);
-        all
+        drained
     }
 
     // ── Severity downgrades (inspired by Lean 4's MessageLog) ───────
@@ -562,8 +601,14 @@ impl<'src> DiagCtxt<'src> {
         if self.unreported_errors == 0 || !self.can_emit_warnings {
             return;
         }
+        let target = self.unreported_errors;
         let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
+            if moved == target {
+                // Every Error in the suffix has been converted; the rest of
+                // the scan can only find Info/Note entries.
+                break;
+            }
             if diag.level() == super::DiagnosticLevel::Error {
                 diag.set_level(super::DiagnosticLevel::Warning);
                 moved += 1;
@@ -572,6 +617,8 @@ impl<'src> DiagCtxt<'src> {
         self.errors = self.errors.saturating_sub(moved);
         self.warnings = self.warnings.saturating_add(moved);
         self.unreported_errors = self.unreported_errors.saturating_sub(moved);
+        // The converted entries are now unreported warnings.
+        self.unreported_warnings = self.unreported_warnings.saturating_add(moved);
     }
 
     /// Downgrade all unreported **Error** diagnostics to information.
@@ -580,8 +627,12 @@ impl<'src> DiagCtxt<'src> {
         if self.unreported_errors == 0 {
             return;
         }
+        let target = self.unreported_errors;
         let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
+            if moved == target {
+                break;
+            }
             if diag.level() == super::DiagnosticLevel::Error {
                 diag.set_level(super::DiagnosticLevel::Info);
                 moved += 1;
@@ -593,17 +644,25 @@ impl<'src> DiagCtxt<'src> {
 
     /// Downgrade all unreported warning-level diagnostics to information.
     pub fn warnings_to_infos(&mut self) {
-        if self.warnings == 0 {
+        // Gate on the UNREPORTED tally, matching the sibling downgrades: with
+        // every warning already in the reported prefix the loop below is dead
+        // work (the old gate used the total and scanned the suffix anyway).
+        if self.unreported_warnings == 0 {
             return;
         }
+        let target = self.unreported_warnings;
         let mut moved = 0usize;
         for diag in &mut self.diags[self.reported_len..] {
+            if moved == target {
+                break;
+            }
             if diag.is_warning() {
                 diag.set_level(super::DiagnosticLevel::Info);
                 moved += 1;
             }
         }
         self.warnings = self.warnings.saturating_sub(moved);
+        self.unreported_warnings = self.unreported_warnings.saturating_sub(moved);
     }
 }
 
@@ -637,6 +696,7 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
             errors,
             warnings,
             unreported_errors: errors,
+            unreported_warnings: warnings,
         }
     }
 }
@@ -862,9 +922,18 @@ mod tests {
         use std::rc::Rc;
 
         struct SharedSink(Rc<RefCell<String>>);
-        impl DiagnosticSink for SharedSink {
-            fn write_str(&mut self, s: &str) -> io::Result<()> {
-                self.0.borrow_mut().push_str(s);
+        // `DiagnosticSink` is sealed and requires `write_fmt`; the blanket
+        // `impl<W: Write>` covers this test sink as soon as it implements
+        // `Write`, which also exercises the production sink path.
+        impl io::Write for SharedSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0
+                    .borrow_mut()
+                    .push_str(std::str::from_utf8(buf).expect("diagnostic output is UTF-8"));
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
                 Ok(())
             }
         }
@@ -916,9 +985,18 @@ mod tests {
         use std::rc::Rc;
 
         struct SharedSink(Rc<RefCell<String>>);
-        impl DiagnosticSink for SharedSink {
-            fn write_str(&mut self, s: &str) -> io::Result<()> {
-                self.0.borrow_mut().push_str(s);
+        // `DiagnosticSink` is sealed and requires `write_fmt`; the blanket
+        // `impl<W: Write>` covers this test sink as soon as it implements
+        // `Write`, which also exercises the production sink path.
+        impl io::Write for SharedSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0
+                    .borrow_mut()
+                    .push_str(std::str::from_utf8(buf).expect("diagnostic output is UTF-8"));
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
                 Ok(())
             }
         }

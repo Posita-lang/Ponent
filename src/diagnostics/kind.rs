@@ -270,7 +270,7 @@ pub enum ComptimeErrorKind {
 /// `Option`), so this helper only bridges legacy `(reason, Span)` lists; a
 /// caller that needs start-of-file zero-length frames must store
 /// `Option<Span>` at construction instead of recovering it here.
-pub fn maybe_span(span: Span) -> Option<Span> {
+pub(crate) fn maybe_span(span: Span) -> Option<Span> {
     (span.start != 0 || span.end != 0).then_some(span)
 }
 
@@ -363,11 +363,14 @@ fn comptime_message<'a>(kind: &ComptimeErrorKind) -> DiagMessage<'a> {
 }
 
 fn name_not_found_help<'src>(suggestions: &[Cow<'src, str>]) -> Option<Cow<'src, str>> {
-    if suggestions.is_empty() {
-        None
-    } else {
-        Some(crate::diagnostics::i18n::fluent::did_you_mean(suggestions.join("` or `")).lift())
+    let (first, rest) = suggestions.split_first()?;
+    // The conjunction is language-specific: the old `join("` or `")` baked
+    // English "or" into every locale's output.
+    let mut joined: Cow<'src, str> = first.clone();
+    for next in rest {
+        joined = crate::diagnostics::i18n::fluent::suggestion_or(joined, next.clone()).lift();
     }
+    Some(crate::diagnostics::i18n::fluent::did_you_mean(joined).lift())
 }
 
 fn type_mismatch_message<'src>(
@@ -376,38 +379,35 @@ fn type_mismatch_message<'src>(
     reason: Option<&Cow<'src, str>>,
     context: Option<TypeCtx>,
 ) -> DiagMessage<'src> {
-    let has_suffix =
-        reason.is_some() || context.is_some_and(|c| !matches!(c, TypeCtx::Unspecified));
-    if !has_suffix {
-        return DiagMessage::Slug {
-            slug: "type-mismatch",
-            pairs: smallvec![("expected", expected.clone()), ("found", found.clone())],
-        };
-    }
-    let mut msg = String::with_capacity(
-        expected.as_ref().len()
-            + found.as_ref().len()
-            + 48
-            + context.map_or(0, |_| 24)
-            + reason.as_ref().map_or(0, |r| r.len() + 8),
-    );
-    crate::diagnostics::i18n::render_into(
-        "type-mismatch",
-        &[("expected", expected.clone()), ("found", found.clone())],
-        &mut msg,
-    );
-    if let Some(ctx) = context
-        && !matches!(ctx, TypeCtx::Unspecified)
-    {
-        let label = ctx.label();
-        if !label.is_empty() {
-            let _ = write!(msg, " ({label})");
-        }
+    // The suffix is composed by Fluent MESSAGE REFERENCES, not by appending
+    // English punctuation here: the em dash and the parenthetical are
+    // language-specific, and the old imperative append path also resolved the
+    // language at construction time instead of at the render boundary (every
+    // other variant returns a `Slug`).
+    let ctx_label = context
+        .filter(|c| !matches!(c, TypeCtx::Unspecified))
+        .map(|c| c.label())
+        .filter(|l| !l.is_empty());
+    let reason = reason.filter(|r| !r.is_empty());
+    let slug = match (ctx_label.is_some(), reason.is_some()) {
+        (false, false) => "type-mismatch",
+        (false, true) => "type-mismatch-reason",
+        (true, false) => "type-mismatch-ctx",
+        (true, true) => "type-mismatch-ctx-reason",
+    };
+    let mut pairs = smallvec![
+        ("expected", expected.clone()),
+        ("found", found.clone()),
+    ];
+    if let Some(label) = ctx_label {
+        // `TypeCtx::label()` already returns `Cow<'static, str>`; wrapping it
+        // again would produce `Cow<Cow<str>>`.
+        pairs.push(("ctx", label));
     }
     if let Some(r) = reason {
-        let _ = write!(msg, " — {r}");
+        pairs.push(("reason", r.clone()));
     }
-    msg.into()
+    DiagMessage::Slug { slug, pairs }
 }
 
 fn comptime_message_with_traceback<'src>(
@@ -423,19 +423,32 @@ fn comptime_message_with_traceback<'src>(
     s.push_str("\n\n");
     s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
     s.push('\n');
-    for (i, (reason, span)) in traceback.iter().enumerate() {
-        if i > 0 {
+    // Consecutive frames at the SAME span (comptime recursion produces runs of
+    // them) would render overlapping secondary labels; emit one per run.
+    let mut emitted = 0usize;
+    let mut prev: Option<Option<Span>> = None;
+    for (reason, span) in traceback {
+        if prev == Some(*span) {
+            continue;
+        }
+        prev = Some(*span);
+        if emitted > 0 {
             s.push('\n');
         }
-        let reason_str = reason.as_str();
-        match span {
-            Some(span) => {
-                let _ = write!(s, "  · {reason_str} at offset {}", span.start);
-            }
-            None => {
-                let _ = write!(s, "  · {reason_str}");
-            }
-        }
+        emitted += 1;
+        // Fluent-composed frame: the old `"at offset"` was English text inside
+        // an otherwise fully localized traceback (the header two lines above
+        // was already localized, so a ru user saw mixed languages in one
+        // message).
+        let frame = match span {
+            Some(span) => crate::diagnostics::i18n::fluent::comptime_frame_offset(
+                reason.as_str(),
+                crate::diagnostics::i18n::DisplayArg(span.start),
+            ),
+            None => crate::diagnostics::i18n::fluent::comptime_frame(reason.as_str()),
+        };
+        s.push_str("  · ");
+        s.push_str(&frame);
     }
     s.into()
 }
@@ -646,10 +659,6 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
             _ => None,
         }
     }
-
-    fn suggestions(&self) -> Vec<Cow<'src, str>> {
-        vec![]
-    }
 }
 
 impl<'src> DiagnosticKind<'src> {
@@ -669,7 +678,6 @@ impl<'src> DiagnosticKind<'src> {
         Option<Cow<'src, str>>,
         Vec<Cow<'src, str>>,
     ) {
-        use crate::diagnostics::i18n::LiftCow;
         use crate::diagnostics::i18n::fluent;
         match self {
             DiagnosticKind::TypeMismatch {
@@ -939,6 +947,68 @@ mod humanizer_differential_tests {
             l.span.end_as_usize(),
             l.message.to_string(),
         )
+    }
+
+    /// Golden text, not self-consistency: the differential test above compares
+    /// two hand-written paths that share every slug constant, so a misspelled
+    /// slug or a missing pair renders verbatim in BOTH and still passes.  These
+    /// assertions pin the rendered English (punctuation, order, composed
+    /// suffix, frame dedup) against fixed expectations.
+    #[test]
+    fn golden_english_composition() {
+        let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
+
+        let plain = DiagnosticKind::TypeMismatch {
+            expected: "int".into(),
+            found: "string".into(),
+            span: span(0, 1),
+            found_span: None,
+            reason: None,
+            context: None,
+        };
+        assert_eq!(
+            render(plain.message()),
+            "type mismatch: expected `int`, found `string`"
+        );
+
+        // The suffix punctuation and order live in Fluent
+        // (`type-mismatch-ctx-reason`), so this is the real oracle for the
+        // composition the old imperative `write!` append got wrong.
+        let ctx_label = TypeCtx::ReturnType.label();
+        let composed = DiagnosticKind::TypeMismatch {
+            expected: "int".into(),
+            found: "string".into(),
+            span: span(0, 1),
+            found_span: None,
+            reason: Some("covariant position".into()),
+            context: Some(TypeCtx::ReturnType),
+        };
+        assert_eq!(
+            render(composed.message()),
+            format!(
+                "type mismatch: expected `int`, found `string` ({ctx_label}) — covariant position"
+            )
+        );
+
+        // Comptime frames: localized frame text plus run-dedup of identical
+        // consecutive spans (comptime recursion produces runs of them).
+        let repeated = DiagnosticKind::Comptime {
+            kind: ComptimeErrorKind::TypeError("boom".into()),
+            span: span(0, 1),
+            traceback: vec![
+                (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+            ],
+        };
+        let out = render(repeated.message());
+        let frame = format!("  · {} (offset 7)", ComptimeReason::ComptimeFnDef.as_str());
+        assert_eq!(
+            out.matches(&frame).count(),
+            1,
+            "consecutive identical frames must be deduped: {out}"
+        );
+        assert!(out.contains("comptime call stack"), "{out}");
     }
 
     /// The borrowing `Humanizer` impl and the consuming `humanize_into`

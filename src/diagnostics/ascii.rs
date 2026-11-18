@@ -30,6 +30,12 @@ impl AllowedControls {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn x86_level_for(len: usize) -> u8 {
+    // The `len < 32` short-circuit deliberately does NOT consult
+    // `swar_forced`: that is why each SSE2 dispatch arm below keeps its own
+    // `!swar_forced()` conjunct.  For `len < 32` the level is 0 without a
+    // forced check, so without the arm-level conjunct a forced-SWAR run would
+    // silently execute SSE2 for `len >= 16`, defeating the forced path — the
+    // conjunct is load-bearing, not redundant.
     if len < 32 { 0 } else { x86_level() }
 }
 
@@ -53,7 +59,11 @@ fn x86_level() -> u8 {
     level
 }
 
-const AVX512_MIN_LEN: usize = 256;
+/// AVX-512 processes 64 bytes per instruction, so the 1× 64-byte loop already
+/// covers `[64, 256)`; entering at 64 spends the wider kernel instead of the
+/// 32-byte AVX2 one with no correctness change (every kernel handles any
+/// length through its own loop plus the deferred parent tail).
+const AVX512_MIN_LEN: usize = 64;
 
 #[cfg(test)]
 thread_local! {
@@ -429,7 +439,15 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     }
 }
 
-/// Byte offset of the first byte ≥ 0x80 in `s`, or `None` if `s` is pure ASCII.
+/// Byte offset of the first byte ≥ 0x80 in `s`, or `usize::MAX` if `s` is
+/// pure ASCII.
+///
+/// The sentinel form is deliberate: `Option<usize>` has no niche, so it costs
+/// a 16-byte return slot (two GPRs / a stack slot under SysV) and a tag branch
+/// at every call site.  This function is called inside `char_col`'s sparse
+/// table build, and every kernel already produces a mask plus
+/// `trailing_zeros`, so `usize::MAX` collapses the "not found" case to a
+/// single GPR.  Use [`next_non_ascii`] off the hot path.
 ///
 /// SIMD kernels scan the widest available chunk; the SWAR fallback uses
 /// `u128` chunks: every non-ASCII UTF-8 byte (lead or continuation) has its
@@ -443,7 +461,7 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 /// byte; callers that resume mid-line must handle that (the lead-byte
 /// assumption only holds for a scan started at a char boundary).
 #[inline]
-pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
+pub(crate) fn next_non_ascii_byte(s: &[u8]) -> usize {
     #[cfg(target_arch = "x86_64")]
     let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
@@ -475,7 +493,7 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
         let hi = x & HI;
         if hi != 0 {
             // First flagged lane (little-endian ⇒ lowest byte index).
-            return Some(i + (hi.trailing_zeros() / 8) as usize);
+            return i + (hi.trailing_zeros() / 8) as usize;
         }
         i += 16;
     }
@@ -484,11 +502,19 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
         let hi = x & HI64;
         if hi != 0 {
-            return Some(i + (hi.trailing_zeros() / 8) as usize);
+            return i + (hi.trailing_zeros() / 8) as usize;
         }
         i += 8;
     }
-    s[i..].iter().position(|&b| b >= 0x80).map(|off| i + off)
+    s[i..].iter().position(|&b| b >= 0x80).map_or(usize::MAX, |off| i + off)
+}
+
+/// `Some(offset)` view of [`next_non_ascii_byte`] for callers that are not on
+/// the byte-scanning hot path.
+#[inline]
+pub(crate) fn next_non_ascii(s: &[u8]) -> Option<usize> {
+    let off = next_non_ascii_byte(s);
+    if off == usize::MAX { None } else { Some(off) }
 }
 
 /// Runtime-dispatched SIMD kernels.
@@ -660,7 +686,7 @@ mod x86_64 {
     }
 
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
+    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> usize {
         let mut i = 0usize;
         while i + 128 <= s.len() {
             let m0 = unsafe {
@@ -678,7 +704,7 @@ mod x86_64 {
             if (m0 | m1 | m2 | m3) != 0 {
                 for (off, mask) in [(0, m0), (32, m1), (64, m2), (96, m3)] {
                     if mask != 0 {
-                        return Some(i + off + mask.trailing_zeros() as usize);
+                        return i + off + mask.trailing_zeros() as usize;
                     }
                 }
             }
@@ -689,11 +715,12 @@ mod x86_64 {
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
             let mask = unsafe { _mm256_movemask_epi8(v) };
             if mask != 0 {
-                return Some(i + mask.trailing_zeros() as usize);
+                return i + mask.trailing_zeros() as usize;
             }
             i += 32;
         }
-        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+        let tail = super::next_non_ascii_byte(&s[i..]);
+        if tail == usize::MAX { usize::MAX } else { i + tail }
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
@@ -845,7 +872,7 @@ mod x86_64 {
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
-    pub(super) unsafe fn next_non_ascii_byte_avx512(s: &[u8]) -> Option<usize> {
+    pub(super) unsafe fn next_non_ascii_byte_avx512(s: &[u8]) -> usize {
         let mut i = 0usize;
         while i + 256 <= s.len() {
             let m0 = unsafe { _mm512_movepi8_mask(_mm512_loadu_si512(s.as_ptr().add(i).cast())) };
@@ -858,7 +885,7 @@ mod x86_64 {
             if (m0 | m1 | m2 | m3) != 0 {
                 for (off, mask) in [(0, m0), (64, m1), (128, m2), (192, m3)] {
                     if mask != 0 {
-                        return Some(i + off + mask.trailing_zeros() as usize);
+                        return i + off + mask.trailing_zeros() as usize;
                     }
                 }
             }
@@ -868,11 +895,12 @@ mod x86_64 {
             let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
             let mask = unsafe { _mm512_movepi8_mask(v) };
             if mask != 0 {
-                return Some(i + mask.trailing_zeros() as usize);
+                return i + mask.trailing_zeros() as usize;
             }
             i += 64;
         }
-        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+        let tail = super::next_non_ascii_byte(&s[i..]);
+        if tail == usize::MAX { usize::MAX } else { i + tail }
     }
 
     #[target_feature(enable = "sse2")]
@@ -971,7 +999,7 @@ mod x86_64 {
     }
 
     #[target_feature(enable = "sse2")]
-    pub(super) unsafe fn next_non_ascii_byte_sse2(s: &[u8]) -> Option<usize> {
+    pub(super) unsafe fn next_non_ascii_byte_sse2(s: &[u8]) -> usize {
         let mut i = 0usize;
         while i + 64 <= s.len() {
             let m0 =
@@ -988,7 +1016,7 @@ mod x86_64 {
             if (m0 | m1 | m2 | m3) != 0 {
                 for (off, mask) in [(0, m0), (16, m1), (32, m2), (48, m3)] {
                     if mask != 0 {
-                        return Some(i + off + mask.trailing_zeros() as usize);
+                        return i + off + mask.trailing_zeros() as usize;
                     }
                 }
             }
@@ -998,11 +1026,12 @@ mod x86_64 {
             let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
             let mask = unsafe { _mm_movemask_epi8(v) };
             if mask != 0 {
-                return Some(i + mask.trailing_zeros() as usize);
+                return i + mask.trailing_zeros() as usize;
             }
             i += 16;
         }
-        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+        let tail = super::next_non_ascii_byte(&s[i..]);
+        if tail == usize::MAX { usize::MAX } else { i + tail }
     }
 }
 
@@ -1159,14 +1188,14 @@ mod wasm {
     }
 
     #[target_feature(enable = "simd128")]
-    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
+    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> usize {
         let mut i = 0usize;
         while i + 64 <= s.len() {
             for off in [0usize, 16, 32, 48] {
                 let v = unsafe { v128_load(s.as_ptr().add(i + off).cast()) };
                 let bits = unsafe { u8x16_bitmask(v) };
                 if bits != 0 {
-                    return Some(i + off + bits.trailing_zeros() as usize);
+                    return i + off + bits.trailing_zeros() as usize;
                 }
             }
             i += 64;
@@ -1175,11 +1204,12 @@ mod wasm {
             let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
             let bits = unsafe { u8x16_bitmask(v) };
             if bits != 0 {
-                return Some(i + bits.trailing_zeros() as usize);
+                return i + bits.trailing_zeros() as usize;
             }
             i += 16;
         }
-        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+        let tail = super::next_non_ascii_byte(&s[i..]);
+        if tail == usize::MAX { usize::MAX } else { i + tail }
     }
 }
 
@@ -1193,7 +1223,7 @@ mod neon {
     }
 
     #[inline]
-    unsafe fn first_high_lane(v: uint8x16_t) -> Option<usize> {
+    unsafe fn first_high_lane(v: uint8x16_t) -> usize {
         let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
         let packed = unsafe { vshrn_n_u16(vreinterpretq_u16_u8(high), 4) };
         let bits = unsafe { vget_lane_u64(vreinterpret_u64_u8(packed), 0) };
@@ -1344,7 +1374,7 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> Option<usize> {
+    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> usize {
         let mut i = 0usize;
         while i + 64 <= s.len() {
             let chunks = [
@@ -1355,7 +1385,7 @@ mod neon {
             ];
             for (off, v) in chunks.into_iter().enumerate() {
                 if let Some(lane) = unsafe { first_high_lane(v) } {
-                    return Some(i + off * 16 + lane);
+                    return i + off * 16 + lane;
                 }
             }
             i += 64;
@@ -1363,17 +1393,42 @@ mod neon {
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
             if let Some(lane) = unsafe { first_high_lane(v) } {
-                return Some(i + lane);
+                return i + lane;
             }
             i += 16;
         }
-        super::next_non_ascii_byte(&s[i..]).map(|off| i + off)
+        let tail = super::next_non_ascii_byte(&s[i..]);
+        if tail == usize::MAX { usize::MAX } else { i + tail }
     }
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+    /// Test-side view of the sentinel API: the explicit import shadows the
+    /// glob-imported `next_non_ascii_byte`, so every existing assertion keeps
+    /// comparing against `Some(offset)`.
+    use super::next_non_ascii as next_non_ascii_byte;
+
+    /// RAII guard for the test-only forced-SWAR switch.  A panic anywhere
+    /// inside the guarded scope would otherwise leave the thread-local set,
+    /// silently turning every later SWAR test on that thread into an SSE2 test
+    /// (and hiding exactly the SWAR borrow-chain bugs those tests exist to
+    /// catch).
+    struct ForceSwarGuard;
+
+    impl ForceSwarGuard {
+        fn new() -> Self {
+            SWAR_FORCED.with(|f| f.set(true));
+            Self
+        }
+    }
+
+    impl Drop for ForceSwarGuard {
+        fn drop(&mut self) {
+            SWAR_FORCED.with(|f| f.set(false));
+        }
+    }
 
     #[test]
     fn next_non_ascii_matches_scalar_reference() {
@@ -1423,6 +1478,46 @@ mod tests {
     fn ref_tab(s: &[u8]) -> bool {
         s.iter().all(|&b| b == 0x09 || (0x20..=0x7E).contains(&b))
     }
+
+    /// Cartesian over control/edge bytes at ADJACENT lanes.  The SWAR bodies
+    /// reason about a carry out of lane *k* into lane *k+1* (see the DEL/~1
+    /// borrow chain), and a single bad byte in a sea of `'a'` cannot exercise
+    /// that interaction.  10² pairs × 15 lane offsets × 4 predicates is cheap
+    /// and pins the borrow-propagation reasoning exhaustively.
+    #[test]
+    fn swar_adjacent_control_pairs_match_scalar() {
+        const BYTES: [u8; 10] = [0x00, 0x01, 0x09, 0x0A, 0x1F, 0x20, 0x7E, 0x7F, 0x80, 0xFF];
+        let _swar = ForceSwarGuard::new();
+        for &a in &BYTES {
+            for &b in &BYTES {
+                for lane in 0..15 {
+                    let mut v = [b'x'; 16];
+                    v[lane] = a;
+                    v[lane + 1] = b;
+                    assert_eq!(
+                        is_printable_ascii(&v),
+                        ref_single(&v),
+                        "single {a:#04x},{b:#04x} lane {lane}"
+                    );
+                    assert_eq!(
+                        is_printable_ascii_or_tab(&v),
+                        ref_tab(&v),
+                        "tab {a:#04x},{b:#04x} lane {lane}"
+                    );
+                    assert_eq!(
+                        is_printable_ascii_multiline(&v),
+                        ref_multi(&v),
+                        "multi {a:#04x},{b:#04x} lane {lane}"
+                    );
+                    assert_eq!(
+                        classify_ascii(&v),
+                        ref_classify(&v),
+                        "class {a:#04x},{b:#04x} lane {lane}"
+                    );
+                }
+            }
+        }
+    }
     fn ref_classify(s: &[u8]) -> AsciiClass {
         let mut tab = false;
         for &b in s {
@@ -1467,7 +1562,7 @@ mod tests {
 
     #[test]
     fn forced_swar_covers_all_u128_lanes_and_bytes() {
-        SWAR_FORCED.with(|f| f.set(true));
+        let _swar = ForceSwarGuard::new();
         for lane in 0..16 {
             for value in 0..=255u8 {
                 let mut v = [b'a'; 16];
@@ -1520,7 +1615,14 @@ mod tests {
                 "{bytes:?}"
             );
             assert_eq!(class == AsciiClass::Other, !tab, "{bytes:?}");
-            assert_eq!(class == AsciiClass::Other, !multi, "{bytes:?}");
+            // `classify_ascii` rejects EVERY control byte other than `\t`
+            // (`lt20 & !tab` in the SWAR body, `AllowedControls::None` in the
+            // scalar tail), so a newline alone yields `Other` while
+            // `is_printable_ascii_multiline` accepts it.  The invariant is the
+            // implication `Other ⇒ !multi` — NOT a biconditional (which is
+            // what made this assertion flaky: a random slice of printable
+            // bytes containing one `\n` satisfies it only by accident).
+            assert!(class == AsciiClass::Other || multi, "{bytes:?}");
         }
     }
 
@@ -1535,7 +1637,7 @@ mod tests {
 
     #[test]
     fn swar_del_then_tilde_borrow_chain() {
-        SWAR_FORCED.with(|f| f.set(true));
+        let _swar = ForceSwarGuard::new();
         for lane in 0..16 {
             if lane + 1 >= 16 {
                 continue;
@@ -1588,7 +1690,7 @@ mod tests {
 
     #[test]
     fn forced_swar_matches_scalar_for_all_predicates() {
-        SWAR_FORCED.with(|f| f.set(true));
+        let _swar = ForceSwarGuard::new();
         let ref_classify = |s: &[u8]| {
             let mut tab = false;
             for &b in s {

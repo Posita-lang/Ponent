@@ -26,22 +26,28 @@ const fn code_slot(code: &str) -> Option<usize> {
     if b.len() != 4 {
         return None;
     }
-    let prefix = match b[0] {
-        b'E' => 0,
+    code_slot_parts(b[0], b[1], b[2], b[3])
+}
+
+/// Shared slot arithmetic for the canonical `^[EW]\d{3}$` shape.  Extracted so
+/// [`lookup_uppercased`] can compute a slot without building a stack buffer and
+/// round-tripping through `from_utf8` plus the full shape check.
+#[inline]
+const fn code_slot_parts(prefix: u8, d1: u8, d2: u8, d3: u8) -> Option<usize> {
+    let p = match prefix {
+        b'E' => 0usize,
         b'W' => 1,
         _ => return None,
     };
-    let mut n = 0usize;
-    let mut i = 1;
-    while i < 4 {
-        let d = b[i];
-        if !d.is_ascii_digit() {
-            return None;
-        }
-        n = n * 10 + (d - b'0') as usize;
-        i += 1;
+    if !(d1.is_ascii_digit() && d2.is_ascii_digit() && d3.is_ascii_digit()) {
+        return None;
     }
-    Some(prefix * 1000 + n)
+    Some(
+        p * 1000
+            + (d1 - b'0') as usize * 100
+            + (d2 - b'0') as usize * 10
+            + (d3 - b'0') as usize,
+    )
 }
 
 const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
@@ -74,6 +80,18 @@ const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
 /// identical allocations); `build` never runs while a lock is held on
 /// `cache` (it may re-enter another `SlotCache`), so there is no
 /// lock-ordering hazard.
+///
+/// # Invariant
+///
+/// Slot-keyed caching is sound only because [`code_slot`] is **injective**
+/// over its accepted domain: the shape is `^[EW]\d{3}$` with a CASE-SENSITIVE
+/// prefix, so two distinct shape-valid strings can never share a slot
+/// (`"e030"` yields `None`, not slot 30).  That is what makes caching an
+/// arbitrary spelling (e.g. `unknown("E999")`, whose visible link text is
+/// `"E999"`) under its slot safe.  Do NOT widen the accepted prefix set —
+/// `lookup_uppercased` is the case-insensitive path and deliberately does not
+/// feed this cache.  `slot_keyed_caches_require_an_injective_code_slot`
+/// pins this.
 type SlotCache = OnceLock<std::sync::RwLock<rustc_hash::FxHashMap<u16, std::sync::Arc<str>>>>;
 
 fn cached_slot_string(
@@ -140,13 +158,6 @@ pub fn is_explain_server_running() -> bool {
 /// an untrusted code (CLI argument, `Diagnostic::with_code_str`) cannot escape
 /// the segment or smuggle control characters into the URL.
 ///
-/// Returns a [`CompactString`] — the URL is short enough to inline in the
-/// common case, and `url()`/`url_ansi()` are called per diagnostic that
-/// carries a code.
-fn explain_url(code: &str) -> CompactString {
-    explain_url_with_port(code, EXPLAIN_PORT.get().copied())
-}
-
 /// Build the explanation URL for a code, given an explicit port.
 ///
 /// This is the pure, testable core of `explain_url`; callers that need the
@@ -460,7 +471,10 @@ impl ErrCode {
     /// from CI.  `literal_codes_are_all_in_code_table` in the test module
     /// is the guard that catches such typos instead.
     ///
-    /// A short code (e.g. `E030`) stays inline with no heap allocation.
+    /// A registry code is a `'static` pointer with no allocation; an unknown
+    /// code costs exactly one `Arc<OtherCode>` allocation.  (The enum itself
+    /// stays two words either way — the earlier inline `CompactString` design
+    /// made EVERY code pay that size.)
     ///
     /// Prefer [`Self::try_new`] when the input comes from an external source
     /// (user input, CLI arguments, etc.).
@@ -514,18 +528,20 @@ impl ErrCode {
     /// dynamically-constructed code strings (e.g. `Diagnostic::with_code_str`).
     pub(crate) fn unknown(code: impl Into<CompactString>) -> Self {
         let raw = code.into();
-        // Exact canonical spelling: `Known` is observationally identical and
-        // avoids an `Arc<OtherCode>` allocation on the per-coded-diagnostic
-        // path.  Non-canonical spellings still need `Other` to preserve the
-        // verbatim echo in `code()`/URL link text.
-        if let Some(e) = lookup(&raw) {
-            return ErrCode(ErrCodeRepr::Known(e));
+        // One table read: `resolve` covers both the exact and the uppercased
+        // spelling, and comparing the entry's canonical `code` against `raw`
+        // decides `Known` vs `Other` without a second lookup.  Exact canonical
+        // spelling is observationally identical to a table hit, so it takes
+        // `Known` (no `Arc<OtherCode>` allocation on the per-coded-diagnostic
+        // path); every other spelling takes `Other` to preserve the verbatim
+        // echo in `code()` and the URL link text.
+        match resolve(&raw) {
+            Some(e) if e.code == raw.as_str() => ErrCode(ErrCodeRepr::Known(e)),
+            canonical => ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode {
+                raw,
+                canonical,
+            }))),
         }
-        let canonical = resolve(&raw);
-        ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode {
-            raw,
-            canonical,
-        })))
     }
 
     /// The code string, e.g. "E030" or "W113".
@@ -827,8 +843,16 @@ pub(crate) fn lookup_uppercased(code: &str) -> Option<&'static CodeEntry> {
     if b.len() != 4 {
         return None;
     }
-    let buf = [b[0].to_ascii_uppercase(), b[1], b[2], b[3]];
-    lookup(std::str::from_utf8(&buf).ok()?)
+    // Compute the slot directly: `to_ascii_uppercase` only affects byte 0
+    // (bytes 1..3 are digits by the table's shape assertion), so this avoids
+    // the stack buffer, the `from_utf8` hop, and the full re-parse `lookup`
+    // would do.  No `&str` is constructed, so no UTF-8 validation is needed.
+    let slot = code_slot_parts(b[0].to_ascii_uppercase(), b[1], b[2], b[3])?;
+    let idx = CODE_INDEX[slot];
+    if idx == u16::MAX {
+        return None;
+    }
+    CODE_TABLE.get(idx as usize)
 }
 
 impl fmt::Display for ErrorCategory {
@@ -1243,11 +1267,25 @@ mod tests {
                     }
                 }
                 b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    // Rust block comments NEST: depth-track so an inner `*/`
+                    // cannot resume code scanning inside the outer comment
+                    // (which would let comment text masquerade as a literal).
+                    let mut depth = 1usize;
                     i += 2;
-                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                        i += 1;
+                    while i < bytes.len() && depth > 0 {
+                        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                        } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
                     }
-                    i += 1;
+                    // `i` is past the closing `*/`; step back one so this
+                    // scanner's trailing `i += 1` lands exactly past it.
+                    i = i.saturating_sub(1);
                 }
                 _ => {}
             }
@@ -1306,11 +1344,22 @@ mod tests {
                     }
                 }
                 b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    // Same nesting discipline as the other scanners: this arm
+                    // owns `i` (no trailing increment), so it may leave `i`
+                    // directly past the outer `*/`.
+                    let mut depth = 1usize;
                     i += 2;
-                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                        i += 1;
+                    while i < bytes.len() && depth > 0 {
+                        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                        } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
                     }
-                    i += 1;
                 }
                 _ => i += 1,
             }
@@ -1435,11 +1484,21 @@ mod tests {
                 continue;
             }
             if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                // Nested block comments: track depth, then `continue` from
+                // directly past the OUTER `*/`.
+                let mut depth = 1usize;
                 i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
+                while i < bytes.len() && depth > 0 {
+                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
                 }
-                i = (i + 2).min(bytes.len());
                 continue;
             }
 
@@ -1588,6 +1647,50 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn nested_block_comments_do_not_escape_the_scanners() {
+        // Rust block comments nest.  Before depth tracking every scanner
+        // stopped at the INNER `*/`, so the remainder of the outer comment was
+        // rescanned as code — a code-shaped literal inside it could be counted
+        // as a call site.
+        let stripped = strip_non_code("/* outer /* inner */ still comment */ x");
+        assert!(!stripped.contains("still comment"), "{stripped:?}");
+        assert!(stripped.contains('x'), "{stripped:?}");
+        let lits = code_literals("/* outer /* \"E123\" */ still comment */ \"W456\"");
+        assert_eq!(lits, vec!["W456"]);
+        // Unterminated nesting must terminate, not loop or panic.
+        let _ = strip_non_code("/* outer /* inner");
+        let _ = code_literals("/* outer /* \"E123\"");
+    }
+
+    #[test]
+    fn slot_keyed_caches_require_an_injective_code_slot() {
+        // The four slot-keyed caches are sound ONLY because `code_slot` accepts
+        // the canonical `^[EW]\d{3}$` shape with a case-sensitive prefix: two
+        // distinct shape-valid strings can never share a slot.  If a future
+        // change widened the prefix set, `unknown("e030")` would populate slot
+        // 30 with visible text `e030` and the canonical `E030` instance would
+        // then render the wrong link text.
+        assert!(lookup("E030").is_some());
+        assert!(
+            lookup("e030").is_none(),
+            "code_slot must stay case-sensitive for slot-keyed caching"
+        );
+        assert_eq!(resolve("e030").map(|e| e.code), Some("E030"));
+        // An unregistered canonical spelling keys its own slot, and repeated
+        // lookups must be stable (the cache stores per-slot, per-spelling).
+        let a = ErrCode::unknown("E999").url();
+        let b = ErrCode::unknown("E999").url();
+        assert_eq!(a, b, "slot-cached URL must be stable");
+        // A lowercase spelling is NOT slot-cacheable, so it keeps its own
+        // verbatim text in the link, while a lowercase spelling of a registered
+        // code resolves to the canonical URI.
+        let lower = ErrCode::unknown("e999").url();
+        assert!(lower.contains("e999"), "{lower}");
+        let canonical = ErrCode::unknown("e030").url();
+        assert!(canonical.contains("/E030"), "{canonical}");
+    }
+
     fn strip_non_code_blanks_comments_and_literals() {
         let src = r##"
             // with_code_str("E901")

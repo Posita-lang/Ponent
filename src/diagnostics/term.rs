@@ -70,28 +70,12 @@ pub struct TermCaps {
 impl TermCaps {
     pub fn detect() -> Self {
         let stderr_is_tty = io::stderr().is_terminal();
-        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-        let colorterm_env = std::env::var_os("COLORTERM");
+        // One canonical colour env-read path: `color_caps_from_env` performs
+        // exactly the reads this function used to duplicate inline, so a
+        // future variable cannot be added to one and forgotten in the other.
+        let caps = color_caps_from_env(stderr_is_tty);
         let term_env = std::env::var_os("TERM");
-        let term_program_env = std::env::var_os("TERM_PROGRAM");
-        let colorterm = colorterm_env.as_deref().and_then(OsStr::to_str);
         let term = term_env.as_deref().and_then(OsStr::to_str);
-        let term_program = term_program_env.as_deref().and_then(OsStr::to_str);
-        let clicolor = std::env::var_os("CLICOLOR");
-        let clicolor_force = std::env::var_os("CLICOLOR_FORCE");
-        let force_color = std::env::var_os("FORCE_COLOR");
-        let wt_session = std::env::var_os("WT_SESSION").is_some_and(|v| !v.is_empty());
-        let caps = color_caps_decision_with_terminal(
-            no_color,
-            clicolor.as_deref(),
-            clicolor_force.as_deref(),
-            force_color.as_deref(),
-            colorterm,
-            term,
-            wt_session,
-            term_program,
-            stderr_is_tty,
-        );
         let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
             .iter()
             .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
@@ -109,10 +93,32 @@ impl TermCaps {
     }
 }
 
+/// Process-stable capability snapshot: the first call wins, later calls are a
+/// single atomic load.
+///
+/// This is the contract [`supports_hyperlinks`] already had, applied to the
+/// rest of the module.  The convenience detectors below are public and a
+/// caller may reasonably use one per diagnostic; without the snapshot that
+/// means an `isatty` syscall (plus ~11 env reads) per call, and a TIOCGWINSZ
+/// per `detect_width`.  Tests exercise the pure decision cores
+/// (`color`, `color_depth_decision`, `width_decision`, `unicode_decision`)
+/// rather than the environment probes, so the snapshot is not observable
+/// there.  [`TermCaps::detect`] remains available for a caller that genuinely
+/// wants a fresh probe (e.g. after deliberately changing the environment).
+static GLOBAL_CAPS: std::sync::OnceLock<TermCaps> = std::sync::OnceLock::new();
+
+fn global_caps() -> &'static TermCaps {
+    GLOBAL_CAPS.get_or_init(TermCaps::detect)
+}
+
 /// Snapshot the colour-related environment once, so `color` and `depth` can
 /// never describe different environments.
 pub fn detect_color_caps() -> ColorCaps {
-    color_caps_from_env(io::stderr().is_terminal())
+    let caps = global_caps();
+    ColorCaps {
+        color: caps.color,
+        depth: caps.depth,
+    }
 }
 
 /// ASCII-only, allocation-free case-insensitive substring test.
@@ -136,7 +142,11 @@ fn ends_with_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> bool {
 fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
     let s = v.to_str()?.trim();
     match s {
-        "" | "true" => Some(ColorDepth::Sixteen),
+        // Modern chalk: `true`/empty mean "force colour ON and let the level
+        // be DETECTED" (the README contract), not "pin level 1".  The force-on
+        // half is `force_color_is_off == false`, handled by `color_decision`;
+        // returning `None` here lets COLORTERM/TERM pick the depth.
+        "" | "true" => None,
         "false" => None,
         _ => s.parse::<u64>().ok().and_then(|n| match n {
             0 => None,
@@ -161,7 +171,11 @@ fn force_color_is_off(v: &OsStr) -> bool {
     if s == "false" {
         return true;
     }
-    s.parse::<u64>().is_ok_and(|n| n == 0)
+    // Modern `supports-color` clamps `level < 0` to 0, i.e. OFF: a CI script
+    // setting `FORCE_COLOR=-1` means "silence colour", not "force it on".
+    // Non-numeric values (`"abc"`, `"FALSE"`, overflow) still mean force-on —
+    // they are not an explicit off request.
+    s.parse::<i64>().is_ok_and(|n| n <= 0)
 }
 
 /// Detect the terminal's colour depth from `FORCE_COLOR`, `COLORTERM` and
@@ -381,11 +395,10 @@ pub(crate) fn color_decision(
 /// colour forced on but `LANG=C` must still get ASCII box-drawing, not
 /// mojibake.
 pub fn detect_unicode() -> bool {
-    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-        .iter()
-        .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
-    let term_dumb = std::env::var_os("TERM").as_deref() == Some(OsStr::new("dumb"));
-    unicode_decision_os(locale.as_deref(), term_dumb)
+    // Process-stable snapshot (see `GLOBAL_CAPS`): the locale/`TERM` reads and
+    // the `isatty`/TIOCGWINSZ probes happen once per process instead of once
+    // per optional-detection call.
+    global_caps().unicode
 }
 
 fn unicode_decision_os(locale: Option<&OsStr>, term_dumb: bool) -> bool {
@@ -417,13 +430,11 @@ pub(crate) fn unicode_decision(locale: Option<&str>, term_dumb: bool) -> bool {
 /// there), falling back to [`DEFAULT_MAX_WIDTH`] when the probe returns
 /// `None`.
 pub fn detect_width() -> usize {
-    let columns = std::env::var("COLUMNS").ok();
-    width_decision(
-        columns.as_deref(),
-        // Diagnostics are rendered to stderr, so size *that* stream: probing
-        // stdout would report the wrong width under `prog > out.log`.
-        terminal_size::terminal_size_of(io::stderr()).map(|(Width(w), _)| w as usize),
-    )
+    // Process-stable snapshot (see `GLOBAL_CAPS`): one TIOCGWINSZ per process
+    // instead of one per call.  The `COLUMNS`/`terminal_size_of` derivation
+    // lives in `TermCaps::detect`, which still reads `COLUMNS` via `var_os` +
+    // `to_str` like the rest of the module.
+    global_caps().width
 }
 
 pub(crate) fn width_decision(columns: Option<&str>, term_size: Option<usize>) -> usize {
@@ -550,6 +561,12 @@ fn wsl_distro_name() -> Option<&'static str> {
             let name = std::env::var("WSL_DISTRO_NAME")
                 .ok()
                 .filter(|s| !s.is_empty())?;
+            // No `/proc` to verify against on macOS/BSD, so a forwarded
+            // `WSL_DISTRO_NAME` (SSH/CI) would otherwise translate paths into
+            // `file://wsl.localhost/...` URLs that point nowhere on that host.
+            if !cfg!(target_os = "linux") {
+                return None;
+            }
             #[cfg(target_os = "linux")]
             {
                 // SSH/CI can forward WSL_DISTRO_NAME to a native Linux host.
@@ -728,6 +745,11 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
     let mut out = String::with_capacity(path.len() + distro.map_or(0, str::len) + 32);
     if let Some(distro) = distro
         && !distro.is_empty()
+        // Only POSIX-shaped paths belong under `wsl.localhost`: routing a
+        // Windows-native path (`C:/...`, or a verbatim path stripped to that)
+        // through this branch produced `file://wsl.localhost/UbuntuC:/...` —
+        // a malformed URL with no separator.
+        && path.starts_with(b"/")
     {
         if let Some(stripped) = path.strip_prefix(b"/mnt/") {
             // Bare drive root (`/mnt/c`, no trailing slash) translates too:
@@ -969,27 +991,36 @@ mod tests {
     }
 
     #[test]
-    fn force_color_true_and_empty_pin_sixteen() {
-        // Node maps `true`/empty to level 1; the depth decision must not
-        // escape the force and resolve to a higher depth via COLORTERM.
+    fn force_color_true_and_empty_detect_depth() {
+        // Modern chalk contract: `true`/empty mean "force colour ON and let
+        // the level be DETECTED", so COLORTERM=truecolor must yield true
+        // colour instead of being pinned to the 16-colour palette.
         for v in ["true", ""] {
             assert_eq!(
                 color_depth_decision(Some("truecolor"), Some("xterm"), Some(OsStr::new(v))),
-                ColorDepth::Sixteen,
+                ColorDepth::TrueColor,
                 "FORCE_COLOR={v:?}"
+            );
+            assert!(
+                color(false, None, None, Some(v), Some("dumb"), false),
+                "FORCE_COLOR={v:?} still forces colour on"
             );
         }
     }
 
     #[test]
     fn force_color_noncanonical_values_force_on() {
-        for v in ["abc", "FALSE", "-1", "18446744073709551616"] {
+        for v in ["abc", "FALSE", "18446744073709551616"] {
             assert!(!force_color_is_off(OsStr::new(v)), "{v}");
             assert!(
                 color(false, None, None, Some(v), Some("dumb"), false),
                 "{v} should force color on"
             );
         }
+        // Modern supports-color clamps negative levels to OFF; a CI script
+        // silencing colour with -1 must not get colour on a TTY.
+        assert!(force_color_is_off(OsStr::new("-1")));
+        assert!(!color(false, None, None, Some("-1"), Some("xterm"), true));
         assert_eq!(
             force_color_level(OsStr::new("256")),
             Some(ColorDepth::TrueColor)
@@ -1200,6 +1231,13 @@ mod tests {
         assert_eq!(
             format_file_url(b"/home/user/file.rs", Some("Ubuntu 20.04")),
             "file://wsl.localhost/Ubuntu%2020.04/home/user/file.rs"
+        );
+        // A Windows-native path must NOT be routed through `wsl.localhost`
+        // (which produced `file://wsl.localhost/UbuntuC:/...`): it falls
+        // through to the drive-letter branch instead.
+        assert_eq!(
+            format_file_url(b"C:/Users/user/file.rs", Some("Ubuntu")),
+            "file:///C:/Users/user/file.rs"
         );
         // A POSIX directory named `c:/x` is not a Windows drive; on Windows the
         // same bytes are a drive path and must gain the third slash.

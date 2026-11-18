@@ -2745,7 +2745,7 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
     opts.use_color = use_color;
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
-    let _ = emitter.emit_all_iter(collector.iter_mut().map(|h| h.into_diagnostic()));
+    let _ = emitter.emit_all_iter(collector.iter_all_mut().map(|h| h.into_diagnostic()));
     // `iter_mut`'s contract is humanize-only.  Recompute in release too so a
     // future caller that changes a level cannot desynchronize `has_errors` /
     // `check`; `summary` keeps the debug cross-check.
@@ -3747,7 +3747,13 @@ impl<'a> LineIndex<'a> {
         // build is O(#non_ascii · chunk) rather than O(line_len) char decodes.
         let bytes = line.as_bytes();
         let mut i = 0usize;
-        while let Some(off) = ascii::next_non_ascii_byte(&bytes[i..]) {
+        loop {
+            // Sentinel form (B2): one GPR return, no `Option` tag branch in
+            // this per-line loop.
+            let off = ascii::next_non_ascii_byte(&bytes[i..]);
+            if off == usize::MAX {
+                break;
+            }
             let start = i + off;
             // `i` only ever sits on a char boundary (0, or just past a
             // decoded char), and in valid UTF-8 the first high byte after a
@@ -4243,7 +4249,7 @@ mod tests {
                     .into())
             });
         assert!(result.is_err());
-        for mut diag in ctxt.iter_mut() {
+        for mut diag in ctxt.iter_all_mut() {
             diag.humanize();
             assert_eq!(diag.spans.primary().as_slice(), &[adorn_span][..]);
             // Kind derivation itself is unaffected.
