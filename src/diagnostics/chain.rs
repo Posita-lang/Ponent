@@ -656,19 +656,6 @@ impl<'src> CallChain<'src> {
         );
     }
 
-    fn ascii_tabbed_width(s: &str, start_col: usize, tab_width: usize) -> usize {
-        let tab_width = tab_width.max(1);
-        let mut col = start_col;
-        for &b in s.as_bytes() {
-            if b == b'\t' {
-                col += tab_width - (col % tab_width);
-            } else {
-                col += 1;
-            }
-        }
-        col - start_col
-    }
-
     /// Capped variant for the fast-path guard: `None` means the measured
     /// width already exceeds `cap`, so the caller must take the wrap path.
     fn ascii_tabbed_width_capped(
@@ -812,11 +799,10 @@ impl<'src> CallChain<'src> {
                 }
             };
             let suffix_cols = suffix.cols(file_cols);
-            // Wrap to the full measure first (the suffix only rides the last
-            // line).  Only if that last line plus the suffix would overflow do
-            // we re-wrap the final segment narrower — using the reduced width
-            // for *every* line would waste 12–20 columns on each non-final
-            // line of a long message.
+            // The suffix is indivisible and rides the last line only, so that
+            // line's budget is `avail_full - suffix_cols` while every other
+            // line keeps the full measure; the wrap below is the minimal-line
+            // single pass (`research/locator-wrap/`, solution.md §2.3).
             // C3: dominant-case fast path — a short printable-ASCII message
             // that fits on one line needs no `wrap_optimal` and no `Vec`.
             // `PrintableOrTab` extends the same path to tab-indented single
@@ -848,60 +834,47 @@ impl<'src> CallChain<'src> {
                 suffix.write_into(out);
                 out.push('\n');
             } else {
-                // Wrap to the full measure first (the suffix only rides the
-                // last line).  Only if that last line plus the suffix would
-                // overflow do we re-wrap the final segment narrower — using
-                // the reduced width for *every* line would waste 12–20
-                // columns on each non-final line of a long message.
-                // `last_text` is declared before `segs` so the re-wrapped
-                // borrowed segments remain valid for the writes below (C4:
-                // one allocation instead of one per segment).
-                let last_text: String;
-                let mut segs = super::wrap::wrap_optimal(&message, avail_full, tab_width);
-                if segs.is_empty() {
-                    // Defensive: `wrap_optimal("")` currently returns `[""]`,
-                    // but an empty segment list would silently drop the
-                    // indent, suffix and newline for this entry.
-                    segs.push(Cow::Borrowed(""));
-                }
-                let narrow = avail_full.saturating_sub(suffix_cols).max(1);
-                if narrow < avail_full
-                    && let Some(last_seg) = segs.pop()
-                {
-                    let last_width = match class {
-                        super::ascii::AsciiClass::Printable => last_seg.as_ref().len(),
-                        super::ascii::AsciiClass::PrintableOrTab => {
-                            Self::ascii_tabbed_width(last_seg.as_ref(), indent_cols, tab_width)
-                        }
-                        super::ascii::AsciiClass::Other => {
-                            super::glyph::visible_width_with_tab(last_seg.as_ref(), tab_width)
-                        }
-                    };
-                    let overflow = last_width + suffix_cols > avail_full;
-                    if overflow {
-                        last_text = last_seg.into_owned();
-                        let reparsed = super::wrap::wrap_optimal(&last_text, narrow, tab_width);
-                        segs.extend(reparsed);
-                    } else {
-                        segs.push(last_seg);
-                    }
-                }
-                // `wrap_optimal` always yields ≥ 1 segment for non-empty
-                // input, but a message that sanitizes to whitespace yields
-                // exactly one empty segment (`""`); `saturating_sub` keeps the
-                // suffix logic correct (and debug builds panic-free) even if
-                // an empty list ever escapes.
-                // Degenerate measure: `narrow.max(1)` already floors the
-                // re-wrap, and when the suffix ALONE is as wide as the content
-                // measure (`suffix_cols >= avail_full`) no single-row
-                // arrangement can satisfy `max_width` — the indent plus the
-                // unbreakable suffix token already exceeds it.  Emitting the
-                // suffix on a continuation line was tried and rejected: for a
-                // deep chain (`avail_full` floored at 1) it doubles the row
-                // count, producing a visible cascade and violating the
-                // renderer's line-count contract.  The width invariant therefore
-                // holds for every entry whose `suffix_cols < avail_full`, which
-                // is the regime the contract test pins.
+                // The locator is indivisible and rides the **last** line only,
+                // so that line's body budget is `avail_full - suffix_cols`
+                // while every other line keeps `avail_full`.
+                //
+                // Wrapping twice — full measure first, then re-wrapping the
+                // overflowing tail at the narrowed measure — is the two-phase Φ
+                // of `research/locator-wrap/`.  Both phases are optimal for
+                // their own budget and the composition is still unboundedly
+                // bad: `avail_full = 2M+1`, `suffix_cols = 2M`, `M` unit words
+                // ⇒ `M` lines where 2 suffice (Fact 2, ratio `M/2 → ∞`).
+                //
+                // `wrap_optimal_reserved` runs the theory's single pass: the
+                // last line is the *longest feasible suffix*
+                // (`j* = min{ j : width(w_j..w_n) ≤ avail_full - suffix_cols }`)
+                // and the prefix is wrapped at the full measure, giving the
+                // minimum line count `L(j* - 1) + 1` (solution.md §2.3) with the
+                // DP resolving the secondary objective.  Non-final lines
+                // therefore never pay for the suffix — the property the old
+                // second pass preserved only by accident — and the borrow
+                // ordering that pass needed is gone with it.
+                let segs = super::wrap::wrap_optimal_reserved(
+                    &message,
+                    avail_full,
+                    tab_width,
+                    suffix_cols,
+                );
+                // The reserved path always yields ≥ 1 segment (an empty message
+                // yields one empty segment), so `saturating_sub` cannot hide a
+                // dropped row here.
+                //
+                // Infeasible entries — `suffix_cols >= avail_full`, or a last
+                // word wider than the narrowed budget — take policy P1 of
+                // solution.md §4: wrap at the full measure and let the locator
+                // overflow that row.  It is the minimum-row-count policy.
+                // Carrying the suffix on its own continuation row (P2) doubles
+                // the row count of a deep chain, the cascade the row budget
+                // rejects; truncating it (P3) would break the click target and
+                // flicker as the line/column digits change.  The width invariant
+                // therefore holds for every entry whose
+                // `suffix_cols < avail_full`, which is the regime the contract
+                // test pins.
                 let last = segs.len().saturating_sub(1);
                 for (i, seg) in segs.iter().enumerate() {
                     super::renderers::fmt::push_spaces(out, indent_cols);
@@ -983,6 +956,26 @@ mod tests {
         chain.push(ChainEntry::new(ChainEntryKind::Call, None, ""));
         let out = chain.render_with_index(false, None, "", None, 40, 4);
         assert_eq!(out.lines().nth(1), Some("    : called from here"));
+    }
+
+    /// The locator is indivisible and rides the last row only, so the reserve
+    /// must narrow that row and no other (`research/locator-wrap/`): wrapping
+    /// at the reduced measure would waste the suffix width on every row.
+    #[test]
+    fn locator_reserve_narrows_only_the_last_row() {
+        // 24 two-letter words: 24*3-1 = 71 columns of body.
+        let msg = vec!["aa"; 24].join(" ");
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(ChainEntryKind::Call, None, msg.as_str()));
+        let out = chain.render_with_index(false, None, "", None, 40, 4);
+        let rows: Vec<&str> = out.lines().skip(1).collect();
+        for row in &rows {
+            assert!(row.len() <= 40, "row exceeds width: {row:?} in {out:?}");
+        }
+        // `avail_full` is 36 and `: called from here` is 18 columns, so a row
+        // wrapped at the reduced measure would stop at column 22; the first
+        // row must use the full measure instead.
+        assert!(rows[0].len() > 22, "first row was narrowed: {rows:?}");
     }
 
     #[test]

@@ -279,13 +279,7 @@ pub(crate) fn wrap_optimal<'a>(
         wrap_optimal_with(text, max_width, tab_width, tables.as_deref(), &mut local)
     } else {
         WRAP_IN_USE.set(true);
-        struct ResetGuard;
-        impl Drop for ResetGuard {
-            fn drop(&mut self) {
-                WRAP_IN_USE.set(false);
-            }
-        }
-        let _reset = ResetGuard;
+        let _reset = WrapInUseGuard;
         WRAP_SCRATCH.with_borrow_mut(|scratch| {
             wrap_optimal_with(text, max_width, tab_width, tables.as_deref(), scratch)
         })
@@ -503,6 +497,206 @@ fn wrap_optimal_with<'a>(
         scratch.words = words;
     }
     out
+}
+
+// ── Last-line reserve ──────────────────────────────────────────
+
+/// [`wrap_optimal`] with an indivisible suffix that must fit on the **last**
+/// line, so that line's body budget is `max_width - last_reserve` while every
+/// other line keeps the full measure.
+///
+/// This is what `chain.rs` renders: a call-chain entry is a wrapped message
+/// plus a locator (`main.pn:12:3`, or a kind label) that rides the last line
+/// only.  Wrapping twice — once at the full measure, then re-wrapping the
+/// overflowing tail at the narrowed one — is the two-phase algorithm Φ of
+/// `research/locator-wrap/`.  Each phase is optimal for its own budget, yet the
+/// composition's line count is unboundedly bad: with
+/// `max_width = 2M + 1`, `last_reserve = 2M` and `M` unit words, Φ emits `M`
+/// lines where 2 suffice (the first `M-1` words on line 1, the last word plus
+/// the suffix on line 2) — a ratio of `M/2 → ∞`.
+///
+/// The minimum line count is `L(j* - 1) + 1`, where `L` is the greedy block
+/// count at the full measure (exchange-optimal, and nondecreasing in the word
+/// count) and
+///
+/// ```text
+/// j* = min { j : width(w_j … w_n) <= max_width - last_reserve }
+/// ```
+///
+/// (`solution.md` §2.3): every legal layout's last block is a *suffix*, so its
+/// start is `>= j*`; a layout whose last block starts at `j` needs
+/// `>= L(j - 1) >= L(j* - 1)` lines above it.  So the suffix is the *longest*
+/// feasible one and the prefix is wrapped at the full measure — non-final lines
+/// never pay for the suffix, and the old "re-wrap the whole tail at the narrow
+/// measure" waste disappears.
+///
+/// The prefix is laid out by [`wrap_dp`], not by greedy: the split point is
+/// count-minimal, while the remaining freedom (which `L`-block prefix layout)
+/// is precisely the secondary objective the badness/fitness model resolves —
+/// and it is a real degree of freedom, not a formality; `solution.md` §3(a)
+/// exhibits instances where the greedy prefix is strictly worse on squared
+/// slack than an equally short alternative.
+///
+/// **Infeasible instances** (the last word alone exceeds
+/// `max_width - last_reserve`) take policy P1 of `solution.md` §4: wrap at the
+/// full measure and let the locator overflow.  It is the minimum-line-count
+/// policy and the one the renderer's row-count contract already assumed.  P2
+/// (locator on its own line) doubles the row count for deep chains, which is
+/// the row-budget hazard `chain.rs` documents; P3 (truncate the locator) would
+/// break its click target and oscillate with the line/column digits.
+///
+/// The reserve is Monge-compatible (`solution.md` §3c): a budget *decrease* on
+/// a single final row only shifts the query point (`C_n → C_n + s`), leaving
+/// the quadrangle inequality at `2·δ·(ε − Δ) > 0`.  A budget *increase*, or
+/// several distinct final budgets, would not preserve it — so the prefix DP
+/// keeps its totals-monotone argument unchanged.
+///
+/// Not memoized: the batch memo stores byte ranges keyed by
+/// `(hash, width, tab_width)`, and a reserved layout differs from an
+/// unreserved one under the same key.  The dominant repeated strings (kind
+/// labels) are handled by `chain.rs`'s single-line fast path before reaching
+/// here, so the lost reuse is the rare multi-line repeat.
+pub(crate) fn wrap_optimal_reserved<'a>(
+    text: &'a str,
+    max_width: usize,
+    tab_width: usize,
+    last_reserve: usize,
+) -> SmallVec<[Cow<'a, str>; 4]> {
+    let tab_width = tab_width.max(1);
+    // Identity when nothing is reserved; also routes every degenerate-width and
+    // over-long-input guard to the single implementation that owns it.
+    if last_reserve == 0 || max_width == 0 || text.len() > u32::MAX as usize {
+        return wrap_optimal(text, max_width, tab_width);
+    }
+    // A trailing `\n` is not a paragraph (`wrap_optimal("a\n") == ["a"]`), so
+    // the reserve belongs to the last *real* paragraph.
+    let core = text.strip_suffix('\n').unwrap_or(text);
+    // Paragraph line counts are additive (`solution.md` §1.4): every paragraph
+    // before the last is unconditional, so only the final one sees the reserve.
+    let (head, last_para) = match core.rsplit_once('\n') {
+        Some((head, last)) => (Some(head), last),
+        None => (None, core),
+    };
+    let mut out: SmallVec<[Cow<'a, str>; 4]> = SmallVec::new();
+    if let Some(head) = head {
+        out.extend(wrap_optimal(head, max_width, tab_width));
+    }
+    let tables = wrap_tables(max_width);
+    // Same reentrancy discipline as `wrap_optimal`: the thread-local scratch is
+    // never borrowed twice, and the returned `Cow`s borrow `text`, not it.
+    let ranges = if WRAP_IN_USE.get() {
+        let mut local = WrapScratch::new();
+        reserved_ranges(
+            last_para,
+            max_width,
+            tab_width,
+            last_reserve,
+            tables.as_deref(),
+            &mut local,
+        )
+    } else {
+        WRAP_IN_USE.set(true);
+        let _reset = WrapInUseGuard;
+        WRAP_SCRATCH.with_borrow_mut(|scratch| {
+            reserved_ranges(
+                last_para,
+                max_width,
+                tab_width,
+                last_reserve,
+                tables.as_deref(),
+                scratch,
+            )
+        })
+    };
+    out.extend(ranges.into_iter().map(|r| Cow::Borrowed(&last_para[r])));
+    out
+}
+
+/// Byte ranges of one paragraph's lines when its last line must leave
+/// `last_reserve` columns free.  Always returns at least one range.
+fn reserved_ranges(
+    para: &str,
+    max_width: usize,
+    tab_width: usize,
+    last_reserve: usize,
+    tables: Option<&WrapTables>,
+    scratch: &mut WrapScratch,
+) -> SmallVec<[Range<usize>; 4]> {
+    // No floor: `max_width - last_reserve == 0` is genuinely infeasible
+    // (`solution.md` §2.1 requires `|w_n| <= A - s`), so it must take P1 below.
+    // Flooring at 1 would instead spend a whole extra row to carry one body
+    // column, which P1 strictly dominates on row count.
+    let budget_last = max_width.saturating_sub(last_reserve);
+    if para.is_empty() {
+        return smallvec![0..0];
+    }
+    // Same admission rule as `wrap_optimal_with`: edge ASCII whitespace and any
+    // tab decline the verbatim path (the DP trims spaces and treats a tab as a
+    // break opportunity, so a verbatim fast path here would diverge).
+    let trimmed = para.trim_matches(' ');
+    let ascii = is_printable_ascii(trimmed.as_bytes());
+    let fits_last = if ascii {
+        trimmed.len() <= budget_last
+    } else {
+        measure_width_unless_tab(trimmed, tab_width).is_some_and(|w| w <= budget_last)
+    };
+    if !trimmed.is_empty() && !edges_have_whitespace(trimmed) && fits_last {
+        let start = para.len() - para.trim_start_matches(' ').len();
+        return smallvec![start..start + trimmed.len()];
+    }
+    let mut words = std::mem::take(&mut scratch.words);
+    let mut breaks = std::mem::take(&mut scratch.breaks);
+    collect_words_into(
+        para,
+        max_width,
+        tab_width,
+        Some(ascii),
+        &mut words,
+        &mut breaks,
+    );
+    scratch.breaks = breaks;
+    if words.is_empty() {
+        scratch.words = words;
+        // Whitespace-only paragraph: layout noise for ASCII, content otherwise
+        // (mirrors `wrap_optimal_with`).
+        return if para.is_ascii() {
+            smallvec![0..0]
+        } else {
+            smallvec![0..para.len()]
+        };
+    }
+    // `j*` of `solution.md` §2.3, accumulated with the DP's own width model
+    // (`Word::width` + `Word::trailing_space`) so the split cannot disagree with
+    // the widths `wrap_dp` scores.  Scanning backwards and overwriting keeps the
+    // *smallest* feasible index — the longest suffix.
+    let last = words.len() - 1;
+    let mut acc = words[last].width as usize;
+    let mut split = (acc <= budget_last).then_some(last);
+    for idx in (0..last).rev() {
+        acc += words[idx].width as usize + words[idx].trailing_space as usize;
+        if acc <= budget_last {
+            split = Some(idx);
+        }
+    }
+    let ranges = match split {
+        // P1: no legal layout — the last word alone overruns the last line's
+        // budget.  Wrap at the full measure; the locator overflows this one row.
+        None => wrap_dp(&words, max_width, tables, scratch),
+        Some(j) => {
+            let mut ranges = if j == 0 {
+                SmallVec::new()
+            } else {
+                wrap_dp(&words[..j], max_width, tables, scratch)
+            };
+            // The suffix line: everything from word `j` to the last word, with
+            // the caller's reserve left free.  `Word::end` already excludes the
+            // final word's trailing whitespace, matching the DP's line ranges.
+            ranges.push(words[j].start as usize..words[last].end as usize);
+            ranges
+        }
+    };
+    scratch.words = words;
+    ranges
 }
 
 // ── Word collection ────────────────────────────────────────────
@@ -1124,6 +1318,17 @@ thread_local! {
         std::cell::RefCell::new(WrapScratch::new());
 }
 
+/// RAII clear for [`WRAP_IN_USE`]: the thread-local scratch must be released
+/// even if a wrap body panics, or every later wrap on this thread would take
+/// the (correct but allocating) local-scratch fallback forever.
+struct WrapInUseGuard;
+
+impl Drop for WrapInUseGuard {
+    fn drop(&mut self) {
+        WRAP_IN_USE.set(false);
+    }
+}
+
 /// Shared table cache used while a parallel render batch is active.
 static SHARED_TABLES: std::sync::OnceLock<std::sync::RwLock<WrapTableSlot>> =
     std::sync::OnceLock::new();
@@ -1721,6 +1926,181 @@ mod tests {
             wrap_optimal("", 10, 4).as_slice(),
             [Cow::Borrowed("")].as_slice()
         );
+    }
+
+    // ── Last-line reserve (`research/locator-wrap/`) ───────────
+
+    /// Greedy block count at `budget` (`L` of solution.md §2.2).
+    fn greedy_lines(widths: &[usize], budget: usize) -> usize {
+        let mut lines = 1;
+        let mut cur = 0usize;
+        for (t, &w) in widths.iter().enumerate() {
+            if t == 0 {
+                cur = w;
+            } else if cur + 1 + w <= budget {
+                cur += 1 + w;
+            } else {
+                lines += 1;
+                cur = w;
+            }
+        }
+        lines
+    }
+
+    /// `OPT = L(j* - 1) + 1` of solution.md §2.3, or `None` when infeasible.
+    fn minimal_lines(widths: &[usize], max_width: usize, reserve: usize) -> Option<usize> {
+        // No floor: a zero last-line budget is infeasible (§2.1).
+        let budget_last = max_width.saturating_sub(reserve);
+        if widths.iter().any(|&w| w > max_width) {
+            return None;
+        }
+        let mut acc = *widths.last()?;
+        let mut split = (acc <= budget_last).then_some(widths.len() - 1);
+        for idx in (0..widths.len() - 1).rev() {
+            acc += widths[idx] + 1;
+            if acc <= budget_last {
+                split = Some(idx);
+            }
+        }
+        let j = split?;
+        Some(if j == 0 {
+            1
+        } else {
+            greedy_lines(&widths[..j], max_width) + 1
+        })
+    }
+
+    /// The two-phase composition Φ that `wrap_optimal_reserved` replaces
+    /// (wrap at the full measure, then re-wrap the overflowing tail at the
+    /// narrowed measure).  Kept here as the regression baseline.
+    fn two_phase_lines(text: &str, max_width: usize, tab_width: usize, reserve: usize) -> usize {
+        let segs = wrap_optimal(text, max_width, tab_width);
+        let narrow = max_width.saturating_sub(reserve).max(1);
+        let mut lines = segs.len();
+        // Count only: re-wrapping into a second buffer would need an owned tail
+        // (`Cow`s from `wrap_optimal` borrow their input), which is exactly the
+        // borrow dance the single-pass rewrite removes.
+        if reserve < max_width
+            && let Some(last) = segs.last()
+            && measure_width(last.as_ref(), tab_width) + reserve > max_width
+        {
+            lines = lines - 1 + wrap_optimal(last.as_ref(), narrow, tab_width).len();
+        }
+        lines
+    }
+
+    /// Fact 2: the composition emits `M` rows where two suffice.
+    #[test]
+    fn reserved_last_line_beats_the_two_phase_composition() {
+        // A = 2M+1 = 9, reserve = 2M = 8 (M = 4) => budget_last = 1.
+        let out = wrap_optimal_reserved("a b c d", 9, 4, 8);
+        assert_eq!(
+            out.as_slice(),
+            [Cow::Borrowed("a b c"), Cow::Borrowed("d")].as_slice()
+        );
+        // Φ's first phase emits one row; the second re-wraps it into M rows.
+        assert_eq!(
+            wrap_optimal("a b c d", 9, 4).as_slice(),
+            [Cow::Borrowed("a b c d")].as_slice()
+        );
+        assert_eq!(two_phase_lines("a b c d", 9, 4, 8), 4);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Exhaustive sweep: the reserve changes only the last row, the layout
+    /// never beats the minimal-line model, never exceeds the composition it
+    /// replaces, and the infeasible branch is exactly P1.
+    #[test]
+    fn reserved_last_line_invariants() {
+        for n in 1..=5usize {
+            for code in 0..3usize.pow(n as u32) {
+                let mut msg = String::new();
+                let mut widths = Vec::with_capacity(n);
+                for t in 0..n {
+                    if t > 0 {
+                        msg.push(' ');
+                    }
+                    let w = (code / 3usize.pow(t as u32)) % 3 + 1;
+                    widths.push(w);
+                    msg.push_str(&"a".repeat(w));
+                }
+                for max_width in 3..=14usize {
+                    for reserve in 0..=max_width {
+                        let out = wrap_optimal_reserved(&msg, max_width, 4, reserve);
+                        // A break consumes the space it breaks at, while an
+                        // unbroken run keeps it, so compare word sequences.
+                        let laid_out: Vec<&str> =
+                            out.iter().flat_map(|s| s.split_whitespace()).collect();
+                        let expected: Vec<&str> = msg.split_whitespace().collect();
+                        assert_eq!(
+                            laid_out, expected,
+                            "content lost: {msg:?} A={max_width} s={reserve}"
+                        );
+                        let last = out.len() - 1;
+                        match minimal_lines(&widths, max_width, reserve) {
+                            Some(opt) => {
+                                for (i, seg) in out.iter().enumerate() {
+                                    let w = measure_width(seg.as_ref(), 4);
+                                    if i == last {
+                                        assert!(
+                                            w + reserve <= max_width,
+                                            "last row + reserve overflows: {msg:?} A={max_width} s={reserve} out={out:?}"
+                                        );
+                                    } else {
+                                        assert!(
+                                            w <= max_width,
+                                            "non-last row overflows: {msg:?} A={max_width} out={out:?}"
+                                        );
+                                    }
+                                }
+                                assert!(
+                                    out.len() >= opt,
+                                    "beats the minimal-line model: {msg:?} A={max_width} s={reserve} out={out:?}"
+                                );
+                            }
+                            None => assert_eq!(
+                                out.as_slice(),
+                                wrap_optimal(&msg, max_width, 4).as_slice(),
+                                "infeasible must take P1 (full measure): {msg:?} A={max_width} s={reserve}"
+                            ),
+                        }
+                        assert!(
+                            out.len() <= two_phase_lines(&msg, max_width, 4, reserve),
+                            "worse than the composition it replaces: {msg:?} A={max_width} s={reserve} out={out:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reserve belongs to the last *real* paragraph only; paragraph line
+    /// counts are additive (solution.md §1.4).
+    #[test]
+    fn reserved_paragraph_applies_only_to_the_last_paragraph() {
+        for text in ["a b c\nd e f", "a b c\nd e f\n"] {
+            let out = wrap_optimal_reserved(text, 8, 4, 6);
+            assert_eq!(
+                out.as_slice(),
+                [
+                    Cow::Borrowed("a b c"),
+                    Cow::Borrowed("d e"),
+                    Cow::Borrowed("f")
+                ]
+                .as_slice(),
+                "text: {text:?}"
+            );
+        }
+        // A zero reserve is exactly `wrap_optimal`.
+        for text in ["", "a", "a b c d", "a\nb c", "a  b\n\nc"] {
+            for width in [1usize, 4, 9, 40] {
+                assert_eq!(
+                    wrap_optimal_reserved(text, width, 4, 0).as_slice(),
+                    wrap_optimal(text, width, 4).as_slice(),
+                    "text: {text:?} width: {width}"
+                );
+            }
+        }
     }
 
     #[test]
