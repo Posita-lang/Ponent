@@ -2727,7 +2727,11 @@ impl InferenceContext {
         ctx: &mut TypeContext<'input>,
         span: Span,
     ) -> Result<TypeId, TypeError> {
-        let result = match ctx.unify(a, b) {
+        // Ambivalent-aware (Garrigue & Rémy, APLAS 2013): inside a GADT arm a
+        // unification that consumes an equation re-labels the result with a
+        // fresh ambivalent label.  Outside an arm `unify_ambivalent` is
+        // bit-identical to `unify`, so OmniML behaviour is unchanged.
+        let result = match ctx.unify_ambivalent(a, b) {
             Ok(ty) => ty,
             Err(mut e) => {
                 e.set_span(span);
@@ -2988,7 +2992,10 @@ impl InferenceContext {
                 }
                 Ok(ra)
             }
-            _ => match ctx.unify(ra, rb) {
+            // Ambivalent-aware (see `unify_and_track`): inside an arm a
+            // unification that consumes an equation widens; elsewhere this
+            // is exactly `unify`.
+            _ => match ctx.unify_ambivalent(ra, rb) {
                 Ok(ty) => Ok(ty),
                 Err(mut e) => {
                     e.set_span(span);

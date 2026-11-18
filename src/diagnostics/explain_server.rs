@@ -2510,6 +2510,8 @@ fn serve_explain_persistent_epoll(
     idle: Option<Duration>,
 ) -> std::io::Result<()> {
     use rustc_hash::FxHashMap;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     enable_tcp_defer_accept(listener);
@@ -2519,9 +2521,20 @@ fn serve_explain_persistent_epoll(
     const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
     /// Shared post-response drain budget (matches the thread path's bound).
     const LINGER_BUDGET: Duration = Duration::from_millis(100);
-    const READING: u8 = 0;
-    const WRITING: u8 = 1;
-    const DRAINING: u8 = 2;
+    /// Explicit connection phase (replaces the former `u8` plus three ad-hoc
+    /// constants).  The reactor's transitions are exactly
+    /// `Reading → Writing → Draining → Reading` (keep-alive) or closed;
+    /// a queued protocol error already has `keep_alive == false`, so it goes
+    /// `Writing → Draining` and never back to `Reading`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ConnState {
+        /// Accumulating a request header.
+        Reading,
+        /// Streaming a prepared response.
+        Writing,
+        /// Linger-draining unread inbound bytes before close.
+        Draining,
+    }
 
     struct Conn {
         stream: TcpStream,
@@ -2534,7 +2547,7 @@ fn serve_explain_persistent_epoll(
         date: Option<std::sync::Arc<str>>,
         conn_hdr: &'static [u8],
         progress: [usize; 6],
-        state: u8,
+        state: ConnState,
         keep_alive: bool,
         consumed: usize,
         deadline: Instant,
@@ -2553,7 +2566,11 @@ fn serve_explain_persistent_epoll(
     }
 
     impl Conn {
-        fn queue_bad_request(&mut self) {
+        fn queue_bad_request(
+            &mut self,
+            fd: i32,
+            heap: &mut BinaryHeap<Reverse<(Instant, i32)>>,
+        ) {
             self.response = Some(bad_request_response());
             self.conn_hdr = b"Connection: close\r\n\r\n";
             self.keep_alive = false;
@@ -2562,11 +2579,15 @@ fn serve_explain_persistent_epoll(
             self.progress = [0; 6];
             self.consumed = 0;
             self.body_remaining = usize::MAX;
-            self.state = WRITING;
-            self.deadline = Instant::now() + WRITE_TIMEOUT;
+            self.state = ConnState::Writing;
+            arm_deadline(&mut *self, fd, Instant::now() + WRITE_TIMEOUT, heap);
         }
 
-        fn queue_too_large(&mut self) {
+        fn queue_too_large(
+            &mut self,
+            fd: i32,
+            heap: &mut BinaryHeap<Reverse<(Instant, i32)>>,
+        ) {
             self.response = Some(HttpResponse::from_cache(
                 "431 Request Header Fields Too Large",
                 "",
@@ -2579,10 +2600,29 @@ fn serve_explain_persistent_epoll(
             self.progress = [0; 6];
             self.consumed = 0;
             self.body_remaining = usize::MAX;
-            self.state = WRITING;
-            self.deadline = Instant::now() + WRITE_TIMEOUT;
+            self.state = ConnState::Writing;
+            arm_deadline(&mut *self, fd, Instant::now() + WRITE_TIMEOUT, heap);
         }
     }
+
+    /// Arm `conn`'s deadline and record it in the lazy heap, so
+    /// `epoll_wait`'s timeout is the earliest LIVE deadline without an O(n)
+    /// scan per wakeup.  Entries are discarded on peek when the connection is
+    /// gone or its current deadline differs (the heap may hold stale arms);
+    /// a deadline that SHORTENS is pushed immediately, so a wakeup is never
+    /// late.
+    fn arm_deadline(
+        conn: &mut Conn,
+        fd: i32,
+        at: Instant,
+        heap: &mut BinaryHeap<Reverse<(Instant, i32)>>,
+    ) {
+        conn.deadline = at;
+        heap.push(Reverse((at, fd)));
+    }
+
+    // Lazy-invalidation deadline heap (see `arm_deadline`).
+    let mut deadline_heap: BinaryHeap<Reverse<(Instant, i32)>> = BinaryHeap::new();
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -2622,8 +2662,19 @@ fn serve_explain_persistent_epoll(
             }
         }
         let mut wait = Duration::from_secs(5);
-        for conn in conns.values() {
-            wait = wait.min(conn.deadline.saturating_duration_since(now));
+        // Drop stale arms (connection closed, or re-armed since) and take the
+        // earliest live deadline from the heap instead of scanning every
+        // connection on every wakeup.
+        while let Some(&Reverse((at, fd))) = deadline_heap.peek() {
+            match conns.get(&fd) {
+                Some(conn) if at == conn.deadline => break,
+                _ => {
+                    deadline_heap.pop();
+                }
+            }
+        }
+        if let Some(&Reverse((at, _))) = deadline_heap.peek() {
+            wait = wait.min(at.saturating_duration_since(now));
         }
         if let Some(idle) = idle {
             let until = if served_any {
@@ -2661,6 +2712,10 @@ fn serve_explain_persistent_epoll(
                             accept_backoff_ms = 50;
                             let _ = stream.set_nodelay(true);
                             let conn_fd = stream.as_raw_fd();
+                            // One deadline value for both the connection and
+                            // the heap arm, so the lazy-invalidation check
+                            // (`at == conn.deadline`) stays exact.
+                            let first_byte_deadline = Instant::now() + FIRST_BYTE_READ_TIMEOUT;
                             let normal = conns.values().filter(|c| !c.overload).count();
                             if normal >= MAX_CONCURRENT_CONNECTIONS {
                                 if conns.len() >= MAX_CONCURRENT_CONNECTIONS * 2 {
@@ -2677,10 +2732,10 @@ fn serve_explain_persistent_epoll(
                                             date: None,
                                             conn_hdr: b"",
                                             progress: [0; 6],
-                                            state: READING,
+                                            state: ConnState::Reading,
                                             keep_alive: false,
                                             consumed: 0,
-                                            deadline: Instant::now() + FIRST_BYTE_READ_TIMEOUT,
+                                            deadline: first_byte_deadline,
                                             header_deadline: None,
                                             header_scan: HeaderScan::new(),
                                             overload: true,
@@ -2698,10 +2753,10 @@ fn serve_explain_persistent_epoll(
                                         date: None,
                                         conn_hdr: b"",
                                         progress: [0; 6],
-                                        state: READING,
+                                        state: ConnState::Reading,
                                         keep_alive: false,
                                         consumed: 0,
-                                        deadline: Instant::now() + FIRST_BYTE_READ_TIMEOUT,
+                                        deadline: first_byte_deadline,
                                         header_deadline: None,
                                         header_scan: HeaderScan::new(),
                                         overload: false,
@@ -2709,8 +2764,11 @@ fn serve_explain_persistent_epoll(
                                     },
                                 );
                             }
+                            // A closed (shed) accept leaves no map entry; the
+                            // arm is then pruned as stale on the next peek.
+                            deadline_heap.push(Reverse((first_byte_deadline, conn_fd)));
                             let mut conn_event = libc::epoll_event {
-                                events: if conns.get(&conn_fd).is_some_and(|c| c.state == WRITING) {
+                                events: if conns.get(&conn_fd).is_some_and(|c| c.state == ConnState::Writing) {
                                     libc::EPOLLOUT as u32
                                 } else {
                                     libc::EPOLLIN as u32
@@ -2774,7 +2832,7 @@ fn serve_explain_persistent_epoll(
                 continue;
             };
             let bits = event.events as i32;
-            if (conn.state == READING || conn.state == DRAINING)
+            if (conn.state == ConnState::Reading || conn.state == ConnState::Draining)
                 && bits & (libc::EPOLLERR | libc::EPOLLHUP) != 0
                 && bits & libc::EPOLLIN == 0
             {
@@ -2782,7 +2840,7 @@ fn serve_explain_persistent_epoll(
                 continue;
             }
 
-            if conn.state == DRAINING {
+            if conn.state == ConnState::Draining {
                 // The response is fully written; consume whatever the client
                 // still sends so the final close sends FIN instead of RST.
                 let mut eof = false;
@@ -2824,7 +2882,7 @@ fn serve_explain_persistent_epoll(
                 continue;
             }
 
-            if conn.state == READING {
+            if conn.state == ConnState::Reading {
                 let mut eof = false;
                 let mut header_progress = HeaderProgress::Incomplete;
                 loop {
@@ -2862,7 +2920,7 @@ fn serve_explain_persistent_epoll(
                     header_progress,
                     HeaderProgress::TooLargeHeader | HeaderProgress::TooLargeLine
                 ) {
-                    conn.queue_too_large();
+                    conn.queue_too_large(fd, &mut deadline_heap);
                     let mut event = libc::epoll_event {
                         events: libc::EPOLLOUT as u32,
                         u64: fd as u64,
@@ -2891,6 +2949,7 @@ fn serve_explain_persistent_epoll(
                             .header_deadline
                             .get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
                         conn.deadline = header_deadline;
+                        deadline_heap.push(Reverse((header_deadline, fd)));
                     }
                     continue;
                 };
@@ -2922,9 +2981,9 @@ fn serve_explain_persistent_epoll(
                     conn.keep_alive = false;
                     conn.consumed = head_end;
                     conn.progress = [0; 6];
-                    conn.state = WRITING;
+                    conn.state = ConnState::Writing;
                     conn.header_deadline = None;
-                    conn.deadline = Instant::now() + WRITE_TIMEOUT;
+                    arm_deadline(conn, fd, Instant::now() + WRITE_TIMEOUT, &mut deadline_heap);
                     let mut conn_event = libc::epoll_event {
                         events: libc::EPOLLOUT as u32,
                         u64: fd as u64,
@@ -2949,7 +3008,7 @@ fn serve_explain_persistent_epoll(
                         // Parity with the other backends: 431 instead of a
                         // bare close, then drain under the shared linger
                         // budget so the response is not RST away.
-                        conn.queue_too_large();
+                        conn.queue_too_large(fd, &mut deadline_heap);
                         let mut event = libc::epoll_event {
                             events: libc::EPOLLOUT as u32,
                             u64: fd as u64,
@@ -2960,7 +3019,7 @@ fn serve_explain_persistent_epoll(
                         continue;
                     }
                     let Ok(request_line) = std::str::from_utf8(&head[..line_end]) else {
-                        conn.queue_bad_request();
+                        conn.queue_bad_request(fd, &mut deadline_heap);
                         let mut event = libc::epoll_event {
                             events: libc::EPOLLOUT as u32,
                             u64: fd as u64,
@@ -3011,8 +3070,8 @@ fn serve_explain_persistent_epoll(
                     b"Connection: close\r\n\r\n"
                 };
                 conn.progress = [0; 6];
-                conn.state = WRITING;
-                conn.deadline = Instant::now() + WRITE_TIMEOUT;
+                conn.state = ConnState::Writing;
+                arm_deadline(conn, fd, Instant::now() + WRITE_TIMEOUT, &mut deadline_heap);
                 let mut conn_event = libc::epoll_event {
                     events: libc::EPOLLOUT as u32,
                     u64: fd as u64,
@@ -3022,7 +3081,7 @@ fn serve_explain_persistent_epoll(
                 }
             }
 
-            if conn.state == WRITING {
+            if conn.state == ConnState::Writing {
                 let mut finished = false;
                 let date = match conn.date.as_ref() {
                     Some(date) => std::sync::Arc::clone(date),
@@ -3106,9 +3165,9 @@ fn serve_explain_persistent_epoll(
                         conn.response = None;
                         conn.date = None;
                         conn.progress = [0; 6];
-                        conn.state = READING;
+                        conn.state = ConnState::Reading;
                         conn.header_deadline = None;
-                        conn.deadline = Instant::now() + KEEP_ALIVE_IDLE;
+                        arm_deadline(conn, fd, Instant::now() + KEEP_ALIVE_IDLE, &mut deadline_heap);
                         let mut conn_event = libc::epoll_event {
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,
@@ -3124,13 +3183,13 @@ fn serve_explain_persistent_epoll(
                         // which can discard the response we just wrote (the
                         // shed 503 path included).
                         let _ = conn.stream.shutdown(Shutdown::Write);
-                        conn.state = DRAINING;
-                        conn.deadline = Instant::now()
-                            + if conn.body_remaining == 0 {
-                                LINGER_BUDGET
-                            } else {
-                                Duration::from_secs(1)
-                            };
+                        conn.state = ConnState::Draining;
+                        let linger = if conn.body_remaining == 0 {
+                            LINGER_BUDGET
+                        } else {
+                            Duration::from_secs(1)
+                        };
+                        arm_deadline(conn, fd, Instant::now() + linger, &mut deadline_heap);
                         let mut conn_event = libc::epoll_event {
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,

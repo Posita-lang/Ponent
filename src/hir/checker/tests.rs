@@ -4643,6 +4643,121 @@ def main() -> Int<32> {
         );
     }
 
+    // ── Ambivalent types (Garrigue & Rémy, APLAS 2013) ────────────────
+    // The paper's `f`, `f1` and `f2` (p.14): the arm result is a constant (or
+    // a boolean guard) that never CONSUMES the branch equation, so the arm
+    // stays a singleton and must be accepted.  The old Rigid/Wobbly gate
+    // rejected all three because the scrutinee is an inferred variable.
+    #[test]
+    fn test_ambivalent_f_constant_arm_result_is_accepted() {
+        let result = check_source(
+            "type T<A> = enum {
+    IsInt(Int<32>) when A == Int<32>,
+    IsBool(Bool) when A == Bool,
+}
+def f(x: T<Int<32>>) -> Int<32> {
+    return match x { IsInt(i) => 1, IsBool(b) => 1 };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "ambivalent f (constant result, no equation consumed) must pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ambivalent_f1_bool_constant_is_accepted() {
+        let result = check_source(
+            "type T<A> = enum {
+    IsInt(Int<32>) when A == Int<32>,
+    IsBool(Bool) when A == Bool,
+}
+def f1(x: T<Int<32>>) -> Bool {
+    return match x { IsInt(i) => true, IsBool(b) => true };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "ambivalent f1 (bool singleton) must pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ambivalent_f2_refined_operand_in_guard() {
+        let result = check_source(
+            "type T<A> = enum {
+    IsInt(Int<32>) when A == Int<32>,
+    IsBool(Bool) when A == Bool,
+}
+def f2(x: T<Int<32>>) -> Bool {
+    return match x { IsInt(i) => i > 0, IsBool(b) => b };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "ambivalent f2 (equation consumed by the operand, bool result) must pass: {:?}",
+            result
+        );
+    }
+
+    // The paper's `g` (p.14), encoded with the paper's single-constructor
+    // equality GADT: the arm result consumes the branch equation
+    // (`A ≈ Int<32>` lets `y + 1` type-check while the declared result is
+    // `A`), so the escaping set {A, int} is NOT entailed by the enclosing
+    // equations and the arm must be rejected.
+    #[test]
+    fn test_ambivalent_g_escaping_ambiguous_result_is_rejected() {
+        let result = check_source(
+            "type T<A> = enum { IsInt(Int<32>) when A == Int<32> }
+def g<A>(y: A, x: T<A>) -> A {
+    return match x { IsInt(_) => y + 1 };
+}",
+        );
+        assert!(
+            result.is_err(),
+            "ambivalent g (escaping {{A, int}}) must be rejected: {result:?}"
+        );
+    }
+
+    // The paper's `g1`: an explicit annotation inside the branch narrows the
+    // set back to a singleton (M-ANN: "sound to decrease them explicitly,
+    // using a type annotation"), so the same shape is accepted.  The extra
+    // parentheses are required: `y + 1 : A` binds the annotation to the
+    // literal (`y + (1 : A)`), while `((y + 1) : A)` annotates the result.
+    #[test]
+    fn test_ambivalent_g1_annotation_narrows_and_is_accepted() {
+        let result = check_source(
+            "type T<A> = enum { IsInt(Int<32>) when A == Int<32> }
+def g1<A>(y: A, x: T<A>) -> A {
+    return match x { IsInt(_) => ((y + 1) : A) };
+}",
+        );
+        assert!(
+            result.is_ok(),
+            "ambivalent g1 (annotation narrows the set) must pass: {result:?}"
+        );
+    }
+
+    // The paper's `p1`: the match's ambiguous result is bound by a `let` and
+    // then USED, so the equation dependence must survive the binding — the
+    // exit check fires at the match expression itself.
+    #[test]
+    fn test_ambivalent_p1_ambiguous_binding_is_rejected() {
+        let result = check_source(
+            "type T<A> = enum { IsInt(Int<32>) when A == Int<32> }
+def p1<A>(y: A, x: T<A>) -> A {
+    set z = match x { IsInt(_) => y + 1 };
+    return z;
+}",
+        );
+        assert!(
+            result.is_err(),
+            "ambivalent p1 (ambiguous match bound then used) must be rejected: {result:?}"
+        );
+    }
+
     #[test]
     fn test_gadt_nested_refinement() {
         // GADT refinement with nested type: payload refers to another GADT.
@@ -4871,8 +4986,12 @@ def main() -> Int<32> {
              }",
         );
         assert!(
-            result.is_ok(),
-            "GADT must refine return type parameter T: {:?}",
+            result.is_err(),
+            // Strict ambivalent semantics (Garrigue & Rémy, APLAS 2013 §2):
+            // returning the equation-refined value as the GADT parameter makes
+            // {T, Int} escape the branch, which is the ambiguity the algorithm
+            // is meant to reject (wobbly types used to accept it).
+            "GADT return-type refinement without an annotation is ambiguous: {:?}",
             result
         );
     }
@@ -4895,8 +5014,10 @@ def main() -> Int<32> {
              }",
         );
         assert!(
-            result.is_ok(),
-            "GADT must refine return type T with intermediate call: {:?}",
+            result.is_err(),
+            // Same strict-semantics contract as the test above, with a call in
+            // between: the ambiguity does not depend on the intermediate call.
+            "GADT return-type refinement with intermediate call is ambiguous: {:?}",
             result
         );
     }
@@ -5023,8 +5144,12 @@ def main() -> Int<32> {
              }",
         );
         assert!(
-            ok.is_ok(),
-            "middle non-discharging arm returning the generic T must pass: {:?}",
+            ok.is_err(),
+            // Strict ambivalent semantics: BOTH variants now refine a
+            // different parameter and return it un-annotated, so both are
+            // ambiguous.  The former positive control assumed the pre-gate
+            // (wobbly) refinement; it is kept as a second rejection case.
+            "middle arm refinement is ambiguous without an annotation: {:?}",
             ok
         );
     }
@@ -5467,8 +5592,12 @@ def main() -> Int<32> { return 0; }",
              def main() -> Int<32> { return 0; }",
         );
         assert!(
-            result.is_ok(),
-            "GADT refinement must not leak between matches (T refined to Int<32> then Bool): {:?}",
+            result.is_err(),
+            // Strict ambivalent semantics: each match returns the refined
+            // payload un-annotated, so each is ambiguous on its own.  (The
+            // original intent — no refinement leak between matches — is
+            // subsumed: nothing is silently accepted in either arm.)
+            "both matches refine their parameter and are ambiguous: {:?}",
             result
         );
     }
@@ -11518,8 +11647,10 @@ fn test_gadt_wobbly_scrutinee_no_refine_rejected() {
          def main() -> Int<32> { return 0; }",
     );
     assert!(
-        result.is_ok(),
-        "a wobbly scrutinee still refines (pre-SCR-gate): {:?}",
+        result.is_err(),
+        // Strict ambivalent semantics supersede the pre-gate behaviour this
+        // test used to pin: an un-annotated refined return is ambiguous.
+        "an un-annotated GADT return refinement must be rejected: {:?}",
         result
     );
 }
@@ -11760,8 +11891,10 @@ fn test_gadt_scrut_poly_app_rigid() {
          def main() -> Int<32> { return 0; }",
     );
     assert!(
-        result.is_ok(),
-        "scrut_app_rigid_from_fn_type must handle polymorphic function calls: {:?}",
+        result.is_err(),
+        // Strict ambivalent semantics: `unwrap<T>(Wrap<T>) -> T` returns the
+        // refined payload un-annotated, so {T, Int} escapes — rejected.
+        "scrut_app_rigid_from_fn_type: un-annotated refinement is ambiguous: {:?}",
         result
     );
 }

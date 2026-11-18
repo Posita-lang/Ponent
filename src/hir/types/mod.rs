@@ -1506,13 +1506,358 @@ impl<'input> TypeContext<'input> {
     ///
     /// See `push_gadt_arm` (OCaml `equated_types` lookup, ctype.ml:3926-3936).
     fn resolve_gadt_eq(&self, id: TypeId) -> Option<TypeId> {
+        // Exit-entailment window: arms at or above `floor` are invisible, so
+        // the exit coherence check resolves under the enclosing equations
+        // only (M-USE's Γ, not Γ, τ₁ ≐ τ₂).
+        let floor = self.gadt.entailment_floor.load(AtomicOrdering::Relaxed);
         let refs = self.gadt.param_refinements.read();
-        for map in refs.iter().rev() {
+        for (pos, map) in refs.iter().enumerate().rev() {
+            if pos >= floor {
+                continue; // hidden by the entailment window
+            }
             if let Some(&to) = map.get(&id) {
                 return Some(to);
             }
         }
         None
+    }
+
+    // ── Ambivalent types (Garrigue & Rémy, APLAS 2013) — replaces the
+    //    Rigid/Wobbly gate ──
+    /// The paper's Vr: rigid variables are this codebase's rigid namespace —
+    /// `GenericParam` (`type a` / generic parameters) and `SkolemVar` (HRTB /
+    /// GADT existentials).  Everything else is a "proper" raw type (int, Fn,
+    /// Adt, …), and WF-TYPE-AMBIVALENT (Fig. 1) allows at most ONE proper
+    /// element per set.
+    fn is_paper_rigid(&self, ty: TypeId) -> bool {
+        matches!(
+            self.get(self.resolve_binding(ty)),
+            TypeData::GenericParam { .. } | TypeData::SkolemVar { .. }
+        )
+    }
+
+    /// Whether a GADT arm is currently active.  Cheap enough for hot paths:
+    /// one relaxed atomic load.
+    pub fn in_gadt_arm(&self) -> bool {
+        self.gadt.arm_depth.load(AtomicOrdering::Relaxed) > 0
+    }
+
+    /// Unification entry point under the ambivalent discipline (replaces
+    /// Rigid/Wobbly-gated GADT solving).
+    ///
+    /// Outside an arm this IS [`TypeContext::unify`] (`arm_depth == 0`
+    /// short-circuits), so the OmniML solver and the Yoneda pipeline are
+    /// completely unaffected.
+    ///
+    /// Inside an arm: when the successful unification DEPENDS on an arm
+    /// equation (one side's resolution chain crosses the GADT registry — the
+    /// paper's M-USE premise Γ, τ₁ ≐ τ₂ is consumed), the unified node is
+    /// re-labelled with a FRESH ambivalent label carrying
+    /// ψ = ψ₁ ∪ ψ₂ ∪ {the pre-registry views}.  The caller must use the
+    /// returned label as the expression's type — that is what makes
+    /// ambivalence visible to [`TypeContext::check_gadt_arm_escape`] and to
+    /// nothing else (a fresh label never pollutes a shared interned type).
+    ///
+    /// Contract: pass the DECLARED types (not pre-resolved through the
+    /// registry).  If a caller resolves first, the crossing is not detected
+    /// and the program is still sound (the branch is typed at the resolved
+    /// concrete type — g1's choice), but that example loses its rejection
+    /// and its principal type; see [`TypeContext::widen_ambivalent_use`].
+    pub fn unify_ambivalent(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
+        if self.gadt.arm_depth.load(AtomicOrdering::Relaxed) == 0 {
+            return self.unify(a, b);
+        }
+        // Pre-registry views: the raw types before consuming any arm
+        // equation — ψ's elements record which types the equation glued
+        // together.
+        let pa = self.resolve_binding_no_gadt(a);
+        let pb = self.resolve_binding_no_gadt(b);
+        let ra = self.resolve_binding(a);
+        let rb = self.resolve_binding(b);
+        let result = self.unify(a, b)?;
+        let crossed_a = pa != ra;
+        let crossed_b = pb != rb;
+        // Nothing was CONSUMED when the two sides were already the same type
+        // before any equation was applied: M-USE records a consumption only
+        // when the equation is what made them equal.  This guard also keeps an
+        // explicit annotation's narrowing (M-ANN) from being undone by the
+        // later IDENTITY unification of the arm result with the signature —
+        // otherwise `(e : a)` would re-widen `{a, int}` right after narrowing
+        // it.
+        if a == b || pa == pb {
+            return Ok(result);
+        }
+        if !crossed_a && !crossed_b {
+            // No equation was consumed: ordinary unification, no ambivalence
+            // (f / f1: the branch keeps its singleton type).
+            return Ok(result);
+        }
+        let root = self.resolve_binding(result);
+        let mut set: SmallVec<[TypeId; 4]> = SmallVec::new();
+        // Inherit any existing set from the inputs AND their registry-resolved
+        // views.  A widened label is keyed by the FRESH label, so a second
+        // widening over the same node must not lose the first one's ψ.
+        for n in [a, b, ra, rb, pa, pb] {
+            if let Some(existing) = self.gadt.set_of_current(n) {
+                set.extend(existing);
+            }
+        }
+        // Only a CROSSING pair contributes ψ elements: the pre-registry view
+        // and the registry view of the side whose resolution actually crossed.
+        // A non-crossing side is ordinary unification — its variable is not
+        // rigid and must not enter ψ, where it would trip the WF
+        // |ψ \ Vr| ≤ 1 check as a phantom second proper type.
+        if crossed_a {
+            set.push(pa);
+            set.push(ra);
+        }
+        if crossed_b {
+            set.push(pb);
+            set.push(rb);
+        }
+        self.mint_widened_label(root, set)
+    }
+
+    /// Explicit widening entry: when the caller has already resolved a type
+    /// through the registry (losing the pre-registry view), record one
+    /// equation consumption manually.  Semantics match `unify_ambivalent`'s
+    /// automatic detection.
+    pub fn widen_ambivalent_use(&mut self, pre: TypeId, post: TypeId) -> Result<TypeId, TypeError> {
+        if self.gadt.arm_depth.load(AtomicOrdering::Relaxed) == 0 {
+            return Ok(post);
+        }
+        let root = self.resolve_binding(post);
+        let mut set: SmallVec<[TypeId; 4]> = SmallVec::new();
+        if let Some(existing) = self.gadt.set_of_current(root) {
+            set.extend(existing);
+        }
+        set.push(pre);
+        set.push(root);
+        self.mint_widened_label(root, set)
+    }
+
+    /// Mint a fresh ambivalent label for `root` carrying the deduplicated set
+    /// ψ, enforcing WF-TYPE-AMBIVALENT's |ψ \ Vr| ≤ 1 (Fig. 1: at most one
+    /// non-rigid raw type per set — the paper's structural discipline
+    /// "(int≈a) → (int≈a)" rather than "{int→int, a→a}"; a violation fails
+    /// closed as a unification mismatch).
+    fn mint_widened_label(
+        &mut self,
+        root: TypeId,
+        set: SmallVec<[TypeId; 4]>,
+    ) -> Result<TypeId, TypeError> {
+        let span = self
+            .current_unify_span
+            .unwrap_or_else(|| crate::ast::Span::new(crate::ast::FileId::DUMMY, 0, 0));
+        let mut dedup: SmallVec<[TypeId; 4]> = SmallVec::new();
+        for t in set {
+            if !dedup.contains(&t) {
+                dedup.push(t);
+            }
+        }
+        let proper: Vec<TypeId> = dedup
+            .iter()
+            .copied()
+            .filter(|t| !self.is_paper_rigid(*t))
+            .collect();
+        // WF-TYPE-AMBIVALENT speaks about TYPES, not TypeIds: two distinct ids
+        // for the same type (e.g. an interned `int` and the arm's refined view
+        // of it) are ONE proper type under the paper's structural equality.
+        // Counting ids here would reject the legitimate set {int, a, int} and
+        // silently fall back to ordinary unification — which is exactly how a
+        // real ambiguity became invisible.
+        let mut distinct_proper: Vec<TypeId> = Vec::new();
+        for t in proper {
+            if !distinct_proper
+                .iter()
+                .any(|d| self.ambivalent_equal(t, *d))
+            {
+                distinct_proper.push(t);
+            }
+        }
+        if distinct_proper.len() > 1 {
+            return Err(TypeError::Mismatch {
+                expected: distinct_proper[0],
+                found: distinct_proper[1],
+                span,
+            });
+        }
+        // Fresh label (§3.1: every node is labelled by a flexible type
+        // variable).  Binding an `InferVar` key is never seal-blocked, and
+        // the label resolves to `root` transparently for every reader.
+        let label = self.alloc_overlap_fresh_var(0);
+        let admitted = self.set_binding(label, root);
+        debug_assert!(
+            admitted,
+            "fresh ambivalent label is an InferVar — never seal-blocked"
+        );
+        self.gadt.widen_current(label, dedup);
+        Ok(label)
+    }
+
+    /// M-ANN (§3.5): the annotation `(e : τ)` replaces e's inner view with the
+    /// singleton outer view {τ}.  This is the escape hatch that lets g1/g2-
+    /// style programs pass the exit check.  τ must be coherent with the
+    /// node's current set under the CURRENT (registry-on) equations — the
+    /// annotation must be a consistent instance (τ ∈ ψ, up to conversion).
+    /// Otherwise the set is left untouched and the exit check rejects the
+    /// escape.
+    pub fn narrow_ambivalent(&self, node: TypeId, tau: TypeId) {
+        if self.gadt.arm_depth.load(AtomicOrdering::Relaxed) == 0 {
+            return;
+        }
+        let t = self.resolve_binding(tau);
+        // A widened set lives on a fresh label β with `β → root`, while the
+        // annotation names the ROOT.  Match by resolved identity as well as
+        // by the raw node, and narrow every consistent entry.
+        let node_root = self.resolve_binding(node);
+        let mut targets: SmallVec<[TypeId; 4]> = SmallVec::new();
+        for (key, set) in self.gadt.current_entries() {
+            if (key == node || self.resolve_binding(key) == node_root)
+                && set.iter().any(|&e| self.ambivalent_equal(t, e))
+            {
+                targets.push(key);
+            }
+        }
+        for key in targets {
+            self.gadt.narrow_current(key, t);
+        }
+    }
+
+    /// Read-only structural equivalence (registry-aware resolution, never
+    /// writes a binding) — Definition 1's θ([[]]) equivalence.  Neither
+    /// entailment nor the narrowing check may mutate inference state.
+    fn ambivalent_equal(&self, a: TypeId, b: TypeId) -> bool {
+        if a == b {
+            return true;
+        }
+        let ra = self.resolve_binding(a);
+        let rb = self.resolve_binding(b);
+        if ra == rb {
+            return true;
+        }
+        match (self.get(ra), self.get(rb)) {
+            (TypeData::Fn { params: p1, ret: r1 }, TypeData::Fn { params: p2, ret: r2 }) => {
+                p1.len() == p2.len()
+                    && p1.iter().zip(p2.iter()).all(|(x, y)| self.ambivalent_equal(*x, *y))
+                    && self.ambivalent_equal(*r1, *r2)
+            }
+            (
+                TypeData::Adt {
+                    def_id: d1,
+                    args: a1,
+                    ..
+                },
+                TypeData::Adt {
+                    def_id: d2,
+                    args: a2,
+                    ..
+                },
+            ) => {
+                d1 == d2
+                    && a1.len() == a2.len()
+                    && a1.iter().zip(a2.iter()).all(|(x, y)| self.ambivalent_equal(*x, *y))
+            }
+            (TypeData::Tuple { elems: e1 }, TypeData::Tuple { elems: e2 }) => {
+                e1.len() == e2.len()
+                    && e1.iter().zip(e2.iter()).all(|(x, y)| self.ambivalent_equal(*x, *y))
+            }
+            _ => false,
+        }
+    }
+
+    /// Definition 1 (entailment), restricted to the exit window:
+    /// Γ ⊨ ψ ⟺ for every ground θ satisfying Γ, θ([[ψ]]) is a singleton.
+    /// Algorithm (§3.3): compute Γ's MGU θ; the entailment holds when
+    /// θ([[ψ]]) is a singleton or θ does not exist.  Here Γ is the set of
+    /// equations outside `floor`, and θ is registry-aware resolution under
+    /// the entailment floor, compared with the read-only
+    /// [`TypeContext::ambivalent_equal`].
+    fn entailed_outside(&self, floor: usize, set: &[TypeId]) -> bool {
+        if set.len() <= 1 {
+            return true;
+        }
+        // MGU existence: every enclosing equation must be satisfied by the
+        // enclosing refinement view.  A failure means Γ is inconsistent, so
+        // the program point is unreachable and ANY ψ is entailed (§3.3:
+        // "any ambivalent type is admissible in an inconsistent context").
+        for (from, to) in self.gadt.equations_below(floor) {
+            if !self.ambivalent_equal_floor(from, to, floor) {
+                return true;
+            }
+        }
+        // θ([[ψ]]) is a singleton: all elements are equal under the outer
+        // view.
+        let first = set[0];
+        set[1..]
+            .iter()
+            .all(|&t| self.ambivalent_equal_floor(first, t, floor))
+    }
+
+    fn ambivalent_equal_floor(&self, a: TypeId, b: TypeId, floor: usize) -> bool {
+        let prev = self
+            .gadt
+            .entailment_floor
+            .swap(floor, AtomicOrdering::Relaxed);
+        let r = self.ambivalent_equal(a, b);
+        self.gadt
+            .entailment_floor
+            .store(prev, AtomicOrdering::Relaxed);
+        r
+    }
+
+    /// M-USE branch boundary (Fig. 3): the branch result ζ₂ must be
+    /// well-formed in Γ WITHOUT this arm's equations.  Walk the escaping
+    /// type; every node whose ambivalent set has more than one element must
+    /// be entailed by the equations OUTSIDE the arm (Definition 1).  A
+    /// violation is the paper's ambiguity: "an ambivalent type becomes
+    /// incoherent by escaping the scope of an equation it depends on" (§2).
+    pub fn check_gadt_arm_escape(&self, result: TypeId) -> Result<(), AmbiguityError> {
+        let depth = self.gadt.arm_depth.load(AtomicOrdering::Relaxed);
+        if depth == 0 {
+            return Ok(());
+        }
+        // The current arm is the LAST pushed frame (index depth − 1); M-USE
+        // asks ζ₂ to be well-formed in Γ WITHOUT this arm's equations, so the
+        // entailment window is everything strictly outer: indices < depth−1.
+        let floor = depth - 1;
+        let mut visited: HashSet<TypeId> = HashSet::default();
+        let mut stack = vec![result];
+        while let Some(n) = stack.pop() {
+            if !visited.insert(n) {
+                continue;
+            }
+            // The set may be recorded on the raw widened label or on its root —
+            // check both.
+            for cand in [n, self.resolve_binding(n)] {
+                if let Some(set) = self.gadt.set_of_current(cand) {
+                    if set.len() > 1 && !self.entailed_outside(floor, &set) {
+                        return Err(AmbiguityError {
+                            node: cand,
+                            set: set.to_vec(),
+                        });
+                    }
+                }
+            }
+            let r = self.resolve_binding(n);
+            visit_type_children(r, self, &mut |c| stack.push(c));
+        }
+        Ok(())
+    }
+
+    /// Checked arm exit (the faithful M-USE form).  Plain
+    /// [`TypeContext::pop_gadt_arm`] remains for scopes that check the result
+    /// type themselves.
+    ///
+    /// The arm is popped on BOTH outcomes: a rejection must not leave the
+    /// ledger/fact frames behind (an early return from the arm would leak
+    /// them into the enclosing scope).  On success the remaining sets are
+    /// entailed by the enclosing context, so discarding them is the paper's
+    /// translation step (§4 type soundness).
+    pub fn pop_gadt_arm_checked(&self, result: TypeId) -> Result<(), AmbiguityError> {
+        let checked = self.check_gadt_arm_escape(result);
+        self.pop_gadt_arm();
+        checked
     }
 
     /// Explicit witness-solving API (GHC-style coercion / OCaml GADT

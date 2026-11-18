@@ -139,13 +139,11 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         scrut_ty: TypeId,
         pattern: &crate::ast::Pattern<'input>,
         span: crate::ast::Span,
-        scrut_rigid: bool,
-        body: impl FnOnce(&mut Self, bool) -> Result<T, Diagnostic<'src>>,
+        body: impl FnOnce(&mut Self, bool) -> Result<(T, TypeId), Diagnostic<'src>>,
     ) -> Result<(HirPattern<'input>, T, bool, bool), Diagnostic<'src>> {
         let _scope = self.checker.enter_var_scope();
         let (p, variant_reachable, gadt_reachable, mut guard) =
-            self.checker
-                .begin_gadt_arm(scrut_ty, pattern, span, scrut_rigid)?;
+            self.checker.begin_gadt_arm(scrut_ty, pattern, span)?;
 
         // Apply θ(Γ) — eagerly refine the variable environment.
         let _refinement_guard = if gadt_reachable {
@@ -154,19 +152,39 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             None
         };
 
-        // Pop the arm's equalities BEFORE the caller continues (cross-arm
-        // unification / else-branch) so this arm's facts do not leak.
-        // Must run on ALL exit paths (including Err from body) so the
-        // GADT fact stack stays balanced regardless of how we exit.
+        // Run the arm body, then check the escaping result type while the
+        // arm's facts and ambivalent ledger are still live: M-USE (Fig. 3)
+        // requires ζ₂ to be well-formed in Γ WITHOUT this arm's equations.
+        // The frames are popped on EVERY path so they stay balanced.
         let body_result = body(self, gadt_reachable);
+        let checked = if gadt_reachable {
+            match &body_result {
+                Ok((_, ty)) => self.checker.ctx.check_gadt_arm_escape(*ty),
+                Err(_) => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
         if gadt_reachable {
             self.checker.ctx.pop_gadt_arm();
+        }
+        if let Err(ambiguity) = checked {
+            // §2: "an ambiguity arises only when an ambivalent type becomes
+            // incoherent by escaping the scope of an equation it depends on".
+            self.checker.diagnostics.push(
+                Diagnostic::error(format!(
+                    "ambiguous GADT branch: an ambivalent type escapes the scope of an \
+                     equation it depends on ({} candidate types)",
+                    ambiguity.set.len()
+                ))
+                .with_span(span),
+            );
         }
         // Restore the TcLevel region entered by the arm guard (sets the
         // flag so the guard's Drop does not restore a second time).
         guard.restore_region();
         match body_result {
-            Ok(t) => Ok((p, t, variant_reachable, gadt_reachable)),
+            Ok((t, _)) => Ok((p, t, variant_reachable, gadt_reachable)),
             Err(e) => Err(e),
         }
     }
@@ -1537,10 +1555,9 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             .checker
             .lookup_type_binding(self.checker.ctx.resolve_binding(scrut_ty))
             .map_or(false, |b| b.variants.iter().any(|v| v.is_gadt()));
-        // SCR gate (PLDI'06 §4.2 / §5.1): refinement applies only when the
-        // scrutinee's type is RIGID (user-annotated).  A wobbly (inferred)
-        // scrutinee keeps the status-quo cross-arm accumulation.
-        let scrut_rigid = self.scrut_is_rigid(scrutinee);
+        // No SCR (rigidity) gate: M-USE has no rigidity premise, so the
+        // refinement lifecycle below runs for every scrutinee; ambiguity is
+        // detected at the branch exit.
         for arm in *arms {
             // GADT refinements are scoped to each arm via the
             // equality registry (see push_gadt_arm).
@@ -1560,7 +1577,6 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 scrut_ty,
                 &arm.pattern,
                 *span,
-                scrut_rigid,
                 |fctx, gadt_reachable| {
                     // Always type-check the guard and body, regardless of
                     // reachability, to ensure consistent diagnostics across
@@ -1601,8 +1617,49 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     // Resolve the body type — follows bindings to the
                     // concrete type where available (normal resolution,
                     // no longer a GADT-specific capture hack).
-                    let arm_body_ty = fctx.checker.ctx.resolve_binding(body_ty);
-                    Ok((guard_hir, body_hir, arm_body_ty, this_arm_discharged))
+                    // M-USE: impose the match's expected type on the arm result WHILE
+                    // this arm's equations are live, so an equation the result
+                    // consumes is recorded as a fresh ambivalent label the exit
+                    // check can see (the paper's g).  A mismatch is reported by
+                    // the per-arm check below, which stays the single
+                    // diagnostic site; on error keep the plain resolved type.
+                    // M-USE (strict ambivalent semantics): impose the match's expected type
+                    // on the arm result WHILE this arm's equations are live, so
+                    // an equation the result consumes becomes a widened label
+                    // the arm-exit check can see (the paper's g).  The match's
+                    // own expectation is applied later by the enclosing
+                    // `return`/binding check, so fall back to the function's
+                    // declared return type.
+                    let arm_expected = expected.or(fctx.checker.current_return_type);
+                    let arm_body_ty = match (gadt_reachable && scrut_is_gadt, arm_expected) {
+                        (true, Some(exp)) => match fctx
+                            .checker
+                            .ctx
+                            .unify_ambivalent(body_ty, exp)
+                        {
+                            Ok(ty) => {
+                                // M-ANN (§3.5): an explicit annotation on
+                                // the arm result may DECREASE the widened set
+                                // to the annotated view — the paper's g1/g2.
+                                // Note the source form: a literal's own
+                                // `:` binds to the literal (`y + (1 : A)`), so
+                                // the whole-result annotation must be written
+                                // with an extra pair of parentheses
+                                // (`((y + 1) : A)`) — exactly how the paper's
+                                // g1 is intended.
+                                if matches!(&arm.body, Expr::TypeAnnotated { .. }) {
+                                    fctx.checker.ctx.narrow_ambivalent(ty, exp);
+                                }
+                                ty
+                            }
+                            Err(_) => fctx.checker.ctx.resolve_binding(body_ty),
+                        },
+                        _ => fctx.checker.ctx.resolve_binding(body_ty),
+                    };
+                    Ok((
+                        (guard_hir, body_hir, arm_body_ty, this_arm_discharged),
+                        arm_body_ty,
+                    ))
                 },
             )?;
             // Cross-arm unification intentionally runs with TcLevel
@@ -2732,8 +2789,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
             .checker
             .lookup_type_binding(self.checker.ctx.resolve_binding(scrut_ty))
             .map_or(false, |b| b.variants.iter().any(|v| v.is_gadt()));
-        // SCR gate: refinement applies only to a rigid (annotated) scrutinee.
-        let scrut_rigid = self.scrut_is_rigid(scrutinee);
+        // No SCR (rigidity) gate: M-USE has no rigidity premise; ambiguity
+        // is detected at the branch exit instead.
         let mut gadt_discharged = false;
         // Enter scope so the pattern binding is scoped to the then-branch
         // (lifecycle encapsulated in `with_gadt_arm`).
@@ -2742,7 +2799,6 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 scrut_ty,
                 pattern,
                 *span,
-                scrut_rigid,
                 |fctx, gadt_reachable| {
                     let t = fctx.check_block(then_branch)?;
                     // Seal: in-scope discharge BEFORE pop (facts visible).
@@ -2766,7 +2822,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     // GADT-specific hack — the bindings persist because we
                     // no longer roll back after each arm).
                     let ty = fctx.checker.ctx.resolve_binding(fctx.block_type(&t));
-                    Ok((t, ty))
+                    Ok(((t, ty), ty))
                 },
             )?;
             (p, t, ty, gadt_reachable)
@@ -3002,6 +3058,12 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 let expected = self.resolve_type(ty)?;
                 let hir =
                     self.check_expr(expr, Expectation::HasType(expected), TypingContext::None)?;
+                // M-ANN (§3.5): an explicit annotation is allowed to DECREASE
+                // the expression's ambivalent set to the singleton outer view
+                // {expected} — "sound to decrease them explicitly, using a
+                // type annotation".  No-op outside a GADT arm or when the
+                // node was never widened.
+                self.checker.ctx.narrow_ambivalent(expected, expected);
                 Ok((
                     HirExpr::TypeAnnotated {
                         expr: Box::new(hir),
@@ -3708,8 +3770,26 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 let then_diverges = self.block_diverges(&then_hir);
                 let else_diverges = else_hir.as_ref().is_some_and(|h| self.block_diverges(h));
                 let both_diverge = then_diverges && else_diverges;
+                let mut merge_label: Option<TypeId> = None;
                 if *is_expression && !then_diverges && !else_diverges {
-                    self.unify(then_ty, else_ty, *span)?;
+                    // Branch-result convergence is the ONE merge whose product
+                    // becomes the expression's type, so inside a GADT arm it
+                    // must go through the ambivalent entry: an equation the
+                    // result consumes mints a widened label the arm-exit check
+                    // can see (the paper's g).  Outside an arm the two entries
+                    // are identical.
+                    if self.checker.ctx.in_gadt_arm() {
+                        match self
+                            .checker
+                            .ctx
+                            .unify_ambivalent_tracked(then_ty, else_ty, *span)
+                        {
+                            Ok(ty) => merge_label = Some(ty),
+                            Err(_) => self.unify(then_ty, else_ty, *span)?,
+                        }
+                    } else {
+                        self.unify(then_ty, else_ty, *span)?;
+                    }
                 }
                 let result_ty = if *is_expression {
                     if then_diverges {
@@ -3717,7 +3797,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     } else if else_diverges {
                         then_ty
                     } else {
-                        then_ty
+                        merge_label.unwrap_or(then_ty)
                     }
                 } else if both_diverge {
                     self.checker.ctx.never()

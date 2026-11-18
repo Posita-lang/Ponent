@@ -669,19 +669,31 @@ pub enum AdtKind {
     Enum,
 }
 
-/// Rigidity of a type variable, distinguishing user-specified (rigid) types
-/// from inferred (wobbly) types (Peyton Jones et al. PLDI'06 §2).
+/// Provenance of a type variable: user-specified (rigid) vs inferred
+/// (wobbly) (Peyton Jones et al., PLDI'06 §2).
 ///
-/// In GADT type inference, type refinement applies only to *rigid* types —
-/// those explicitly specified by the user in annotations, signatures, or
-/// `when` constraints.  *Wobbly* types (created by the inference engine)
-/// are never refined by GADT equalities, preventing unsound refinement of
-/// inferred types that the programmer did not commit to.
+/// HISTORICAL ROLE — superseded as a GADT-refinement decision: this enum used
+/// to gate GADT pattern refinement (only `Rigid` variables were refined),
+/// which rejected every branch in which an engine-created variable flows
+/// through the arm equation — too conservative (all of f, f1, f2 and g1 in
+/// the comparison table of Garrigue & Rémy, APLAS 2013, p.14 are rejected by
+/// it).
+///
+/// The gate is replaced by the ambivalent discipline (`types::gadt`):
+/// refinement is open to EVERY variable — the equation enters the branch
+/// context (M-USE), and a unification that consumes it widens the node's
+/// ambivalent set ψ; the ambiguity boundary moves from "which variables
+/// exist" to the branch exit — an escaping node's ψ that the enclosing
+/// equations do not entail is rejected.  That is what restores the principal
+/// type AND monotonicity (paper §4).
+///
+/// The enum is kept as provenance metadata (diagnostics; OmniML's
+/// scheme-formation escape check tests rigidity directly on `TypeData` and
+/// never queries this enum).
 ///
 /// # Examples
 /// - A user-written `fn foo(x: Int<32>)` declares `x`'s type as **Rigid**.
 /// - An inferred type variable `?a` created by the engine is **Wobbly**.
-/// - A GADT `when T == Int<32>` constraint refines `T` only if `T` is rigid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rigidity {
     /// The type was explicitly specified by the user (annotation, signature,

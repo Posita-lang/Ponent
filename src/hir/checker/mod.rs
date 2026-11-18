@@ -3050,16 +3050,14 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 span,
             } => {
                 let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee, None)?;
-                let scrut_rigid = {
-                    let mut fc = FnCtxt::new(self);
-                    fc.scrut_is_rigid(scrutinee)
-                };
                 // Shared GADT arm lifecycle (enter/pop/region-restore
                 // encapsulated in `with_gadt_arm` — same sequence as the
                 // other three pattern-matching sites).
                 let (pattern_hir, then_hir, _variant_reachable, _gadt_reachable) = self
-                    .with_gadt_arm(scrut_ty, pattern, *span, scrut_rigid, |ck, _| {
-                        ck.check_block(then_branch)
+                    .with_gadt_arm(scrut_ty, pattern, *span, |ck, _| {
+                        let block = ck.check_block(then_branch)?;
+                        let ty = ck.block_type(&block);
+                        Ok((block, ty))
                     })?;
                 let else_hir = if let Some(else_branch) = else_branch {
                     Some(self.check_block(else_branch)?)
@@ -3134,10 +3132,6 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 span,
             } => {
                 let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee, None)?;
-                let scrut_rigid = {
-                    let mut fc = FnCtxt::new(self);
-                    fc.scrut_is_rigid(scrutinee)
-                };
                 // Shared GADT arm lifecycle (enter/pop/region-restore
                 // encapsulated in `with_gadt_arm` — same sequence as the
                 // other three pattern-matching sites).
@@ -3146,7 +3140,7 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     (inv_hir, dec_hir, body_hir),
                     _variant_reachable,
                     _gadt_reachable,
-                ) = self.with_gadt_arm(scrut_ty, pattern, *span, scrut_rigid, |ck, _| {
+                ) = self.with_gadt_arm(scrut_ty, pattern, *span, |ck, _| {
                     let inv_hir = invariant
                         .as_ref()
                         .map(|inv| ck.infer_expr(inv, None).map(|(h, _)| h))
@@ -3162,7 +3156,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     );
                     let body_hir = ck.check_block(body)?;
                     ck.pop_ctx();
-                    Ok((inv_hir, dec_hir, body_hir))
+                    let ty = ck.block_type(&body_hir);
+                    Ok(((inv_hir, dec_hir, body_hir), ty))
                 })?;
                 Ok(HirStmt::WhileLet {
                     label: *label,
@@ -9364,6 +9359,20 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             let Some(actual) = args.get(i).copied() else {
                 continue;
             };
+            // A rigid/inference variable on the scrutinee side is NOT a
+            // concrete conflict: the arm's own `when` equation is exactly
+            // what refines it (M-USE, Fig. 3).  Deciding reachability with a
+            // probe that does not assume that equation would report EVERY
+            // generic scrutinee as unreachable — which skipped refinement for
+            // the entire generic-GADT case (`g` in Garrigue & Rémy, APLAS
+            // 2013, p.14) before this branch existed.
+            let actual_resolved = self.ctx.resolve_binding(actual);
+            if matches!(
+                self.ctx.get(actual_resolved),
+                TypeData::GenericParam { .. } | TypeData::InferVar { .. }
+            ) {
+                continue;
+            }
             // If the constraint type cannot be resolved, treat the variant
             // as SATISFIED (reachable) — the SAFE direction for
             // exhaustiveness: requiring the user to handle a variant is
@@ -9515,7 +9524,6 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         scrut_ty: TypeId,
         pattern: &crate::ast::Pattern<'input>,
         span: crate::ast::Span,
-        scrut_rigid: bool,
     ) -> Result<(HirPattern<'input>, bool, bool, GadtArmGuard<'input>), Diagnostic<'src>> {
         // Record the existential-frame depth BEFORE this arm's frames are
         // pushed — outer arms' witnesses must survive nested arms, and the
@@ -9559,13 +9567,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                 .with_span(span),
             );
         }
-        // SCR gate (PLDI'06 §4.2 / §5.1): GADT refinement — registering
-        // `when` equalities, pushing the arm frame, refining the
-        // environment — applies only to RIGID (user-annotated) scrutinees.
-        // A wobbly (inferred) scrutinee keeps the status-quo cross-arm
-        // accumulation; the variant may still be structurally unreachable
-        // (for warnings), but no GADT facts are registered.
-        let gadt_reachable = variant_reachable && scrut_rigid;
+        // No SCR (rigidity) gate: M-USE (Fig. 3) has no rigidity premise, so
+        // refinement is open to every variable.  Ambiguity is detected at the
+        // branch exit (`check_gadt_arm_escape`, Garrigue & Rémy APLAS 2013
+        // §2) instead of by refusing to refine inferred scrutinees — wobbly
+        // types are too conservative: the paper's f/f1/f2/g1 are all
+        // rejected by that gate.
+        let gadt_reachable = variant_reachable;
         // Save depth BEFORE push so the guard can pop on early return.
         let saved_depth = self.ctx.gadt.arm_depth.load(AtomicOrdering::Relaxed);
         if gadt_reachable {
@@ -9591,12 +9599,11 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         scrut_ty: TypeId,
         pattern: &crate::ast::Pattern<'input>,
         span: crate::ast::Span,
-        scrut_rigid: bool,
-        body: impl FnOnce(&mut Self, bool) -> Result<T, Diagnostic<'src>>,
+        body: impl FnOnce(&mut Self, bool) -> Result<(T, TypeId), Diagnostic<'src>>,
     ) -> Result<(HirPattern<'input>, T, bool, bool), Diagnostic<'src>> {
         let _scope = self.enter_var_scope();
         let (p, variant_reachable, gadt_reachable, mut guard) =
-            self.begin_gadt_arm(scrut_ty, pattern, span, scrut_rigid)?;
+            self.begin_gadt_arm(scrut_ty, pattern, span)?;
 
         // Apply θ(Γ) — eagerly refine the variable environment.
         // The guard pops the refinement frame on drop (even on early return).
@@ -9606,19 +9613,39 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             None
         };
 
-        // Pop the arm's equalities BEFORE the caller continues (cross-arm
-        // unification / else-branch) so this arm's facts do not leak.
-        // Must run on ALL exit paths (including Err from body) so the
-        // GADT fact stack stays balanced regardless of how we exit.
+        // Run the arm body, then check the escaping result type while the
+        // arm's facts and ambivalent ledger are still live: M-USE (Fig. 3)
+        // requires ζ₂ to be well-formed in Γ WITHOUT this arm's equations.
+        // The frames are popped on EVERY path so they stay balanced.
         let body_result = body(self, gadt_reachable);
+        let checked = if gadt_reachable {
+            match &body_result {
+                Ok((_, ty)) => self.ctx.check_gadt_arm_escape(*ty),
+                Err(_) => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
         if gadt_reachable {
             self.ctx.pop_gadt_arm();
+        }
+        if let Err(ambiguity) = checked {
+            // §2: "an ambiguity arises only when an ambivalent type becomes
+            // incoherent by escaping the scope of an equation it depends on".
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "ambiguous GADT branch: an ambivalent type escapes the scope of an \
+                     equation it depends on ({} candidate types)",
+                    ambiguity.set.len()
+                ))
+                .with_span(span),
+            );
         }
         // Restore the TcLevel region entered by the arm guard (sets the
         // flag so the guard's Drop does not restore a second time).
         guard.restore_region();
         match body_result {
-            Ok(t) => Ok((p, t, variant_reachable, gadt_reachable)),
+            Ok((t, _)) => Ok((p, t, variant_reachable, gadt_reachable)),
             Err(e) => Err(e),
         }
     }
@@ -9626,10 +9653,12 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
     /// Apply the current GADT arm's refinement θ to the variable
     /// environment Γ (Peyton Jones et al. PLDI'06, PCON-R: θ(Γ)).
     ///
-    /// For every RIGID binding in scope, resolve the binding's type
-    /// through the GADT fact registry. If the type changes, push a
-    /// new scope frame containing the refined binding. Wobbly bindings
-    /// are left untouched (θ𝓌(σ) = σ).
+    /// Every binding in scope is refined: M-USE (Fig. 3) has no rigidity
+    /// premise, so a binding whose type resolves through the GADT registry
+    /// is replaced in a new scope frame.  The binding's provenance
+    /// (`Rigidity`) is preserved verbatim — it is metadata now, not a gate.
+    /// Whether the refined type may ESCAPE is decided at the branch exit
+    /// (`check_gadt_arm_escape`), not here.
     ///
     /// Returns a `GadtRefinementGuard` that pops the frame on drop.
     /// If no bindings are refined, the guard is a no-op.
@@ -9639,22 +9668,19 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         let mut refined: Vec<(Symbol, TypeId, crate::hir::types::Rigidity, bool)> = Vec::new();
 
         for (name, ty) in all_bindings {
-            let rigidity = self.local_variable_types.get_rigidity(name);
-            if !matches!(rigidity, Some(crate::hir::types::Rigidity::Rigid)) {
+            // No rigidity filter: refinement applies to EVERY variable
+            // (M-USE has no rigidity premise).  The binding's provenance is
+            // preserved verbatim in the refined frame.
+            let Some(rigidity) = self.local_variable_types.get_rigidity(name) else {
                 continue;
-            }
+            };
             let refined_ty = self.ctx.resolve_binding(ty);
             if refined_ty != ty {
                 // GADT refinement changes the type but must NOT change the
                 // binding's mutability: a `set mut x` stays assignable in the
                 // refined frame, and an immutable binding stays frozen.
                 let mutable = self.local_variable_types.is_mutable(name).unwrap_or(false);
-                refined.push((
-                    name,
-                    refined_ty,
-                    crate::hir::types::Rigidity::Rigid,
-                    mutable,
-                ));
+                refined.push((name, refined_ty, rigidity, mutable));
             }
         }
 

@@ -30,6 +30,43 @@ pub(crate) enum GadtFact {
     ExistentialEquation { lhs: TypeId, rhs: TypeId },
 }
 
+// ══ Ambivalent types — the GADT solving core ═══════════════════════════
+// (Garrigue & Rémy, "Ambivalent types for principal type inference with
+// GADTs," APLAS 2013, LNCS 8301 pp.257–272; HAL hal-00914560)
+//
+// Replaces the PLDI'06 Rigid/Wobbly gate (the historical role of
+// `data.rs::Rigidity`):
+//  • M-USE (Fig. 3) has NO rigidity premise — the equation τ₁≐τ₂ enters the
+//    branch context, and any variable may be unified through it;
+//  • a node's ambivalent set ψ (§3.1, ζ ::= ψ^α) widens only when
+//    unification actually CONSUMES an equation, and the widening lands on a
+//    FRESH label (f's `1:int` stays a singleton — §2: "nothing forces us to
+//    use this equation");
+//  • the ambiguity boundary is the branch EXIT: an escaping node's ψ must be
+//    entailed by the enclosing equations (Definition 1 plus M-USE's
+//    well-formedness requirement on ζ₂), otherwise the arm is rejected —
+//    restoring principality and monotonicity (§4).
+//
+// Ambivalence is pure metadata (a per-node ledger keyed by TypeId) and never
+// enters `TypeData`, so the Yoneda pipeline and the OmniML solver only ever
+// see ordinary types; the ledger frame is discarded with the arm (§4:
+// "ambivalent types … are dropped during the translation").
+/// Per-arm ledger: node label → the raw type set ψ assumed interchangeable
+/// at that node (§3.1).
+pub(crate) type AmbivalentLedger = HashMap<TypeId, SmallVec<[TypeId; 4]>>;
+
+/// Branch-exit rejection: an ambivalent type escaped the scope of an
+/// equation it depends on — §2: "an ambiguity arises only when an ambivalent
+/// type becomes incoherent by escaping the scope of an equation it depends
+/// on".  The checker renders it as an ambiguity diagnostic at the match span.
+#[derive(Debug, Clone)]
+pub struct AmbiguityError {
+    /// The escaping node (a widened ambivalent label).
+    pub node: TypeId,
+    /// ψ — the elements that cannot be proved equal outside the branch.
+    pub set: Vec<TypeId>,
+}
+
 /// One existential scope frame: the variant it was created for (identified
 /// by enum DefId AND variant name — occurrence identity) and the skolems
 /// allocated for that variant, indexed by binder position in
@@ -116,6 +153,17 @@ pub(crate) struct GadtContext<'input> {
     pub(crate) exist_skolems: RwLock<Vec<ExistScopeFrame>>,
     /// Inner GADT `when` equalities collected before `push_gadt_arm`.
     pub(crate) pending_eqs: Vec<PendingInnerGadtEq<'input>>,
+    /// Per-arm ambivalent ledgers (§3.1), frame i ↔ arm depth i.  `exit_arm`
+    /// drops the frame: after the exit check the remaining sets are entailed
+    /// by the enclosing context, so discarding them is the paper's
+    /// translation step (§4: "ambivalent types … are dropped during the
+    /// translation").
+    pub(crate) ambivalent: RwLock<Vec<AmbivalentLedger>>,
+    /// Exit-entailment window: arms with index ≥ floor are invisible to
+    /// `resolve_gadt_eq`, so the coherence check resolves under the enclosing
+    /// equations (M-USE's Γ, not Γ, τ₁ ≐ τ₂).  `usize::MAX` = no suppression
+    /// (the default).
+    pub(crate) entailment_floor: AtomicUsize,
 }
 
 impl<'input> GadtContext<'input> {
@@ -126,6 +174,8 @@ impl<'input> GadtContext<'input> {
             param_refinements: RwLock::new(Vec::new()),
             exist_skolems: RwLock::new(Vec::new()),
             pending_eqs: Vec::new(),
+            ambivalent: RwLock::new(Vec::new()),
+            entailment_floor: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -133,6 +183,9 @@ impl<'input> GadtContext<'input> {
     pub(crate) fn enter_arm(&self) {
         self.facts.write().push(Vec::new());
         self.param_refinements.write().push(HashMap::default());
+        // Push the arm's ambivalent ledger in lockstep with the fact stack
+        // (§3.1: ambivalence is per-arm state, dropped at the arm boundary).
+        self.ambivalent.write().push(AmbivalentLedger::default());
         self.arm_depth.store(
             self.arm_depth.load(AtomicOrdering::Relaxed) + 1,
             AtomicOrdering::Relaxed,
@@ -148,6 +201,12 @@ impl<'input> GadtContext<'input> {
     pub(crate) fn exit_arm(&self) {
         self.facts.write().pop();
         self.param_refinements.write().pop();
+        // Drop the arm's ambivalent ledger (§4: the sets are entailed by the
+        // enclosing equations at this point, so discarding them is the
+        // paper's translation step, not a loss of information).
+        self.ambivalent.write().pop();
+        self.entailment_floor
+            .store(usize::MAX, AtomicOrdering::Relaxed);
         let d = self.arm_depth.load(AtomicOrdering::Relaxed);
         self.arm_depth
             .store(d.saturating_sub(1), AtomicOrdering::Relaxed);
@@ -184,5 +243,66 @@ impl<'input> GadtContext<'input> {
     /// Take the collected inner `when` equalities (clearing the queue).
     pub(crate) fn take_pending_eqs(&mut self) -> Vec<PendingInnerGadtEq<'input>> {
         std::mem::take(&mut self.pending_eqs)
+    }
+
+    /// ψ(node) in the current arm (`None` ⇒ the implicit singleton `{node}`,
+/// §3.1's `{t}^t`).  Read-only: the ledger is pure metadata, so a query never
+    /// mutates inference state.
+    pub(crate) fn set_of_current(&self, node: TypeId) -> Option<SmallVec<[TypeId; 4]>> {
+        self.ambivalent
+            .read()
+            .last()
+            .and_then(|l| l.get(&node).cloned())
+    }
+
+    /// Record ψ for `node` in the current arm.  The caller enforces
+    /// WF-TYPE-AMBIVALENT's |ψ \\ Vr| ≤ 1 (Fig. 1); see
+    /// `TypeContext::mint_widened_label`.
+    pub(crate) fn widen_current(&self, node: TypeId, set: SmallVec<[TypeId; 4]>) {
+        if let Some(l) = self.ambivalent.write().last_mut() {
+            l.insert(node, set);
+        }
+    }
+
+    /// M-ANN (§3.5: "sound to decrease them explicitly, using a type
+    /// annotation"): replace ψ(node) with the singleton {τ}.
+    pub(crate) fn narrow_current(&self, node: TypeId, tau: TypeId) {
+        if let Some(l) = self.ambivalent.write().last_mut() {
+            if l.contains_key(&node) {
+                l.insert(node, smallvec::smallvec![tau]);
+            }
+        }
+    }
+
+    /// Snapshot of the current arm's ledger entries.  A widened set lives on a
+    /// fresh label β with `β → root`, so callers that know only the resolved
+    /// type (e.g. M-ANN's annotation type) must scan the (tiny) frame to find
+    /// the label; see `TypeContext::narrow_ambivalent`.
+    pub(crate) fn current_entries(&self) -> Vec<(TypeId, SmallVec<[TypeId; 4]>)> {
+        self.ambivalent
+            .read()
+            .last()
+            .map(|l| l.iter().map(|(&k, v)| (k, v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Equation pairs of every arm with index < floor — the enclosing
+    /// context Γ at exit depth `floor`.  Existential equations are inert and
+    /// never participate (opacity preserved).
+    ///
+    /// The read guard is dropped before returning, so callers may re-enter
+    /// `resolve_gadt_eq` (which takes the same lock) without nesting reads.
+    pub(crate) fn equations_below(&self, floor: usize) -> Vec<(TypeId, TypeId)> {
+        let refs = self.param_refinements.read();
+        let mut out = Vec::new();
+        for (i, map) in refs.iter().enumerate() {
+            if i >= floor {
+                break;
+            }
+            for (&f, &t) in map.iter() {
+                out.push((f, t));
+            }
+        }
+        out
     }
 }

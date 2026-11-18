@@ -19,6 +19,22 @@ impl<'input> TypeContext<'input> {
         r
     }
 
+    /// Ambivalent-aware counterpart of [`Self::unify_tracked`] for callers that
+    /// need the merged TypeId (a branch-result convergence can mint a widened
+    /// label the arm-exit check must see).  Outside an arm it is exactly
+    /// `unify_tracked`.
+    pub(crate) fn unify_ambivalent_tracked(
+        &mut self,
+        a: TypeId,
+        b: TypeId,
+        span: crate::ast::Span,
+    ) -> Result<TypeId, TypeError> {
+        let prev = std::mem::replace(&mut self.current_unify_span, Some(span));
+        let r = self.unify_ambivalent(a, b);
+        self.current_unify_span = prev;
+        r
+    }
+
     #[must_use]
     pub fn unify(&mut self, a: TypeId, b: TypeId) -> Result<TypeId, TypeError> {
         // FIX: binder scope — clear stack at top-level entry.
