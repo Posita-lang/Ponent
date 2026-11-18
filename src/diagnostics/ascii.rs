@@ -39,6 +39,7 @@ fn x86_level_for(len: usize) -> u8 {
     if len < 32 { 0 } else { x86_level() }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn x86_level() -> u8 {
     if swar_forced() {
         return 0;
