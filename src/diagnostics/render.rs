@@ -275,6 +275,12 @@ pub struct RenderCtx<'a> {
     /// Optional cross-worker share of line tables for a parallel batch (see
     /// [`SharedSources`]).  `None` on the serial path.
     shared: Option<Arc<SharedSources>>,
+    /// Content-addressed tables prebuilt for this batch, consulted *before* the
+    /// per-ctx LRU.  The serial path fills it opportunistically once
+    /// `Emitter::file_index_cache` holds content keys: an LSP re-publish is the
+    /// same file in a *new* source allocation, so all three `(ptr, len)` tiers
+    /// miss and the whole file would be rescanned for every publish.
+    prebuilt: Option<&'a [PreloadedSource]>,
 }
 
 impl<'a> RenderCtx<'a> {
@@ -289,6 +295,7 @@ impl<'a> RenderCtx<'a> {
             file_urls: Arc::default(),
             scratch: CtxCell::Owned(RefCell::new(SectionScratch::new())),
             shared: None,
+            prebuilt: None,
         }
     }
 
@@ -312,6 +319,28 @@ impl<'a> RenderCtx<'a> {
             file_urls: Arc::clone(&shared.file_urls),
             scratch: CtxCell::Borrowed(&shared.scratch),
             shared: None,
+            prebuilt: None,
+        }
+    }
+
+    /// [`Self::hoisted`] plus the content-addressed line tables `Emitter`
+    /// prebuilt for this batch (see the `prebuilt` field).  Byte output is
+    /// unaffected: the tables are exactly what `LineIndex::new` would build.
+    pub(crate) fn hoisted_with_prebuilt(
+        opts: &'a DiagOpts,
+        uri: Option<&'a str>,
+        shared: &'a SharedRenderState,
+        prebuilt: &'a [PreloadedSource],
+    ) -> Self {
+        Self {
+            opts,
+            uri,
+            source_index: RefCell::new(SmallVec::new()),
+            line_cache: Some(&shared.line_cache),
+            file_urls: Arc::clone(&shared.file_urls),
+            scratch: CtxCell::Borrowed(&shared.scratch),
+            shared: None,
+            prebuilt: Some(prebuilt),
         }
     }
 
@@ -322,6 +351,30 @@ impl<'a> RenderCtx<'a> {
     pub(crate) fn line_index<'s>(&self, source: &'s str) -> LineIndex<'s> {
         let ptr = source.as_ptr() as usize;
         let len = source.len();
+        // Tier 0: tables prebuilt from the content-addressed cache.  The pair is
+        // exact for this batch — the prebuild recorded the pointer of the very
+        // source string being rendered — so a hit cannot alias another
+        // allocation, and the debug fingerprint check guards the case where the
+        // allocator handed a *previous* batch's address to a new source.
+        if let Some(prebuilt) = self.prebuilt
+            && let Some(e) = prebuilt.iter().find(|e| e.ptr == ptr && e.len == len)
+        {
+            #[cfg(debug_assertions)]
+            if e.fingerprint != 0 {
+                debug_assert_eq!(
+                    e.fingerprint,
+                    source_fingerprint(source),
+                    "(ptr,len) collision — prebuilt line table belongs to a different source"
+                );
+            }
+            return LineIndex::from_shared(
+                source,
+                Arc::clone(&e.starts),
+                e.ascii,
+                Arc::clone(&e.char_prefixes),
+                e.generation,
+            );
+        }
         {
             let mut cache = self.source_index.borrow_mut();
             if let Some(pos) = cache.iter().position(|c| c.ptr == ptr && c.len == len) {

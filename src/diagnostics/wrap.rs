@@ -314,6 +314,14 @@ impl Drop for SharedWrapGuard {
     }
 }
 
+/// Switch the wrap caches to shared mode until the returned guard is dropped.
+///
+/// **Process-global, deliberately**: the counter is a `static AtomicUsize` and
+/// `wrap_shared()` reads it on every thread, so a guard entered on the
+/// *spawning* thread is visible to every worker in the resident pool.  Do not
+/// "fix" this into a thread-local: the parallel render path relies on the
+/// workers seeing it, and the byte-identical serial/parallel contract tests
+/// would then compare two different cache policies.
 pub(crate) fn enter_shared_wrap() -> SharedWrapGuard {
     SHARED_WRAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     SharedWrapGuard

@@ -3712,7 +3712,7 @@ pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
     // tab list (`disp(b) = b + extra_before(b)`, O(ntabs) per endpoint) —
     // O(len) with one compare per byte plus O(intervals) work, versus the
     // branch-heavy per-grapheme walk below.
-    if ascii_class != crate::diagnostics::ascii::AsciiClass::Other {
+    if ascii_class == crate::diagnostics::ascii::AsciiClass::PrintableOrTab {
         // Tab expansion is column-dependent: a tab's stop is computed from
         // the *absolute* cursor column (`content_start_col` + display col of
         // the tab), exactly as `grapheme_width_cached` does for the walk.

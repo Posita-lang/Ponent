@@ -126,8 +126,24 @@ impl Drop for RestoreNonblocking<'_> {
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
-fn enable_tcp_defer_accept(listener: &TcpListener) {
+fn enable_tcp_defer_accept(listener: &TcpListener) -> TcpDeferAcceptGuard {
     use std::os::fd::AsRawFd;
+    let fd = listener.as_raw_fd();
+    // Query first: if the read fails the socket is left alone and the guard
+    // carries no restore token.
+    let mut previous: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&previous) as libc::socklen_t;
+    // SAFETY: `fd` is a live TCP socket; `previous`/`len` describe a valid
+    // `c_int` out-parameter for this option.
+    let queried = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_DEFER_ACCEPT,
+            std::ptr::from_mut(&mut previous).cast(),
+            &mut len,
+        )
+    } == 0;
     let one: libc::c_int = 1;
     // SAFETY: `listener` owns a live TCP socket fd; `one` is a valid
     // `c_int` and its size is exactly the optval length.  The call only
@@ -135,12 +151,52 @@ fn enable_tcp_defer_accept(listener: &TcpListener) {
     // the userspace first-byte budgets remain authoritative.
     unsafe {
         libc::setsockopt(
-            listener.as_raw_fd(),
+            fd,
             libc::IPPROTO_TCP,
             libc::TCP_DEFER_ACCEPT,
             std::ptr::from_ref(&one).cast(),
             std::mem::size_of_val(&one) as libc::socklen_t,
         );
+    }
+    TcpDeferAcceptGuard {
+        fd,
+        previous: queried.then_some(previous),
+    }
+}
+
+/// Restores a caller-owned listener's `TCP_DEFER_ACCEPT` when dropped.
+///
+/// The serving entry points document that they leave the listener as they found
+/// it (see [`RestoreNonblocking`]), and `TCP_DEFER_ACCEPT` was the one socket
+/// option mutated without a matching restore — a caller that reused the
+/// listener inherited a silently changed accept policy.  Best-effort by design:
+/// a failing `setsockopt` during unwinding must never panic, `previous` is
+/// `None` when the option could not be read, and an fd the caller closed early
+/// just makes the restore fail harmlessly.
+#[cfg(all(target_os = "linux", not(test)))]
+struct TcpDeferAcceptGuard {
+    fd: std::os::fd::RawFd,
+    previous: Option<libc::c_int>,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl Drop for TcpDeferAcceptGuard {
+    fn drop(&mut self) {
+        let Some(previous) = self.previous else {
+            return;
+        };
+        // SAFETY: the fd belongs to the caller's listener, which outlives the
+        // call this guard was created in; the payload is the same `c_int` shape
+        // the set call used.
+        unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_DEFER_ACCEPT,
+                std::ptr::from_ref(&previous).cast(),
+                std::mem::size_of_val(&previous) as libc::socklen_t,
+            );
+        }
     }
 }
 
@@ -189,7 +245,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     }
 
     let _nonblocking_guard = RestoreNonblocking::new(listener, true)?;
-    enable_tcp_defer_accept(listener);
+    let _defer_accept = enable_tcp_defer_accept(listener);
 
     let html = std::sync::Arc::<str>::from(build_explain_page(&ec));
     // only a request for this code's page consumes the one-shot server.
@@ -435,6 +491,14 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             if !handoff.is_empty() {
                 for (mut stream, buf, action, head) in handoff.drain(..) {
                     if action == PendingAction::TooLarge {
+                        if !workers.has_capacity() {
+                            // Overload shed: answering here would hold the
+                            // reactor for the client's write timeout, which is
+                            // the stall the worker pool exists to prevent, so
+                            // close instead.
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
                         let handle =
                             std::thread::Builder::new()
                                 .stack_size(64 * 1024)
@@ -450,6 +514,12 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                         if let Ok(handle) = handle {
                             workers.push(handle);
                         }
+                        continue;
+                    }
+                    if !workers.has_capacity() {
+                        // Eight requests already in flight: shed this one
+                        // without blocking the accept loop (see has_capacity).
+                        let _ = stream.shutdown(Shutdown::Both);
                         continue;
                     }
                     let html = std::sync::Arc::clone(&html);
@@ -626,13 +696,27 @@ struct JoinWorkers(Vec<std::thread::JoinHandle<()>>);
 impl JoinWorkers {
     const MAX_WORKERS: usize = 8;
 
+    /// Reap finished workers and report whether one more may be spawned.
+    ///
+    /// The capacity check has to happen *before* `spawn`, not inside `push`: a
+    /// running worker may be draining a request body, writing to a client that
+    /// is not reading, or inside the 150 ms linger, so joining it from the
+    /// reactor thread reintroduces exactly the head-of-line blocking the
+    /// polling loop exists to avoid.  Overload is therefore shed by the caller.
+    ///
+    /// Detaching a finished handle is safe — the thread has already exited.
+    fn has_capacity(&mut self) -> bool {
+        self.0.retain(|h| !h.is_finished());
+        self.0.len() < Self::MAX_WORKERS
+    }
+
+    /// Adopt a freshly spawned worker.  The caller must have taken a slot with
+    /// [`Self::has_capacity`] first, so this never has to join anything.
     fn push(&mut self, handle: std::thread::JoinHandle<()>) {
-        while self.0.len() >= Self::MAX_WORKERS {
-            let Some(oldest) = self.0.drain(..1).next() else {
-                break;
-            };
-            let _ = oldest.join();
-        }
+        debug_assert!(
+            self.0.len() < Self::MAX_WORKERS,
+            "push without a has_capacity slot"
+        );
         self.0.push(handle);
     }
 
@@ -780,6 +864,43 @@ struct HeaderFraming {
     /// H3: `Connection: close` appears anywhere in the complete header block
     /// (case-insensitive, comma-separated token list, multiple occurrences).
     connection_close: bool,
+}
+
+/// Body framing decision, derived once from the header scan.
+///
+/// The three backends used to answer "is the body unframed?" with
+/// `has_transfer_encoding || ambiguous || oversized` and "is there no body?"
+/// with `content_length.map_or(true, |n| n == 0)` independently — exactly the
+/// shape where they can drift apart.  Both questions now have one answer, and
+/// the boolean combinations that implied a fourth state are enumerated instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestBody {
+    /// No body bytes remain to be read.
+    Empty,
+    /// A declared length with `remaining` bytes not yet read.
+    Fixed { remaining: usize },
+    /// Chunked/unsupported transfer coding, conflicting or malformed
+    /// `Content-Length`, or a body over the cap.  Only peer EOF (or the drain
+    /// budget) can complete it, so it must never be treated as reusable.
+    Unframed,
+}
+
+impl HeaderFraming {
+    /// Classify the body given how many body bytes already arrived in the same
+    /// read as the head.
+    fn body(self, already_read: usize) -> RequestBody {
+        if self.has_transfer_encoding || self.ambiguous || self.oversized {
+            return RequestBody::Unframed;
+        }
+        match self
+            .content_length
+            .unwrap_or(0)
+            .saturating_sub(already_read)
+        {
+            0 => RequestBody::Empty,
+            remaining => RequestBody::Fixed { remaining },
+        }
+    }
 }
 
 /// One parsed request head shared between the poll handoff and the worker.
@@ -950,7 +1071,7 @@ fn drain_after_head(
 ) -> DrainOutcome {
     let deadline = Instant::now() + budget;
     let mut sink = [0u8; 4096];
-    if framing.has_transfer_encoding || framing.ambiguous || framing.oversized {
+    if matches!(framing.body(already_read), RequestBody::Unframed) {
         loop {
             if Instant::now() >= deadline {
                 return DrainOutcome::HeadersOnly;
@@ -1131,13 +1252,12 @@ fn drain_request_tracked(
     // Bytes past the terminator arrived in the same read as the headers and
     // count toward the body, then toward a pipelined request.
     let framing = scan_framing(&collected[..head_end]);
-    *wants_close = framing.connection_close
-        || framing.has_transfer_encoding
-        || framing.ambiguous
-        || framing.oversized
-        || framing.content_length.is_some_and(|n| n > 0);
     let already_read = collected.len() - head_end;
-    if framing.has_transfer_encoding || framing.ambiguous || framing.oversized {
+    // Any body at all (declared, chunked, or unframable) means this path cannot
+    // reuse the connection for a following request.
+    *wants_close =
+        framing.connection_close || !matches!(framing.body(already_read), RequestBody::Empty);
+    if matches!(framing.body(already_read), RequestBody::Unframed) {
         // Chunked/unsupported framing, conflicting or malformed
         // `Content-Length`, or a body over the cap: request framing cannot be
         // established, so `Complete` is only safe on peer EOF.  A budget
@@ -1479,7 +1599,13 @@ fn looks_like_http_request(bytes: &[u8]) -> bool {
         return false;
     }
     for (i, &b) in bytes.iter().enumerate() {
-        if b == b' ' {
+        // Same separator class the authoritative parser accepts
+        // (`parse_request_line` splits on ASCII whitespace), so a tab-separated
+        // request line cannot be rejected here and accepted by the persistent
+        // backend.  The prefilter must only ever be *weaker* than the parser,
+        // never stricter.  CR/LF stay excluded: a request line cannot be
+        // newline-terminated before it has a target.
+        if matches!(b, b' ' | b'\t') {
             return i > 0;
         }
         if !is_token_byte(b) {
@@ -1499,6 +1625,13 @@ fn extension_method_probe_is_accepted() {
     assert!(looks_like_http_request(b"REP"));
     assert!(!looks_like_http_request(b"\x16\x03\x01"));
     assert!(!looks_like_http_request(b" GET /"));
+    // Backend parity: the persistent parser splits the request line on ASCII
+    // whitespace, so the prefilter must accept a tab separator too — otherwise
+    // one backend answers and the other rejects before parsing.
+    assert!(looks_like_http_request(b"GET\t/E030\tHTTP/1.1\r\n"));
+    // ... but CR/LF are not separators: a newline before the target means the
+    // request line is malformed, not merely partial.
+    assert!(!looks_like_http_request(b"GET\r"));
 }
 
 #[cfg(test)]
@@ -2263,7 +2396,7 @@ fn serve_explain_persistent_impl(
     // Preserve the caller's listener mode: the Linux reactor flips it to
     // nonblocking below, and the guard restores the original on every return.
     let _restore = RestoreNonblocking::new(listener, false)?;
-    enable_tcp_defer_accept(listener);
+    let _defer_accept = enable_tcp_defer_accept(listener);
     // Thread-per-connection: a slow client (its 500 ms read-timeout path, or
     // one that stalls mid-request) must not delay accepting the browser's
     // other connections.  The shared caches (`explain_page_cached`,
@@ -2514,7 +2647,7 @@ fn serve_explain_persistent_epoll(
     use std::collections::BinaryHeap;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    enable_tcp_defer_accept(listener);
+    let _defer_accept = enable_tcp_defer_accept(listener);
 
     const MAX_EVENTS: usize = 64;
     const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(2);
@@ -2943,13 +3076,23 @@ fn serve_explain_persistent_epoll(
                     if eof {
                         close.push(fd);
                     } else if !conn.buf.is_empty() {
-                        // First byte seen: the header budget starts now and
-                        // is never extended by later reads.
+                        // First byte seen: the header budget starts now and is
+                        // never extended by later reads.  Push the heap entry
+                        // only on that transition: a client dribbling its
+                        // header one byte at a time produces one readiness event
+                        // per byte, and re-pushing the *same* deadline each time
+                        // grew the heap with the number of reads instead of the
+                        // number of connections (the lazy stale sweep stops at
+                        // an entry whose deadline still matches the live one, so
+                        // it cannot discard the duplicates).
+                        let first_byte = conn.header_deadline.is_none();
                         let header_deadline = *conn
                             .header_deadline
                             .get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
                         conn.deadline = header_deadline;
-                        deadline_heap.push(Reverse((header_deadline, fd)));
+                        if first_byte {
+                            deadline_heap.push(Reverse((header_deadline, fd)));
+                        }
                     }
                     continue;
                 };
@@ -2957,16 +3100,10 @@ fn serve_explain_persistent_epoll(
                     let is_head = conn.buf.starts_with(b"HEAD ");
                     let framing = scan_framing(&conn.buf[..head_end]);
                     let already_read = conn.buf.len().saturating_sub(head_end);
-                    conn.body_remaining = if framing.has_transfer_encoding
-                        || framing.ambiguous
-                        || framing.oversized
-                    {
-                        usize::MAX
-                    } else {
-                        framing
-                            .content_length
-                            .unwrap_or(0)
-                            .saturating_sub(already_read)
+                    conn.body_remaining = match framing.body(already_read) {
+                        RequestBody::Unframed => usize::MAX,
+                        RequestBody::Empty => 0,
+                        RequestBody::Fixed { remaining } => remaining,
                     };
                     conn.buf.clear();
                     conn.buf.shrink_to_fit();
@@ -3041,7 +3178,7 @@ fn serve_explain_persistent_epoll(
                 };
                 let already_read = conn.buf.len().saturating_sub(head_end);
                 conn.body_remaining =
-                    if framing.has_transfer_encoding || framing.ambiguous || framing.oversized {
+                    if matches!(framing.body(already_read), RequestBody::Unframed) {
                         usize::MAX
                     } else {
                         framing
@@ -3049,11 +3186,9 @@ fn serve_explain_persistent_epoll(
                             .unwrap_or(0)
                             .saturating_sub(already_read)
                     };
+                let body = framing.body(already_read);
                 let keep = response_allows_keep_alive(response.status)
-                    && !framing.has_transfer_encoding
-                    && !framing.ambiguous
-                    && !framing.oversized
-                    && framing.content_length.map_or(true, |n| n == 0)
+                    && matches!(body, RequestBody::Empty)
                     && !framing.connection_close
                     && http11
                     && conn.buf.len() == head_end;
@@ -3160,7 +3295,18 @@ fn serve_explain_persistent_epoll(
                     served_any = true;
                     last_served = Instant::now();
                     if conn.keep_alive {
-                        conn.buf.drain(..conn.consumed);
+                        // Keep-alive reuse requires the buffer to end exactly at
+                        // the header terminator (no pipelined remainder), so
+                        // `consumed` covers the whole buffer and
+                        // `drain(..consumed)` only shifted nothing.  Assert the
+                        // invariant and clear instead: `clear` keeps the
+                        // allocation without a memmove.
+                        debug_assert_eq!(
+                            conn.consumed,
+                            conn.buf.len(),
+                            "keep-alive reuse with a pipelined remainder would lose bytes"
+                        );
+                        conn.buf.clear();
                         conn.header_scan.reset();
                         conn.response = None;
                         conn.date = None;
@@ -3204,10 +3350,24 @@ fn serve_explain_persistent_epoll(
             }
         }
 
+        // Expiry is driven by the deadline heap, not by a scan of every live
+        // connection: pop entries whose deadline has passed and close the
+        // connection only when the entry still describes its *current*
+        // deadline.  Stale entries (a connection that re-armed since) are
+        // dropped without touching the map, so a wakeup costs
+        // O(expired + stale) instead of O(connections).
+        //
+        // Sound only because every write to `conn.deadline` also pushes a heap
+        // entry (`Conn::arm_deadline`, plus the first-byte header deadline), so
+        // a live deadline is always represented by at least one entry.
         let now = Instant::now();
-        for (fd, conn) in &conns {
-            if now >= conn.deadline {
-                close.push(*fd);
+        while let Some(&Reverse((deadline, fd))) = deadline_heap.peek() {
+            if deadline > now {
+                break;
+            }
+            deadline_heap.pop();
+            if conns.get(&fd).is_some_and(|conn| conn.deadline == deadline) {
+                close.push(fd);
             }
         }
         close.sort_unstable();
@@ -3922,7 +4082,19 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     struct Shard {
         map: rustc_hash::FxHashMap<CompactString, std::sync::Arc<Entry>>,
         ring: std::collections::VecDeque<std::sync::Arc<Entry>>,
+        /// Admission window: keys observed once but not yet cached.  A key must
+        /// be seen twice before it may enter `map`, so a flood of one-hit paths
+        /// (broken links, favicon probes) cannot displace pages that are
+        /// actually requested repeatedly.  Bounded exactly like the map.
+        seen: std::collections::VecDeque<CompactString>,
     }
+    /// Per-shard size of the two-strike admission window.
+    const SEEN_CAP: usize = PER_SHARD_CAP;
+    /// Entries admitted across *all* shards.  The memory bound is global:
+    /// eviction triggers on this counter rather than on a fixed per-shard cap,
+    /// so capacity follows demand under skew instead of a hot shard evicting
+    /// while idle shards hold empty slots.
+    static TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static CACHE: std::sync::OnceLock<Box<[std::sync::Mutex<Shard>]>> = std::sync::OnceLock::new();
     let build = |code: &str| {
         let body = build_not_found_page(code);
@@ -3940,6 +4112,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
                 std::sync::Mutex::new(Shard {
                     map: rustc_hash::FxHashMap::default(),
                     ring: std::collections::VecDeque::new(),
+                    seen: std::collections::VecDeque::new(),
                 })
             })
             .collect::<Vec<_>>()
@@ -3963,7 +4136,33 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         drop(guard);
         return std::sync::Arc::clone(entry.page.get_or_init(|| std::sync::Arc::new(build(code))));
     }
-    if guard.map.len() >= PER_SHARD_CAP {
+    // Two-strike admission (O4).  The first observation records the key in the
+    // bounded window and serves the page *without* caching it; the second
+    // observation admits.  Repeatedly requested paths — the ones a cache
+    // actually helps — therefore survive a flood of unique ones, which under
+    // the previous one-strike policy could cycle the whole ring.
+    let key = CompactString::from(code);
+    let admit = match guard.seen.iter().position(|k| k == &key) {
+        Some(pos) => {
+            guard.seen.remove(pos);
+            true
+        }
+        None => {
+            if guard.seen.len() >= SEEN_CAP {
+                guard.seen.pop_front();
+            }
+            guard.seen.push_back(key.clone());
+            false
+        }
+    };
+    if !admit {
+        drop(guard);
+        return std::sync::Arc::new(build(code));
+    }
+    // Evict only when the *global* budget is exhausted (F5): a fixed per-shard
+    // cap both wasted capacity under skew and evicted hot entries in a shard
+    // that happened to fill first.
+    if TOTAL.load(std::sync::atomic::Ordering::Relaxed) >= NOT_FOUND_CACHE_CAP {
         // Bound the sweep per shard; if every entry is referenced, evict the
         // hand's candidate after two full rotations.
         let mut evicted = false;
@@ -3989,25 +4188,38 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
                     .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry))
                 {
                     guard.map.remove(&entry.key);
+                    TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 evicted = true;
                 break;
             }
         }
-        if !evicted && let Some(entry) = guard.ring.pop_front() {
-            entry
-                .live
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            if guard
-                .map
-                .get(&entry.key)
-                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry))
-            {
-                guard.map.remove(&entry.key);
+        if !evicted {
+            // Nothing evictable in *this* shard while the budget is full: serve
+            // the page uncached instead of exceeding the global bound.
+            let removed = match guard.ring.pop_front() {
+                Some(entry) => {
+                    entry
+                        .live
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    let hit = guard
+                        .map
+                        .get(&entry.key)
+                        .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry));
+                    if hit {
+                        guard.map.remove(&entry.key);
+                        TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    hit
+                }
+                None => false,
+            };
+            if !removed {
+                drop(guard);
+                return std::sync::Arc::new(build(code));
             }
         }
     }
-    let key = CompactString::from(code);
     let entry = std::sync::Arc::new(Entry {
         key: key.clone(),
         page: std::sync::OnceLock::new(),
@@ -4016,6 +4228,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     });
     guard.map.insert(key, std::sync::Arc::clone(&entry));
     guard.ring.push_back(std::sync::Arc::clone(&entry));
+    TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     drop(guard);
     std::sync::Arc::clone(entry.page.get_or_init(|| std::sync::Arc::new(build(code))))
 }

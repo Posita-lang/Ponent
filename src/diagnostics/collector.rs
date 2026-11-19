@@ -69,6 +69,23 @@ pub struct DiagCtxt<'src> {
     /// `warnings_to_infos` and `for_each_warning` gate and skip the reported
     /// prefix in O(1) instead of scanning the suffix to find out.
     unreported_warnings: usize,
+    /// Severity tallies of the **reported** prefix (`0..reported_len`).
+    ///
+    /// The emitter only ever receives `&mut diags[reported_len..]`, so the
+    /// prefix cannot change behind a recount's back; keeping its tallies lets
+    /// [`Self::recount_derived_state`] scan only the unreported suffix instead
+    /// of the whole vector after every emit (O(n) → O(suffix), O(n²) → O(n)
+    /// over a context's lifetime).  Invariant:
+    /// `errors == reported_errors + unreported_errors` (same for warnings).
+    reported_errors: usize,
+    reported_warnings: usize,
+    /// Warnings dropped by the [`Self::set_can_emit_warnings`] gate.
+    ///
+    /// Monotone and *not* derivable from `diags` (a suppressed diagnostic is
+    /// never stored), so no recount can or may recompute it.  Surfaced so a
+    /// caller can print "N warnings suppressed" instead of losing them
+    /// silently.
+    suppressed_warnings: usize,
 }
 
 /// The inline `SmallVec<[Diagnostic; 2]>` is what keeps a zero/one-diagnostic
@@ -124,6 +141,9 @@ impl<'src> DiagCtxt<'src> {
             warnings: 0,
             unreported_errors: 0,
             unreported_warnings: 0,
+            reported_errors: 0,
+            reported_warnings: 0,
+            suppressed_warnings: 0,
         }
     }
 
@@ -137,6 +157,9 @@ impl<'src> DiagCtxt<'src> {
             }
             super::DiagnosticLevel::Warning => {
                 if !self.can_emit_warnings {
+                    // Count before dropping: the suppressed diagnostic never
+                    // enters `diags`, so this is the only record of it.
+                    self.suppressed_warnings += 1;
                     return EmissionGuarantee::suppressed();
                 }
                 self.warnings += 1;
@@ -194,11 +217,17 @@ impl<'src> DiagCtxt<'src> {
         // O(log N) times.  A warning-filtered batch may reserve slightly
         // more than it keeps; that is cheaper than growing repeatedly.
         let (lower, upper) = iter.size_hint();
-        // Reserve from the UPPER bound: an exact-size producer (`Vec`, slice,
-        // most in-tree iterators) reports `Some(exact)`, and using only the
-        // lower bound reintroduced the O(log N) growth this reserve exists to
-        // avoid on filtered batches.
-        let hint = upper.unwrap_or(lower);
+        // Reserve the hint only when the iterator knows its size exactly.
+        // `upper` alone is the *pre-filter* bound for adapters such as
+        // `filter`/`filter_map`, so `extend(big.into_iter().filter(..))` would
+        // reserve the whole input to keep a handful.  `Vec::extend` uses the
+        // lower bound for the same reason; `lower == upper` recovers the exact
+        // case (`Vec`, slice, most in-tree iterators) that motivated the
+        // reserve.
+        let hint = match (lower, upper) {
+            (l, Some(u)) if l == u => u,
+            (l, _) => l,
+        };
         if hint > 0 {
             self.diags.reserve(hint);
         }
@@ -300,8 +329,21 @@ impl<'src> DiagCtxt<'src> {
             "truncate_unreported: stale count {keep_unreported} > {}",
             self.unreported_len()
         );
+        // Clamp a stale count in release.  Without this, `reported_len + keep`
+        // lands past the end, nothing is truncated, and the caller believes the
+        // rollback happened.
+        let keep_unreported = keep_unreported.min(self.unreported_len());
         let keep = self.reported_len.saturating_add(keep_unreported);
-        if keep < self.diags.len() {
+        if keep_unreported == 0 && keep < self.diags.len() {
+            // Dropping the whole unreported suffix is the common checkpoint
+            // discard, and the tallies already hold exactly its counts, so the
+            // per-diagnostic subtraction is dead work.
+            self.errors = self.errors.saturating_sub(self.unreported_errors);
+            self.warnings = self.warnings.saturating_sub(self.unreported_warnings);
+            self.unreported_errors = 0;
+            self.unreported_warnings = 0;
+            self.diags.truncate(keep);
+        } else if keep < self.diags.len() {
             for d in &self.diags[keep..] {
                 if d.is_error() {
                     self.errors = self.errors.saturating_sub(1);
@@ -326,6 +368,10 @@ impl<'src> DiagCtxt<'src> {
         self.warnings = 0;
         self.unreported_errors = 0;
         self.unreported_warnings = 0;
+        self.reported_errors = 0;
+        self.reported_warnings = 0;
+        // `suppressed_warnings` is deliberately NOT reset: it is a
+        // session-lifetime observation, not derived state.
     }
 
     /// Emit all unreported diagnostics via the given emitter.
@@ -349,6 +395,11 @@ impl<'src> DiagCtxt<'src> {
             return Ok(());
         }
         emitter.emit_all(&mut self.diags[self.reported_len..])?;
+        // Fold the suffix tallies into the prefix ones: the emitter only ever
+        // saw `diags[reported_len..]` through `HumanizeOnly`, so the prefix is
+        // unchanged and this keeps `errors == reported + unreported`.
+        self.reported_errors += self.unreported_errors;
+        self.reported_warnings += self.unreported_warnings;
         self.reported_len = self.diags.len();
         self.unreported_errors = 0;
         self.unreported_warnings = 0;
@@ -493,8 +544,15 @@ impl<'src> DiagCtxt<'src> {
     /// everything.  Useful after a checkpoint / snapshot in incremental
     /// compilation.
     pub fn mark_all_reported(&mut self) {
+        self.reported_errors += self.unreported_errors;
+        self.reported_warnings += self.unreported_warnings;
         self.reported_len = self.diags.len();
         self.unreported_errors = 0;
+        // BOTH unreported tallies must be cleared.  `for_each_warning`'s fast
+        // path is `warnings == unreported_warnings` → scan only the unreported
+        // suffix; leaving the warning count stale makes that path scan a now
+        // empty suffix and silently drop the just-reported warnings.
+        self.unreported_warnings = 0;
     }
 
     /// Recompute every derived tally/frontier from `diags` and `reported_len`.
@@ -503,32 +561,56 @@ impl<'src> DiagCtxt<'src> {
     /// through the iterator cannot leave `has_errors`/`check()` disagreeing
     /// with the actual diagnostics.
     pub(crate) fn recount_derived_state(&mut self) {
-        let mut errors = 0usize;
-        let mut warnings = 0usize;
-        let mut unreported_errors = 0usize;
-        let mut unreported_warnings = 0usize;
-        let mut first_unspanned = None;
-        for (i, d) in self.diags.iter().enumerate() {
-            if d.is_error() {
-                errors += 1;
-                if i >= self.reported_len {
-                    unreported_errors += 1;
+        let reported_len = self.reported_len;
+        let (unreported_errors, unreported_warnings, first_unspanned) = {
+            let suffix = &self.diags[reported_len..];
+            let mut errors = 0usize;
+            let mut warnings = 0usize;
+            let mut first = None;
+            for (i, d) in suffix.iter().enumerate() {
+                if d.is_error() {
+                    errors += 1;
+                } else if d.is_warning() {
+                    warnings += 1;
                 }
-            } else if d.is_warning() {
-                warnings += 1;
-                if i >= self.reported_len {
-                    unreported_warnings += 1;
+                if first.is_none() && d.source().is_none() {
+                    first = Some(reported_len + i);
                 }
             }
-            if first_unspanned.is_none() && d.source().is_none() {
-                first_unspanned = Some(i);
-            }
-        }
-        self.errors = errors;
-        self.warnings = warnings;
+            (errors, warnings, first)
+        };
         self.unreported_errors = unreported_errors;
         self.unreported_warnings = unreported_warnings;
-        self.first_unspanned = first_unspanned.unwrap_or(self.diags.len());
+        // Totals = immutable prefix tallies + the freshly scanned suffix.  The
+        // emitter only receives `&mut diags[reported_len..]` (through
+        // `HumanizeOnly`), so the prefix cannot have changed; rescanning it was
+        // the O(n) work that made a long-lived context's emit loop quadratic.
+        self.errors = self.reported_errors + unreported_errors;
+        self.warnings = self.reported_warnings + unreported_warnings;
+        self.first_unspanned = self
+            .first_unspanned
+            .min(first_unspanned.unwrap_or(self.diags.len()));
+        // The full scan is now a debug-only cross-check: if a future mutator
+        // touches the prefix, this fails loudly instead of leaving the O(1)
+        // tallies silently wrong.
+        #[cfg(debug_assertions)]
+        {
+            let (errors, warnings, ue, uw, frontier) = scan_derived(&self.diags, self.reported_len);
+            debug_assert_eq!(
+                (
+                    self.errors,
+                    self.warnings,
+                    self.unreported_errors,
+                    self.unreported_warnings
+                ),
+                (errors, warnings, ue, uw),
+                "suffix-only recount diverged from the full scan"
+            );
+            debug_assert_eq!(
+                self.first_unspanned, frontier,
+                "source frontier diverged from the full scan"
+            );
+        }
     }
 
     /// Drain the unreported list and return it.
@@ -582,8 +664,54 @@ impl<'src> DiagCtxt<'src> {
         // The drained region was reported by construction, so the
         // unreported counters are untouched.
         self.reported_len = 0;
+        self.reported_errors = 0;
+        self.reported_warnings = 0;
         self.first_unspanned = self.first_unspanned.saturating_sub(reported_len);
         drained
+    }
+
+    /// Drop the reported prefix without allocating.
+    ///
+    /// [`Self::drain_reported`] has to allocate a `Vec` for the caller; this is
+    /// the "just get rid of it" form, which only fixes the tallies and the
+    /// partition.
+    pub fn discard_reported(&mut self) {
+        let reported_len = self.reported_len;
+        if reported_len == 0 {
+            return;
+        }
+        self.diags.drain(..reported_len);
+        self.reported_len = 0;
+        self.reported_errors = 0;
+        self.reported_warnings = 0;
+        self.errors = self.unreported_errors;
+        self.warnings = self.unreported_warnings;
+        self.first_unspanned = self.first_unspanned.saturating_sub(reported_len);
+    }
+
+    /// Drop the unreported suffix without allocating.
+    ///
+    /// Symmetric to [`Self::discard_reported`]; the O(1) tally path is the same
+    /// one `truncate_unreported(0)` takes.
+    pub fn discard_unreported(&mut self) {
+        let keep = self.reported_len;
+        if keep == self.diags.len() {
+            return;
+        }
+        self.diags.truncate(keep);
+        self.errors = self.reported_errors;
+        self.warnings = self.reported_warnings;
+        self.unreported_errors = 0;
+        self.unreported_warnings = 0;
+        self.first_unspanned = self.first_unspanned.min(keep);
+    }
+
+    /// Warnings dropped by the `can_emit_warnings` gate since construction.
+    ///
+    /// Monotone: suppressed diagnostics are never stored, so this cannot be
+    /// derived from [`Self::iter`] (and [`Self::clear`] deliberately keeps it).
+    pub fn suppressed_warning_count(&self) -> usize {
+        self.suppressed_warnings
     }
 
     // ── Severity downgrades (inspired by Lean 4's MessageLog) ───────
@@ -666,6 +794,46 @@ impl<'src> DiagCtxt<'src> {
     }
 }
 
+/// One pass over `diags` deriving every cached tally plus the source frontier.
+///
+/// Shared by `From<Vec>` and [`DiagCtxt::recount_derived_state`] so the initial
+/// construction and the post-emit recount cannot drift apart: `reported_len`
+/// splits "total" from "unreported" counts, and `From<Vec>` passes `0` because
+/// a freshly built context has nothing reported yet.
+fn scan_derived(
+    diags: &[Diagnostic<'_>],
+    reported_len: usize,
+) -> (usize, usize, usize, usize, usize) {
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut unreported_errors = 0usize;
+    let mut unreported_warnings = 0usize;
+    let mut first_unspanned = None;
+    for (i, d) in diags.iter().enumerate() {
+        if d.is_error() {
+            errors += 1;
+            if i >= reported_len {
+                unreported_errors += 1;
+            }
+        } else if d.is_warning() {
+            warnings += 1;
+            if i >= reported_len {
+                unreported_warnings += 1;
+            }
+        }
+        if first_unspanned.is_none() && d.source().is_none() {
+            first_unspanned = Some(i);
+        }
+    }
+    (
+        errors,
+        warnings,
+        unreported_errors,
+        unreported_warnings,
+        first_unspanned.unwrap_or(diags.len()),
+    )
+}
+
 impl Default for DiagCtxt<'_> {
     fn default() -> Self {
         Self::new()
@@ -674,20 +842,12 @@ impl Default for DiagCtxt<'_> {
 
 impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
     fn from(diags: Vec<Diagnostic<'src>>) -> Self {
-        let mut errors = 0usize;
-        let mut warnings = 0usize;
-        let mut first_unspanned = None;
-        for (i, d) in diags.iter().enumerate() {
-            if d.is_error() {
-                errors += 1;
-            } else if d.is_warning() {
-                warnings += 1;
-            }
-            if first_unspanned.is_none() && d.source().is_none() {
-                first_unspanned = Some(i);
-            }
-        }
-        let first_unspanned = first_unspanned.unwrap_or(diags.len());
+        // One shared scan with `recount_derived_state`: every diagnostic starts
+        // unreported (`reported_len == 0`), so the totals and the unreported
+        // tallies coincide.  Deriving them twice is how the initial
+        // construction and the post-emit recount drift apart.
+        let (errors, warnings, unreported_errors, unreported_warnings, first_unspanned) =
+            scan_derived(&diags, 0);
         DiagCtxt {
             diags: SmallVec::from_vec(diags),
             reported_len: 0,
@@ -695,8 +855,11 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
             can_emit_warnings: true,
             errors,
             warnings,
-            unreported_errors: errors,
-            unreported_warnings: warnings,
+            unreported_errors,
+            unreported_warnings,
+            reported_errors: 0,
+            reported_warnings: 0,
+            suppressed_warnings: 0,
         }
     }
 }
@@ -894,6 +1057,79 @@ mod tests {
         c.truncate_unreported(1);
         assert_eq!(c.unreported_len(), 1);
         assert_eq!(c.reported().len(), 1);
+    }
+
+    /// `mark_all_reported` must clear BOTH unreported tallies: with only the
+    /// error count cleared, `for_each_warning`'s `warnings ==
+    /// unreported_warnings` fast path scans the empty unreported suffix and
+    /// silently drops the reported warnings.
+    #[test]
+    fn mark_all_reported_clears_the_unreported_warning_tally() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::warning("w"));
+        c.mark_all_reported();
+        let mut seen = 0;
+        c.for_each_warning(|_| seen += 1);
+        assert_eq!(seen, 1, "the reported warning must still be enumerated");
+        assert_eq!(c.warning_count(), 1);
+
+        // A later downgrade gates on the same tally: it must not resurrect the
+        // already-reported warning, which would double-count it as unreported.
+        c.warnings_to_infos();
+        assert_eq!(c.warning_count(), 1);
+        assert!(c.diags[0].is_warning(), "reported warning was converted");
+
+        // A push after the mark starts from a clean base.
+        c.push(Diagnostic::warning("w2"));
+        c.warnings_to_infos();
+        assert!(c.diags[0].is_warning(), "reported warning was converted");
+        assert!(!c.diags[1].is_warning());
+        assert_eq!(c.warning_count(), 1);
+    }
+
+    /// Dropping the whole unreported suffix takes the O(1) tally path; the
+    /// tallies must come out exactly as the per-diagnostic subtraction would
+    /// leave them.
+    #[test]
+    fn truncate_unreported_to_zero_clears_unreported_tallies() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("reported-error"));
+        c.push(Diagnostic::warning("reported-warning"));
+        c.mark_all_reported();
+        c.push(Diagnostic::error("dropped-error"));
+        c.push(Diagnostic::warning("dropped-warning"));
+        c.push(Diagnostic::note("dropped-note"));
+        assert_eq!(c.unreported_len(), 3);
+
+        c.truncate_unreported(0);
+        assert_eq!(c.unreported_len(), 0);
+        assert_eq!(c.reported().len(), 2);
+        assert_eq!(c.error_count(), 1);
+        assert_eq!(c.warning_count(), 1);
+        assert!(!c.has_unreported_errors());
+
+        let mut warnings = 0;
+        c.for_each_warning(|_| warnings += 1);
+        assert_eq!(warnings, 1, "the reported warning must survive");
+    }
+
+    /// A stale (too large) count is clamped in release instead of silently
+    /// truncating nothing.
+    #[test]
+    fn truncate_unreported_clamps_a_stale_count() {
+        let mut c = DiagCtxt::new();
+        c.push(Diagnostic::error("a"));
+        c.push(Diagnostic::error("b"));
+        // `usize::MAX` reproduces the release-mode wrap the saturating add and
+        // the clamp exist to prevent.
+        let stale = if cfg!(debug_assertions) {
+            2
+        } else {
+            usize::MAX
+        };
+        c.truncate_unreported(stale);
+        assert_eq!(c.unreported_len(), 2);
+        assert_eq!(c.error_count(), 2);
     }
 
     #[test]

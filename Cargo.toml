@@ -34,6 +34,10 @@ omniml_pool = []
 # `--features slow-tests`. NOT part of the default/release test run.
 slow-tests = []
 shuttle = ["dep:shuttle"]
+# Exposes measurement-only hooks (`ascii::set_swar_forced`) to the criterion
+# benches so a vector path and its SWAR fallback can be compared inside one
+# binary. No effect on the shipped binary.
+bench-hooks = []
 
 [package.metadata.cargo-machete]
 ignored = ["z3"]
@@ -201,4 +205,11 @@ harness = false
 # `#[path]`-includes `src/sat/` (same empty-lib workaround as octagon).
 [[bench]]
 name = "sat_solver"
+harness = false
+
+# ASCII fast-path dispatch boundaries. `#[path]`-includes
+# `src/diagnostics/ascii.rs`; run with `--features bench-hooks` to also pin the
+# SWAR tier and compare it against the vector paths in the same binary.
+[[bench]]
+name = "ascii_dispatch"
 harness = false

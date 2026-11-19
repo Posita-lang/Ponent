@@ -40,15 +40,36 @@ fn x86_level_for(len: usize) -> u8 {
 }
 
 #[cfg(target_arch = "x86_64")]
+static LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Cached ISA level: `3` = AVX-512BW, `2` = AVX2, `1` = SSE2 baseline.
+///
+/// Split so the hot path is one `Relaxed` load that inlines into the caller's
+/// predicate body, while the detection (three `is_x86_feature_detected!` reads
+/// plus a store) lives in a cold, never-inlined helper.  The manual cache is
+/// still worth keeping over reading the macros every call: it collapses three
+/// cached loads into one, and it is the module's own contract rather than an
+/// implementation detail of the macros.
+#[cfg(target_arch = "x86_64")]
+#[inline]
 fn x86_level() -> u8 {
     if swar_forced() {
         return 0;
     }
-    static LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     let cached = LEVEL.load(std::sync::atomic::Ordering::Relaxed);
     if cached != 0 {
         return cached;
     }
+    x86_level_init()
+}
+
+/// One-time detection.  `swar_forced()` is checked by the caller and the forced
+/// path returns before reaching here, so a test that forces SWAR can never
+/// poison the cache for the rest of the process.
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+fn x86_level_init() -> u8 {
     let level = if std::arch::is_x86_feature_detected!("avx512bw") {
         3
     } else if std::arch::is_x86_feature_detected!("avx2") {
@@ -64,20 +85,40 @@ fn x86_level() -> u8 {
 /// covers `[64, 256)`; entering at 64 spends the wider kernel instead of the
 /// 32-byte AVX2 one with no correctness change (every kernel handles any
 /// length through its own loop plus the deferred parent tail).
+///
+/// Downclocking tradeoff, stated rather than assumed: on parts with AVX-512
+/// frequency licensing (Skylake-X, some Ice Lake server SKUs) the transition
+/// can cost more than the two AVX2 loads it saves for a single 64-byte row,
+/// and the penalty lands on the surrounding non-AVX-512 code.  Modern parts
+/// (Sapphire Rapids, Zen 4) do not downclock at all.  Raising the threshold to
+/// 128 would make every 64–127-byte row take AVX2 instead, so it is kept at 64
+/// until a measurement on the target mix says otherwise — this constant is the
+/// knob, and no correctness argument depends on its value.
 const AVX512_MIN_LEN: usize = 64;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bench-hooks"))]
 thread_local! {
     static SWAR_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Pin the SWAR tier on/off for the current thread.
+///
+/// The unit tests set `SWAR_FORCED` directly; `bench-hooks` exposes the same
+/// switch so `benches/ascii_dispatch.rs` can compare the vector and scalar
+/// paths inside one binary (wall-clock comparisons across binaries on this box
+/// drift by more than the effect being measured).
+#[cfg(any(test, feature = "bench-hooks"))]
+pub(crate) fn set_swar_forced(on: bool) {
+    SWAR_FORCED.with(|f| f.set(on));
+}
+
 #[inline]
 fn swar_forced() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-hooks"))]
     {
         SWAR_FORCED.with(std::cell::Cell::get)
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "bench-hooks")))]
     {
         false
     }
@@ -104,64 +145,8 @@ fn swar_forced() -> bool {
 /// targets without a vector backend.
 #[inline]
 pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    let level = x86_level_for(s.len());
-    #[cfg(target_arch = "x86_64")]
-    if s.len() >= AVX512_MIN_LEN && level >= 3 {
-        return unsafe { x86_64::is_printable_ascii_avx512(s) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && level >= 2 {
-        // SAFETY: AVX2 support was just checked at runtime; the kernel only
-        // reads full chunks and defers its tail back to this function.
-        return unsafe { x86_64::is_printable_ascii(s) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 16 {
-        // SSE2 is baseline on x86_64; no runtime probe is needed.
-        return unsafe { x86_64::is_printable_ascii_sse2(s) };
-    }
-    #[cfg(target_arch = "aarch64")]
-    if !swar_forced() && s.len() >= 16 {
-        return unsafe { neon::is_printable_ascii(s) };
-    }
-    #[cfg(target_arch = "wasm32")]
-    if !swar_forced() && s.len() >= 16 {
-        return unsafe { wasm::is_printable_ascii(s) };
-    }
-    const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
-    const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
-    const DEL: u128 = 0x7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F;
-    const ONES: u128 = 0x0101_0101_0101_0101_0101_0101_0101_0101;
-
-    let mut i = 0usize;
-    while i + 16 <= s.len() {
-        let x = u128::from_le_bytes(s[i..i + 16].try_into().unwrap());
-        // A lane's high bit survives `x | (x - 0x20…)` iff the byte is
-        // `< 0x20` (the subtraction borrows) or `>= 0x80` (its own bit).
-        // The borrow may over-flag a *following* printable byte, but the
-        // predicate is existential: the triggering non-printable byte always
-        // flags itself, so the overall answer is unchanged. Do not "fix" the
-        // mask into a per-byte test.
-        let v = x ^ DEL;
-        if ((x | x.wrapping_sub(SP)) | (v.wrapping_sub(ONES))) & HI != 0 {
-            return false;
-        }
-        i += 16;
-    }
-    const HI64: u64 = 0x8080_8080_8080_8080;
-    const SP64: u64 = 0x2020_2020_2020_2020;
-    const DEL64: u64 = 0x7F7F_7F7F_7F7F_7F7F;
-    const ONES64: u64 = 0x0101_0101_0101_0101;
-    while i + 8 <= s.len() {
-        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
-        let v = x ^ DEL64;
-        if ((x | x.wrapping_sub(SP64)) | (v.wrapping_sub(ONES64))) & HI64 != 0 {
-            return false;
-        }
-        i += 8;
-    }
-    s[i..].iter().all(|&b| AllowedControls::None.allows(b))
+    // Defined by the class: one pass, no separate kernel family.
+    matches!(classify_ascii(s), AsciiClass::Printable)
 }
 
 /// `true` when every byte is printable ASCII **or** the two layout controls
@@ -190,81 +175,9 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 /// bytes).
 #[inline]
 pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    let level = x86_level_for(s.len());
-    #[cfg(target_arch = "x86_64")]
-    if s.len() >= AVX512_MIN_LEN && level >= 3 {
-        return unsafe { x86_64::is_printable_ascii_multiline_avx512(s) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && level >= 2 {
-        // SAFETY: runtime-checked AVX2; tail is deferred to this function.
-        return unsafe { x86_64::is_printable_ascii_multiline(s) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 16 {
-        return unsafe { x86_64::is_printable_ascii_multiline_sse2(s) };
-    }
-    #[cfg(target_arch = "aarch64")]
-    if !swar_forced() && s.len() >= 16 {
-        return unsafe { neon::is_printable_ascii_multiline(s) };
-    }
-    #[cfg(target_arch = "wasm32")]
-    if !swar_forced() && s.len() >= 16 {
-        return unsafe { wasm::is_printable_ascii_multiline(s) };
-    }
-    const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
-    const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
-    const TAB: u128 = 0x0909_0909_0909_0909_0909_0909_0909_0909;
-    const NL: u128 = 0x0A0A_0A0A_0A0A_0A0A_0A0A_0A0A_0A0A_0A0A;
-    const DEL: u128 = 0x7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F;
-    const ONES: u128 = 0x0101_0101_0101_0101_0101_0101_0101_0101;
-
-    let mut i = 0usize;
-    while i + 16 <= s.len() {
-        let x = u128::from_le_bytes(s[i..i + 16].try_into().unwrap());
-        // Any byte >= 0x80: not printable, and no per-byte exception exists.
-        let q = x ^ DEL;
-        if (x | (q.wrapping_sub(ONES))) & HI != 0 {
-            return false;
-        }
-        // Exact `< 0x20` lanes (see the derivation above).
-        let lt20 = !((x | HI).wrapping_sub(SP)) & HI;
-        if lt20 != 0 {
-            let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI;
-            let nl = !(((x ^ NL) | HI).wrapping_sub(ONES)) & HI;
-            // A `< 0x20` lane that is neither tab nor newline is an offender.
-            if (lt20 & !tab & !nl) != 0 {
-                return false;
-            }
-        }
-        i += 16;
-    }
-    const HI64: u64 = 0x8080_8080_8080_8080;
-    const SP64: u64 = 0x2020_2020_2020_2020;
-    const TAB64: u64 = 0x0909_0909_0909_0909;
-    const NL64: u64 = 0x0A0A_0A0A_0A0A_0A0A;
-    const DEL64: u64 = 0x7F7F_7F7F_7F7F_7F7F;
-    const ONES64: u64 = 0x0101_0101_0101_0101;
-    while i + 8 <= s.len() {
-        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
-        let q = x ^ DEL64;
-        if (x | (q.wrapping_sub(ONES64))) & HI64 != 0 {
-            return false;
-        }
-        let lt20 = !((x | HI64).wrapping_sub(SP64)) & HI64;
-        if lt20 != 0 {
-            let tab = !(((x ^ TAB64) | HI64).wrapping_sub(ONES64)) & HI64;
-            let nl = !(((x ^ NL64) | HI64).wrapping_sub(ONES64)) & HI64;
-            if (lt20 & !tab & !nl) != 0 {
-                return false;
-            }
-        }
-        i += 8;
-    }
-    s[i..]
-        .iter()
-        .all(|&b| AllowedControls::TabAndNewline.allows(b))
+    // `!= Other` is the multiline set exactly: the fourth class is defined as
+    // printable + tab + newline.
+    !matches!(classify_ascii(s), AsciiClass::Other)
 }
 
 /// `true` when every byte is printable ASCII **or** the tab (`0x09`).
@@ -276,82 +189,27 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
 /// and the SWAR fallback both implement it.
 #[inline]
 pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    let level = x86_level_for(s.len());
-    #[cfg(target_arch = "x86_64")]
-    if s.len() >= AVX512_MIN_LEN && level >= 3 {
-        return unsafe { x86_64::is_printable_ascii_or_tab_avx512(s) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && level >= 2 {
-        // SAFETY: runtime-checked AVX2; tail is deferred to this function.
-        return unsafe { x86_64::is_printable_ascii_or_tab(s) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 16 {
-        return unsafe { x86_64::is_printable_ascii_or_tab_sse2(s) };
-    }
-    #[cfg(target_arch = "aarch64")]
-    if !swar_forced() && s.len() >= 16 {
-        return unsafe { neon::is_printable_ascii_or_tab(s) };
-    }
-    #[cfg(target_arch = "wasm32")]
-    if !swar_forced() && s.len() >= 16 {
-        return unsafe { wasm::is_printable_ascii_or_tab(s) };
-    }
-    const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
-    const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
-    const TAB: u128 = 0x0909_0909_0909_0909_0909_0909_0909_0909;
-    const DEL: u128 = 0x7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F;
-    const ONES: u128 = 0x0101_0101_0101_0101_0101_0101_0101_0101;
-
-    let mut i = 0usize;
-    while i + 16 <= s.len() {
-        let x = u128::from_le_bytes(s[i..i + 16].try_into().unwrap());
-        // A high byte is never printable and has no per-byte exception, so
-        // reject before paying for the other masks.
-        let v = x ^ DEL;
-        if (x | (v.wrapping_sub(ONES))) & HI != 0 {
-            return false;
-        }
-        // Exact `< 0x20` lanes (see `is_printable_ascii_multiline`).
-        let lt20 = !((x | HI).wrapping_sub(SP)) & HI;
-        if lt20 != 0 {
-            let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI;
-            if (lt20 & !tab) != 0 {
-                return false;
-            }
-        }
-        i += 16;
-    }
-    const HI64: u64 = 0x8080_8080_8080_8080;
-    const SP64: u64 = 0x2020_2020_2020_2020;
-    const TAB64: u64 = 0x0909_0909_0909_0909;
-    const DEL64: u64 = 0x7F7F_7F7F_7F7F_7F7F;
-    const ONES64: u64 = 0x0101_0101_0101_0101;
-    while i + 8 <= s.len() {
-        let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
-        let v = x ^ DEL64;
-        if (x | (v.wrapping_sub(ONES64))) & HI64 != 0 {
-            return false;
-        }
-        let lt20 = !((x | HI64).wrapping_sub(SP64)) & HI64;
-        if lt20 != 0 {
-            let tab = !(((x ^ TAB64) | HI64).wrapping_sub(ONES64)) & HI64;
-            if (lt20 & !tab) != 0 {
-                return false;
-            }
-        }
-        i += 8;
-    }
-    s[i..].iter().all(|&b| AllowedControls::Tab.allows(b))
+    // The two narrow classes are exactly the tab set.
+    matches!(
+        classify_ascii(s),
+        AsciiClass::Printable | AsciiClass::PrintableOrTab
+    )
 }
 
+/// Combine a kernel's accumulated tab/newline sightings with its tail's class.
+///
+/// The result is the **widest** accepted set: a newline anywhere outranks a tab,
+/// which outranks plain printable, and any offender wins over all three.
 #[inline]
-fn compose_classify_tail(saw_tab: bool, tail: AsciiClass) -> AsciiClass {
+fn compose_classify_tail(saw_tab: bool, saw_newline: bool, tail: AsciiClass) -> AsciiClass {
     if tail == AsciiClass::Other {
-        AsciiClass::Other
-    } else if tail == AsciiClass::PrintableOrTab || saw_tab {
+        return AsciiClass::Other;
+    }
+    let newline = saw_newline || tail == AsciiClass::PrintableOrTabNewline;
+    let tab = saw_tab || tail == AsciiClass::PrintableOrTab;
+    if newline {
+        AsciiClass::PrintableOrTabNewline
+    } else if tab {
         AsciiClass::PrintableOrTab
     } else {
         AsciiClass::Printable
@@ -367,18 +225,74 @@ pub(crate) enum AsciiClass {
     Printable,
     /// Printable ASCII plus horizontal tabs; no other control bytes.
     PrintableOrTab,
+    /// Printable ASCII plus tabs and newlines — exactly the
+    /// [`is_printable_ascii_multiline`] accepted set.
+    PrintableOrTabNewline,
     /// Anything else (high byte, DEL, other C0/C1).
     Other,
 }
 
-/// Classify `s` in one pass at the widest available vector width, with the
-/// SWAR fallback for the tail.
+/// Scalar classification over the same set the vector and SWAR bodies
+/// implement ([`AllowedControls::TabAndNewline`]): the widest accepted class.
+#[inline]
+fn classify_scalar(s: &[u8]) -> AsciiClass {
+    let mut saw_tab = false;
+    let mut saw_newline = false;
+    for &b in s {
+        if b == b'\t' {
+            saw_tab = true;
+        } else if b == b'\n' {
+            saw_newline = true;
+        } else if !AllowedControls::None.allows(b) {
+            return AsciiClass::Other;
+        }
+    }
+    if saw_newline {
+        AsciiClass::PrintableOrTabNewline
+    } else if saw_tab {
+        AsciiClass::PrintableOrTab
+    } else {
+        AsciiClass::Printable
+    }
+}
+
+/// Four-way classification of one row: the **widest** accepted set that
+/// contains `s`.  The single primitive the three predicates are defined by:
 ///
-/// The SWAR fallback rejects high bytes first (as
-/// [`is_printable_ascii_multiline`] does): the `(x | HI) - SP` form is only
-/// exact when every lane is ≤ `0x7F`.
+/// - `is_printable_ascii(s)` ⟺ `class == Printable`
+/// - `is_printable_ascii_or_tab(s)` ⟺ `class ∈ {Printable, PrintableOrTab}`
+/// - `is_printable_ascii_multiline(s)` ⟺ `class != Other`
+///
+/// pinned by `classify_ascii_matches_predicates_on_random_bytes` and
+/// `newline_is_the_fourth_class_and_survives_the_vector_widths`.
+///
+/// One pass at the widest available vector width, SWAR for the tail.
+///
+/// # SWAR lane proof
+///
+/// The high-byte/DEL rejection is deliberately *not* an exact mask: it is
+/// existential — any high bit in `x`, or a DEL lane in `x ^ 0x7F`, is itself
+/// the proof, and a borrow chain can only originate at such a lane within the
+/// same chunk.  The `< 0x20`, tab and newline masks **are** exact (each minuend
+/// byte has its high bit forced with `x | HI`, so the word subtraction cannot
+/// borrow between lanes):
+///
+/// * `lt20 = !((x|HI) - SP) & HI` — high bit clear iff `b + 0x60 < 0x80` iff
+///   `b < 0x20`, exactly.
+/// * `tab = !(((x ^ TAB)|HI) - ONES) & HI` — high bit clear iff `b ^ 0x09 == 0`
+///   iff `b == 0x09`, exactly (the 0x08-neighbour trap of a `has_zero` value
+///   mask cannot occur here because the minuend never borrows); `nl` likewise
+///   with 0x0A.
+///
+/// High bytes are rejected first: the `(x | HI) - SP` form is only exact when
+/// every lane is ≤ `0x7F` (otherwise `b + 0x80 - 0x20` overflows).
 #[inline]
 pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
+    // Scalar remainder, resolved inline like the other three predicates: a
+    // kernel's tail must not re-enter the dispatcher.
+    if s.len() < 16 {
+        return classify_scalar(s);
+    }
     #[cfg(target_arch = "x86_64")]
     let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
@@ -405,10 +319,12 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
     const TAB: u128 = 0x0909_0909_0909_0909_0909_0909_0909_0909;
+    const NL: u128 = 0x0A0A_0A0A_0A0A_0A0A_0A0A_0A0A_0A0A_0A0A;
     const DEL: u128 = 0x7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F_7F7F;
     const ONES: u128 = 0x0101_0101_0101_0101_0101_0101_0101_0101;
 
     let mut saw_tab = false;
+    let mut saw_newline = false;
     let mut i = 0usize;
     while i + 16 <= s.len() {
         let x = u128::from_le_bytes(s[i..i + 16].try_into().unwrap());
@@ -419,21 +335,28 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
         let lt20 = !((x | HI).wrapping_sub(SP)) & HI;
         if lt20 != 0 {
             let tab = !(((x ^ TAB) | HI).wrapping_sub(ONES)) & HI;
-            if (lt20 & !tab) != 0 {
+            let nl = !(((x ^ NL) | HI).wrapping_sub(ONES)) & HI;
+            // A `< 0x20` lane that is neither tab nor newline is an offender.
+            if (lt20 & !tab & !nl) != 0 {
                 return AsciiClass::Other;
             }
-            saw_tab = true;
+            saw_tab |= tab != 0;
+            saw_newline |= nl != 0;
         }
         i += 16;
     }
     for &b in &s[i..] {
         if b == b'\t' {
             saw_tab = true;
+        } else if b == b'\n' {
+            saw_newline = true;
         } else if !AllowedControls::None.allows(b) {
             return AsciiClass::Other;
         }
     }
-    if saw_tab {
+    if saw_newline {
+        AsciiClass::PrintableOrTabNewline
+    } else if saw_tab {
         AsciiClass::PrintableOrTab
     } else {
         AsciiClass::Printable
@@ -463,6 +386,17 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 /// assumption only holds for a scan started at a char boundary).
 #[inline]
 pub(crate) fn next_non_ascii_byte(s: &[u8]) -> usize {
+    // Same short-input reasoning as the predicate families: this is the *entry*
+    // point (called per non-ASCII character from `char_col`'s sparse-table
+    // build), so a short remaining run must not pay `x86_level_for` plus the
+    // whole `cfg` chain to reach a `position()`.  `usize::MAX` is the sentinel
+    // shared with every kernel tail.
+    if s.len() < 16 {
+        return s
+            .iter()
+            .position(|&b| b >= 0x80)
+            .map_or(usize::MAX, |off| off);
+    }
     #[cfg(target_arch = "x86_64")]
     let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
@@ -507,7 +441,10 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> usize {
         }
         i += 8;
     }
-    s[i..].iter().position(|&b| b >= 0x80).map_or(usize::MAX, |off| i + off)
+    s[i..]
+        .iter()
+        .position(|&b| b >= 0x80)
+        .map_or(usize::MAX, |off| i + off)
 }
 
 /// `Some(offset)` view of [`next_non_ascii_byte`] for callers that are not on
@@ -534,59 +471,39 @@ mod x86_64 {
     use std::arch::x86_64::*;
 
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn is_printable_ascii(s: &[u8]) -> bool {
-        let sp = _mm256_set1_epi8(0x20);
-        let del = _mm256_set1_epi8(0x7F);
-        let mut i = 0usize;
-        while i + 64 <= s.len() {
-            let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
-            let bad_a =
-                unsafe { _mm256_or_si256(_mm256_cmpgt_epi8(sp, a), _mm256_cmpeq_epi8(a, del)) };
-            let bad_b =
-                unsafe { _mm256_or_si256(_mm256_cmpgt_epi8(sp, b), _mm256_cmpeq_epi8(b, del)) };
-            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad_a, bad_b)) } != 0 {
-                return false;
-            }
-            i += 64;
-        }
-        while i + 32 <= s.len() {
-            // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
-            let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
-            let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
-            // High bytes (0x80..=0xFF) are negative as i8, so `sp > v` is true
-            // for them; `(lt | eq)` rejects high bytes, <0x20, and DEL in one
-            // movemask.  No separate high-bit test is needed.
-            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(lt, eq)) } != 0 {
-                return false;
-            }
-            i += 32;
-        }
-        super::is_printable_ascii(&s[i..])
-    }
-
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn is_printable_ascii_multiline(s: &[u8]) -> bool {
+    pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
         let sp = _mm256_set1_epi8(0x20);
         let del = _mm256_set1_epi8(0x7F);
         let tab_v = _mm256_set1_epi8(0x09);
         let nl_v = _mm256_set1_epi8(0x0A);
+        let mut saw_tab = false;
+        let mut saw_newline = false;
         let mut i = 0usize;
         while i + 64 <= s.len() {
             let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
             let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
-            let bad = |v: __m256i| unsafe {
+            let classify = |v: __m256i| unsafe {
                 let lt = _mm256_cmpgt_epi8(sp, v);
                 let tab = _mm256_cmpeq_epi8(v, tab_v);
                 let nl = _mm256_cmpeq_epi8(v, nl_v);
-                let off = _mm256_andnot_si256(_mm256_or_si256(tab, nl), lt);
+                // Tab and newline are the two allowed layout controls; every
+                // other `< 0x20` lane, and DEL, is an offender.
+                let allowed_ctrl = _mm256_or_si256(tab, nl);
+                let off = _mm256_andnot_si256(allowed_ctrl, lt);
                 let eq = _mm256_cmpeq_epi8(v, del);
-                _mm256_or_si256(eq, off)
+                (
+                    _mm256_or_si256(eq, off),
+                    _mm256_movemask_epi8(tab),
+                    _mm256_movemask_epi8(nl),
+                )
             };
-            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad(a), bad(b))) } != 0 {
-                return false;
+            let (bad_a, tab_a, nl_a) = classify(a);
+            let (bad_b, tab_b, nl_b) = classify(b);
+            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad_a, bad_b)) } != 0 {
+                return super::AsciiClass::Other;
             }
+            saw_tab |= tab_a != 0 || tab_b != 0;
+            saw_newline |= nl_a != 0 || nl_b != 0;
             i += 64;
         }
         while i + 32 <= s.len() {
@@ -595,95 +512,17 @@ mod x86_64 {
             let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
             let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
             let nl = unsafe { _mm256_cmpeq_epi8(v, nl_v) };
-            let allowed = unsafe { _mm256_or_si256(tab, nl) };
-            let off = unsafe { _mm256_andnot_si256(allowed, lt) };
-            let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
-            let bad = unsafe { _mm256_or_si256(eq, off) };
-            if unsafe { _mm256_movemask_epi8(bad) } != 0 {
-                return false;
-            }
-            i += 32;
-        }
-        super::is_printable_ascii_multiline(&s[i..])
-    }
-
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
-        let sp = _mm256_set1_epi8(0x20);
-        let del = _mm256_set1_epi8(0x7F);
-        let tab_v = _mm256_set1_epi8(0x09);
-        let mut i = 0usize;
-        while i + 64 <= s.len() {
-            let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
-            let bad = |v: __m256i| unsafe {
-                let lt = _mm256_cmpgt_epi8(sp, v);
-                let tab = _mm256_cmpeq_epi8(v, tab_v);
-                let off = _mm256_andnot_si256(tab, lt);
-                let eq = _mm256_cmpeq_epi8(v, del);
-                _mm256_or_si256(eq, off)
-            };
-            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad(a), bad(b))) } != 0 {
-                return false;
-            }
-            i += 64;
-        }
-        while i + 32 <= s.len() {
-            // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
-            let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
-            let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
-            let off = unsafe { _mm256_andnot_si256(tab, lt) };
-            let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
-            let bad = unsafe { _mm256_or_si256(eq, off) };
-            if unsafe { _mm256_movemask_epi8(bad) } != 0 {
-                return false;
-            }
-            i += 32;
-        }
-        super::is_printable_ascii_or_tab(&s[i..])
-    }
-
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
-        let sp = _mm256_set1_epi8(0x20);
-        let del = _mm256_set1_epi8(0x7F);
-        let tab_v = _mm256_set1_epi8(0x09);
-        let mut saw_tab = false;
-        let mut i = 0usize;
-        while i + 64 <= s.len() {
-            let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
-            let classify = |v: __m256i| unsafe {
-                let lt = _mm256_cmpgt_epi8(sp, v);
-                let tab = _mm256_cmpeq_epi8(v, tab_v);
-                let off = _mm256_andnot_si256(tab, lt);
-                let eq = _mm256_cmpeq_epi8(v, del);
-                (_mm256_or_si256(eq, off), _mm256_movemask_epi8(tab))
-            };
-            let (bad_a, tab_a) = classify(a);
-            let (bad_b, tab_b) = classify(b);
-            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad_a, bad_b)) } != 0 {
-                return super::AsciiClass::Other;
-            }
-            saw_tab |= tab_a != 0 || tab_b != 0;
-            i += 64;
-        }
-        while i + 32 <= s.len() {
-            // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
-            let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
-            let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
-            let off = unsafe { _mm256_andnot_si256(tab, lt) };
+            let off = unsafe { _mm256_andnot_si256(_mm256_or_si256(tab, nl), lt) };
             let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
             let bad = unsafe { _mm256_or_si256(eq, off) };
             if unsafe { _mm256_movemask_epi8(bad) } != 0 {
                 return super::AsciiClass::Other;
             }
             saw_tab |= unsafe { _mm256_movemask_epi8(tab) } != 0;
+            saw_newline |= unsafe { _mm256_movemask_epi8(nl) } != 0;
             i += 32;
         }
-        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "avx2")]
@@ -721,63 +560,40 @@ mod x86_64 {
             i += 32;
         }
         let tail = super::next_non_ascii_byte(&s[i..]);
-        if tail == usize::MAX { usize::MAX } else { i + tail }
+        if tail == usize::MAX {
+            usize::MAX
+        } else {
+            i + tail
+        }
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
-    pub(super) unsafe fn is_printable_ascii_avx512(s: &[u8]) -> bool {
-        let sp = _mm512_set1_epi8(0x20);
-        let del = _mm512_set1_epi8(0x7F);
-        let mut i = 0usize;
-        while i + 256 <= s.len() {
-            let a = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
-            let b = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) };
-            let c = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) };
-            let d = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) };
-            let bad = (_mm512_cmpgt_epi8_mask(sp, a) | _mm512_cmpeq_epi8_mask(a, del))
-                | (_mm512_cmpgt_epi8_mask(sp, b) | _mm512_cmpeq_epi8_mask(b, del))
-                | (_mm512_cmpgt_epi8_mask(sp, c) | _mm512_cmpeq_epi8_mask(c, del))
-                | (_mm512_cmpgt_epi8_mask(sp, d) | _mm512_cmpeq_epi8_mask(d, del));
-            if bad != 0 {
-                return false;
-            }
-            i += 256;
-        }
-        while i + 64 <= s.len() {
-            let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
-            let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
-            let eq = unsafe { _mm512_cmpeq_epi8_mask(v, del) };
-            if lt | eq != 0 {
-                return false;
-            }
-            i += 64;
-        }
-        super::is_printable_ascii(&s[i..])
-    }
-
-    #[target_feature(enable = "avx512f,avx512bw")]
-    pub(super) unsafe fn is_printable_ascii_multiline_avx512(s: &[u8]) -> bool {
+    pub(super) unsafe fn classify_ascii_avx512(s: &[u8]) -> super::AsciiClass {
         let sp = _mm512_set1_epi8(0x20);
         let del = _mm512_set1_epi8(0x7F);
         let tab_v = _mm512_set1_epi8(0x09);
         let nl_v = _mm512_set1_epi8(0x0A);
+        let mut saw_tab = false;
+        let mut saw_newline = false;
         let mut i = 0usize;
         while i + 256 <= s.len() {
-            let bad = |v: __m512i| unsafe {
+            let class = |v: __m512i| unsafe {
                 let lt = _mm512_cmpgt_epi8_mask(sp, v);
                 let tab = _mm512_cmpeq_epi8_mask(v, tab_v);
                 let nl = _mm512_cmpeq_epi8_mask(v, nl_v);
                 let off = lt & !(tab | nl);
                 let eq = _mm512_cmpeq_epi8_mask(v, del);
-                eq | off
+                (eq | off, tab, nl)
             };
-            let a = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
-            let b = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) };
-            let c = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) };
-            let d = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) };
-            if bad(a) | bad(b) | bad(c) | bad(d) != 0 {
-                return false;
+            let (ba, ta, na) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) });
+            let (bb, tb, nb) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) });
+            let (bc, tc, nc) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) });
+            let (bd, td, nd) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) });
+            if ba | bb | bc | bd != 0 {
+                return super::AsciiClass::Other;
             }
+            saw_tab |= (ta | tb | tc | td) != 0;
+            saw_newline |= (na | nb | nc | nd) != 0;
             i += 256;
         }
         while i + 64 <= s.len() {
@@ -788,88 +604,13 @@ mod x86_64 {
             let off = lt & !(tab | nl);
             let eq = unsafe { _mm512_cmpeq_epi8_mask(v, del) };
             if eq | off != 0 {
-                return false;
-            }
-            i += 64;
-        }
-        super::is_printable_ascii_multiline(&s[i..])
-    }
-
-    #[target_feature(enable = "avx512f,avx512bw")]
-    pub(super) unsafe fn is_printable_ascii_or_tab_avx512(s: &[u8]) -> bool {
-        let sp = _mm512_set1_epi8(0x20);
-        let del = _mm512_set1_epi8(0x7F);
-        let tab_v = _mm512_set1_epi8(0x09);
-        let mut i = 0usize;
-        while i + 256 <= s.len() {
-            let bad = |v: __m512i| unsafe {
-                let lt = _mm512_cmpgt_epi8_mask(sp, v);
-                let tab = _mm512_cmpeq_epi8_mask(v, tab_v);
-                let off = lt & !tab;
-                let eq = _mm512_cmpeq_epi8_mask(v, del);
-                eq | off
-            };
-            let a = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
-            let b = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) };
-            let c = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) };
-            let d = unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) };
-            if bad(a) | bad(b) | bad(c) | bad(d) != 0 {
-                return false;
-            }
-            i += 256;
-        }
-        while i + 64 <= s.len() {
-            let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
-            let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
-            let tab = unsafe { _mm512_cmpeq_epi8_mask(v, tab_v) };
-            let off = lt & !tab;
-            let eq = unsafe { _mm512_cmpeq_epi8_mask(v, del) };
-            if eq | off != 0 {
-                return false;
-            }
-            i += 64;
-        }
-        super::is_printable_ascii_or_tab(&s[i..])
-    }
-
-    #[target_feature(enable = "avx512f,avx512bw")]
-    pub(super) unsafe fn classify_ascii_avx512(s: &[u8]) -> super::AsciiClass {
-        let sp = _mm512_set1_epi8(0x20);
-        let del = _mm512_set1_epi8(0x7F);
-        let tab_v = _mm512_set1_epi8(0x09);
-        let mut saw_tab = false;
-        let mut i = 0usize;
-        while i + 256 <= s.len() {
-            let class = |v: __m512i| unsafe {
-                let lt = _mm512_cmpgt_epi8_mask(sp, v);
-                let tab = _mm512_cmpeq_epi8_mask(v, tab_v);
-                let off = lt & !tab;
-                let eq = _mm512_cmpeq_epi8_mask(v, del);
-                (eq | off, tab)
-            };
-            let (ba, ta) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) });
-            let (bb, tb) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 64).cast()) });
-            let (bc, tc) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 128).cast()) });
-            let (bd, td) = class(unsafe { _mm512_loadu_si512(s.as_ptr().add(i + 192).cast()) });
-            if ba | bb | bc | bd != 0 {
-                return super::AsciiClass::Other;
-            }
-            saw_tab |= (ta | tb | tc | td) != 0;
-            i += 256;
-        }
-        while i + 64 <= s.len() {
-            let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
-            let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
-            let tab = unsafe { _mm512_cmpeq_epi8_mask(v, tab_v) };
-            let off = lt & !tab;
-            let eq = unsafe { _mm512_cmpeq_epi8_mask(v, del) };
-            if eq | off != 0 {
                 return super::AsciiClass::Other;
             }
             saw_tab |= tab != 0;
+            saw_newline |= nl != 0;
             i += 64;
         }
-        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
@@ -901,79 +642,11 @@ mod x86_64 {
             i += 64;
         }
         let tail = super::next_non_ascii_byte(&s[i..]);
-        if tail == usize::MAX { usize::MAX } else { i + tail }
-    }
-
-    #[target_feature(enable = "sse2")]
-    pub(super) unsafe fn is_printable_ascii_sse2(s: &[u8]) -> bool {
-        let sp = _mm_set1_epi8(0x20);
-        let del = _mm_set1_epi8(0x7F);
-        let mut i = 0usize;
-        while i + 32 <= s.len() {
-            let a = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
-            let b = unsafe { _mm_loadu_si128(s.as_ptr().add(i + 16) as *const __m128i) };
-            let bad_a = unsafe { _mm_or_si128(_mm_cmpgt_epi8(sp, a), _mm_cmpeq_epi8(a, del)) };
-            let bad_b = unsafe { _mm_or_si128(_mm_cmpgt_epi8(sp, b), _mm_cmpeq_epi8(b, del)) };
-            if unsafe { _mm_movemask_epi8(_mm_or_si128(bad_a, bad_b)) } != 0 {
-                return false;
-            }
-            i += 32;
+        if tail == usize::MAX {
+            usize::MAX
+        } else {
+            i + tail
         }
-        while i + 16 <= s.len() {
-            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
-            let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
-            let eq = unsafe { _mm_cmpeq_epi8(v, del) };
-            if unsafe { _mm_movemask_epi8(_mm_or_si128(lt, eq)) } != 0 {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii(&s[i..])
-    }
-
-    #[target_feature(enable = "sse2")]
-    pub(super) unsafe fn is_printable_ascii_multiline_sse2(s: &[u8]) -> bool {
-        let sp = _mm_set1_epi8(0x20);
-        let del = _mm_set1_epi8(0x7F);
-        let tab_v = _mm_set1_epi8(0x09);
-        let nl_v = _mm_set1_epi8(0x0A);
-        let mut i = 0usize;
-        while i + 16 <= s.len() {
-            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
-            let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
-            let tab = unsafe { _mm_cmpeq_epi8(v, tab_v) };
-            let nl = unsafe { _mm_cmpeq_epi8(v, nl_v) };
-            let allowed = unsafe { _mm_or_si128(tab, nl) };
-            let off = unsafe { _mm_andnot_si128(allowed, lt) };
-            let eq = unsafe { _mm_cmpeq_epi8(v, del) };
-            let bad = unsafe { _mm_or_si128(eq, off) };
-            if unsafe { _mm_movemask_epi8(bad) } != 0 {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii_multiline(&s[i..])
-    }
-
-    #[target_feature(enable = "sse2")]
-    pub(super) unsafe fn is_printable_ascii_or_tab_sse2(s: &[u8]) -> bool {
-        let sp = _mm_set1_epi8(0x20);
-        let del = _mm_set1_epi8(0x7F);
-        let tab_v = _mm_set1_epi8(0x09);
-        let mut i = 0usize;
-        while i + 16 <= s.len() {
-            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
-            let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
-            let tab = unsafe { _mm_cmpeq_epi8(v, tab_v) };
-            let off = unsafe { _mm_andnot_si128(tab, lt) };
-            let eq = unsafe { _mm_cmpeq_epi8(v, del) };
-            let bad = unsafe { _mm_or_si128(eq, off) };
-            if unsafe { _mm_movemask_epi8(bad) } != 0 {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii_or_tab(&s[i..])
     }
 
     #[target_feature(enable = "sse2")]
@@ -981,22 +654,26 @@ mod x86_64 {
         let sp = _mm_set1_epi8(0x20);
         let del = _mm_set1_epi8(0x7F);
         let tab_v = _mm_set1_epi8(0x09);
+        let nl_v = _mm_set1_epi8(0x0A);
         let mut saw_tab = false;
+        let mut saw_newline = false;
         let mut i = 0usize;
         while i + 16 <= s.len() {
             let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
             let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
             let tab = unsafe { _mm_cmpeq_epi8(v, tab_v) };
-            let off = unsafe { _mm_andnot_si128(tab, lt) };
+            let nl = unsafe { _mm_cmpeq_epi8(v, nl_v) };
+            let off = unsafe { _mm_andnot_si128(_mm_or_si128(tab, nl), lt) };
             let eq = unsafe { _mm_cmpeq_epi8(v, del) };
             let bad = unsafe { _mm_or_si128(eq, off) };
             if unsafe { _mm_movemask_epi8(bad) } != 0 {
                 return super::AsciiClass::Other;
             }
             saw_tab |= unsafe { _mm_movemask_epi8(tab) } != 0;
+            saw_newline |= unsafe { _mm_movemask_epi8(nl) } != 0;
             i += 16;
         }
-        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "sse2")]
@@ -1032,7 +709,11 @@ mod x86_64 {
             i += 16;
         }
         let tail = super::next_non_ascii_byte(&s[i..]);
-        if tail == usize::MAX { usize::MAX } else { i + tail }
+        if tail == usize::MAX {
+            usize::MAX
+        } else {
+            i + tail
+        }
     }
 }
 
@@ -1066,126 +747,56 @@ mod wasm {
     }
 
     #[target_feature(enable = "simd128")]
-    pub(super) unsafe fn is_printable_ascii(s: &[u8]) -> bool {
-        let sp = u8x16_splat(0x20);
-        let del = u8x16_splat(0x7F);
-        let mut i = 0usize;
-        while i + 32 <= s.len() {
-            let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
-            let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
-            let bad = |v: v128| unsafe { v128_or(i8x16_lt(v, sp), u8x16_eq(v, del)) };
-            if unsafe { any(v128_or(bad(a), bad(b))) } {
-                return false;
-            }
-            i += 32;
-        }
-        while i + 16 <= s.len() {
-            let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
-            if unsafe { any(v128_or(i8x16_lt(v, sp), u8x16_eq(v, del))) } {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii(&s[i..])
-    }
-
-    #[target_feature(enable = "simd128")]
-    pub(super) unsafe fn is_printable_ascii_multiline(s: &[u8]) -> bool {
-        let sp = u8x16_splat(0x20);
-        let del = u8x16_splat(0x7F);
-        let tab = u8x16_splat(0x09);
-        let nl = u8x16_splat(0x0A);
-        let mut i = 0usize;
-        while i + 32 <= s.len() {
-            let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
-            let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
-            let bad = |v: v128| unsafe {
-                let lt = i8x16_lt(v, sp);
-                let off = andnot(lt, v128_or(u8x16_eq(v, tab), u8x16_eq(v, nl)));
-                v128_or(u8x16_eq(v, del), off)
-            };
-            if unsafe { any(v128_or(bad(a), bad(b))) } {
-                return false;
-            }
-            i += 32;
-        }
-        while i + 16 <= s.len() {
-            let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
-            let lt = unsafe { i8x16_lt(v, sp) };
-            let off = unsafe { andnot(lt, v128_or(u8x16_eq(v, tab), u8x16_eq(v, nl))) };
-            if unsafe { any(v128_or(u8x16_eq(v, del), off)) } {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii_multiline(&s[i..])
-    }
-
-    #[target_feature(enable = "simd128")]
-    pub(super) unsafe fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
-        let sp = u8x16_splat(0x20);
-        let del = u8x16_splat(0x7F);
-        let tab = u8x16_splat(0x09);
-        let mut i = 0usize;
-        while i + 32 <= s.len() {
-            let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
-            let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
-            let bad = |v: v128| unsafe {
-                v128_or(u8x16_eq(v, del), andnot(i8x16_lt(v, sp), u8x16_eq(v, tab)))
-            };
-            if unsafe { any(v128_or(bad(a), bad(b))) } {
-                return false;
-            }
-            i += 32;
-        }
-        while i + 16 <= s.len() {
-            let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
-            let bad =
-                unsafe { v128_or(u8x16_eq(v, del), andnot(i8x16_lt(v, sp), u8x16_eq(v, tab))) };
-            if unsafe { any(bad) } {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii_or_tab(&s[i..])
-    }
-
-    #[target_feature(enable = "simd128")]
     pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
         let sp = u8x16_splat(0x20);
         let del = u8x16_splat(0x7F);
         let tab = u8x16_splat(0x09);
+        let nl = u8x16_splat(0x0A);
         let mut saw_tab = false;
+        let mut saw_newline = false;
         let mut i = 0usize;
         while i + 32 <= s.len() {
             let a = unsafe { v128_load(s.as_ptr().add(i).cast()) };
             let b = unsafe { v128_load(s.as_ptr().add(i + 16).cast()) };
             let classify = |v: v128| unsafe {
                 let tabm = u8x16_eq(v, tab);
+                let nlm = u8x16_eq(v, nl);
                 (
-                    v128_or(u8x16_eq(v, del), andnot(i8x16_lt(v, sp), tabm)),
+                    v128_or(
+                        u8x16_eq(v, del),
+                        andnot(i8x16_lt(v, sp), v128_or(tabm, nlm)),
+                    ),
                     u8x16_bitmask(tabm),
+                    u8x16_bitmask(nlm),
                 )
             };
-            let (ba, ta) = classify(a);
-            let (bb, tb) = classify(b);
+            let (ba, ta, na) = classify(a);
+            let (bb, tb, nb) = classify(b);
             if unsafe { any(v128_or(ba, bb)) } {
                 return super::AsciiClass::Other;
             }
             saw_tab |= ta != 0 || tb != 0;
+            saw_newline |= na != 0 || nb != 0;
             i += 32;
         }
         while i + 16 <= s.len() {
             let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
             let tabm = unsafe { u8x16_eq(v, tab) };
-            let bad = unsafe { v128_or(u8x16_eq(v, del), andnot(i8x16_lt(v, sp), tabm)) };
+            let nlm = unsafe { u8x16_eq(v, nl) };
+            let bad = unsafe {
+                v128_or(
+                    u8x16_eq(v, del),
+                    andnot(i8x16_lt(v, sp), v128_or(tabm, nlm)),
+                )
+            };
             if unsafe { any(bad) } {
                 return super::AsciiClass::Other;
             }
             saw_tab |= unsafe { u8x16_bitmask(tabm) != 0 };
+            saw_newline |= unsafe { u8x16_bitmask(nlm) != 0 };
             i += 16;
         }
-        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "simd128")]
@@ -1210,7 +821,11 @@ mod wasm {
             i += 16;
         }
         let tail = super::next_non_ascii_byte(&s[i..]);
-        if tail == usize::MAX { usize::MAX } else { i + tail }
+        if tail == usize::MAX {
+            usize::MAX
+        } else {
+            i + tail
+        }
     }
 }
 
@@ -1224,7 +839,15 @@ mod neon {
     }
 
     #[inline]
-    unsafe fn first_high_lane(v: uint8x16_t) -> usize {
+    unsafe fn first_high_lane(v: uint8x16_t) -> Option<usize> {
+        // `vcgeq_u8` yields 0xFF/0x00 per lane.  Reinterpreted as u16 lanes,
+        // adjacent byte lanes form 0xFFFF / 0x00FF / 0xFF00 / 0x0000, and
+        // `vshrn_n_u16(.., 4)` narrows each u16 to its top 4 bits per original
+        // byte — so each output byte holds two nibbles, one per input byte.
+        // Reading the 64-bit word little-endian puts the lowest input lane in
+        // the lowest nibble, so `trailing_zeros() / 4` is the original lane
+        // index.  Do not "simplify" the divisor to `/8`: that would be a byte
+        // index into the packed word, not a lane index.
         let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
         let packed = unsafe { vshrn_n_u16(vreinterpretq_u16_u8(high), 4) };
         let bits = unsafe { vget_lane_u64(vreinterpret_u64_u8(packed), 0) };
@@ -1232,115 +855,13 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn is_printable_ascii(s: &[u8]) -> bool {
-        let sp = unsafe { vdupq_n_s8(0x20) };
-        let del = unsafe { vdupq_n_u8(0x7F) };
-        let mut i = 0usize;
-        while i + 32 <= s.len() {
-            let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let b = unsafe { vld1q_u8(s.as_ptr().add(i + 16)) };
-            let bad = |v: uint8x16_t| unsafe {
-                // Signed `< 0x20` also catches every high byte (negative as
-                // i8), replacing the separate unsigned `>= 0x80` test.
-                let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
-                let eq = vceqq_u8(v, del);
-                vorrq_u8(lt, eq)
-            };
-            if unsafe { any_nonzero(vorrq_u8(bad(a), bad(b))) } {
-                return false;
-            }
-            i += 32;
-        }
-        while i + 16 <= s.len() {
-            let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
-            let eq = unsafe { vceqq_u8(v, del) };
-            if unsafe { any_nonzero(vorrq_u8(lt, eq)) } {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii(&s[i..])
-    }
-
-    #[target_feature(enable = "neon")]
-    pub(super) unsafe fn is_printable_ascii_multiline(s: &[u8]) -> bool {
-        let sp = unsafe { vdupq_n_s8(0x20) };
-        let del = unsafe { vdupq_n_u8(0x7F) };
-        let tab_v = unsafe { vdupq_n_u8(0x09) };
-        let nl_v = unsafe { vdupq_n_u8(0x0A) };
-        let mut i = 0usize;
-        while i + 32 <= s.len() {
-            let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let b = unsafe { vld1q_u8(s.as_ptr().add(i + 16)) };
-            let bad = |v: uint8x16_t| unsafe {
-                let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
-                let tab = vceqq_u8(v, tab_v);
-                let nl = vceqq_u8(v, nl_v);
-                let off = vbicq_u8(lt, vorrq_u8(tab, nl));
-                vorrq_u8(vceqq_u8(v, del), off)
-            };
-            if unsafe { any_nonzero(vorrq_u8(bad(a), bad(b))) } {
-                return false;
-            }
-            i += 32;
-        }
-        while i + 16 <= s.len() {
-            let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
-            let tab = unsafe { vceqq_u8(v, tab_v) };
-            let nl = unsafe { vceqq_u8(v, nl_v) };
-            let allowed = unsafe { vorrq_u8(tab, nl) };
-            let off = unsafe { vbicq_u8(lt, allowed) };
-            let eq = unsafe { vceqq_u8(v, del) };
-            if unsafe { any_nonzero(vorrq_u8(eq, off)) } {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii_multiline(&s[i..])
-    }
-
-    #[target_feature(enable = "neon")]
-    pub(super) unsafe fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
-        let sp = unsafe { vdupq_n_s8(0x20) };
-        let del = unsafe { vdupq_n_u8(0x7F) };
-        let tab_v = unsafe { vdupq_n_u8(0x09) };
-        let mut i = 0usize;
-        while i + 32 <= s.len() {
-            let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let b = unsafe { vld1q_u8(s.as_ptr().add(i + 16)) };
-            let bad = |v: uint8x16_t| unsafe {
-                let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
-                let tab = vceqq_u8(v, tab_v);
-                let off = vbicq_u8(lt, tab);
-                vorrq_u8(vceqq_u8(v, del), off)
-            };
-            if unsafe { any_nonzero(vorrq_u8(bad(a), bad(b))) } {
-                return false;
-            }
-            i += 32;
-        }
-        while i + 16 <= s.len() {
-            let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
-            let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
-            let tab = unsafe { vceqq_u8(v, tab_v) };
-            let off = unsafe { vbicq_u8(lt, tab) };
-            let eq = unsafe { vceqq_u8(v, del) };
-            if unsafe { any_nonzero(vorrq_u8(eq, off)) } {
-                return false;
-            }
-            i += 16;
-        }
-        super::is_printable_ascii_or_tab(&s[i..])
-    }
-
-    #[target_feature(enable = "neon")]
     pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
         let sp = unsafe { vdupq_n_s8(0x20) };
         let del = unsafe { vdupq_n_u8(0x7F) };
         let tab_v = unsafe { vdupq_n_u8(0x09) };
+        let nl_v = unsafe { vdupq_n_u8(0x0A) };
         let mut saw_tab = false;
+        let mut saw_newline = false;
         let mut i = 0usize;
         while i + 32 <= s.len() {
             let a = unsafe { vld1q_u8(s.as_ptr().add(i)) };
@@ -1348,30 +869,38 @@ mod neon {
             let classify = |v: uint8x16_t| unsafe {
                 let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
                 let tab = vceqq_u8(v, tab_v);
-                let off = vbicq_u8(lt, tab);
-                (vorrq_u8(vceqq_u8(v, del), off), any_nonzero(tab))
+                let nl = vceqq_u8(v, nl_v);
+                let off = vbicq_u8(lt, vorrq_u8(tab, nl));
+                (
+                    vorrq_u8(vceqq_u8(v, del), off),
+                    any_nonzero(tab),
+                    any_nonzero(nl),
+                )
             };
-            let (bad_a, tab_a) = classify(a);
-            let (bad_b, tab_b) = classify(b);
+            let (bad_a, tab_a, nl_a) = classify(a);
+            let (bad_b, tab_b, nl_b) = classify(b);
             if unsafe { any_nonzero(vorrq_u8(bad_a, bad_b)) } {
                 return super::AsciiClass::Other;
             }
             saw_tab |= tab_a || tab_b;
+            saw_newline |= nl_a || nl_b;
             i += 32;
         }
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
             let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
             let tab = unsafe { vceqq_u8(v, tab_v) };
-            let off = unsafe { vbicq_u8(lt, tab) };
+            let nl = unsafe { vceqq_u8(v, nl_v) };
+            let off = unsafe { vbicq_u8(lt, vorrq_u8(tab, nl)) };
             let eq = unsafe { vceqq_u8(v, del) };
             if unsafe { any_nonzero(vorrq_u8(eq, off)) } {
                 return super::AsciiClass::Other;
             }
             saw_tab |= unsafe { any_nonzero(tab) };
+            saw_newline |= unsafe { any_nonzero(nl) };
             i += 16;
         }
-        super::compose_classify_tail(saw_tab, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
     }
 
     #[target_feature(enable = "neon")]
@@ -1399,17 +928,21 @@ mod neon {
             i += 16;
         }
         let tail = super::next_non_ascii_byte(&s[i..]);
-        if tail == usize::MAX { usize::MAX } else { i + tail }
+        if tail == usize::MAX {
+            usize::MAX
+        } else {
+            i + tail
+        }
     }
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
-    use super::*;
     /// Test-side view of the sentinel API: the explicit import shadows the
     /// glob-imported `next_non_ascii_byte`, so every existing assertion keeps
     /// comparing against `Some(offset)`.
     use super::next_non_ascii as next_non_ascii_byte;
+    use super::*;
 
     /// RAII guard for the test-only forced-SWAR switch.  A panic anywhere
     /// inside the guarded scope would otherwise leave the thread-local set,
@@ -1521,14 +1054,19 @@ mod tests {
     }
     fn ref_classify(s: &[u8]) -> AsciiClass {
         let mut tab = false;
+        let mut newline = false;
         for &b in s {
             if b == b'\t' {
                 tab = true;
+            } else if b == b'\n' {
+                newline = true;
             } else if !(0x20..=0x7E).contains(&b) {
                 return AsciiClass::Other;
             }
         }
-        if tab {
+        if newline {
+            AsciiClass::PrintableOrTabNewline
+        } else if tab {
             AsciiClass::PrintableOrTab
         } else {
             AsciiClass::Printable
@@ -1609,21 +1147,72 @@ mod tests {
             let single = is_printable_ascii(&bytes);
             let tab = is_printable_ascii_or_tab(&bytes);
             let multi = is_printable_ascii_multiline(&bytes);
+            // Four classes = the widest accepted set, so each predicate is an
+            // exact test of the class: biconditionals, not implications.
             assert_eq!(class == AsciiClass::Printable, single, "{bytes:?}");
             assert_eq!(
                 class == AsciiClass::PrintableOrTab,
                 tab && !single,
                 "{bytes:?}"
             );
-            assert_eq!(class == AsciiClass::Other, !tab, "{bytes:?}");
-            // `classify_ascii` rejects EVERY control byte other than `\t`
-            // (`lt20 & !tab` in the SWAR body, `AllowedControls::None` in the
-            // scalar tail), so a newline alone yields `Other` while
-            // `is_printable_ascii_multiline` accepts it.  The invariant is the
-            // implication `Other ⇒ !multi` — NOT a biconditional (which is
-            // what made this assertion flaky: a random slice of printable
-            // bytes containing one `\n` satisfies it only by accident).
-            assert!(class == AsciiClass::Other || multi, "{bytes:?}");
+            assert_eq!(
+                class == AsciiClass::PrintableOrTabNewline,
+                multi && !tab,
+                "{bytes:?}"
+            );
+            assert_eq!(class == AsciiClass::Other, !multi, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn newline_is_the_fourth_class_and_survives_the_vector_widths() {
+        assert_eq!(classify_ascii(b"abc def"), AsciiClass::Printable);
+        assert_eq!(classify_ascii(b"a\tb"), AsciiClass::PrintableOrTab);
+        assert_eq!(classify_ascii(b"a\nb"), AsciiClass::PrintableOrTabNewline);
+        assert_eq!(
+            classify_ascii(b"a\tb\nc"),
+            AsciiClass::PrintableOrTabNewline
+        );
+        // Long enough to reach the SWAR body (and any enabled SIMD kernel), so
+        // the fourth class is not a scalar-only accident.
+        let tabbed = format!("{}\t{}", "x".repeat(40), "y".repeat(40));
+        assert_eq!(
+            classify_ascii(tabbed.as_bytes()),
+            AsciiClass::PrintableOrTab
+        );
+        let multiline = format!("{}\n{}", "x".repeat(100), "y".repeat(100));
+        assert_eq!(
+            classify_ascii(multiline.as_bytes()),
+            AsciiClass::PrintableOrTabNewline
+        );
+        // An offender always outranks the newline class.
+        assert_eq!(classify_ascii(b"a\n\x01b"), AsciiClass::Other);
+        let bad = format!("{}\u{0080}", "x".repeat(100));
+        assert_eq!(classify_ascii(bad.as_bytes()), AsciiClass::Other);
+        // Every predicate is exactly a test of the class, including the
+        // newline cases the old three-class contract could not express.
+        for s in [
+            &b""[..],
+            b"abc def",
+            b"a\tb",
+            b"a\nb",
+            b"a\tb\nc",
+            b"a\n\x01b",
+            b"\x7f",
+            "\u{00e9}".as_bytes(),
+        ] {
+            let class = classify_ascii(s);
+            assert_eq!(is_printable_ascii(s), class == AsciiClass::Printable);
+            assert_eq!(
+                is_printable_ascii_or_tab(s),
+                matches!(class, AsciiClass::Printable | AsciiClass::PrintableOrTab),
+                "{s:?}"
+            );
+            assert_eq!(
+                is_printable_ascii_multiline(s),
+                class != AsciiClass::Other,
+                "{s:?}"
+            );
         }
     }
 
@@ -1694,14 +1283,19 @@ mod tests {
         let _swar = ForceSwarGuard::new();
         let ref_classify = |s: &[u8]| {
             let mut tab = false;
+            let mut newline = false;
             for &b in s {
                 if b == b'\t' {
                     tab = true;
+                } else if b == b'\n' {
+                    newline = true;
                 } else if !(0x20..=0x7E).contains(&b) {
                     return AsciiClass::Other;
                 }
             }
-            if tab {
+            if newline {
+                AsciiClass::PrintableOrTabNewline
+            } else if tab {
                 AsciiClass::PrintableOrTab
             } else {
                 AsciiClass::Printable

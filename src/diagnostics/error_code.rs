@@ -70,16 +70,21 @@ const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
 /// Per-slot memoization map shared by [`ErrCode::url`] / [`ErrCode::url_ansi`]
 /// (one `SlotCache` static per (port-set, doc-URL) × (plain, ANSI) quadrant).
 ///
-/// Shape: a lazily-built `RwLock<FxHashMap<slot, Arc<str>>>` instead of an eagerly-allocated
-/// `CODE_INDEX_SLOTS`-sized array of `OnceLock` shells — a process that only
-/// renders a handful of distinct codes pays for those codes, not ~256 KB of
-/// shells across the four caches.  The hit path is one map lookup + a
-/// refcount bump (`Arc<str>`, not a deep string clone: the OSC 8 form is
-/// 40–80+ heap bytes, and `write_header` calls `url_ansi()` per diagnostic,
-/// so a 1 000-diagnostic batch sharing one code would otherwise pay 1 000
-/// identical allocations); `build` never runs while a lock is held on
-/// `cache` (it may re-enter another `SlotCache`), so there is no
-/// lock-ordering hazard.
+/// Shape: one [`std::sync::OnceLock`] per direct-address slot, indexed by the
+/// slot itself — the slot space is the closed `^[EW]\d{3}$` range
+/// (`DIRECT_ADDRESS_SLOTS = 2000`), so the cache needs neither a hash nor a
+/// lock.  The hit path is one `Acquire` load of the slot state plus an `Arc`
+/// refcount bump; `build` runs exactly once per slot even under a true race
+/// (`get_or_init` parks the loser instead of the old map's "both build, one
+/// insert wins").  The values live inline in the static, so only the pages of
+/// codes a process actually renders are ever committed.
+///
+/// The raw-pointer tier (`AtomicPtr` + a length word, published by `CAS`, read
+/// with `Arc::from_raw`) would shave that one refcount bump, but the published
+/// value would then have to outlive every reader — a deliberate
+/// `Box::into_raw` leak reconstructed through raw pointers on every hit.  This
+/// codebase forbids leak-based lifetime reconstruction, and the difference is a
+/// single atomic RMW, so direct-addressed `OnceLock` is the right endpoint.
 ///
 /// # Invariant
 ///
@@ -92,41 +97,26 @@ const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
 /// `lookup_uppercased` is the case-insensitive path and deliberately does not
 /// feed this cache.  `slot_keyed_caches_require_an_injective_code_slot`
 /// pins this.
-type SlotCache = OnceLock<std::sync::RwLock<rustc_hash::FxHashMap<u16, std::sync::Arc<str>>>>;
+type SlotCache = [std::sync::OnceLock<std::sync::Arc<str>>; DIRECT_ADDRESS_SLOTS];
 
+/// The all-empty cache `static` initialiser.
+const fn new_slot_cache() -> SlotCache {
+    [const { std::sync::OnceLock::new() }; DIRECT_ADDRESS_SLOTS]
+}
+
+#[inline]
 fn cached_slot_string(
     cache: &SlotCache,
     slot: u16,
     build: impl FnOnce() -> CompactString,
 ) -> std::sync::Arc<str> {
-    // One `OnceLock` load, then the map read for hits.  The double-checked
-    // insert guarantees exactly one stored value per slot; a losing racer has
-    // already paid `build()` before discovering the winner.  That duplicate
-    // work is intentional: building under the map write lock would serialize
-    // every miss, and `build` is a cheap pure `format_compact!`.
-    let m = cache.get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashMap::default()));
-    // Poison recovery: the guarded value is only `Arc<str>` built by a pure
-    // function, so a poisoned map is still valid.  Silently bypassing the
-    // cache on poison would turn every later call into a rebuild.
-    {
-        let r = m.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(v) = r.get(&slot) {
-            return std::sync::Arc::clone(v);
-        }
-    }
-    let built: std::sync::Arc<str> = build().into();
-    {
-        let mut w = m.write().unwrap_or_else(|e| e.into_inner());
-        // Double-checked insert: a racing caller may have built and inserted
-        // the same `(slot)` value first.  Its value is identical (both are
-        // pure functions of the slot), so returning the winner's copy skips
-        // a redundant build and keeps exactly one entry per slot.
-        if let Some(v) = w.get(&slot) {
-            return std::sync::Arc::clone(v);
-        }
-        w.insert(slot, std::sync::Arc::clone(&built));
-    }
-    built
+    // The whole hit path: an `Acquire` load of this slot's state and a null
+    // check.  `code_slot` guarantees `slot < DIRECT_ADDRESS_SLOTS`, so the
+    // index is in range by construction.
+    debug_assert!((slot as usize) < DIRECT_ADDRESS_SLOTS);
+    std::sync::Arc::clone(
+        cache[slot as usize].get_or_init(|| std::sync::Arc::from(build().as_str())),
+    )
 }
 
 /// Set the port for the local explain server.  Called by the CLI before
@@ -417,11 +407,34 @@ impl fmt::Display for ErrCode {
 /// `HashMap`/`HashSet` keys.
 impl PartialEq for ErrCode {
     fn eq(&self, other: &Self) -> bool {
-        self.canonical() == other.canonical()
+        let (a, b) = (self.canonical(), other.canonical());
+        // Two representations of one registry code canonicalise to the *same*
+        // `&'static str` (`e.code`), so a fat-pointer compare settles the common
+        // `HashSet<ErrCode>` dedup case in one instruction; junk codes live in
+        // distinct allocations and fall through to the byte compare.  Registry
+        // duplicates are rejected at build time, so pointer equality can never
+        // conflate two distinct codes.
+        std::ptr::eq(a, b) || a == b
     }
 }
 
 impl Eq for ErrCode {}
+
+/// Cold constructor for an unregistered code: the one `Arc<OtherCode>`
+/// allocation an unknown code is documented to cost.
+///
+/// Out of line so `new`/`unknown`/`try_new` callers keep their registry-hit path
+/// I-cache tight — the same treatment `ascii.rs::x86_level_init` gets.  `raw`
+/// keeps the caller's verbatim spelling; `canonical` is the resolved entry when
+/// a differently-cased spelling hit the table.
+#[cold]
+#[inline(never)]
+fn unknown_repr(raw: CompactString, canonical: Option<&'static CodeEntry>) -> ErrCode {
+    ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode {
+        raw,
+        canonical,
+    })))
+}
 
 impl std::hash::Hash for ErrCode {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -480,27 +493,18 @@ impl ErrCode {
     /// (user input, CLI arguments, etc.).
     pub fn new(code: impl AsRef<str>) -> Self {
         let code = code.as_ref();
-        // Fast path: an already-canonical code (the overwhelmingly common
-        // case) hits the table with no allocation and stores the entry
-        // pointer directly.
-        if let Some(e) = lookup(code) {
-            return ErrCode(ErrCodeRepr::Known(e));
-        }
-        // Retry case-insensitively (`e030` → `E030`), matching
-        // `suggest_code`'s case-insensitive comparison — a lowercase code
-        // must resolve to its entry, not degrade to unknown-code metadata.
-        // The retry is allocation-free for real codes (see
-        // [`lookup_uppercased`]).
-        if let Some(e) = lookup_uppercased(code) {
+        // One choke point ([`resolve`]): exact lookup first, then the
+        // allocation-free case-insensitive retry (`e030` → `E030`) that
+        // `suggest_code` also relies on.  Inlining the pair here (as this
+        // function used to) is exactly the drift E5 consolidated away — a
+        // future change to the retry rule must not need two edits.
+        if let Some(e) = resolve(code) {
             return ErrCode(ErrCodeRepr::Known(e));
         }
         // Unknown: stored verbatim — never invent case for arbitrary
-        // strings that are not error codes.  Both lookups above already
-        // failed, so the cached canonical resolution is `None`.
-        ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode {
-            raw: CompactString::from(code),
-            canonical: None,
-        })))
+        // strings that are not error codes.  `resolve` already failed, so the
+        // cached canonical resolution is `None`.
+        unknown_repr(CompactString::from(code), None)
     }
 
     /// Validate that `code` exists in the lookup table, returning
@@ -537,10 +541,7 @@ impl ErrCode {
         // echo in `code()` and the URL link text.
         match resolve(&raw) {
             Some(e) if e.code == raw.as_str() => ErrCode(ErrCodeRepr::Known(e)),
-            canonical => ErrCode(ErrCodeRepr::Other(std::sync::Arc::new(OtherCode {
-                raw,
-                canonical,
-            }))),
+            canonical => unknown_repr(raw, canonical),
         }
     }
 
@@ -669,11 +670,11 @@ impl ErrCode {
             // Two disjoint caches (port set / port unset) mirror `url_ansi`'s
             // split so a later `set_explain_port` can never observe a stale
             // doc-URL host.
-            static URL_CACHE: SlotCache = SlotCache::new();
+            static URL_CACHE: SlotCache = new_slot_cache();
             cached_slot_string(&URL_CACHE, slot, || explain_url_with_port(code, Some(port)))
         } else {
             // No explain server: the doc URL depends only on the code.
-            static DOC_URL_CACHE: SlotCache = SlotCache::new();
+            static DOC_URL_CACHE: SlotCache = new_slot_cache();
             cached_slot_string(&DOC_URL_CACHE, slot, || explain_url_with_port(code, None))
         }
     }
@@ -713,7 +714,7 @@ impl ErrCode {
             return self.url_ansi_build(Some(slot), port).into();
         }
         if port.is_some() {
-            static URL_ANSI_CACHE: SlotCache = SlotCache::new();
+            static URL_ANSI_CACHE: SlotCache = new_slot_cache();
             cached_slot_string(&URL_ANSI_CACHE, slot, || {
                 self.url_ansi_build(Some(slot), port)
             })
@@ -722,7 +723,7 @@ impl ErrCode {
             // same way the doc URL itself is memoized in `url`.  Disjoint
             // from the port cache, so a later `set_explain_port` cannot
             // return a stale doc host.
-            static DOC_URL_ANSI_CACHE: SlotCache = SlotCache::new();
+            static DOC_URL_ANSI_CACHE: SlotCache = new_slot_cache();
             cached_slot_string(&DOC_URL_ANSI_CACHE, slot, || {
                 self.url_ansi_build(Some(slot), port)
             })
@@ -809,13 +810,25 @@ pub(crate) fn direct_slot(code: &str) -> Option<usize> {
     code_slot(code)
 }
 
-/// Case-insensitive registry resolution: canonical [`lookup`] first, then
-/// [`lookup_uppercased`]. One choke point for the pattern that was copied
-/// verbatim into `new`/`try_new`/`canonical`/`entry`/`entry_or_unknown`/
-/// `related_codes_of` (E5).
+/// Case-insensitive registry resolution.
+///
+/// **`resolve` ≡ [`lookup_uppercased`]** — the older
+/// `lookup(code).or_else(|| lookup_uppercased(code))` did redundant work.  Proof:
+/// both require a four-byte code (`code_slot`/`code_slot_parts` return `None`
+/// otherwise), and `lookup_uppercased` computes the slot from
+/// `(b[0].to_ascii_uppercase(), b[1..])`.  For a code `lookup` accepts, `b[0]` is
+/// already `E` or `W` (the table's only prefixes), on which `to_ascii_uppercase`
+/// is the identity, so both compute the same slot.  For any other `b[0]`,
+/// `lookup` is `None` while `lookup_uppercased` may still resolve `e`/`w` — a
+/// strict superset.  Hence `lookup ⊆ lookup_uppercased` and the exact-lookup
+/// branch was dead weight on every construction path
+/// (`new`/`try_new`/`unknown`/`related_codes_of`/`category_siblings_of`).
+///
+/// [`lookup`] itself is kept: `direct_address_index_matches_table` and the
+/// registry tests use it as the exact-case reference.
 #[inline]
 pub(crate) fn resolve(code: &str) -> Option<&'static CodeEntry> {
-    lookup(code).or_else(|| lookup_uppercased(code))
+    lookup_uppercased(code)
 }
 
 /// Look up a code string in the table.
@@ -1152,6 +1165,29 @@ mod tests {
     /// `open_idx`, skipping nested parens, string literals, and comments.
     /// Skip a raw string starting at the `r` of `r#"…"#` (or `br#"…"#`),
     /// returning the index just past the closing delimiter (or `len`).
+    /// Index of the `r` in a raw-string opener at `i` (`r"…"`, `r#"…"#`,
+    /// `br"…"`), or `None` when `i` does not start one.
+    ///
+    /// The identifier-boundary check mirrors [`is_call_site`]: an identifier
+    /// ending in `r`/`br` immediately followed by a literal (`foobar"x"`) must
+    /// not be swallowed as a raw string, or the embedded literal would vanish
+    /// from the scan.  In valid Rust that adjacency is a syntax error, so this
+    /// is defence-in-depth for the scanner, not a correctness fix for compiling
+    /// code.
+    fn raw_string_opener(bytes: &[u8], i: usize) -> Option<usize> {
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                return None;
+            }
+        }
+        match bytes[i] {
+            b'r' => Some(i),
+            b'b' if bytes.get(i + 1) == Some(&b'r') => Some(i + 1),
+            _ => None,
+        }
+    }
+
     fn skip_raw_string(bytes: &[u8], r: usize) -> Option<usize> {
         let mut h = r + 1;
         while h < bytes.len() && bytes[h] == b'#' {
@@ -1230,13 +1266,11 @@ mod tests {
         while i < bytes.len() {
             // Raw strings (r"…", r#"…"#, br#"…"#) may contain parens/quotes
             // that must not affect the scan (E2).
-            if bytes[i] == b'r' || (bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r')
+            if let Some(r) = raw_string_opener(bytes, i)
+                && let Some(end) = skip_raw_string(bytes, r)
             {
-                let r = if bytes[i] == b'r' { i } else { i + 1 };
-                if let Some(end) = skip_raw_string(bytes, r) {
-                    i = end;
-                    continue;
-                }
+                i = end;
+                continue;
             }
             match bytes[i] {
                 b'(' => depth += 1,
@@ -1299,6 +1333,33 @@ mod tests {
     ///
     /// Escaped quotes (`\"`) inside a literal are skipped so the scanner
     /// cannot end the literal early and resume inside the string body.
+    /// `true` when `stripped[start..]` begins a *real* call to the callee.
+    ///
+    /// The preceding byte must not continue an identifier (`MyErrCode::new`,
+    /// `xwith_code_str`), while a path separator stays valid
+    /// (`diagnostics::ErrCode::new`).  Known limits, documented rather than
+    /// half-handled: `ErrCode ::new` (internal whitespace) and an aliased import
+    /// (`use ErrCode as EC; EC::new(..)`) are both missed — tolerating them
+    /// would need a whitespace-aware matcher and an alias table, and a miss only
+    /// weakens the guard, it cannot corrupt a code.
+    fn is_call_site(stripped: &str, start: usize) -> bool {
+        match start.checked_sub(1).map(|i| stripped.as_bytes()[i]) {
+            Some(prev) => !(prev.is_ascii_alphanumeric() || prev == b'_'),
+            None => true,
+        }
+    }
+
+    #[test]
+    fn scanner_requires_an_identifier_boundary() {
+        assert!(is_call_site("ErrCode::new(", 0));
+        // `diagnostics::ErrCode::new(` — the preceding `:` is a path separator.
+        assert!(is_call_site("diagnostics::ErrCode::new(", 13));
+        // A longer identifier ending in the callee is not a call site.
+        assert!(!is_call_site("MyErrCode::new(", 2));
+        assert!(!is_call_site("xwith_code_str(", 1));
+        assert!(!is_call_site("_with_code_str(", 1));
+    }
+
     fn code_literals(arg: &str) -> Vec<&str> {
         let bytes = arg.as_bytes();
         let mut out = Vec::new();
@@ -1306,13 +1367,11 @@ mod tests {
         while i < bytes.len() {
             // Raw strings are not code literals and may contain quotes that
             // would desynchronise the scan (E2).
-            if bytes[i] == b'r' || (bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r')
+            if let Some(r) = raw_string_opener(bytes, i)
+                && let Some(end) = skip_raw_string(bytes, r)
             {
-                let r = if bytes[i] == b'r' { i } else { i + 1 };
-                if let Some(end) = skip_raw_string(bytes, r) {
-                    i = end;
-                    continue;
-                }
+                i = end;
+                continue;
             }
             match bytes[i] {
                 // A char literal such as `'"'` would otherwise flip the
@@ -1514,6 +1573,12 @@ mod tests {
     /// "unknown error" in both `ErrCode::new` and `with_code_str`; this test is
     /// the sole guard.  Scans the crate source, including conditional
     /// forms like `with_code_str(if … { "E109" } else { "E110" })`.
+    ///
+    /// Call sites are matched on an identifier boundary ([`is_call_site`]), so a
+    /// longer name such as `MyErrCode::new` is not treated as this callee and
+    /// cannot demand registration of its literals.  Internal whitespace
+    /// (`ErrCode ::new`) and aliased imports are known misses; both only weaken
+    /// the guard.
     #[test]
     fn literal_codes_are_all_in_code_table() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1532,7 +1597,16 @@ mod tests {
             for callee in ["with_code_str", "ErrCode::new"] {
                 let mut from = 0;
                 while let Some(pos) = stripped[from..].find(callee) {
-                    let after = from + pos + callee.len();
+                    let start = from + pos;
+                    let after = start + callee.len();
+                    // Word boundary: `MyErrCode::new` and `xwith_code_str` are
+                    // different identifiers, and treating them as call sites
+                    // would demand registration of literals in innocent code.
+                    // A preceding `:` stays valid (`diagnostics::ErrCode::new`).
+                    if !is_call_site(&stripped, start) {
+                        from = after;
+                        continue;
+                    }
                     // `stripped` preserves byte offsets, so comments between
                     // the callee and `(` are blanked but the `(` position is
                     // still valid in `src`.
@@ -1647,7 +1721,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn nested_block_comments_do_not_escape_the_scanners() {
         // Rust block comments nest.  Before depth tracking every scanner
         // stopped at the INNER `*/`, so the remainder of the outer comment was
@@ -1663,8 +1736,61 @@ mod tests {
         let _ = code_literals("/* outer /* \"E123\"");
     }
 
+    /// Measurement, not an assertion: the warm slot-cache hit path that
+    /// `write_header` walks once per diagnostic when OSC 8 hyperlinks are on.
+    ///
+    /// In-crate rather than in `benches/`: `error_code.rs` needs the generated
+    /// code table and the Fluent bundles at build time, so it does not survive
+    /// a standalone `#[path]` include the way `ascii.rs` does.
+    ///
+    /// ```text
+    /// cargo test --bin ponent slot_cache_hit_path_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement only"]
+    fn slot_cache_hit_path_cost() {
+        let code = ErrCode::new("E030");
+        // Warm the slot so the timed loop measures the hit path only.
+        let _ = code.url_ansi();
+        let _ = code.url();
+        const N: usize = 200_000;
+        let ansi = {
+            let t0 = std::time::Instant::now();
+            let mut acc = 0usize;
+            for _ in 0..N {
+                acc = acc.wrapping_add(code.url_ansi().len());
+            }
+            let ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+            println!("url_ansi warm hit: {ns:.1} ns/call (acc={acc})");
+            ns
+        };
+        let plain = {
+            let t0 = std::time::Instant::now();
+            let mut acc = 0usize;
+            for _ in 0..N {
+                acc = acc.wrapping_add(code.url().len());
+            }
+            let ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+            println!("url warm hit:      {ns:.1} ns/call (acc={acc})");
+            ns
+        };
+        // Sanity floor, not a performance assertion: a hit is a direct-address
+        // load plus an `Arc` clone, so even an extremely slow host stays far
+        // below this.  A regression to a per-call build (microseconds) trips it.
+        assert!(
+            ansi < 500.0 && plain < 500.0,
+            "slot cache hit path is not constant-time (ansi {ansi} ns, plain {plain} ns)"
+        );
+    }
+
     #[test]
     fn slot_keyed_caches_require_an_injective_code_slot() {
+        // Port-sensitive: this test compares two `url()` results, and
+        // `set_explain_port_reports_second_set` flips the process port from
+        // another test thread.  Without the lock the two calls can straddle the
+        // flip (doc URL vs `127.0.0.1:<port>` URL), which is an intermittent
+        // failure, not a stable result.
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The four slot-keyed caches are sound ONLY because `code_slot` accepts
         // the canonical `^[EW]\d{3}$` shape with a case-sensitive prefix: two
         // distinct shape-valid strings can never share a slot.  If a future

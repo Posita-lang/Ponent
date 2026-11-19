@@ -3393,7 +3393,48 @@ static LINE_INDEX_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// input, and the halved table halves `line_of`'s binary-search cache
 /// footprint (the table is read on every span conversion).  The `debug_assert`
 /// guards the cast; sources are ≤ 4 GiB in every supported configuration.
-fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool) {
+/// Word-at-a-time content hash: 8-byte chunks, one multiply+shift each.
+///
+/// Used as the cross-batch identity of a source's text (the emitter's
+/// `file_index_cache` key).  It must be a *content* hash — the cheap
+/// `source_fingerprint` (first/last 8 + len) is only an ABA tripwire, and a
+/// middle-only edit preserves it.  No cryptographic strength is needed: the
+/// cache is also keyed by `FileId`.
+///
+/// [`scan_line_starts_and_ascii`] accumulates this exact function while it is
+/// already walking the bytes, so a cache miss costs one pass instead of two.
+pub(crate) fn content_hash_of(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = K ^ (bytes.len() as u64).wrapping_mul(K);
+    let mut chunks = bytes.chunks_exact(8);
+    for c in &mut chunks {
+        let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        h = (h ^ w).wrapping_mul(K);
+        h ^= h >> 29;
+    }
+    let tail = chunks.remainder();
+    if !tail.is_empty() {
+        let mut w = 0u64;
+        for (i, &b) in tail.iter().enumerate() {
+            w |= u64::from(b) << (i * 8);
+        }
+        h = (h ^ w).wrapping_mul(K);
+        h ^= h >> 29;
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(K);
+    h ^= h >> 29;
+    h
+}
+
+/// Line-start table, ASCII flag and [`content_hash_of`] in **one** pass.
+///
+/// The line scan already walks every 8-byte word, so folding the hash in costs
+/// a multiply+shift per word and saves the separate `O(len)` hashing pass the
+/// emitter used to pay on a cache miss.  The fused accumulation is bit-identical
+/// to [`content_hash_of`] (same chunking, same tail assembly, same avalanche),
+/// pinned by `fused_scan_hash_matches_the_standalone_function`.
+fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool, u64) {
     const HI: u64 = 0x8080_8080_8080_8080;
     const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
     const ONES: u64 = 0x0101_0101_0101_0101;
@@ -3418,9 +3459,15 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool) {
     let mut starts = Vec::with_capacity(capacity);
     starts.push(0);
     let mut ascii = true;
+    // Fused content hash (see `content_hash_of`): identical chunking, so the
+    // two implementations cannot drift.
+    const HASH_K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut hash = HASH_K ^ (bytes.len() as u64).wrapping_mul(HASH_K);
     let mut i = 0;
     while i + 8 <= bytes.len() {
         let x = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        hash = (hash ^ x).wrapping_mul(HASH_K);
+        hash ^= hash >> 29;
         ascii &= (x & HI) == 0;
         let q = x ^ NL;
         // Exact newline mask.  `(q | HI)` is 0x80 at a newline and also at
@@ -3436,15 +3483,26 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool) {
         }
         i += 8;
     }
+    let mut tail_word = 0u64;
+    let mut tail_len = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
         ascii &= b < 0x80;
+        tail_word |= u64::from(b) << (tail_len * 8);
+        tail_len += 1;
         if b == b'\n' {
             starts.push((i + 1) as u32);
         }
         i += 1;
     }
-    (starts, ascii)
+    if tail_len != 0 {
+        hash = (hash ^ tail_word).wrapping_mul(HASH_K);
+        hash ^= hash >> 29;
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(HASH_K);
+    hash ^= hash >> 29;
+    (starts, ascii, hash)
 }
 
 /// Soft cap on `LineIndex::char_prefixes` growth: the map gains one entry per
@@ -3510,14 +3568,23 @@ fn cap_char_prefixes(cache: &mut FxHashMap<usize, crate::diagnostics::render::Ch
 
 impl<'a> LineIndex<'a> {
     pub(crate) fn new(source: &'a str) -> Self {
-        let (starts, ascii) = scan_line_starts_and_ascii(source);
-        Self {
+        Self::new_hashed(source).0
+    }
+
+    /// [`Self::new`] plus the fused content hash: the emitter keys its
+    /// cross-batch table cache by that hash, so returning it from the scan it
+    /// already performs turns a cache miss from two full passes (hash, then
+    /// index) into one.
+    pub(crate) fn new_hashed(source: &'a str) -> (Self, u64) {
+        let (starts, ascii, content_hash) = scan_line_starts_and_ascii(source);
+        let idx = Self {
             starts: Arc::from(starts),
             source,
             ascii,
             char_prefixes: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
             generation: LINE_INDEX_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        }
+        };
+        (idx, content_hash)
     }
 
     /// Build an index for `source` from a table already computed for that same
@@ -3886,6 +3953,46 @@ impl<'a> LineIndex<'a> {
 mod tests {
     use super::*;
     use crate::ast::Span;
+
+    /// The fused scan must be *bit-identical* to the standalone mixer, and must
+    /// still produce the same line table as `LineIndex::new`.  If the two ever
+    /// drift, every emitter cache lookup would miss forever (and the cache
+    /// would silently stop working rather than fail loudly).
+    #[test]
+    fn fused_scan_hash_matches_the_standalone_function() {
+        let mut cases: Vec<String> = vec![
+            String::new(),
+            "a".into(),
+            "abc".into(),
+            "a\nb".into(),
+            "x".repeat(7),
+            "x".repeat(8),
+            "x".repeat(9),
+            "line\n".repeat(37),
+            format!("{}\n{}", "y".repeat(1023), "誤り"),
+            "\u{0080}\u{202E}".into(),
+            "\n".repeat(64),
+        ];
+        cases.push(format!("{}\t{}", "z".repeat(64), "w".repeat(64)));
+        for s in &cases {
+            let (starts, ascii, hash) = super::scan_line_starts_and_ascii(s);
+            assert_eq!(hash, super::content_hash_of(s.as_bytes()), "{s:?}");
+            let idx = super::LineIndex::new(s);
+            assert_eq!(idx.starts_arc().as_ref(), starts.as_slice(), "{s:?}");
+            assert_eq!(idx.ascii(), ascii, "{s:?}");
+            let (idx2, h2) = super::LineIndex::new_hashed(s);
+            assert_eq!(h2, hash, "{s:?}");
+            assert_eq!(idx2.starts_arc().as_ref(), starts.as_slice(), "{s:?}");
+        }
+        // A middle-only edit must move the hash (the whole point of hashing the
+        // content instead of the first/last 8 bytes).
+        let a = format!("{}{}{}", "a".repeat(64), 'b', "a".repeat(64));
+        let b = format!("{}{}{}", "a".repeat(64), 'c', "a".repeat(64));
+        assert_ne!(
+            super::content_hash_of(a.as_bytes()),
+            super::content_hash_of(b.as_bytes())
+        );
+    }
 
     #[test]
     fn test_basic_error() {

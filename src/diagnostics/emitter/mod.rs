@@ -233,7 +233,17 @@ impl FilesSeen {
                 }
             }
             FilesSeenInner::Large { names, .. } => {
-                names.claimed.insert(CompactString::from(name));
+                // Probe before allocating: `CompactString::from` heap-allocates
+                // once a name outgrows the inline store, and a batch that keeps
+                // re-seeing the same files paid that allocation only for
+                // `insert` to drop it.  `claimed` is probed borrow-free
+                // (`CompactString: Borrow<str>`).
+                if !names.claimed.contains(name) {
+                    names.claimed.insert(CompactString::from(name));
+                }
+                // The `(FileId, name)` key cannot be looked up without building
+                // it, so this insert keeps one allocation; the repeat-file case
+                // now pays one instead of two.
                 names.id_names.insert((id, CompactString::from(name)));
             }
         }
@@ -322,17 +332,48 @@ struct BatchScratch {
 /// Prebuilt line-table entry shared by all workers.
 type Prebuilt = crate::diagnostics::render::PreloadedSource;
 
-/// Full-content FNV-1a for the cross-batch line-table cache key.  The cheap
-/// `source_fingerprint` (first/last 8 + len) is fine for the debug ABA
-/// tripwire but not for a persistent cache: a middle-only edit preserves the
-/// old fingerprint and would reuse stale line starts.
+/// Full-content hash for the cross-batch line-table cache key.
+///
+/// Single definition lives in [`crate::diagnostics::content_hash_of`], because
+/// `LineIndex::new_hashed` fuses the same accumulation into the line scan; two
+/// copies of the mixer could silently disagree and turn every miss into a
+/// permanent cache miss.  Kept as a named wrapper for the tests below and for
+/// callers that only have the text.
+#[inline]
 fn source_content_hash(s: &str) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in s.as_bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    crate::diagnostics::content_hash_of(s.as_bytes())
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::source_content_hash;
+
+    #[test]
+    fn middle_edit_changes_the_hash() {
+        let a = format!("{}{}{}", "a".repeat(64), 'b', "a".repeat(64));
+        let b = format!("{}{}{}", "a".repeat(64), 'c', "a".repeat(64));
+        assert_ne!(source_content_hash(&a), source_content_hash(&b));
     }
-    h
+
+    #[test]
+    fn equal_content_hashes_equal() {
+        let a = format!("{}{}", "x".repeat(37), "yz");
+        assert_eq!(source_content_hash(&a), source_content_hash(&a.clone()));
+        assert_eq!(source_content_hash(""), source_content_hash(""));
+    }
+
+    #[test]
+    fn length_and_tail_are_part_of_the_hash() {
+        assert_ne!(source_content_hash(""), source_content_hash("\0"));
+        assert_ne!(
+            source_content_hash("abcdefg"),
+            source_content_hash("abcdefgh")
+        );
+        assert_ne!(
+            source_content_hash("abcdefgh"),
+            source_content_hash("abcdefgi")
+        );
+    }
 }
 
 /// One batch shared with resident workers.  No lifetime erasure: the
@@ -354,6 +395,13 @@ struct BatchShared<'a, 'src, R: Renderer> {
     string_pools: &'a [std::sync::Mutex<Vec<String>>],
     streaming: bool,
 }
+
+/// Largest buffer the pool keeps unconditionally.
+const POOL_SMALL_CAP: usize = 64 * 1024;
+/// Largest *oversize* buffer the pool keeps at all: one per pool, so a single
+/// huge diagnostic cannot evict its size class permanently while the retained
+/// memory stays `pools * (64 * POOL_SMALL_CAP + POOL_OVERSIZE_CAP)`.
+const POOL_OVERSIZE_CAP: usize = 1024 * 1024;
 
 /// Resident-pool worker for one batch.  Claims are atomic and each cell is
 /// locked exactly for its own render, so weight-model lies only affect claim
@@ -382,7 +430,12 @@ fn worker_render_dynamic<R: Renderer>(
             break;
         }
         let orig = shared.order[claim];
-        let mut buf = shared.string_pools[worker_idx % shared.string_pools.len()]
+        // `worker_idx` is already reduced modulo the pool count by the
+        // dispatcher (`worker_idx % pool_count` at the submit site) and
+        // `shared.string_pools.len() == pool_count`, so this index is in range
+        // by construction — the repeated `%` was a division per diagnostic.
+        debug_assert!(worker_idx < shared.string_pools.len());
+        let mut buf = shared.string_pools[worker_idx]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop()
@@ -411,7 +464,9 @@ fn worker_render_dynamic<R: Renderer>(
         };
         *shared.slots[orig].lock().unwrap_or_else(|e| e.into_inner()) = Some((buf, worker_idx));
         if shared.streaming {
-            shared.slot_cv.notify_all();
+            // Streaming has exactly one waiter (the main consumer); notifying
+            // the whole queue for a single thread is wasted wakeups.
+            shared.slot_cv.notify_one();
         }
     }
 }
@@ -767,7 +822,18 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         {
             self.render_dynamic(filtered.as_mut_slice(), &mut batch, sink, num_threads)
         } else {
-            let cx = RenderCtx::hoisted(&self.opts, None, &self.shared);
+            // Opportunistic content-keyed reuse.  Hashing every source is only
+            // worth it once the cache already holds content keys (a parallel
+            // batch or an earlier serial batch); on a cold process it would add
+            // a full pass on top of the `LineIndex::new` the path pays anyway.
+            // With keys present, an LSP re-publish (same file, new allocation)
+            // reuses the table instead of rescanning the whole file.
+            let prebuilt = if self.file_index_cache.borrow().is_empty() {
+                Vec::new()
+            } else {
+                self.prebuild_sources(&filtered[..], &batch.weights).0
+            };
+            let cx = RenderCtx::hoisted_with_prebuilt(&self.opts, None, &self.shared, &prebuilt);
             self.render_sequential(filtered.as_mut_slice(), sink, &cx)
         };
         self.batch = batch;
@@ -836,7 +902,13 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             if first {
                 first = false;
             } else if !separator.is_empty() {
-                buf.insert_str(0, separator);
+                // Write the separator on its own instead of splicing it into
+                // the buffer: `insert_str(0, ..)` memmoves the whole rendered
+                // diagnostic (up to a 64 KiB pooled buffer) per emission, and
+                // may reallocate when capacity == len.  A sink is a
+                // concatenation of `write_str` calls, so the bytes are
+                // identical.
+                sink.write_str(separator)?;
             }
             sink.write_str(&buf)?;
         }
@@ -862,16 +934,53 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 if seen.insert(key) {
                     let file_id = diag.spans.primary_ref().first().map(|s| s.file);
                     let fingerprint = crate::diagnostics::render::source_fingerprint(src);
-                    let content_hash = source_content_hash(src);
+                    // Two shapes, chosen by whether this file already has a
+                    // cache entry:
+                    //
+                    // * cold (no entry for this `FileId`): the lookup cannot
+                    //   hit, so the fused scan gives table *and* key in one
+                    //   pass instead of two;
+                    // * warm: hash first (one word-at-a-time pass), because
+                    //   building a table we are about to discard would allocate
+                    //   a line-start vector per hit — worse than a hash pass on
+                    //   large sources.
+                    let warm = file_id.is_some_and(|id| {
+                        self.file_index_cache
+                            .borrow()
+                            .iter()
+                            .any(|(f, _, _)| *f == id)
+                    });
+                    let (prebuilt_idx, content_hash) = if warm {
+                        (None, source_content_hash(src))
+                    } else {
+                        let (idx, h) = LineIndex::new_hashed(src);
+                        (Some(idx), h)
+                    };
                     let cached = file_id.and_then(|id| {
                         self.file_index_cache.borrow().iter().find_map(|(f, h, p)| {
                             (*f == id && *h == content_hash).then(|| p.clone())
                         })
                     });
                     if let Some(p) = cached {
-                        out.push(Prebuilt { fingerprint, ..p });
+                        // The hit proves *content* identity (the cache is keyed
+                        // by `(FileId, content hash)`), but `p`'s identity
+                        // fields address the allocation of a previous batch.
+                        // Every downstream lookup matches prebuilt tables by
+                        // `(ptr, len)` — `source_weight`, the worker `RenderCtx`
+                        // LRU — so reusing the old pair made each hit useless
+                        // (weight 0, silent rebuild) and, if the allocator
+                        // reused that address for a different file's source,
+                        // could associate the wrong line table.  Refresh them
+                        // from *this* batch's source; `starts`/`char_prefixes`
+                        // are content-derived and stay valid.
+                        out.push(Prebuilt {
+                            ptr: key.0,
+                            len: key.1,
+                            fingerprint,
+                            ..p
+                        });
                     } else {
-                        let idx = LineIndex::new(src);
+                        let idx = prebuilt_idx.unwrap_or_else(|| LineIndex::new(src));
                         let entry = Prebuilt {
                             ptr: key.0,
                             len: key.1,
@@ -969,14 +1078,27 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             if first {
                 first = false;
             } else if !separator.is_empty() {
-                buf.insert_str(0, separator);
+                // Write the separator on its own instead of splicing it into
+                // the buffer: `insert_str(0, ..)` memmoves the whole rendered
+                // diagnostic (up to a 64 KiB pooled buffer) per emission, and
+                // may reallocate when capacity == len.  A sink is a
+                // concatenation of `write_str` calls, so the bytes are
+                // identical.
+                sink.write_str(separator)?;
             }
             sink.write_str(&buf)?;
-            if buf.capacity() <= 64 * 1024 {
+            // Keep one oversize buffer per pool (bounded by
+            // `POOL_OVERSIZE_CAP`): a single huge diagnostic used to evict its
+            // size class from the pool permanently, so every later batch
+            // re-allocated.
+            let oversize = buf.capacity() > POOL_SMALL_CAP;
+            if !oversize || buf.capacity() <= POOL_OVERSIZE_CAP {
                 let mut pool = string_pools[owner]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if pool.len() < 64 {
+                let oversize_slot_taken =
+                    oversize && pool.iter().any(|b| b.capacity() > POOL_SMALL_CAP);
+                if pool.len() < 64 && !oversize_slot_taken {
                     buf.clear();
                     pool.push(buf);
                 }
@@ -1053,17 +1175,26 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             if first {
                 first = false;
             } else if !separator.is_empty() {
-                buf.insert_str(0, separator);
+                // Write the separator on its own instead of splicing it into
+                // the buffer: `insert_str(0, ..)` memmoves the whole rendered
+                // diagnostic (up to a 64 KiB pooled buffer) per emission, and
+                // may reallocate when capacity == len.  A sink is a
+                // concatenation of `write_str` calls, so the bytes are
+                // identical.
+                sink.write_str(separator)?;
             }
             if let Err(err) = sink.write_str(&buf) {
                 result = Err(err);
                 break;
             }
-            if buf.capacity() <= 64 * 1024 {
+            let oversize = buf.capacity() > POOL_SMALL_CAP;
+            if !oversize || buf.capacity() <= POOL_OVERSIZE_CAP {
                 let mut pool = shared.string_pools[owner]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if pool.len() < 64 {
+                let oversize_slot_taken =
+                    oversize && pool.iter().any(|b| b.capacity() > POOL_SMALL_CAP);
+                if pool.len() < 64 && !oversize_slot_taken {
                     buf.clear();
                     pool.push(buf);
                 }
@@ -1457,7 +1588,6 @@ mod tests {
         assert_eq!(seen.len(), 2, "distinct FileIds were merged by name");
     }
 
-    #[test]
     #[test]
     fn files_seen_large_spill_preserves_last_and_claim() {
         let mut seen = FilesSeen::new();

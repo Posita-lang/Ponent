@@ -118,19 +118,22 @@ impl<'a> ChainSuffix<'a> {
 }
 
 /// A single entry in a call/reference chain (Zig-style `referenced by`).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written ([below](ChainEntry)) so it cannot recurse through
+/// `children`; only `Clone` is derived.
+#[derive(Clone)]
 pub struct ChainEntry<'src> {
-    pub kind: ChainEntryKind,
+    pub(crate) kind: ChainEntryKind,
     /// Source location of this entry, or `None` when the caller has no
     /// position information.  Using `Option` avoids the `(0, 0)` sentinel,
     /// which could not be distinguished from a real zero-length span at the
     /// start of a file.
-    pub span: Option<Span>,
-    pub message: Cow<'src, str>,
+    pub(crate) span: Option<Span>,
+    pub(crate) message: Cow<'src, str>,
     /// Nested entries below this one.  `None` for the common flat-chain
     /// case: `Option<Box<[T]>>` is 16 bytes (the slice pointer's niche is
     /// the discriminant), versus 24 for an always-empty `Vec`.
-    pub children: Option<Box<[CallChain<'src>]>>,
+    pub(crate) children: Option<Box<[CallChain<'src>]>>,
 }
 
 impl<'src> ChainEntry<'src> {
@@ -215,7 +218,7 @@ impl ChainEntryKind {
 ///   referenced by:
 ///       main: file.ps:8:12
 ///       callMain: std/start.zig:698:59
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CallChain<'src> {
     entries: Vec<ChainEntry<'src>>,
     /// Per-chain memo for [`Self::scan`]; invalidated by [`Self::push`].
@@ -225,6 +228,12 @@ pub struct CallChain<'src> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChainFacts {
     any_spanned: bool,
+    /// `FileId` of the first spanned entry in pre-order, within the same depth
+    /// and entry caps the renderer applies.  Folded in here so the anchor
+    /// derivation costs no second traversal *and* cannot name an entry the
+    /// renderer would never emit (the old `first_spanned_file` walk was
+    /// uncapped, so on a hostile chain it could disagree with the render).
+    first_file: Option<FileId>,
     entry_count: usize,
     message_bytes: usize,
     indent_bytes: usize,
@@ -281,6 +290,78 @@ impl Drop for CallChain<'_> {
             }
         }
     }
+}
+
+/// How many top-level entries [`Debug`] prints before eliding the rest.
+///
+/// `Debug` output is bounded for the same reason rendering is: a hostile or
+/// fuzzer-built chain must not turn a `format!("{:?}")` into megabytes of text.
+const DEBUG_ENTRIES: usize = 8;
+
+/// Depth-limited `Debug` (the derive would recurse one frame per nesting
+/// level).
+///
+/// The iterative [`Drop`] above exists because a 100k-deep chain overflows the
+/// stack on teardown; a derived `Debug` would reopen the same hazard through
+/// every `unwrap` panic message, `assert_eq!` failure and tracing field on a
+/// chain.  Nested chains are summarised by their entry count instead of being
+/// printed, so this implementation is O(top-level entries) regardless of depth.
+impl std::fmt::Debug for CallChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CallChain {{ entries: {}, head: [", self.entries.len())?;
+        for (i, entry) in self.entries.iter().take(DEBUG_ENTRIES).enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{entry:?}")?;
+        }
+        if self.entries.len() > DEBUG_ENTRIES {
+            write!(f, ", … {} more", self.entries.len() - DEBUG_ENTRIES)?;
+        }
+        f.write_str("] }")
+    }
+}
+
+/// See [`CallChain`]'s `Debug`: `children` is a count, never a recursive walk.
+impl std::fmt::Debug for ChainEntry<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainEntry")
+            .field("kind", &self.kind)
+            .field("span", &self.span)
+            .field("message", &self.message)
+            .field(
+                "nested_chains",
+                &self.children.as_ref().map_or(0, |c| c.len()),
+            )
+            .finish()
+    }
+}
+
+/// Percent-encode every byte `>= 0x80` so an OSC 8 payload stays a valid URL.
+///
+/// [`path_to_file_url`](super::term::path_to_file_url) already emits ASCII (it
+/// encodes non-ASCII path bytes itself), so this only fires for a custom
+/// [`RenderCtx::file_url`](super::RenderCtx::file_url) that hands back raw
+/// UTF-8.  Dropping the hyperlink there loses the link for a legitimate
+/// non-ASCII filename; encoding keeps it.
+fn percent_encode_high_bytes(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    // Exact capacity: every byte >= 0x80 becomes three bytes (`%XX`).  The
+    // sibling `encode_url_path_segment` uses the same worst-case reasoning;
+    // reserving `len + 8` reallocated ~log2(n) times on a fully non-ASCII URL.
+    let high = s.bytes().filter(|b| *b >= 0x80).count();
+    let mut out = String::with_capacity(s.len() + 2 * high);
+    for &b in s.as_bytes() {
+        if b >= 0x80 {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        } else {
+            // ASCII only: `as char` is the identity on this branch.
+            out.push(b as char);
+        }
+    }
+    out
 }
 
 impl<'src> CallChain<'src> {
@@ -342,6 +423,7 @@ impl<'src> CallChain<'src> {
 
     fn compute_facts(&self) -> ChainFacts {
         let mut any_spanned = false;
+        let mut first_file: Option<FileId> = None;
         let mut message_bytes = 0usize;
         let mut indent_bytes = 0usize;
         let mut visited = 0usize;
@@ -385,7 +467,11 @@ impl<'src> CallChain<'src> {
                     .saturating_add(indent.saturating_mul(extra_rows))
                     .min(MAX_RESERVE_MESSAGE_BYTES);
             }
-            any_spanned = any_spanned || entry.span.is_some();
+            if let Some(span) = entry.span {
+                any_spanned = true;
+                // Pre-order: the first spanned entry encountered is the anchor.
+                first_file = first_file.or(Some(span.file));
+            }
             message_bytes = message_bytes
                 .saturating_add(entry.message.len())
                 .min(MAX_RESERVE_MESSAGE_BYTES);
@@ -397,6 +483,7 @@ impl<'src> CallChain<'src> {
         }
         ChainFacts {
             any_spanned,
+            first_file,
             entry_count: visited,
             message_bytes,
             indent_bytes,
@@ -472,38 +559,15 @@ impl<'src> CallChain<'src> {
             // Derive the anchor instead of assuming every span belongs to
             // `file_name`: a foreign span then falls back to its kind label
             // rather than printing this file's name with another file's
-            // line/column (the legacy `anchor = None` hazard).
-            self.first_spanned_file(),
+            // line/column (the legacy `anchor = None` hazard).  `facts` already
+            // carries the pre-order first spanned file, computed with the same
+            // caps as the renderer, so the anchor costs no second walk and can
+            // never name an entry the render truncates away.
+            facts.first_file,
             facts,
             &mut out,
         );
         out
-    }
-
-    /// `FileId` of the first spanned entry in pre-order (same depth cap as
-    /// [`Self::scan`]).  Used by [`Self::render_with_index`] to derive the
-    /// anchor rather than assuming every span belongs to `file_name`.
-    fn first_spanned_file(&self) -> Option<FileId> {
-        let mut stack: SmallVec<[(&CallChain<'src>, usize, usize); 8]> = SmallVec::new();
-        stack.push((self, 0, 0));
-        while let Some((chain, depth, next)) = stack.pop() {
-            if depth > MAX_CHAIN_DEPTH || next >= chain.entries.len() {
-                continue;
-            }
-            let entry = &chain.entries[next];
-            if let Some(span) = entry.span {
-                return Some(span.file);
-            }
-            if next + 1 < chain.entries.len() {
-                stack.push((chain, depth, next + 1));
-            }
-            if let Some(children) = &entry.children {
-                for child in children.iter().rev() {
-                    stack.push((child, depth + 1, 0));
-                }
-            }
-        }
-        None
     }
 
     /// Render the chain into an existing buffer.
@@ -534,6 +598,11 @@ impl<'src> CallChain<'src> {
         anchor: Option<FileId>,
         out: &mut String,
     ) {
+        // An empty chain renders nothing, so skip the facts DFS (whose debug
+        // canary recomputes it) entirely.
+        if self.entries.is_empty() {
+            return;
+        }
         let facts = self.scan();
         self.render_into_with_facts(
             use_color, source, file_name, idx, max_width, tab_width, cx, anchor, facts, out,
@@ -580,7 +649,16 @@ impl<'src> CallChain<'src> {
         // `file_name` and the process environment, neither of which changes
         // across recursion levels — only `depth` varies.  Computing them
         // once turns an N-level chain from N syscalls + N env probes into 1.
-        let sanitized = super::sanitize_filename(file_name);
+        //
+        // A chain with no *located* entry never renders `file_name` (every
+        // suffix falls back to its kind label), so the sanitize allocation and
+        // the grapheme-width scan are dead there.
+        let located = source.is_some() && facts.any_spanned;
+        let sanitized = if located {
+            super::sanitize_filename(file_name)
+        } else {
+            Cow::Borrowed(file_name)
+        };
         // The URL is consumed only by a spanned entry; a kind-only chain would
         // otherwise pay a `canonicalize` syscall chain for output that never
         // uses it.  Gate on whether any entry anywhere carries a span.
@@ -608,10 +686,20 @@ impl<'src> CallChain<'src> {
             // control byte.  A custom `RenderCtx::file_url` can violate the
             // upstream contracts, so degrade to plain text here.  Validating
             // once per chain also removes a per-entry byte scan.
-            if candidate.bytes().any(|b| b.is_ascii_control() || b >= 0x80) {
+            if candidate.bytes().any(|b| b.is_ascii_control()) {
                 None
-            } else {
+            } else if candidate.is_ascii() {
                 Some(candidate)
+            } else {
+                // High bytes are not dangerous, only non-conforming: terminals
+                // accept raw UTF-8 in OSC 8, but a URL must be ASCII (RFC
+                // 3986).  Encoding keeps the link for a non-ASCII filename
+                // where the old blanket rejection silently dropped it, and the
+                // payload is zero-width so `cols()` is unaffected.  One
+                // allocation per chain, only on this path.
+                Some(std::sync::Arc::from(
+                    percent_encode_high_bytes(&candidate).as_str(),
+                ))
             }
         } else {
             None
@@ -620,7 +708,13 @@ impl<'src> CallChain<'src> {
         // points at the same file, and `visible_width` reads only
         // `file_name` — so compute it once here instead of once per
         // recursion level (an N-level chain used to rescan the name N×).
-        let file_cols = visible_width(&sanitized);
+        // Only a `FileLineCol` suffix reads it; a kind-only chain leaves the
+        // scan out entirely (`ChainSuffix::Kind` carries its own width).
+        let file_cols = if located {
+            visible_width(&sanitized)
+        } else {
+            0
+        };
         let capped = std::cell::Cell::new(false);
         let rendered = std::cell::Cell::new(0usize);
         // Resolve the four kind labels once: the language cannot change inside
@@ -688,7 +782,13 @@ impl<'src> CallChain<'src> {
         if start_col % tab_width == 0 || !message.contains('\t') {
             return Cow::Borrowed(message);
         }
-        let mut out = String::with_capacity(message.len() + 8);
+        // Each tab expands to at most `tab_width - 1` spaces *instead of* its
+        // single byte, so `len + tabs * (tab_width - 1)` is an exact upper
+        // bound.  The old `len + 8` reallocated on every tab-dense message —
+        // precisely the input this function exists for.  `memchr` is SIMD.
+        let tabs = memchr::memchr_iter(b'\t', message.as_bytes()).count();
+        let extra = tabs.saturating_mul(tab_width - 1);
+        let mut out = String::with_capacity(message.len() + extra);
         for (i, line) in message.split('\n').enumerate() {
             if i > 0 {
                 out.push('\n');
@@ -815,7 +915,13 @@ impl<'src> CallChain<'src> {
                     tab_width,
                     max_width.saturating_sub(indent_cols.saturating_add(suffix_cols)),
                 ),
-                super::ascii::AsciiClass::Other => None,
+                // A layout-intended newline means the message is not single-line,
+                // so it must go through `wrap_optimal`, which honours hard
+                // newlines.  (This arm exists only because the class is now
+                // exact: previously a newline classified as `Other` and fell
+                // through the same way.)
+                super::ascii::AsciiClass::PrintableOrTabNewline
+                | super::ascii::AsciiClass::Other => None,
             };
             if fast_width.is_some_and(|width| {
                 // `wrap_optimal` trims edge whitespace; decline both space
@@ -1184,6 +1290,49 @@ mod tests {
             };
         }
         drop(chain);
+    }
+
+    /// The derived `Debug` recursed one frame per nesting level — the same
+    /// hazard the iterative `Drop` above removes, but reachable through any
+    /// `unwrap` panic message or `assert_eq!` on a chain.
+    #[test]
+    fn debug_of_a_deep_chain_is_bounded() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        let mut chain = CallChain {
+            entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")],
+            facts: std::sync::OnceLock::new(),
+        };
+        for _ in 0..10_000 {
+            let entry =
+                ChainEntry::new(ChainEntryKind::Call, Some(span), "x").with_children(vec![chain]);
+            chain = CallChain {
+                entries: vec![entry],
+                facts: std::sync::OnceLock::new(),
+            };
+        }
+        let rendered = format!("{chain:?}");
+        assert!(
+            rendered.len() < 4_096,
+            "Debug output grew with depth: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.contains("nested_chains: 1"), "{rendered}");
+        drop(chain);
+    }
+
+    /// A custom `RenderCtx::file_url` can hand back raw UTF-8; the OSC 8
+    /// payload must still be an ASCII URL, so those bytes are percent-encoded
+    /// rather than dropping the hyperlink.
+    #[test]
+    fn non_ascii_url_bytes_are_percent_encoded() {
+        assert_eq!(
+            percent_encode_high_bytes("file:///tmp/café.rs"),
+            "file:///tmp/caf%C3%A9.rs"
+        );
+        assert_eq!(
+            percent_encode_high_bytes("file:///tmp/a.rs"),
+            "file:///tmp/a.rs"
+        );
     }
 
     #[test]
