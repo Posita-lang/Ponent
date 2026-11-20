@@ -95,7 +95,6 @@ assert tuple(max(x,y) for x,y in zip(*CB)) in CB
 p1, p2 = partitions(CB[0]), partitions(CB[1])
 assert not refines(p1,p2) and not refines(p2,p1)
 common_ref = {frozenset(a & b) for a in p1 for b in p2 if a & b}
-common_coa = {frozenset.union(*g) for g in []}  # computed explicitly below
 # coarsening = transitive closure of "share a vertex" over the two partitions
 blocks = list(p1) + list(p2)
 parent = list(range(len(blocks)))
@@ -278,8 +277,16 @@ for n in (3,4):
         rf_chain = all(refines(a,b) or refines(b,a) for a,b in combinations(parts,2))
         # is it an interval graph? chordal (no induced C4+) -- small brute check
         print(f"  n={n} edges={edges} chi=omega={ch} |C|={len(Cs)} pointwise_chain={pw_chain} refinement_chain={rf_chain}")
-        if n == 4 and not (pw_chain and rf_chain):
-            print("    ^^ failure found at n=4")
+        # Pin the note's §10 table instead of only printing it: pointwise is
+        # always a chain at n <= 4, and refinement fails exactly once — for the
+        # paw (4 vertices, 3 edges, |C| = 2).
+        if n == 3:
+            assert pw_chain and rf_chain, (n, edges, Cs)
+        if n == 4:
+            assert pw_chain, ("pointwise must stay a chain at n=4", edges, Cs)
+            assert rf_chain or len(Cs) == 2, ("refinement failed for a non-paw graph", edges, Cs)
+            if not rf_chain:
+                print("    ^^ failure is the paw (|C| = 2), as the note's §10 table records")
 
 # ---------- IGMRC sweep DP vs brute force ----------
 import random
@@ -332,6 +339,21 @@ for trial in range(300):
     bf,k1=igmrc_bruteforce(iv,w)
     dp,k2=igmrc_dp(iv,w)
     assert k1==k2 and bf==dp, (iv,w,bf,dp,k1,k2)
+
+# Same cross-check with mixed-sign weights: the sweep DP is the exact engine the
+# padding script relies on for its negative-weight case, so pin that domain too
+# (the positive slice alone does not).
+for trial in range(150):
+    n=random.randint(2,6)
+    iv=[]
+    for _ in range(n):
+        a=random.randint(0,9); b=random.randint(a+1,12)
+        iv.append((a,b))
+    w=[random.randint(-9,9) for _ in range(n)]
+    bf,k1=igmrc_bruteforce(iv,w)
+    dp,k2=igmrc_dp(iv,w)
+    assert k1==k2 and bf==dp, (iv,w,bf,dp,k1,k2)
+print("sweep DP matches brute force on positive and mixed-sign weights  OK")
 # ---------- the greedy + relabelling post-pass is NOT exact ----------
 def greedy_relabel(iv, w):
     """Greedy chi-lane sweep by start order, then descending-weight relabel.
@@ -346,7 +368,8 @@ def greedy_relabel(iv, w):
             for t in sorted({x for a in iv for x in a}))
     c = [0]*n
     for v in sorted(range(n), key=lambda v: (iv[v][0], iv[v][1])):
-        used = {c[u] for u in range(n) if c[u] and (u, v) in edges or c[u] and (v, u) in edges}
+        used = {c[u] for u in range(n)
+                if c[u] and ((u, v) in edges or (v, u) in edges)}
         for q in range(1, k+1):
             if q not in used:
                 c[v] = q

@@ -37,9 +37,51 @@ LP = [
 ]
 
 
+def conflicts(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """Closed-interval overlap: even touching endpoints conflict."""
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
+def maximal_cliques(intervals: list[tuple[int, int]]) -> list[tuple[int, ...]]:
+    """All maximal cliques by 2^n enumeration (n = 9 -> 511 subsets).
+
+    The hard-coded `CLIQUES` list is an input to both the LP feasibility check and
+    the IP brute force, so a *missing non-binding* clique would slip through both
+    (the IP optimum is pinned by the binding ones).  Recomputing makes the list —
+    and therefore the documented "maximal cliques" instance — self-validating.
+    """
+    n = len(intervals)
+    out = []
+    for mask in range(1, 1 << n):
+        verts = [v for v in range(n) if mask >> v & 1]
+        if any(
+            not conflicts(intervals[u], intervals[v])
+            for i, u in enumerate(verts)
+            for v in verts[i + 1 :]
+        ):
+            continue
+        # Maximal: no outside vertex is adjacent to every member.
+        if all(
+            any(not conflicts(intervals[v], intervals[w]) for w in verts)
+            for v in range(n)
+            if not mask >> v & 1
+        ):
+            out.append(tuple(verts))
+    return sorted(out)
+
+
 def check_lp() -> Fraction:
+    # The instance's clique list must be the *complete* maximal-clique set.
+    assert sorted(CLIQUES) == maximal_cliques(INTERVALS), (
+        "CLIQUES is not the complete maximal-clique set: "
+        f"missing {sorted(set(maximal_cliques(INTERVALS)) - set(map(tuple, CLIQUES)))}"
+    )
     for v, row in enumerate(LP):
         assert sum(row) == 1, f"row {v} does not sum to 1"
+        # Pinning half-integrality makes the "half-integral LP point" claim
+        # machine-checked rather than prose.
+        for lane, val in enumerate(row):
+            assert val in (0, H, 1), f"LP[{v}][{lane}] = {val} is not half-integral"
     for clique in CLIQUES:
         for lane in range(K):
             column = sum((LP[v][lane] for v in clique), Fraction(0))

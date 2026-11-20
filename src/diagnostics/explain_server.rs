@@ -860,6 +860,14 @@ struct HeaderFraming {
     /// Conflicting duplicates, a malformed value, or a body over the cap: the
     /// framing cannot be trusted, so `Complete` may only come from peer EOF.
     ambiguous: bool,
+    /// A header line with no `:` (excluding the request line and the blank
+    /// terminator): the head is syntactically broken, so a `Content-Length`-like
+    /// line cannot be distinguished from junk.  Kept separate from
+    /// `has_transfer_encoding` — "unsupported but well-formed" and "not even a
+    /// header" deserve different diagnosis — but both make the connection
+    /// non-reusable, because a silently skipped framing field would otherwise
+    /// turn a malformed request into an unambiguous empty-body one.
+    malformed: bool,
     oversized: bool,
     /// H3: `Connection: close` appears anywhere in the complete header block
     /// (case-insensitive, comma-separated token list, multiple occurrences).
@@ -889,7 +897,7 @@ impl HeaderFraming {
     /// Classify the body given how many body bytes already arrived in the same
     /// read as the head.
     fn body(self, already_read: usize) -> RequestBody {
-        if self.has_transfer_encoding || self.ambiguous || self.oversized {
+        if self.has_transfer_encoding || self.ambiguous || self.malformed || self.oversized {
             return RequestBody::Unframed;
         }
         match self
@@ -940,12 +948,29 @@ fn scan_framing(headers: &[u8]) -> HeaderFraming {
         content_length: None,
         has_transfer_encoding: false,
         ambiguous: false,
+        malformed: false,
         oversized: false,
         connection_close: false,
     };
-    for line in headers.split(|&b| b == b'\n') {
+    for (index, line) in headers.split(|&b| b == b'\n').enumerate() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // The block starts with the request line on the real path
+        // (`buf[..head_end]` spans request line + headers) and ends with a blank
+        // terminator.  Recognise the request line by *shape* — spaces, no colon
+        // — rather than by position, so a caller that passes a header block only
+        // (as the unit tests do) still has its first header line scanned.
+        if line.is_empty() {
+            continue;
+        }
+        if index == 0 && line.contains(&b' ') && !line.contains(&b':') {
+            continue;
+        }
         let Some(colon) = line.iter().position(|&b| b == b':') else {
+            // A header line without a colon is not "a header we ignore": if it
+            // was meant as `Content-Length 100`, skipping it silently would
+            // frame the request as an unambiguous empty body.  Record it so the
+            // connection is drained and closed instead of reused.
+            framing.malformed = true;
             continue;
         };
         let name_raw = &line[..colon];
@@ -2806,6 +2831,22 @@ fn serve_explain_persistent_epoll(
                 }
             }
         }
+        // The lazy heap can only accumulate: every re-arm (first byte, headers,
+        // write, keep-alive idle, drain linger) pushes another entry, and a
+        // stale entry survives until its deadline reaches the front.  Live
+        // connections are bounded (normal + overload slots), so without a bound
+        // the heap would track recent request throughput instead.  Rebuild from
+        // the live set when it outgrows a small multiple of the connection count;
+        // the O(n) rebuild is amortised against the >= O(n) stale pops it
+        // removes, so it can never fire more than once per O(n) pushes.
+        const HEAP_COMPACT_MIN: usize = 64;
+        const HEAP_COMPACT_FACTOR: usize = 4;
+        if deadline_heap.len() > HEAP_COMPACT_MIN + conns.len() * HEAP_COMPACT_FACTOR {
+            deadline_heap = conns
+                .iter()
+                .map(|(&fd, conn)| Reverse((conn.deadline, fd)))
+                .collect();
+        }
         if let Some(&Reverse((at, _))) = deadline_heap.peek() {
             wait = wait.min(at.saturating_duration_since(now));
         }
@@ -4048,6 +4089,21 @@ fn write_html_escaped_filtered(out: &mut String, input: &str) {
     }
 }
 
+/// Entries admitted across *all* 404-cache shards.
+///
+/// The memory bound is global: admission reserves a slot here rather than
+/// checking a fixed per-shard cap, so capacity follows demand under skew
+/// instead of a hot shard evicting while idle shards hold empty slots.  It lives
+/// at module scope (not inside [`not_found_page_cached`]) so the reservation
+/// protocol and its stress test observe the same counter.
+static NOT_FOUND_CACHE_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, not(feature = "shuttle")))]
+fn not_found_cache_entry_count() -> usize {
+    NOT_FOUND_CACHE_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Serve a cached 404 page for `code`.
 ///
 /// Mirrors [`explain_page_cached`]: the page is a pure function of `code`,
@@ -4090,11 +4146,6 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     }
     /// Per-shard size of the two-strike admission window.
     const SEEN_CAP: usize = PER_SHARD_CAP;
-    /// Entries admitted across *all* shards.  The memory bound is global:
-    /// eviction triggers on this counter rather than on a fixed per-shard cap,
-    /// so capacity follows demand under skew instead of a hot shard evicting
-    /// while idle shards hold empty slots.
-    static TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static CACHE: std::sync::OnceLock<Box<[std::sync::Mutex<Shard>]>> = std::sync::OnceLock::new();
     let build = |code: &str| {
         let body = build_not_found_page(code);
@@ -4159,13 +4210,51 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         drop(guard);
         return std::sync::Arc::new(build(code));
     }
-    // Evict only when the *global* budget is exhausted (F5): a fixed per-shard
-    // cap both wasted capacity under skew and evicted hot entries in a shard
-    // that happened to fill first.
-    if TOTAL.load(std::sync::atomic::Ordering::Relaxed) >= NOT_FOUND_CACHE_CAP {
+    // ── Global admission ────────────────────────────────────────────────
+    // The shard mutex protects one shard, so the previous
+    // `if TOTAL.load() >= CAP { evict }; …insert…; TOTAL.fetch_add(1)`
+    // sequence was not transactional: two threads in different shards could
+    // both observe `TOTAL < CAP`, both skip eviction, and both insert,
+    // overshooting the advertised bound by one per racing pair.  `Relaxed` is
+    // fine for counter arithmetic; it cannot make check-then-increment atomic.
+    //
+    // Reserve a global slot with a CAS *before* publishing the entry, and give
+    // the reservation back when eviction cannot free one.  Every exit path
+    // either publishes (ownership of the slot transfers to the cache) or lets
+    // `SlotReservation::drop` subtract it again.
+    fn try_reserve() -> bool {
+        let mut cur = NOT_FOUND_CACHE_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if cur >= NOT_FOUND_CACHE_CAP {
+                return false;
+            }
+            match NOT_FOUND_CACHE_TOTAL.compare_exchange_weak(
+                cur,
+                cur + 1,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+    /// Release a reserved-but-unpublished slot (panic or unsuccessful
+    /// publish), so a failed admission never leaks capacity.
+    struct SlotReservation(bool);
+    impl Drop for SlotReservation {
+        fn drop(&mut self) {
+            if self.0 {
+                NOT_FOUND_CACHE_TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    // CLOCK sweep, then (if every entry is referenced) the oldest live entry;
+    // true iff an entry was actually removed and its global slot released.
+    // A nested `fn` rather than a closure so `evict_from_other` can call it.
+    fn evict_one(guard: &mut Shard) -> bool {
         // Bound the sweep per shard; if every entry is referenced, evict the
         // hand's candidate after two full rotations.
-        let mut evicted = false;
         for _ in 0..PER_SHARD_CAP.saturating_mul(2) {
             let Some(entry) = guard.ring.pop_front() else {
                 break;
@@ -4188,37 +4277,81 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
                     .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry))
                 {
                     guard.map.remove(&entry.key);
-                    TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    NOT_FOUND_CACHE_TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                evicted = true;
-                break;
+                return true;
             }
         }
-        if !evicted {
-            // Nothing evictable in *this* shard while the budget is full: serve
-            // the page uncached instead of exceeding the global bound.
-            let removed = match guard.ring.pop_front() {
-                Some(entry) => {
-                    entry
-                        .live
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    let hit = guard
-                        .map
-                        .get(&entry.key)
-                        .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry));
-                    if hit {
-                        guard.map.remove(&entry.key);
-                        TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    hit
+        // Nothing evictable in *this* shard while the budget is full: take the
+        // oldest live entry.  A shard that cannot reclaim only serves the page
+        // uncached — but never exceeds the global bound.
+        match guard.ring.pop_front() {
+            Some(entry) => {
+                entry
+                    .live
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let hit = guard
+                    .map
+                    .get(&entry.key)
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry));
+                if hit {
+                    guard.map.remove(&entry.key);
+                    NOT_FOUND_CACHE_TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                None => false,
-            };
-            if !removed {
-                drop(guard);
-                return std::sync::Arc::new(build(code));
+                hit
+            }
+            None => false,
+        }
+    }
+    /// Reclaim one slot from a shard *other* than ours.
+    ///
+    /// Only called with our own shard unlocked, so at most one shard lock is
+    /// held at a time — no lock ordering, no deadlock.  This closes the gap
+    /// where a shard that happened to fill first served uncached while other
+    /// shards still held evictable entries, contradicting the global-budget
+    /// policy.
+    fn evict_from_other(shards: &[std::sync::Mutex<Shard>], me: usize) -> bool {
+        for (i, shard) in shards.iter().enumerate() {
+            if i == me {
+                continue;
+            }
+            let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            if evict_one(&mut guard) {
+                return true;
             }
         }
+        false
+    }
+    // A freed slot can be stolen by a concurrent admission, so retry a bounded
+    // number of times instead of assuming one eviction is enough.
+    let mut reservation = SlotReservation(false);
+    let mut admitted = false;
+    for _ in 0..3 {
+        if try_reserve() {
+            reservation = SlotReservation(true);
+            admitted = true;
+            break;
+        }
+        if evict_one(&mut guard) {
+            continue;
+        }
+        drop(guard);
+        let freed = evict_from_other(shards, shard_idx);
+        guard = shards[shard_idx].lock().unwrap_or_else(|e| e.into_inner());
+        // Another thread may have admitted our key while we were unlocked: it
+        // is in the map now, so serve it uncached instead of publishing a
+        // duplicate entry for the same key.
+        if guard.map.contains_key(code) {
+            drop(guard);
+            return std::sync::Arc::new(build(code));
+        }
+        if !freed {
+            break;
+        }
+    }
+    if !admitted {
+        drop(guard);
+        return std::sync::Arc::new(build(code));
     }
     let entry = std::sync::Arc::new(Entry {
         key: key.clone(),
@@ -4228,7 +4361,9 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     });
     guard.map.insert(key, std::sync::Arc::clone(&entry));
     guard.ring.push_back(std::sync::Arc::clone(&entry));
-    TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The published entry now accounts the reserved slot.
+    reservation.0 = false;
+    drop(reservation);
     drop(guard);
     std::sync::Arc::clone(entry.page.get_or_init(|| std::sync::Arc::new(build(code))))
 }
@@ -4356,6 +4491,42 @@ mod tests {
         assert!(page.contains("var(--bg)"));
         assert!(page.contains("&lt;bad&gt;"));
         assert!(page.contains(r#"id="theme-toggle""#));
+    }
+
+    /// F1 regression: the shard mutex protects one shard, so admission has to be
+    /// transactional.  Before the reservation protocol two threads in different
+    /// shards could both observe `TOTAL < CAP`, both skip eviction, and both
+    /// publish, exceeding the advertised bound by one per racing pair.  This
+    /// hammers every shard from several threads and pins the global bound.
+    #[test]
+    fn concurrent_not_found_admissions_respect_the_global_cap() {
+        // `NOT_FOUND_CACHE_CAP` is function-local; keep this in sync with it.
+        const CAP: usize = 1024;
+        let keys: Vec<String> = (0..2048).map(|i| format!("E{i:04}")).collect();
+        let keys = std::sync::Arc::new(keys);
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let keys = std::sync::Arc::clone(&keys);
+                std::thread::spawn(move || {
+                    // Rounds give the two-strike window a chance to admit each
+                    // key before it ages out, so real admissions (and therefore
+                    // evictions) race rather than hits short-circuiting.
+                    for _ in 0..3 {
+                        for key in keys.iter() {
+                            let _ = not_found_page_cached(key);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let count = not_found_cache_entry_count();
+        assert!(count <= CAP, "global 404 cache exceeded its cap: {count}");
+        // The counter must also agree with the live entries it claims to
+        // account for: a leaked reservation would inflate it.
+        assert!(count > 0, "the stress workload admitted nothing");
     }
 
     /// A request body announced by `Content-Length` must be read before the
@@ -4807,6 +4978,38 @@ mod tests {
             scan_framing(b"Content-Length: 999999999999999999999999999999\r\n\r\n").oversized,
             "a Content-Length beyond the body cap must be marked oversized"
         );
+    }
+
+    /// A colon-less header line must not silently become "no framing": if it was
+    /// meant as `Content-Length 100`, treating the request as an unambiguous
+    /// empty body would leave the body bytes in the stream (smuggling shape).
+    /// The request line and the blank terminator are not header fields.
+    #[test]
+    fn scan_framing_marks_colonless_header_lines_as_malformed() {
+        let head = b"GET /E030 HTTP/1.1\r\nHost: localhost\r\nContent-Length 100\r\n\r\n";
+        let framing = scan_framing(head);
+        assert!(
+            framing.malformed,
+            "colon-less header line must be malformed"
+        );
+        assert!(
+            framing.content_length.is_none(),
+            "the malformed line must not be parsed as a length"
+        );
+        assert_eq!(
+            framing.body(0),
+            RequestBody::Unframed,
+            "a malformed head must never be reusable"
+        );
+
+        // Well-formed heads (including a bare LF flavour) stay clean.
+        for head in [
+            &b"GET /E030 HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET /E030 HTTP/1.1\nHost: localhost\n\n"[..],
+            &b"GET /E030 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"[..],
+        ] {
+            assert!(!scan_framing(head).malformed, "head: {:?}", head);
+        }
     }
 
     #[test]

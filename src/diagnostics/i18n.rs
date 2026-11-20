@@ -267,6 +267,10 @@ const _: () = {
     assert!(matches!(Lang::from_u8(LANG_EN), Some(Lang::En)));
     assert!(matches!(Lang::from_u8(LANG_RU), Some(Lang::Ru)));
     assert!(matches!(Lang::from_u8(LANG_ZH), Some(Lang::Zh)));
+    // `Diagnostic::humanized_lang` stores this discriminant in a `u8`.  A `Lang`
+    // domain wider than 255 would alias there and make the re-humanization latch
+    // serve stale text silently; pin the width while it is still cheap.
+    assert!(N_LANGS < u8::MAX as usize);
 };
 
 /// Number of supported languages. Single source of truth for the bundle
@@ -477,6 +481,45 @@ pub fn render_into<'msg, 'src>(
     out.push_str(msg);
 }
 
+/// Render `msg` with one **native numeric** argument.
+///
+/// [`render_into`] takes `Cow<str>` pairs, so a count had to be formatted into a
+/// string (`push_uint` into an `ArrayString`) for Fluent to re-parse as a number
+/// — that round trip only works because Fluent accepts numeric strings, which is
+/// a fragile dependency, and it costs a formatting pass per call.
+///
+/// Passing the number as a number gives CLDR's plural rules the value directly.
+/// This is the only place a native value is needed today (fold markers), so it
+/// stays a focused entry point rather than a second, parallel argument
+/// machinery: duplicating the resolve/retry loop would be the drift risk the
+/// `render_into`/`try_fluent_into` pair exists to avoid.
+pub fn render_into_count(msg: &str, key: &'static str, n: u64, out: &mut String) {
+    if is_ftl_slug(msg) && fluent::zero_arg_slug(msg).is_none() {
+        let lang_idx = Lang::current().index();
+        let bundles = bundles();
+        let primary = &bundles[lang_idx];
+        let en = &bundles[0];
+        let mut args = FluentArgs::new();
+        args.set(key, FluentValue::from(n));
+        let mut errors = Vec::new();
+        // Same resolve-then-retry-on-format-failure policy as
+        // `try_fluent_into`: a translation that fails to format falls back to
+        // `en` rather than disappearing.
+        for b in std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en)) {
+            let Some(pattern) = b.get_message(msg).and_then(|m| m.value()) else {
+                continue;
+            };
+            errors.clear();
+            let val = b.format_pattern(pattern, Some(&args), &mut errors);
+            if errors.is_empty() {
+                out.push_str(&val);
+                return;
+            }
+        }
+    }
+    out.push_str(msg);
+}
+
 /// FTL text identifiers are `[A-Za-z][A-Za-z0-9_-]*`; every legacy English
 /// key contains spaces, backticks or braces, so the two key spaces cannot
 /// collide and dispatch is unambiguous.
@@ -494,21 +537,14 @@ fn is_ftl_slug(msg: &str) -> bool {
 /// `LanguageIdentifier` for the `i`-th supported language (0 = en fallback).
 pub(crate) fn lang_id_at(i: usize) -> &'static LanguageIdentifier {
     // Same loud-failure stance as `cached_label!`: a bad index is a programmer
-    // error in the established `discriminant - 1` mapping, so flag it by name
-    // in debug and let the slice bounds check panic in release rather than
-    // silently serving a different locale.
+    // error against `Lang::index()` (a 0-based `match`), so flag it by name in
+    // debug and let the slice bounds check panic in release rather than silently
+    // serving a different locale.  There is no `discriminant - 1` arithmetic
+    // anywhere in this module; `index()` is the single mapping.
     debug_assert!(i < N_LANGS, "language index {i} out of range 0..{N_LANGS}");
     static IDS: std::sync::OnceLock<[LanguageIdentifier; N_LANGS]> = std::sync::OnceLock::new();
     let ids = IDS.get_or_init(|| [langid!("en"), langid!("ru"), langid!("zh")]);
     &ids[i]
-}
-
-fn lang_id() -> &'static LanguageIdentifier {
-    // `Lang` discriminants start at 1 (`LANG_EN`), so the table index is
-    // `discriminant - 1`.  A future 0-discriminant variant underflows and must
-    // fail loudly instead of aliasing another language.
-    let lang_idx = Lang::current().index();
-    lang_id_at(lang_idx)
 }
 
 /// `None` when the slug is unknown even after the loader's fallback chain
@@ -566,9 +602,20 @@ fn try_fluent_into<'msg, 'src>(
     let primary = &bundles[lang_idx];
     let en = &bundles[0];
     if pairs.is_empty() {
-        // Zero-argument fast path: one lookup per bundle attempt, no
-        // argument map.
-        return format_slug_in_into(primary, en, msg, None, out);
+        // Zero-argument fast path: one lookup per bundle attempt, no argument
+        // map.  The "known slug that fails to format" tripwire must run here
+        // too: this branch returns before the shared one below, so with the
+        // default language (primary == en) a known slug missing its required
+        // arguments used to fall through to the raw slug in *every* profile
+        // without an assert firing — the tripwire had a hole on the one path
+        // most likely to hit it.
+        let ok = format_slug_in_into(primary, en, msg, None, out);
+        debug_assert!(
+            ok || en.get_message(msg).is_none(),
+            "slug {msg:?} exists but formatting failed (zero-argument path) — \
+             missing or misspelled argument?"
+        );
+        return ok;
     }
     // Single-pass resolve+format: walk the bundle chain once.  The argument
     // map is built lazily, only after a bundle actually has the message.
@@ -765,15 +812,26 @@ macro_rules! cached_label_static {
         static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] =
             [const { ::std::sync::OnceLock::new() }; $crate::diagnostics::i18n::N_LANGS];
         let lang_idx = $crate::diagnostics::i18n::Lang::current().index();
-        // Same invariant as `cached_label!`: `LANG_EN = 1` anchors the
-        // `discriminant - 1` index in `0..3`; a 0-discriminant variant would
-        // wrap and must fail the debug assertion, not index garbage in
-        // release (the bounds check panics; no `.min` coercion).
+        // `index()` is the single `Lang`→slot mapping (a dense `match`); the
+        // assert is belt-and-braces against `N_LANGS` drift, and names what it
+        // checks (an index, not a discriminant).
         debug_assert!(
             lang_idx < $crate::diagnostics::i18n::N_LANGS,
-            "Lang discriminant out of the cached range"
+            "Lang index out of the cached range"
         );
-        let table = CACHES[lang_idx].get_or_init(|| [$($init),+]);
+        let table = CACHES[lang_idx].get_or_init(|| {
+            // The init expressions re-resolve `Lang` internally, so a
+            // `Lang::set` racing this closure would render one language's
+            // strings into another language's slot — permanently, and silently
+            // in release.  The slot was chosen from the index read above; make
+            // any divergence loud instead of poisoning the cache.
+            debug_assert!(
+                $crate::diagnostics::i18n::Lang::current().index() == lang_idx,
+                "language changed while initializing a cached label table — \
+                 the slot would serve the wrong language forever"
+            );
+            [$($init),+]
+        });
         table[$variant].as_str()
     }};
 }
@@ -782,6 +840,107 @@ pub(crate) use cached_label_static;
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    /// Static half of the runtime retry logic in [`try_fluent_into`].
+    ///
+    /// A locale may translate fewer keys than `en` (missing key → English text,
+    /// which is acceptable), but it must never *add* a key `en` lacks (nothing
+    /// can resolve it) and every shared key must take the **same placeholder
+    /// set** — a translation that drops `{ $gap }` formats fine and silently
+    /// loses the number, which is exactly the bug the runtime tripwire can only
+    /// catch after the fact.
+    ///
+    /// Parsed textually: the shipped `.ftl` files are the input, not the
+    /// generated accessors (the accessors cannot tell you what the *translation*
+    /// contains).
+    #[test]
+    fn locales_are_covered_by_english_keys_and_placeholders() {
+        type Args = std::collections::BTreeSet<String>;
+        type Keys = std::collections::BTreeMap<String, Args>;
+
+        fn collect_placeholders(s: &str, set: &mut Args) {
+            let b = s.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'$' {
+                    let start = i + 1;
+                    let mut j = start;
+                    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                        j += 1;
+                    }
+                    if j > start {
+                        set.insert(s[start..j].to_string());
+                    }
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        /// `key = value` starts a message (column 0); indented lines — including
+        /// `[one] …` select arms and `.attr = …` — continue it.
+        fn parse(src: &str) -> Keys {
+            let mut out: Keys = Keys::new();
+            let mut key: Option<String> = None;
+            for line in src.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let indented = line.starts_with([' ', '\t']);
+                if !indented && let Some((k, value)) = trimmed.split_once('=') {
+                    let k = k.trim().to_string();
+                    let entry = out.entry(k.clone()).or_default();
+                    collect_placeholders(value, entry);
+                    key = Some(k);
+                } else if let Some(k) = &key
+                    && let Some(entry) = out.get_mut(k)
+                {
+                    collect_placeholders(trimmed, entry);
+                }
+            }
+            out
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        let read = |name: &str| {
+            std::fs::read_to_string(root.join(name))
+                .unwrap_or_else(|e| panic!("cannot read locales/{name}: {e}"))
+        };
+        let en = parse(&read("en.ftl"));
+        assert!(!en.is_empty(), "en.ftl parsed to zero keys");
+
+        for other in ["ru.ftl", "zh.ftl"] {
+            let loc = parse(&read(other));
+            assert!(!loc.is_empty(), "{other} parsed to zero keys");
+            for k in loc.keys() {
+                assert!(
+                    en.contains_key(k),
+                    "{other} defines {k:?}, which en.ftl does not"
+                );
+            }
+            for (k, args) in &loc {
+                assert_eq!(
+                    &en[k], args,
+                    "{other}: placeholder set for {k:?} differs from en (en={:?}, {other}={args:?})",
+                    en[k]
+                );
+            }
+        }
+    }
+
+    /// A *known* slug missing its required arguments is a caller bug, and the
+    /// zero-argument path used to return the raw slug in every profile with no
+    /// tripwire.  The assert now fires there as well; `type-mismatch` in `en`
+    /// requires `$expected`/`$found`.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "exists but formatting failed")]
+    fn known_slug_without_required_arguments_trips_the_tripwire() {
+        let mut out = String::new();
+        render_into("type-mismatch", &[], &mut out);
+    }
 
     #[test]
     fn broken_localized_translation_retries_english() {

@@ -15,6 +15,10 @@ comptime-internal = internal comptime error: { $e }
 comptime-call-stack-header = comptime call stack (most recent first):
 comptime-frame = { $reason }
 comptime-frame-offset = { $reason } (offset { $offset })
+# Marker before each `comptime-frame` line.  Locale-owned because list markers
+# differ (a locale may prefer a bullet, a dash, or nothing); a leading space
+# cannot live in the frame templates themselves — Fluent trims pattern edges.
+comptime-frame-bullet = ·
 trait-solver-error = trait solver error: { $msg }
 type-mismatch = type mismatch: expected `{ $expected }`, found `{ $found }`
 type-mismatch-reason = { type-mismatch } — { $reason }
@@ -125,11 +129,10 @@ suppressed-note =
         [one]   { $count } additional error suppressed
        *[other] { $count } additional errors suppressed
     }
-fold-marker-lines =
-    { $gap ->
+fold-marker-lines = { " " }({ $gap ->
         [one]   { $gap } line omitted
        *[other] { $gap } lines omitted
-    }
+    })
 chain-header = referenced by:
 html-doc-title = Ponent Compiler Diagnostics
 html-h1 = Ponent Compiler Diagnostics

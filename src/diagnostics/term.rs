@@ -5,16 +5,15 @@
 //! OSC 8 hyperlink probes, so downstream consumers don't each reimplement it
 //! (and get it subtly wrong).
 //!
-//! Probes read the process environment and, where relevant, the `stderr`
-//! `isatty` state, so colour/width/Unicode results are cheap but not stable
-//! across a process lifetime.  Callers that need a fixed answer (or that want
-//! to honour a CLI flag) should snapshot into
-//! [`DiagOpts`](crate::diagnostics::DiagOpts) once via
-//! [`DiagOpts::detect`](crate::diagnostics::DiagOpts::detect).
-//!
-//! The OSC 8 hyperlink probe is process-stable with first-call-wins semantics
-//! (a `OnceLock`), because the underlying environment table cannot change
-//! during a single CLI run and the probe is on the per-diagnostic path.
+//! Every public detector is **process-stable with first-call-wins semantics**:
+//! the first call snapshots the environment (and, where relevant, the `stderr`
+//! `isatty` state) into a `OnceLock`, and later calls are a single atomic load.
+//! The real hazard is therefore *ordering*, not instability — whatever the
+//! environment looks like when the first detector runs decides the answer for
+//! the whole run, so a CLI flag must be applied through
+//! [`DiagOpts`](crate::diagnostics::DiagOpts) rather than by re-probing.
+//! [`TermCaps::detect`] is the escape hatch for callers that genuinely want a
+//! fresh probe.
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -42,7 +41,7 @@ pub enum ColorDepth {
 
 impl ColorDepth {
     /// Whether this depth can render 256-colour palette sequences.
-    pub fn supports_256(self) -> bool {
+    pub const fn supports_256(self) -> bool {
         matches!(self, ColorDepth::TwoFiftySix | ColorDepth::TrueColor)
     }
 }
@@ -70,12 +69,15 @@ pub struct TermCaps {
 impl TermCaps {
     pub fn detect() -> Self {
         let stderr_is_tty = io::stderr().is_terminal();
+        // `TERM` is read exactly once and threaded into the colour decision:
+        // reading it again below let `color` and `unicode` observe different
+        // snapshots (the module's "one canonical env-read path" contract).
+        let term_env = std::env::var_os("TERM");
+        let term = term_env.as_deref().and_then(OsStr::to_str);
         // One canonical colour env-read path: `color_caps_from_env` performs
         // exactly the reads this function used to duplicate inline, so a
         // future variable cannot be added to one and forgotten in the other.
-        let caps = color_caps_from_env(stderr_is_tty);
-        let term_env = std::env::var_os("TERM");
-        let term = term_env.as_deref().and_then(OsStr::to_str);
+        let caps = color_caps_from_env(stderr_is_tty, term);
         let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
             .iter()
             .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
@@ -142,28 +144,42 @@ fn ends_with_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> bool {
 fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
     let s = v.to_str()?.trim();
     match s {
-        // Modern chalk: `true`/empty mean "force colour ON and let the level
-        // be DETECTED" (the README contract), not "pin level 1".  The force-on
-        // half is `force_color_is_off == false`, handled by `color_decision`;
-        // returning `None` here lets COLORTERM/TERM pick the depth.
+        // Deliberate deviation from `supports-color`, which pins `true`/`""` to
+        // level 1: pinning 16 colours *downgrades* a truecolor terminal, so we
+        // only force colour on (the `force_color_is_off == false` half, handled
+        // by `color_decision`) and let COLORTERM/TERM pick the depth.
+        // Pinned by `force_color_true_and_empty_detect_depth`.
         "" | "true" => None,
         "false" => None,
-        _ => s.parse::<u64>().ok().and_then(|n| match n {
-            0 => None,
-            1 => Some(ColorDepth::Sixteen),
-            2 => Some(ColorDepth::TwoFiftySix),
-            _ => Some(ColorDepth::TrueColor),
-        }),
+        _ => match s.parse::<u128>() {
+            Ok(0) => None,
+            Ok(1) => Some(ColorDepth::Sixteen),
+            Ok(2) => Some(ColorDepth::TwoFiftySix),
+            Ok(_) => Some(ColorDepth::TrueColor),
+            // All-digit input beyond `u128::MAX` is still a number ≥ 3, so the
+            // doc's "any larger numeric value → true colour" holds at *every*
+            // magnitude.  Without this arm a 40-digit generated CI string parsed
+            // as a failure and silently fell back to depth *detection* — the
+            // same boundary `force_color_is_off` solves by widening to `i128`.
+            Err(_) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+                Some(ColorDepth::TrueColor)
+            }
+            Err(_) => None,
+        },
     }
 }
 
-/// `FORCE_COLOR=0`/`false` is a *hard off* in the Node/chalk convention (not
-/// merely "don't force"): a CI script silencing colour must not get colour on
-/// a TTY.  Non-canonical non-numeric values (`"abc"`, `"FALSE"`, `"-1"`,
-/// overflow) are deliberately treated as "force on" — the older Node
-/// convention — because they are not an explicit off request.  This differs
-/// from `Math.min(parseInt(v), 3)` on garbage; the behavior is pinned by
-/// `force_color_noncanonical_values_force_on`.
+/// The three rules, in the order the body applies them (this list IS the
+/// contract — the function name reads as "off unless…", which is not it):
+///   1. `"false"` → off.
+///   2. Any numeric value `≤ 0` → off, including magnitudes beyond `i64`:
+///      `supports-color` clamps `level < 0` to 0, so `FORCE_COLOR=-1` from a CI
+///      script means "silence colour", not "force it on".
+///   3. Anything else — non-numeric garbage (`"abc"`, `"FALSE"`) or a numeric
+///      `> 0` — is not an explicit off request, so colour stays on (the caller
+///      then detects the depth).
+/// `force_color_noncanonical_values_force_on` and
+/// `force_color_off_survives_negative_overflow` pin the two edges.
 fn force_color_is_off(v: &OsStr) -> bool {
     let Some(s) = v.to_str().map(str::trim) else {
         return false;
@@ -173,52 +189,84 @@ fn force_color_is_off(v: &OsStr) -> bool {
     }
     // Modern `supports-color` clamps `level < 0` to 0, i.e. OFF: a CI script
     // setting `FORCE_COLOR=-1` means "silence colour", not "force it on".
-    // Non-numeric values (`"abc"`, `"FALSE"`, overflow) still mean force-on —
-    // they are not an explicit off request.
-    s.parse::<i64>().is_ok_and(|n| n <= 0)
+    // Parsed as `i128`, not `i64`: a negative value *below* `i64::MIN` (a
+    // generated CI string, a `-99999999999999999999`) must still read as OFF.
+    // With `i64` the parse failed and fell through to "force on" — exactly the
+    // bug the clamping rule exists to prevent, one boundary further out.
+    // Non-numeric values (`"abc"`, `"FALSE"`) still mean force-on — they are
+    // not an explicit off request.
+    s.parse::<i128>().is_ok_and(|n| n <= 0)
 }
 
 /// Detect the terminal's colour depth from `FORCE_COLOR`, `COLORTERM` and
 /// `TERM`.
 ///
-/// Precedence:
+/// Precedence, as implemented by [`color_depth_decision_with_terminal`] (which
+/// is the authoritative list — this summary must not drift from it):
 ///   1. `FORCE_COLOR=1|2|3` → 16/256/24-bit respectively (Node/chalk levels).
-///   2. `COLORTERM` contains `truecolor` or `24bit` → [`ColorDepth::TrueColor`]
-///   3. `TERM` ends with `truecolor` or `direct` → [`ColorDepth::TrueColor`]
-///   4. `TERM` ends with `256color` → [`ColorDepth::TwoFiftySix`]
-///   5. Otherwise → [`ColorDepth::Sixteen`]
+///   2. A terminal-family signal *before* `COLORTERM`: `WT_SESSION` (Windows
+///      Terminal) → [`ColorDepth::TrueColor`], and an exact `TERM_PROGRAM` in
+///      `{iTerm.app, WezTerm, vscode, WarpTerminal, Warp}` → [`ColorDepth::TrueColor`].
+///   3. `COLORTERM` contains `truecolor` or `24bit` → [`ColorDepth::TrueColor`]
+///   4. `TERM` ends with `truecolor` or `direct` → [`ColorDepth::TrueColor`]
+///   5. `TERM` ends with `256color` → [`ColorDepth::TwoFiftySix`]
+///   6. Otherwise → [`ColorDepth::Sixteen`]
 pub fn detect_color_depth() -> ColorDepth {
     detect_color_caps().depth
 }
 
-/// [`color_depth_decision_with_terminal`] without the terminal-family
-/// signals (kept for the pure decision core and its tests).
+/// The colour-related environment as one named value.
+///
+/// Replaces nine positional parameters.  `colorterm` and `term` are both
+/// `Option<&str>`, so a swapped pair type-checks and can even *pass* (a
+/// `COLORTERM` value shaped like a `TERM`); named fields make every call site
+/// auditable and turn the literal into its own documentation.  `Default` is the
+/// "nothing set" environment, which is what the decision-core tests want.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ColorEnv<'a> {
+    /// `NO_COLOR` set to a non-empty value (no-color.org).
+    pub no_color: bool,
+    pub clicolor: Option<&'a OsStr>,
+    pub clicolor_force: Option<&'a OsStr>,
+    pub force_color: Option<&'a OsStr>,
+    pub colorterm: Option<&'a str>,
+    pub term: Option<&'a str>,
+    /// `WT_SESSION` set to a non-empty value.
+    pub wt_session: bool,
+    pub term_program: Option<&'a str>,
+    pub terminal_emulator: Option<&'a str>,
+    /// `stderr` is a terminal.  Part of the same snapshot on purpose: pairing a
+    /// stale TTY probe with a fresh environment is exactly the half-updated view
+    /// [`color_caps_from_env`] exists to prevent.
+    pub stderr_is_tty: bool,
+}
+
+/// The depth-only subset of [`ColorEnv`], for callers that do not care about
+/// colour-on/off (and for the pure decision core's tests).
 pub(crate) fn color_depth_decision(
     colorterm: Option<&str>,
     term: Option<&str>,
     force_color: Option<&OsStr>,
 ) -> ColorDepth {
-    color_depth_decision_with_terminal(colorterm, term, force_color, false, None)
+    color_depth_decision_env(&ColorEnv {
+        colorterm,
+        term,
+        force_color,
+        ..ColorEnv::default()
+    })
 }
 
-/// [`color_depth_decision`] plus the terminal-family signals that some
-/// environments expose *instead of* `COLORTERM`.
-pub(crate) fn color_depth_decision_with_terminal(
-    colorterm: Option<&str>,
-    term: Option<&str>,
-    force_color: Option<&OsStr>,
-    wt_session: bool,
-    term_program: Option<&str>,
-) -> ColorDepth {
-    if let Some(depth) = force_color.and_then(force_color_level) {
+/// Pure depth decision core: [`detect_color_depth`] without the environment read.
+pub(crate) fn color_depth_decision_env(env: &ColorEnv<'_>) -> ColorDepth {
+    if let Some(depth) = env.force_color.and_then(force_color_level) {
         return depth;
     }
     // Windows Terminal and the iTerm/WezTerm/VS Code/Warp family are
     // truecolor even when `COLORTERM` is unset (older builds, some remotes).
-    if wt_session {
+    if env.wt_session {
         return ColorDepth::TrueColor;
     }
-    if let Some(tp) = term_program {
+    if let Some(tp) = env.term_program {
         // Exact, case-insensitive values only: `contains` treated
         // "not-iTerm.app" or "vscode-fork" as truecolor terminals.
         if ["iTerm.app", "WezTerm", "vscode", "WarpTerminal", "Warp"]
@@ -228,15 +276,29 @@ pub(crate) fn color_depth_decision_with_terminal(
             return ColorDepth::TrueColor;
         }
     }
-    if let Some(ct) = colorterm {
+    // JetBrains terminals (IDEA, CLion, …) set no `COLORTERM` at all, so
+    // without this an IDE user with a truecolor terminal gets 256-colour
+    // output.  `supports-color` reads the same variable with `includes`.
+    if let Some(te) = env.terminal_emulator
+        && contains_ignore_ascii_case(te.as_bytes(), b"jetbrains")
+    {
+        return ColorDepth::TrueColor;
+    }
+    if let Some(ct) = env.colorterm {
         let ct = ct.as_bytes();
         if contains_ignore_ascii_case(ct, b"truecolor") || contains_ignore_ascii_case(ct, b"24bit")
         {
             return ColorDepth::TrueColor;
         }
     }
-    if let Some(t) = term {
+    if let Some(t) = env.term {
         let t = t.as_bytes();
+        // Some kitty builds do not set `COLORTERM`; `supports-color` special-cases
+        // the TERM value itself, and without it those terminals fall through to
+        // `Sixteen`.
+        if t.eq_ignore_ascii_case(b"xterm-kitty") {
+            return ColorDepth::TrueColor;
+        }
         if ends_with_ignore_ascii_case(t, b"truecolor") || ends_with_ignore_ascii_case(t, b"direct")
         {
             return ColorDepth::TrueColor;
@@ -253,8 +315,9 @@ pub(crate) fn color_depth_decision_with_terminal(
 /// Precedence (matching `anstream`/`should-color`):
 ///   1. `NO_COLOR` set to a non-empty value → off (per no-color.org, the
 ///      empty string means "unset").
-///   2. `CLICOLOR_FORCE` set to anything other than `"0"` → on.
-///   3. `FORCE_COLOR=0|false` → off; any other value → on (Node semantics).
+///   2. `CLICOLOR_FORCE` set to a non-empty value other than `"0"` → on.
+///   3. `FORCE_COLOR` → see [`force_color_is_off`]: `false` and any numeric
+///      `≤ 0` are off, non-numeric garbage is on, everything else is on.
 ///   4. `CLICOLOR=0` → off.
 ///   5. `TERM=dumb` → off.
 ///   6. Otherwise: on iff `stderr` is a terminal.
@@ -262,10 +325,23 @@ pub fn detect_color() -> bool {
     detect_color_caps().color
 }
 
+/// Trimmed view of an env value, with empty mapped to `None`.
+///
+/// The one convention for the numeric-ish colour switches (`CLICOLOR`,
+/// `CLICOLOR_FORCE`, `FORCE_COLOR`): padding is stripped before any comparison,
+/// so `" 0"` and `"0"` agree.  Kept separate from the `NO_COLOR` /
+/// `WT_SESSION` / `NO_HYPERLINK` "present and non-empty" rule, which is
+/// spec-mandated for those (an empty value means "inherit", a padded one is
+/// still *present*).
+fn env_trimmed(v: &OsStr) -> Option<&str> {
+    let s = v.to_str()?.trim();
+    (!s.is_empty()).then_some(s)
+}
+
 /// Snapshot the colour-related environment once and fold it through the pure
 /// decision cores.  Kept private so no caller can observe a half-updated
 /// environment.
-fn color_caps_from_env(stderr_is_tty: bool) -> ColorCaps {
+fn color_caps_from_env(stderr_is_tty: bool, term: Option<&str>) -> ColorCaps {
     // no-color.org: "when present and not an empty string".  CI harnesses set
     // `NO_COLOR=""` to mean "inherit", so an empty value must NOT disable.
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
@@ -274,81 +350,38 @@ fn color_caps_from_env(stderr_is_tty: bool) -> ColorCaps {
     let force_color = std::env::var_os("FORCE_COLOR");
     let wt_session = std::env::var_os("WT_SESSION").is_some_and(|v| !v.is_empty());
     let colorterm_env = std::env::var_os("COLORTERM");
-    let term_env = std::env::var_os("TERM");
     let term_program_env = std::env::var_os("TERM_PROGRAM");
+    let terminal_emulator_env = std::env::var_os("TERMINAL_EMULATOR");
     let colorterm = colorterm_env.as_deref().and_then(OsStr::to_str);
-    let term = term_env.as_deref().and_then(OsStr::to_str);
     let term_program = term_program_env.as_deref().and_then(OsStr::to_str);
-    color_caps_decision_with_terminal(
+    let terminal_emulator = terminal_emulator_env.as_deref().and_then(OsStr::to_str);
+    color_caps_decision(&ColorEnv {
         no_color,
-        clicolor.as_deref(),
-        clicolor_force.as_deref(),
-        force_color.as_deref(),
+        clicolor: clicolor.as_deref(),
+        clicolor_force: clicolor_force.as_deref(),
+        force_color: force_color.as_deref(),
         colorterm,
         term,
         wt_session,
         term_program,
+        terminal_emulator,
         stderr_is_tty,
-    )
+    })
 }
 
 /// Pure colour/depth decision core, factored out so the policy can be tested
-/// without mutating process-global environment variables.
-pub(crate) fn color_caps_decision(
-    no_color: bool,
-    clicolor: Option<&OsStr>,
-    clicolor_force: Option<&OsStr>,
-    force_color: Option<&OsStr>,
-    colorterm: Option<&str>,
-    term: Option<&str>,
-    stderr_is_tty: bool,
-) -> ColorCaps {
-    color_caps_decision_with_terminal(
-        no_color,
-        clicolor,
-        clicolor_force,
-        force_color,
-        colorterm,
-        term,
-        false,
-        None,
-        stderr_is_tty,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn color_caps_decision_with_terminal(
-    no_color: bool,
-    clicolor: Option<&OsStr>,
-    clicolor_force: Option<&OsStr>,
-    force_color: Option<&OsStr>,
-    colorterm: Option<&str>,
-    term: Option<&str>,
-    wt_session: bool,
-    term_program: Option<&str>,
-    stderr_is_tty: bool,
-) -> ColorCaps {
-    let color = color_decision(
-        no_color,
-        clicolor,
-        clicolor_force,
-        force_color,
-        term.map(OsStr::new),
-        stderr_is_tty,
-    );
+/// without mutating process-global environment variables.  One entry point: the
+/// terminal-family signals live in [`ColorEnv`] instead of in a second
+/// positional signature.
+pub(crate) fn color_caps_decision(env: &ColorEnv<'_>) -> ColorCaps {
     ColorCaps {
-        color,
-        depth: color_depth_decision_with_terminal(
-            colorterm,
-            term,
-            force_color,
-            wt_session,
-            term_program,
-        ),
+        color: color_decision_env(env),
+        depth: color_depth_decision_env(env),
     }
 }
 
-/// Pure decision core of [`detect_color`].
+/// Pure decision core of [`detect_color`] (the colour-on/off half of
+/// [`ColorEnv`] only).
 pub(crate) fn color_decision(
     no_color: bool,
     clicolor: Option<&OsStr>,
@@ -357,28 +390,44 @@ pub(crate) fn color_decision(
     term: Option<&OsStr>,
     stderr_is_tty: bool,
 ) -> bool {
-    if no_color {
+    color_decision_env(&ColorEnv {
+        no_color,
+        clicolor,
+        clicolor_force,
+        force_color,
+        term: term.and_then(OsStr::to_str),
+        stderr_is_tty,
+        ..ColorEnv::default()
+    })
+}
+
+/// The single implementation behind [`color_decision`].
+pub(crate) fn color_decision_env(env: &ColorEnv<'_>) -> bool {
+    if env.no_color {
         return false;
     }
     // `CLICOLOR_FORCE=0` means "don't force", not "force off" — it falls
-    // through to normal detection.  Any other value (including empty) forces.
-    if let Some(v) = clicolor_force
+    // through to normal detection.  An *empty* value is treated as unset, like
+    // `NO_COLOR`/`WT_SESSION`/`NO_HYPERLINK` here and like anstream's
+    // `anstyle-query`: templated CI matrices routinely materialise empty
+    // strings, and force-on-empty pushed colour into piped logs.
+    if let Some(v) = env.clicolor_force.and_then(env_trimmed)
         && v != "0"
     {
         return true;
     }
-    if let Some(v) = force_color {
+    if let Some(v) = env.force_color {
         return !force_color_is_off(v);
     }
-    if let Some(v) = clicolor
+    if let Some(v) = env.clicolor.and_then(env_trimmed)
         && v == "0"
     {
         return false;
     }
-    if term == Some(OsStr::new("dumb")) {
+    if env.term == Some("dumb") {
         return false;
     }
-    stderr_is_tty
+    env.stderr_is_tty
 }
 
 /// Whether the terminal can render box-drawing (`┌─└─│`) and wide glyphs.
@@ -504,7 +553,7 @@ fn is_url_safe(b: u8) -> bool {
     URL_SAFE[b as usize]
 }
 
-const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+use crate::diagnostics::HEX_UPPER;
 
 /// Append the percent-encoded form of `s` to `out`.
 ///
@@ -573,8 +622,12 @@ fn wsl_distro_name() -> Option<&'static str> {
                 // Only translate when the kernel also identifies as WSL; if
                 // /proc cannot be read, keep the env-only fallback.
                 if let Ok(version) = std::fs::read_to_string("/proc/version") {
-                    let lower = version.to_ascii_lowercase();
-                    if !lower.contains("microsoft") && !lower.contains("wsl") {
+                    // Allocation-free and ASCII-case-insensitive, like the rest
+                    // of this module: lowercasing copied the whole kernel version
+                    // string just to run two substring tests.
+                    if !contains_ignore_ascii_case(version.as_bytes(), b"microsoft")
+                        && !contains_ignore_ascii_case(version.as_bytes(), b"wsl")
+                    {
                         return None;
                     }
                 }
@@ -622,8 +675,12 @@ fn encode_url_component_into(out: &mut String, s: &[u8]) {
     }
 }
 
-fn encode_file_url_path_into(out: &mut String, s: &[u8]) {
-    let (first_unsafe, unsafe_count) = scan_url_path(s);
+/// [`encode_file_url_path_pre`] with the scan already done.
+///
+/// `format_file_url` scans the path anyway to size its buffer, so re-scanning
+/// here would be a second O(n) pass on exactly the long, heavily-encoded paths
+/// the reserve exists for.
+fn encode_file_url_path_pre(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
     if first_unsafe == s.len() {
         out.push_str(std::str::from_utf8(s).expect("URL-safe bytes are ASCII"));
     } else {
@@ -662,40 +719,34 @@ pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
 /// to native Windows file URLs (`file:///C:/...`) so they open directly in
 /// Windows without going through the WSL share.
 ///
-/// Only *relative* paths are canonicalised.  An absolute path is already a
-/// valid URL path, and resolving symlinks there would both change the
-/// user-visible file the hyperlink targets (breaking workspace-relative
-/// tooling) and pay a multi-syscall chain per diagnostic — expensive on
-/// NFS/WSL mounts.
+/// No path is canonicalised.  Relative paths are resolved with
+/// [`std::path::absolute`], which joins the process CWD lexically: no syscalls,
+/// no symlink resolution, and it works for a file that does not exist yet
+/// (`canonicalize` failed on those, which is why the old code paid the syscall
+/// chain and then re-joined the CWD anyway).
 ///
-/// A relative path that does not exist yet (a not-yet-written output file)
-/// cannot be canonicalised, so it is joined onto the process CWD instead of
-/// being emitted as `file://<relative>` — where the first component would be
-/// parsed as a URL *host*.  The URL is inherently host-specific either way
-/// (`canonicalize` embeds an absolute path), so this changes no contract.
-pub fn path_to_file_url(path: &std::path::Path) -> String {
+/// Preserving symlinks is deliberate: this is a *diagnostics* system, not a
+/// sysroot/extern lookup — the hyperlink must open the file the diagnostic
+/// names, not whatever inode a resolution chain ends at.  The two differ on
+/// macOS (`/tmp` vs `/private/tmp`), so canonicalising would rewrite the very
+/// path the user just read.
+pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
     if path.as_os_str().is_empty() {
-        return "file://".to_string();
+        return std::sync::Arc::from("file://");
     }
     let abs_path = if path.is_absolute() {
         Cow::Borrowed(path)
     } else {
-        match path.canonicalize() {
+        match std::path::absolute(path) {
             Ok(p) => Cow::Owned(p),
-            Err(_) => {
-                let base = match std::env::current_dir() {
-                    Ok(base) => base,
-                    // No CWD means no honest absolute URL.  Emit the explicit
-                    // sentinel instead of silently linking `/<path>`.
-                    Err(_) => return "file://".to_string(),
-                };
-                Cow::Owned(base.join(path))
-            }
+            // No CWD means no honest absolute URL.  Emit the explicit sentinel
+            // instead of silently linking `/<path>`.
+            Err(_) => return std::sync::Arc::from("file://"),
         }
     };
     let raw = abs_path.as_os_str().as_encoded_bytes();
     if raw.is_empty() {
-        return "file://".to_string();
+        return std::sync::Arc::from("file://");
     }
 
     // `canonicalize()` on Windows returns verbatim paths (`\\?\C:\...`).
@@ -711,7 +762,7 @@ pub fn path_to_file_url(path: &std::path::Path) -> String {
         && (raw.starts_with(b"\\\\?\\") || raw.starts_with(b"\\\\.\\"))
     {
         // Volume-GUID / device paths have no safe `file://` representation.
-        return "file://".to_string();
+        return std::sync::Arc::from("file://");
     }
     // Windows paths use `\`, but URLs require `/`.  Gate strictly on the
     // platform: on POSIX a `\` is a legal filename byte and must be
@@ -738,11 +789,64 @@ pub fn path_to_file_url(path: &std::path::Path) -> String {
     };
 
     let distro = wsl_distro_name();
-    format_file_url(&bytes, distro)
+    file_url_cached(&bytes, distro)
+}
+
+/// Map `path` (already absolute, `/`-separated, verbatim prefix stripped) to its
+/// finished `file://` URL, memoised per thread for the life of the process.
+///
+/// Sound because the URL is a pure function of the path bytes, the
+/// process-stable [`wsl_distro_name`] snapshot and compile-time cfg.  Relative
+/// inputs are resolved to absolute *before* the lookup, so a changed CWD can
+/// never alias an old entry.
+///
+/// Thread-local rather than a shared map: the emitter renders in parallel, and a
+/// global mutex on the per-diagnostic URL path would serialise it for no gain.
+/// Each worker warms its own table; the cap bounds a pathological run, and
+/// clearing is cheaper than an LRU for this access pattern (diagnostics cluster
+/// on a handful of files).
+fn file_url_cached(path: &[u8], distro: Option<&str>) -> std::sync::Arc<str> {
+    thread_local! {
+        static URLS: std::cell::RefCell<rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>> =
+            std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    }
+    const CACHE_CAP: usize = 1024;
+    URLS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(hit) = cache.get(path) {
+            return std::sync::Arc::clone(hit);
+        }
+        let url: std::sync::Arc<str> = std::sync::Arc::from(format_file_url(path, distro));
+        if cache.len() >= CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_vec().into_boxed_slice(),
+            std::sync::Arc::clone(&url),
+        );
+        url
+    })
 }
 
 fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
-    let mut out = String::with_capacity(path.len() + distro.map_or(0, str::len) + 32);
+    // One scan, in the caller: percent-encoding expands an unsafe byte to three
+    // bytes, so the old `path.len() + 32` under-reserved by up to 2× and forced a
+    // realloc on exactly the long/heavily-encoded paths this sizing exists for.
+    let (first_unsafe, unsafe_count) = scan_url_path(path);
+    // Capacity must cover the *longest* prefix this function can emit, not just
+    // the path: the WSL form starts with `file://wsl.localhost/` (21 bytes) and
+    // percent-encodes the distro name too (`Ubuntu 20.04` → 3× for two bytes),
+    // so the old `+ distro.len() + 16` under-reserved by `5 + 2·unsafe_in_distro`
+    // on exactly that branch — a guaranteed realloc plus a full-buffer copy per
+    // uncached WSL URL.  `distro.len() * 3` is the worst case for the encoded
+    // distro; distros are short, so the over-reserve is bounded and the exact
+    // arithmetic needs no second scan.
+    let mut out = String::with_capacity(
+        path.len()
+            + unsafe_count.saturating_mul(2)
+            + distro.map_or(0, |d| d.len().saturating_mul(3) + 21)
+            + 16,
+    );
     if let Some(distro) = distro
         && !distro.is_empty()
         // Only POSIX-shaped paths belong under `wsl.localhost`: routing a
@@ -751,6 +855,16 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
         // a malformed URL with no separator.
         && path.starts_with(b"/")
     {
+        // `//server/share/file` is a Windows UNC path as seen from Linux.
+        // Routing it through `wsl.localhost` makes the 9P server traverse a
+        // CIFS mount — which it usually cannot — and is slower even when it
+        // can.  Windows can open the native UNC form directly.
+        if let Some(rest) = path.strip_prefix(b"//") {
+            out.push_str("file://");
+            let (rest_first, rest_unsafe) = scan_url_path(rest);
+            encode_file_url_path_pre(&mut out, rest, rest_first, rest_unsafe);
+            return out;
+        }
         if let Some(stripped) = path.strip_prefix(b"/mnt/") {
             // Bare drive root (`/mnt/c`, no trailing slash) translates too:
             // it becomes `/C:/`, the native-drive URL for the drive root.
@@ -764,13 +878,15 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
                 out.push_str("file:///");
                 out.push(stripped[0].to_ascii_uppercase() as char);
                 out.push(':');
-                encode_file_url_path_into(&mut out, &stripped[1..]);
+                let tail = &stripped[1..];
+                let (tail_first, tail_unsafe) = scan_url_path(tail);
+                encode_file_url_path_pre(&mut out, tail, tail_first, tail_unsafe);
                 return out;
             }
         }
         out.push_str("file://wsl.localhost/");
         encode_url_component_into(&mut out, distro.as_bytes());
-        encode_file_url_path_into(&mut out, path);
+        encode_file_url_path_pre(&mut out, path, first_unsafe, unsafe_count);
         return out;
     }
 
@@ -784,7 +900,7 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
         && (cfg!(windows) || distro.is_some() || path[0].is_ascii_uppercase());
     if looks_like_drive {
         out.push_str("file:///");
-        encode_file_url_path_into(&mut out, path);
+        encode_file_url_path_pre(&mut out, path, first_unsafe, unsafe_count);
         return out;
     }
 
@@ -800,12 +916,13 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
         } else {
             out.push_str("file://");
         }
-        encode_file_url_path_into(&mut out, rest);
+        let (rest_first, rest_unsafe) = scan_url_path(rest);
+        encode_file_url_path_pre(&mut out, rest, rest_first, rest_unsafe);
         return out;
     }
 
     out.push_str("file://");
-    encode_file_url_path_into(&mut out, path);
+    encode_file_url_path_pre(&mut out, path, first_unsafe, unsafe_count);
     out
 }
 
@@ -865,9 +982,13 @@ mod tests {
     }
 
     #[test]
-    fn clicolor_force_only_forces_on_a_nonzero_value() {
+    fn clicolor_force_only_forces_on_a_nonempty_nonzero_value() {
         assert!(color(false, None, Some("1"), None, Some("dumb"), false));
-        assert!(color(false, None, Some(""), None, Some("dumb"), false));
+        // An *empty* value is unset, matching `NO_COLOR`/`WT_SESSION` here and
+        // `anstyle-query`: a templated CI matrix that materialises "" must not
+        // force colour into piped logs.
+        assert!(!color(false, None, Some(""), None, Some("dumb"), false));
+        assert!(!color(false, None, Some(""), None, Some("xterm"), false));
         // `0` means "don't force": fall through to the terminal check.
         assert!(!color(false, None, Some("0"), None, Some("xterm"), false));
         assert!(color(false, None, Some("0"), None, Some("xterm"), true));
@@ -967,25 +1088,47 @@ mod tests {
     fn terminal_family_signals_select_truecolor() {
         // WT_SESSION is the only truecolor signal on older Windows Terminal.
         assert_eq!(
-            color_depth_decision_with_terminal(None, Some("xterm"), None, true, None),
+            color_depth_decision_env(&ColorEnv {
+                term: Some("xterm"),
+                wt_session: true,
+                ..ColorEnv::default()
+            }),
             ColorDepth::TrueColor
         );
-        for tp in ["iTerm.app", "WezTerm", "vscode", "WarpTerminal"] {
+        for tp in ["iTerm.app", "WezTerm", "vscode", "WarpTerminal", "Warp"] {
             assert_eq!(
-                color_depth_decision_with_terminal(None, Some("xterm"), None, false, Some(tp)),
+                color_depth_decision_env(&ColorEnv {
+                    term: Some("xterm"),
+                    term_program: Some(tp),
+                    ..ColorEnv::default()
+                }),
                 ColorDepth::TrueColor,
                 "{tp}"
             );
         }
+        // JetBrains terminals set no `COLORTERM`; kitty may not either.
+        assert_eq!(
+            color_depth_decision_env(&ColorEnv {
+                term: Some("xterm"),
+                terminal_emulator: Some("JetBrains-JediTerm"),
+                ..ColorEnv::default()
+            }),
+            ColorDepth::TrueColor
+        );
+        assert_eq!(
+            color_depth_decision_env(&ColorEnv {
+                term: Some("xterm-kitty"),
+                ..ColorEnv::default()
+            }),
+            ColorDepth::TrueColor
+        );
         // An unrelated TERM_PROGRAM must not upgrade the depth.
         assert_eq!(
-            color_depth_decision_with_terminal(
-                None,
-                Some("xterm"),
-                None,
-                false,
-                Some("Apple_Terminal")
-            ),
+            color_depth_decision_env(&ColorEnv {
+                term: Some("xterm"),
+                term_program: Some("Apple_Terminal"),
+                ..ColorEnv::default()
+            }),
             ColorDepth::Sixteen
         );
     }
@@ -1025,6 +1168,36 @@ mod tests {
             force_color_level(OsStr::new("256")),
             Some(ColorDepth::TrueColor)
         );
+    }
+
+    /// A negative value outside `i64` must still read as OFF.  Parsed as `i64`
+    /// the parse failed and fell through to "force on", defeating the very
+    /// clamping rule the comment above it documents.
+    #[test]
+    fn force_color_off_survives_negative_overflow() {
+        assert!(force_color_is_off(OsStr::new("-99999999999999999999")));
+        assert!(!color(
+            false,
+            None,
+            None,
+            Some("-99999999999999999999"),
+            Some("xterm"),
+            true
+        ));
+    }
+
+    /// Rust's integer `FromStr` accepts a leading `+`, so `FORCE_COLOR=+2` and
+    /// `COLUMNS=+80` behave like their unsigned spellings.  Node's `parseInt`
+    /// accepts them too, so the behaviour is correct — but it was incidental;
+    /// pin it so a future "strict env parsing" change is a visible decision.
+    #[test]
+    fn leading_plus_signs_parse_like_node() {
+        assert_eq!(
+            force_color_level(OsStr::new("+2")),
+            Some(ColorDepth::TwoFiftySix)
+        );
+        assert!(!force_color_is_off(OsStr::new("+1")));
+        assert_eq!(width_decision(Some("+80"), None), 80);
     }
 
     #[test]
@@ -1145,27 +1318,22 @@ mod tests {
 
     #[test]
     fn caps_are_coherent() {
-        let caps = color_caps_decision(
-            false,
-            None,
-            None,
-            Some(OsStr::new("2")),
-            None,
-            Some("xterm-256color"),
-            true,
-        );
+        let caps = color_caps_decision(&ColorEnv {
+            force_color: Some(OsStr::new("2")),
+            term: Some("xterm-256color"),
+            stderr_is_tty: true,
+            ..ColorEnv::default()
+        });
         assert!(caps.color);
         assert_eq!(caps.depth, ColorDepth::TwoFiftySix);
 
-        let caps = color_caps_decision(
-            false,
-            None,
-            None,
-            Some(OsStr::new("0")),
-            Some("truecolor"),
-            Some("xterm"),
-            true,
-        );
+        let caps = color_caps_decision(&ColorEnv {
+            force_color: Some(OsStr::new("0")),
+            colorterm: Some("truecolor"),
+            term: Some("xterm"),
+            stderr_is_tty: true,
+            ..ColorEnv::default()
+        });
         assert!(!caps.color);
     }
 
@@ -1232,6 +1400,13 @@ mod tests {
             format_file_url(b"/home/user/file.rs", Some("Ubuntu 20.04")),
             "file://wsl.localhost/Ubuntu%2020.04/home/user/file.rs"
         );
+        // A UNC share stays a native UNC URL under WSL too: the 9P server
+        // usually cannot traverse a CIFS mount, so `wsl.localhost/<distro>//
+        // server/share` would be a dead (and slower) link.
+        assert_eq!(
+            format_file_url(b"//server/share/file.rs", Some("Ubuntu")),
+            "file://server/share/file.rs"
+        );
         // A Windows-native path must NOT be routed through `wsl.localhost`
         // (which produced `file://wsl.localhost/UbuntuC:/...`): it falls
         // through to the drive-letter branch instead.
@@ -1250,6 +1425,6 @@ mod tests {
 
     #[test]
     fn empty_path_is_not_garbage() {
-        assert_eq!(path_to_file_url(std::path::Path::new("")), "file://");
+        assert_eq!(&*path_to_file_url(std::path::Path::new("")), "file://");
     }
 }

@@ -20,13 +20,19 @@ const fn build_digit_pairs() -> [u8; 200] {
 }
 static DIGITS: [u8; 200] = build_digit_pairs();
 
-/// Append a decimal `u64` without `core::fmt` and without allocating.
+/// Append a decimal `u64` without `core::fmt`'s number machinery and without
+/// allocating.
+///
+/// Generic over the sink so the no-`core::fmt` contract actually holds at every
+/// call site: `String` and `ArrayString` both implement `fmt::Write`, and
+/// `String::write_str` delegates to `push_str` (std marks it `#[inline]`), so
+/// monomorphization leaves existing call sites' codegen unchanged.
 ///
 /// Two digits per iteration (halving the div-mod count for `n ≥ 100`) and a
-/// single `push_str` of a stack buffer instead of one capacity-checked `push`
-/// per digit.  20 digits covers every 64-bit value (`2^64 - 1` has 20).
+/// single write of a stack buffer instead of one capacity-checked `push` per
+/// digit.  20 digits covers every 64-bit value (`2^64 - 1` has 20).
 #[inline]
-pub fn push_uint(out: &mut String, mut n: u64) {
+pub fn push_uint<W: std::fmt::Write + ?Sized>(out: &mut W, mut n: u64) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     while n >= 100 {
@@ -51,7 +57,12 @@ pub fn push_uint(out: &mut String, mut n: u64) {
     // SAFETY: `buf[i..]` holds only ASCII digit bytes — written from `DIGITS`
     // (const-built from `b'0' + …`) or `b'0' + n as u8` with `n < 10`, all in
     // `0x30..=0x39`.
-    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+    //
+    // The `write_str` result is discarded deliberately: these sinks are
+    // infallible in practice (`String`, `ArrayString`), and the value is a
+    // compile-time-valid decimal — an error would mean the sink is broken, not
+    // that the number is unrepresentable.
+    let _ = out.write_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
 /// Const-built table mapping each `u8` to its two lowercase hex digits,
@@ -59,10 +70,6 @@ pub fn push_uint(out: &mut String, mut n: u64) {
 /// byte's two hex chars per iteration and one `push_str` at the end.
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
-/// Uppercase hex digits for percent-encoding (`%XX`) in URL path segments —
-/// shared by `error_code::encode_url_path_segment` and
-/// `term::encode_file_url_path` so the two encoders cannot drift apart.
-pub(crate) const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 const fn build_hex_pairs() -> [u8; 512] {
     let mut t = [0u8; 512];
     let mut i = 0;
@@ -144,29 +151,20 @@ pub fn push_uint_padded(out: &mut String, n: u64, width: usize) {
 }
 
 /// Append the fold marker text shared by the glyph and HTML renderers:
-/// `...` when nothing was omitted, else `... (N line[s] omitted)` with the
-/// locale's CLDR plural categories.  One source of truth so the two renderers
-/// cannot drift on the wording, and the plural correctness is inherited from
-/// Fluent rather than re-implemented with a binary `== 1` split.
+/// `...` when nothing was omitted, else the locale's own wrapper around the
+/// pluralized count.  One source of truth so the two renderers cannot drift on
+/// the wording, and the plural correctness is inherited from Fluent (including
+/// Russian's `few`/`many` categories) rather than re-implemented with a binary
+/// `== 1` split.
 #[inline]
 pub fn push_fold_marker(out: &mut String, gap: usize) {
     out.push_str("...");
     if gap > 0 {
-        out.push_str(" (");
-        // Format into a stack buffer and borrow it for the duration of the
-        // call: `render_into` only reads the `Cow`, so a fold-marker-dense
-        // diff no longer pays one heap allocation per marker.  39 bytes cover
-        // every `u128`/128-bit `usize` decimal, so a future 128-bit target
-        // cannot silently truncate the marker.
-        let mut buf = arrayvec::ArrayString::<39>::new();
-        use std::fmt::Write as _;
-        let _ = write!(buf, "{gap}");
-        crate::diagnostics::i18n::render_into(
-            "fold-marker-lines",
-            &[("gap", std::borrow::Cow::Borrowed(buf.as_str()))],
-            out,
-        );
-        out.push(')');
+        // The wrapper — the separating space *and* the brackets — is
+        // locale-owned (English/Russian ` (…)`, CJK ` （…）`); hardcoding it
+        // here handed translators half a sentence.  The count goes in as a
+        // native number: no `ArrayString`, no string→number re-parse.
+        crate::diagnostics::i18n::render_into_count("fold-marker-lines", "gap", gap as u64, out);
     }
 }
 
@@ -177,4 +175,123 @@ pub fn push_fold_marker(out: &mut String, gap: usize) {
 #[inline]
 pub const fn dec_digits(n: u64) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every off-by-one the pair/tail split could produce is caught by comparing
+    /// against `to_string`, plus an exhaustive small-range sweep.
+    #[test]
+    fn push_uint_matches_display() {
+        for n in [
+            0u64,
+            1,
+            9,
+            10,
+            11,
+            99,
+            100,
+            101,
+            999,
+            1000,
+            u32::MAX as u64,
+            1_000_000_000_000_000_000,
+            u64::MAX,
+        ] {
+            let mut out = String::new();
+            push_uint(&mut out, n);
+            assert_eq!(out, n.to_string(), "push_uint({n})");
+        }
+        for n in 0..=10_000u64 {
+            let mut out = String::new();
+            push_uint(&mut out, n);
+            assert_eq!(out, n.to_string(), "push_uint({n})");
+        }
+    }
+
+    #[test]
+    fn push_hex64_is_fixed_width_lowercase() {
+        for (n, want) in [
+            (0u64, "0000000000000000"),
+            (1, "0000000000000001"),
+            (0xdead_beef, "00000000deadbeef"),
+            (u64::MAX, "ffffffffffffffff"),
+        ] {
+            let mut out = String::new();
+            push_hex64(&mut out, n);
+            assert_eq!(out, want, "push_hex64({n:#x})");
+        }
+        for n in [0u64, 7, 1 << 63, u64::MAX] {
+            let mut out = String::new();
+            push_hex64(&mut out, n);
+            assert_eq!(out.len(), 16);
+            assert!(
+                out.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            );
+            assert_eq!(out, format!("{n:016x}"));
+        }
+    }
+
+    #[test]
+    fn push_spaces_covers_chunk_and_tail_paths() {
+        for n in [0usize, 1, 63, 64, 65, 127, 128, 1000] {
+            let mut out = String::from("|");
+            push_spaces(&mut out, n);
+            assert_eq!(out.len(), n + 1, "n = {n}");
+            assert!(out[1..].bytes().all(|b| b == b' '), "n = {n}");
+        }
+    }
+
+    #[test]
+    fn push_uint_padded_never_truncates() {
+        for (n, width, want) in [
+            (0u64, 0usize, "0"),
+            (0, 3, "  0"),
+            (5, 3, "  5"),
+            (5, 1, "5"),
+            (1234, 2, "1234"),
+            (u64::MAX, 5, "18446744073709551615"),
+        ] {
+            let mut out = String::new();
+            push_uint_padded(&mut out, n, width);
+            assert_eq!(out, want, "push_uint_padded({n}, {width})");
+        }
+    }
+
+    #[test]
+    fn dec_digits_boundaries() {
+        for (n, want) in [
+            (0u64, 1usize),
+            (9, 1),
+            (10, 2),
+            (99, 2),
+            (100, 3),
+            (u64::MAX, 20),
+        ] {
+            assert_eq!(dec_digits(n), want, "dec_digits({n})");
+        }
+    }
+
+    /// `gap == 0` is exactly `...`; `gap > 0` pins the ASCII wrapper around the
+    /// Fluent body.  The wrapper is what a §5-style i18n change would move.
+    #[test]
+    fn fold_marker_shape_is_pinned() {
+        let _guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
+
+        let mut out = String::new();
+        push_fold_marker(&mut out, 0);
+        assert_eq!(out, "...");
+
+        let mut out = String::new();
+        push_fold_marker(&mut out, 1);
+        assert_eq!(out, "... (1 line omitted)");
+
+        let mut out = String::new();
+        push_fold_marker(&mut out, 5);
+        assert_eq!(out, "... (5 lines omitted)");
+    }
 }

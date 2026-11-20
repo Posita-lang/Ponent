@@ -53,8 +53,7 @@ def lp_cost() -> Fraction:
 
 
 def check_colouring() -> int:
-    mu = [sum((j + 1) * LP[v][j] for j in range(K)) for v in range(len(LP))]
-    lp = sum(w * m for w, m in zip(WEIGHTS, mu))
+    lp = lp_cost()
     ip = sum(w * c for w, c in zip(WEIGHTS, C_STAR))
     print(f"LP point cost = {lp}, colouring cost = {ip}")
     assert lp == Fraction(-201, 2) and ip == -100

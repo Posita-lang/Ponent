@@ -27,6 +27,22 @@ impl Ord for DiagnosticLevel {
     }
 }
 
+// `Ord`'s contract requires `cmp(a, b) == Equal` **iff** `a == b`.  That holds
+// only while every severity value is distinct: a copy-pasted severity would make
+// two distinct variants compare equal, which `sort` tolerates but
+// `BTreeMap`/binary search silently corrupt.  `severity()` is a `const fn`, so
+// the ladder is a build-time fact (the same discipline as `error_code.rs`'s
+// shape/slot asserts).  Pinning the exact values also makes a severity
+// re-weighting a conscious edit to this block instead of silent drift.
+const _: () = {
+    assert!(DiagnosticLevel::Info.severity() == 0);
+    assert!(DiagnosticLevel::Note.severity() == 1);
+    assert!(DiagnosticLevel::Help.severity() == 2);
+    assert!(DiagnosticLevel::Warning.severity() == 3);
+    assert!(DiagnosticLevel::Error.severity() == 4);
+    assert!(DiagnosticLevel::Fatal.severity() == 5);
+};
+
 impl PartialOrd for DiagnosticLevel {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -67,9 +83,7 @@ impl DiagnosticLevel {
     /// `max_errors` gate.
     pub const fn is_error(&self) -> bool {
         matches!(self, DiagnosticLevel::Error | DiagnosticLevel::Fatal)
-    }
-
-    pub const fn prefix(&self) -> &'static str {
+    }    pub const fn prefix(&self) -> &'static str {
         match self {
             DiagnosticLevel::Fatal => "F",
             DiagnosticLevel::Error => "E",
@@ -93,6 +107,11 @@ impl DiagnosticLevel {
 
     /// Bold form where the level has one; Help/Note/Info deliberately fall
     /// through to the non-bold color (they are annotations, not headlines).
+    ///
+    /// Every variant is written out: a catch-all arm would silently extend the
+    /// "annotations are not headlines" policy to a future level that never
+    /// consented to it, and this was the file's only silent arm on variant
+    /// addition (every other accessor is exhaustive by construction).
     pub const fn ansi_bold_color(&self) -> &'static str {
         match self {
             // Keep Fatal visually consistent with `ansi_color` (white on red),
@@ -100,14 +119,24 @@ impl DiagnosticLevel {
             DiagnosticLevel::Fatal => "\x1b[1;41;97m",
             DiagnosticLevel::Error => "\x1b[31;1m",
             DiagnosticLevel::Warning => "\x1b[33;1m",
-            _ => self.ansi_color(),
+            DiagnosticLevel::Help => self.ansi_color(),
+            DiagnosticLevel::Note => self.ansi_color(),
+            DiagnosticLevel::Info => self.ansi_color(),
         }
     }
 
-    #[inline]
-    pub const fn ansi_reset() -> &'static str {
-        "\x1b[0m"
-    }
+    /// SGR reset, emitted at every colour close.
+    ///
+    /// A `const` rather than a `const fn` so it is usable in const context
+    /// (static tables, `concat!`-adjacent helpers) and needs no call at all at
+    /// the hot close sites.
+    ///
+    /// This is a **full** reset: it clears bold/fg/bg together.  Correct for the
+    /// current flat header layout; if a renderer ever colours a region larger
+    /// than one header and closes inner spans with this, the enclosing style
+    /// dies silently (selective resets — `ESC[22m`/`39m`/`49m` — are the escape
+    /// hatch if nesting ever arrives).
+    pub const ANSI_RESET: &str = "\x1b[0m";
 
     /// Localized human-readable label for this level.
     ///
@@ -140,6 +169,41 @@ impl DiagnosticLevel {
             ],
         }
     }
+
+    /// Uppercased localized label, cached per language.
+    ///
+    /// `mod.rs`'s `impl Display for Diagnostic` used to call
+    /// `label().to_uppercase()`, allocating a fresh `String` per render for a
+    /// value fully determined by `(level, language)` — at most 6 × `N_LANGS`
+    /// entries.  Unicode uppercase, not `to_ascii_uppercase`: labels are
+    /// localized (`Ошибка`), so an ASCII-only fold would leave Cyrillic
+    /// lowercase.
+    pub fn label_upper(&self) -> &'static str {
+        // Same variant → init-array anchoring as `label()`: the index names the
+        // table position, not `severity()`'s semantic weight (they coincide
+        // today by construction and must not be coupled — a severity
+        // re-weighting would otherwise silently swap labels).
+        let idx = match self {
+            DiagnosticLevel::Info => 0,
+            DiagnosticLevel::Note => 1,
+            DiagnosticLevel::Help => 2,
+            DiagnosticLevel::Warning => 3,
+            DiagnosticLevel::Error => 4,
+            DiagnosticLevel::Fatal => 5,
+        };
+        crate::diagnostics::i18n::cached_label_static! {
+            n = 6,
+            variant = idx,
+            init = [
+                crate::diagnostics::i18n::fluent::level_info().to_uppercase(),
+                crate::diagnostics::i18n::fluent::level_note().to_uppercase(),
+                crate::diagnostics::i18n::fluent::level_help().to_uppercase(),
+                crate::diagnostics::i18n::fluent::level_warning().to_uppercase(),
+                crate::diagnostics::i18n::fluent::level_error().to_uppercase(),
+                crate::diagnostics::i18n::fluent::level_fatal().to_uppercase(),
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +230,121 @@ mod tests {
         }
         assert_eq!(DiagnosticLevel::Fatal.as_str(), "fatal");
         assert_eq!(DiagnosticLevel::Error.as_str(), "error");
+    }
+
+    const ALL: [DiagnosticLevel; 6] = [
+        DiagnosticLevel::Info,
+        DiagnosticLevel::Note,
+        DiagnosticLevel::Help,
+        DiagnosticLevel::Warning,
+        DiagnosticLevel::Error,
+        DiagnosticLevel::Fatal,
+    ];
+
+    /// Machine forms and prefixes are pairwise distinct (a copy-paste would make
+    /// two levels indistinguishable to `--level` filters and CI token parsing).
+    #[test]
+    fn machine_forms_are_pairwise_distinct() {
+        for (i, a) in ALL.iter().enumerate() {
+            for b in &ALL[i + 1..] {
+                assert_ne!(a.as_str(), b.as_str(), "{a:?} vs {b:?}");
+                assert_ne!(a.prefix(), b.prefix(), "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// The severity ladder is the Ord delegate (compile-time pinned above); the
+    /// runtime pin documents intent next to the values.
+    #[test]
+    fn severity_ladder_and_error_set() {
+        assert_eq!(
+            ALL.map(|l| l.severity()),
+            [0, 1, 2, 3, 4, 5],
+            "severity ladder changed: Ord/Eq consistency and documented order"
+        );
+        // Exactly `{Error, Fatal}`: a new gate-worthy level silently dropping
+        // out of exit-code / `max_errors` accounting is the failure this pins.
+        for l in ALL {
+            assert_eq!(
+                l.is_error(),
+                matches!(l, DiagnosticLevel::Error | DiagnosticLevel::Fatal),
+                "{l:?}"
+            );
+        }
+        // Ord follows severity, and Equal only for the same variant.
+        let mut sorted = ALL;
+        sorted.sort();
+        assert_eq!(sorted, ALL, "Ord must follow the declaration/severity order");
+    }
+
+    /// Golden English labels: distinctness alone cannot catch two swapped
+    /// accessors in the `label()` init array.
+    #[test]
+    fn label_goldens_are_stable_english() {
+        let _guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
+        for (level, want) in [
+            (DiagnosticLevel::Info, "info"),
+            (DiagnosticLevel::Note, "note"),
+            (DiagnosticLevel::Help, "help"),
+            (DiagnosticLevel::Warning, "warning"),
+            (DiagnosticLevel::Error, "error"),
+            (DiagnosticLevel::Fatal, "fatal"),
+        ] {
+            assert_eq!(level.label(), want, "{level:?}");
+            assert!(level.label_upper().len() >= want.len(), "{level:?}");
+            assert_eq!(
+                level.label_upper(),
+                want.to_uppercase(),
+                "label_upper must be the Unicode uppercase of label, {level:?}"
+            );
+        }
+        // Per-variant distinctness, so an accessor swap that keeps arity fails.
+        for (i, a) in ALL.iter().enumerate() {
+            assert!(!a.label().is_empty(), "{a:?}");
+            for b in &ALL[i + 1..] {
+                assert_ne!(a.label(), b.label(), "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// Non-ASCII uppercasing: the one way `label_upper` can be subtly wrong
+    /// (an ASCII fold would leave Cyrillic lowercase).
+    #[test]
+    fn label_upper_uses_unicode_folding() {
+        let _guard = crate::diagnostics::i18n::acquire_test_lang_lock();
+        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::Ru);
+        let err = DiagnosticLevel::Error;
+        assert_eq!(err.label_upper(), err.label().to_uppercase());
+        assert_ne!(err.label(), err.label_upper(), "ru error label is lowercase");
+        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
+    }
+
+    /// SGR goldens: a typo (`32m` where `31m` belongs) ships as green errors and
+    /// no other test in the tree would notice.
+    #[test]
+    fn ansi_goldens_are_pinned() {
+        assert_eq!(DiagnosticLevel::ANSI_RESET, "\x1b[0m");
+        for (level, color) in [
+            (DiagnosticLevel::Fatal, "\x1b[41;37m"),
+            (DiagnosticLevel::Error, "\x1b[31m"),
+            (DiagnosticLevel::Warning, "\x1b[33m"),
+            (DiagnosticLevel::Help, "\x1b[36m"),
+            (DiagnosticLevel::Note, "\x1b[34m"),
+            (DiagnosticLevel::Info, "\x1b[32m"),
+        ] {
+            assert_eq!(level.ansi_color(), color, "{level:?}");
+        }
+        assert_eq!(DiagnosticLevel::Fatal.ansi_bold_color(), "\x1b[1;41;97m");
+        assert_eq!(DiagnosticLevel::Error.ansi_bold_color(), "\x1b[31;1m");
+        assert_eq!(DiagnosticLevel::Warning.ansi_bold_color(), "\x1b[33;1m");
+        // The documented fall-through: annotations are not headlines.
+        for level in [
+            DiagnosticLevel::Help,
+            DiagnosticLevel::Note,
+            DiagnosticLevel::Info,
+        ] {
+            assert_eq!(level.ansi_bold_color(), level.ansi_color(), "{level:?}");
+        }
     }
 }

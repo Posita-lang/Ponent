@@ -735,7 +735,7 @@ impl<'src, 'input> Parser<'src, 'input> {
             // `^`-underline context (idempotent — later callers are no-ops).
             for d in &mut diags {
                 if d.source().is_none() {
-                    d.set_source(Some(self.source));
+                    d.set_source(self.source);
                 }
             }
             Err(diags)

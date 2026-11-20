@@ -307,8 +307,6 @@ pub(crate) struct SectionScratch {
     /// batch.  `Vec` (not `SmallVec`) because it is indexed by suggestion
     /// number and must cover every suggestion even when most are `None`.
     pub suggestion_lines_buf: Vec<Option<(usize, usize)>>,
-    /// Per-section row coverage of suggestion spans, reused across sections.
-    pub sug_covered: Vec<bool>,
     /// Scratch for the highlighter's `_into` entry points where the
     /// highlighted text must be assembled *before* it can be pushed between
     /// gutter pieces (the connector re-colouring pass scans the highlighted
@@ -363,7 +361,6 @@ impl SectionScratch {
             indent: String::new(),
             hl_buf: String::new(),
             suggestion_lines_buf: Vec::new(),
-            sug_covered: Vec::new(),
             section_label_lines: SmallVec::new(),
             section_label_sources: SmallVec::new(),
             section_label_order: SmallVec::new(),
@@ -875,9 +872,7 @@ impl GlyphRenderer {
                 if hyperlink_enabled && super::is_real_file_name(anchor_fname) {
                     match cx {
                         Some(cx) => Some(cx.file_url(anchor_fname)),
-                        None => Some(Arc::from(
-                            path_to_file_url(std::path::Path::new(anchor_fname)).as_str(),
-                        )),
+                        None => Some(path_to_file_url(std::path::Path::new(anchor_fname))),
                     }
                 } else {
                     None
@@ -1049,9 +1044,7 @@ impl GlyphRenderer {
                             if hyperlink_enabled && super::is_real_file_name(f_fname) {
                                 match cx {
                                     Some(cx) => Some(cx.file_url(f_fname)),
-                                    None => Some(Arc::from(
-                                        path_to_file_url(std::path::Path::new(f_fname)).as_str(),
-                                    )),
+                                    None => Some(path_to_file_url(std::path::Path::new(f_fname))),
                                 }
                             } else {
                                 None
@@ -1935,29 +1928,19 @@ impl GlyphRenderer {
         gutter_tail.push(' ');
 
         let primary_end_line = idx.to_linecol(primary_span.end_as_usize()).line;
-        // A suggestion span contributes context rows; precompute its coverage
-        // once so the row loop does an O(1) array lookup instead of scanning
-        // every suggestion per row.
-        scratch.sug_covered.clear();
-        scratch
-            .sug_covered
-            .resize(last_line.saturating_sub(first_line) + 1, false);
-        for &(a, b) in suggestion_lines.iter().flatten() {
-            let lo = a.max(first_line);
-            let hi = b.min(last_line);
-            if lo <= hi {
-                for line in lo..=hi {
-                    scratch.sug_covered[line - first_line] = true;
-                }
-            }
-        }
         for line_idx in first_line..=last_line {
             // O(1) slice via the shared index instead of indexing a
             // whole-file `Vec<&str>` that was collected only for this.
             let line = idx.line(line_idx);
+            // A suggestion-covered row used to be excluded here by a
+            // `sug_covered` table.  That term was redundant: a suggestion
+            // contributes its diff block separately and never adds source-row
+            // ranges, so the highlighted path emits byte-identical output for
+            // such a row.  `suggestion_covered_row_renders_like_a_plain_row`
+            // pins the equivalence, and the per-row table plus its O(S·rows)
+            // fill are gone.
             let context_only = (line_idx < start_pos.line || line_idx > primary_end_line)
-                && label_window.is_idle_for(line_idx)
-                && !scratch.sug_covered[line_idx - first_line];
+                && label_window.is_idle_for(line_idx);
             // One grapheme walk converts this row's byte ranges to display
             // columns, measures the line's width, and emits the highlighted
             // source text — replacing the three separate passes over the
@@ -2104,9 +2087,18 @@ impl GlyphRenderer {
                     let start_off = span_start
                         .saturating_sub(start_line_start)
                         .min(start_line.len());
-                    let col = label_start_cols[i].unwrap_or_else(|| {
-                        byte_offset_to_display(start_line, start_off, self.tab_width)
-                    });
+                    // The fallback is row-invariant (it depends only on the
+                    // label's start line, which is above the window), so cache
+                    // it in the per-section scratch: without this it is
+                    // recomputed once per middle row of the same label.
+                    let col = match label_start_cols[i] {
+                        Some(c) => c,
+                        None => {
+                            let c = byte_offset_to_display(start_line, start_off, self.tab_width);
+                            label_start_cols[i] = Some(c);
+                            c
+                        }
+                    };
                     multiline_flags.push((col, "middle"));
                 }
             }
@@ -2464,9 +2456,9 @@ impl GlyphRenderer {
 
             let applicability = suggestion.applicability;
             let glyph = match applicability {
-                // `√` is East-Asian-Ambiguous width; CJK terminals render it
-                // two cells wide, shifting the `-`/`+` payload. Use the
-                // unambiguous ASCII `+` in ASCII mode (C10).
+                // ASCII markers, not `√`: `√` is East-Asian-Ambiguous width, so
+                // CJK terminals render it two cells wide and shift the `-`/`+`
+                // payload out of alignment with the source rows above (C10).
                 crate::diagnostics::Applicability::MachineApplicable => ">",
                 crate::diagnostics::Applicability::MaybeIncorrect => "?",
                 _ => "",
@@ -2545,7 +2537,9 @@ impl GlyphRenderer {
             out.push_str(self.bc.sub_v);
             out.push_str(self.s.reset);
             out.push('\n');
-            // Message line: `│ 12  √ help: message`
+            // Message line: `│ 12  message` — same gutter as the diff rows
+            // below, whose markers are the ASCII `>` / `?` (never `√`:
+            // East-Asian-Ambiguous, two cells wide in CJK terminals).
             // Gutter: `│` + `12` (line_num_width) + ` ` + `│` = 4 visible
             // columns when width is 2; the `+`/`-` rows below share the
             // same gutter so the two diff rows align.
@@ -2866,23 +2860,30 @@ impl GlyphRenderer {
         let level_label = DiagnosticLevel::Note.label();
         let suffix_cols = suffix.map_or(0, |s| 4 + visible_width(s));
         let avail_full = self.max_width.saturating_sub(prefix_cols).max(1);
-        let mut last_text = String::new();
         let mut segments = self.wrap_msg(&sanitized, prefix_cols);
-        // Wrap the full measure first; only re-wrap the final segment if the
-        // locator suffix would overflow it.  This mirrors chain.rs and avoids
-        // wasting suffix width on every non-final line.
+        // Wrap the full measure first; only when the locator suffix would
+        // overflow the last line does the reserve enter the layout.
+        //
+        // The reserve is applied by re-wrapping the *whole* text at
+        // `avail_full` with `last_reserve = suffix_cols`, not by re-wrapping the
+        // overflowing tail at the narrowed measure.  The two-phase composition Φ
+        // = `wrap(M) then wrap(narrow, tail)` is unboundedly worse on line count
+        // (it can never pull words from earlier lines onto the reserved line),
+        // which is exactly the defect `wrap_optimal_reserved` was written to
+        // remove; `research/locator-wrap/` has the proof and the witness family.
+        // Byte output is unchanged whenever the suffix already fits (the gate
+        // below is false), so only the previously-suboptimal path moves.
         if !self.no_wrap
             && suffix_cols > 0
             && let Some(last_seg) = segments.last()
             && visible_width_with_tab(last_seg.as_ref(), self.tab_width) + suffix_cols > avail_full
         {
-            let narrow = avail_full.saturating_sub(suffix_cols).max(1);
-            last_text = segments.pop().expect("non-empty wrap").into_owned();
-            segments.extend(super::wrap::wrap_optimal(
-                &last_text,
-                narrow,
+            segments = super::wrap::wrap_optimal_reserved(
+                &sanitized,
+                avail_full,
                 self.tab_width,
-            ));
+                suffix_cols,
+            );
         }
         let last = segments.len().saturating_sub(1);
         for (i, seg) in segments.iter().enumerate() {
@@ -6398,6 +6399,52 @@ mod tests {
         );
     }
 
+    /// `sug_covered` makes a suggestion-covered row take the highlighted path
+    /// instead of the `context_only` plain path.  The claim under test is that
+    /// both paths emit the *same* bytes for such a row (suggestions add their
+    /// diff block separately and never contribute source-row ranges), i.e. the
+    /// term is redundant.  This pins the equivalence directly: the second
+    /// source row renders identically whether or not a suggestion covers it.
+    #[test]
+    fn suggestion_covered_row_renders_like_a_plain_row() {
+        let src = "aaa\nbbb\n";
+        let covered = Diagnostic::error("boom")
+            .with_span(Span::new(FileId::DUMMY, 0, 3))
+            .with_span_suggestion(
+                Span::new(FileId::DUMMY, 4, 7),
+                "ccc",
+                "replace `bbb` with `ccc`",
+                Applicability::MachineApplicable,
+            )
+            .with_source(src);
+        // Same diagnostic, suggestion moved onto the first row: the second row
+        // is then *not* suggestion-covered.
+        let not_covered = Diagnostic::error("boom")
+            .with_span(Span::new(FileId::DUMMY, 0, 3))
+            .with_span_suggestion(
+                Span::new(FileId::DUMMY, 0, 3),
+                "zzz",
+                "replace `aaa` with `zzz`",
+                Applicability::MachineApplicable,
+            )
+            .with_source(src);
+        let row = |out: &str, needle: &str| -> String {
+            out.lines()
+                .find(|l| l.contains(needle) && !l.contains("- ") && !l.contains("+ "))
+                .unwrap_or_else(|| panic!("row {needle:?} missing in {out:?}"))
+                .to_string()
+        };
+        let a = GlyphRenderer::new(false).render_diagnostic(&covered);
+        let b = GlyphRenderer::new(false).render_diagnostic(&not_covered);
+        assert_eq!(
+            row(&a, "bbb"),
+            row(&b, "bbb"),
+            "a suggestion-covered row must render exactly like a plain row:\n{a}\n---\n{b}"
+        );
+        // And the covered render still emits its diff block.
+        assert!(a.contains("+ ccc"), "diff block lost: {a}");
+    }
+
     #[test]
     fn span_suggestion_renders_diff() {
         let src = "dem main(){}\n";
@@ -6858,6 +6905,74 @@ mod tests {
             );
         }
         assert!(out.lines().last().unwrap().contains(" at f.ps:12:3"));
+    }
+
+    /// The note's locator reserve must be *reserved-optimal*, not the two-phase
+    /// composition Φ (wrap at the full measure, then re-wrap the overflowing
+    /// tail narrow): Φ cannot pull words from earlier lines onto the reserved
+    /// line, so it can spend a whole extra line.  Line count is compared against
+    /// `wrap_optimal_reserved`, with Φ as an upper bound.
+    #[test]
+    fn note_locator_wrap_is_reserved_optimal() {
+        let opts = crate::diagnostics::DiagOpts {
+            max_width: 30,
+            ..crate::diagnostics::DiagOpts::default()
+        };
+        let renderer = GlyphRenderer::with_opts(false, Some(&opts));
+        let prefix_cols = renderer.prefix_cols(DiagnosticLevel::Note);
+        let avail_full = renderer.max_width.saturating_sub(prefix_cols).max(1);
+        let suffix = "f.ps:12:3";
+        let suffix_cols = 4 + visible_width(suffix);
+        let narrow = avail_full.saturating_sub(suffix_cols).max(1);
+        let mut improved = false;
+        for msg in [
+            "alpha bravo charlie delta echo foxtrot",
+            "aaa bbb ccc ddd eee fff ggg hhh iii jjj",
+            "one two three four five six seven eight nine ten",
+            "aa bb cc dd ee ff gg hh ii jj kk ll",
+        ] {
+            let sanitized = crate::diagnostics::sanitize_for_terminal_multiline(msg);
+            let mut out = String::new();
+            renderer.write_note_line_with(&mut out, msg, Some(suffix));
+            let lines = out.lines().count();
+            let optimal = crate::diagnostics::wrap::wrap_optimal_reserved(
+                &sanitized,
+                avail_full,
+                renderer.tab_width,
+                suffix_cols,
+            )
+            .len();
+            assert_eq!(
+                lines, optimal,
+                "note wrap is not the reserved-optimal layout: {msg:?}"
+            );
+            let full =
+                crate::diagnostics::wrap::wrap_optimal(&sanitized, avail_full, renderer.tab_width);
+            let phi = match full.last() {
+                Some(last)
+                    if visible_width_with_tab(last.as_ref(), renderer.tab_width) + suffix_cols
+                        > avail_full =>
+                {
+                    full.len() - 1
+                        + crate::diagnostics::wrap::wrap_optimal(
+                            last.as_ref(),
+                            narrow,
+                            renderer.tab_width,
+                        )
+                        .len()
+                }
+                _ => full.len(),
+            };
+            assert!(
+                lines <= phi,
+                "regressed against two-phase Φ: {msg:?} -> {lines} > {phi}"
+            );
+            improved |= lines < phi;
+        }
+        assert!(
+            improved,
+            "corpus never exercises the case Φ gets wrong; the oracle is vacuous"
+        );
     }
 
     /// Regression: `write_help_line` (and `write_note_line`) once pushed the
@@ -7652,16 +7767,22 @@ mod tests {
     /// so the relabel must move that heavier lane to index 0.
     #[test]
     fn lanes_are_relabelled_by_descending_weight() {
+        // The greedy opens lanes in `(start, end)` order, so the primary (which
+        // sorts first) opens lane 0; every label lies *inside* the primary, so
+        // each one is forced into lane 1.  Nineteen labels weigh
+        // 19 × (1 + 1) = 38 against the primary's 20, so the relabel must move
+        // the label lane to index 0.  The previous numbers (primary 1000 vs
+        // 240, labels outside it) produced the identity permutation, so the
+        // assertion held even with the relabel code deleted.
         let mut underlines: Vec<(usize, usize, char, Option<usize>)> =
-            vec![(0usize, 1000usize, '^', None)]; // primary, wide
-        for k in 0..40usize {
-            let start = 10 + k * 20;
-            underlines.push((start, 5, '~', Some(k)));
+            vec![(0usize, 20usize, '^', None)]; // primary, weight 20
+        for k in 0..19usize {
+            underlines.push((1 + k, 1, '~', Some(k)));
         }
 
         let mut lanes = UnderlineLanes::new();
         let count = lanes.assign(&underlines);
-        assert_eq!(count, 2, "primary + disjoint labels fits in two lanes");
+        assert_eq!(count, 2, "primary plus interior labels fits in two lanes");
 
         let weight = |l: usize| -> usize {
             lanes.lanes[l]
@@ -7673,6 +7794,28 @@ mod tests {
         assert!(
             w0 >= w1,
             "lane 0 ({w0}) must be at least as heavy as lane 1 ({w1})"
+        );
+        assert!(
+            underlines[lanes.lanes[0][0]].3.is_some(),
+            "the label lane is the heavier one, so the relabel must put it at index 0: {:?}",
+            lanes.lanes
+        );
+
+        // Second case: the primary is already the heaviest lane, so the
+        // permutation is the identity.  Pinning both directions keeps a relabel
+        // that always swaps from passing the assertion above.
+        let mut underlines: Vec<(usize, usize, char, Option<usize>)> =
+            vec![(0usize, 100usize, '^', None)]; // primary, weight 100
+        for k in 0..19usize {
+            underlines.push((1 + k, 1, '~', Some(k)));
+        }
+        let mut lanes = UnderlineLanes::new();
+        assert_eq!(lanes.assign(&underlines), 2);
+        assert_eq!(
+            lanes.lanes[0].first().copied(),
+            Some(0),
+            "the primary is the heaviest lane and must stay at index 0: {:?}",
+            lanes.lanes
         );
     }
 
@@ -7986,7 +8129,8 @@ mod tests {
         // stop-aligned in absolute terms (5+3 = 8 = 8+4 mod 4 = 0) — the
         // payloads legitimately differ, exactly as a real terminal renders
         // them.  Compare display columns (char counts — the plain renderer
-        // emits no ANSI and `√` is one cell), not byte offsets.
+        // emits no ANSI and the `>`/`?` applicability marker is one cell), not
+        // byte offsets.
         let main_row = out
             .lines()
             .find(|l| l.contains("set i = j;") && !l.contains("- "))
@@ -7995,7 +8139,7 @@ mod tests {
         let main_payload = &main_row[gutter_end + 2..]; // skip '|' + gutter space
         let m_ws = main_payload.len() - main_payload.trim_start().len();
         let d_gutter_end = minus.match_indices('|').nth(1).map(|(i, _)| i).unwrap();
-        let d_rest = &minus[d_gutter_end + 2..]; // "√- <expanded payload>"
+        let d_rest = &minus[d_gutter_end + 2..]; // ">- <expanded payload>"
         let d_payload = &d_rest[d_rest.find("- ").expect("diff marker missing") + 2..];
         let d_ws = d_payload.len() - d_payload.trim_start().len();
         // Absolute columns: main content starts at 5 (`│ 1 │ `), the diff

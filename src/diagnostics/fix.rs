@@ -384,7 +384,7 @@ impl<'src> FixSet<'src> {
     /// order).
     #[must_use = "apply returns the rewritten source; write it out or the fix is lost"]
     pub fn apply<'s>(&self, source: &'s str) -> Cow<'s, str> {
-        self.apply_counted(source).0
+        self.apply_single_file(source).0
     }
 
     /// Apply only the edits that target `file` to `source`, returning the
@@ -406,12 +406,19 @@ impl<'src> FixSet<'src> {
     }
 
     /// [`Self::apply`] plus the number of edits that actually spliced.
-    #[must_use = "apply_counted returns the rewritten source and count"]
-    pub fn apply_counted<'s>(&self, source: &'s str) -> (Cow<'s, str>, usize) {
+    ///
+    /// The name carries the precondition: this applies the edits of **one**
+    /// file to **one** buffer.  `apply_counted` read as a drop-in variant of
+    /// [`Self::apply`], so a multi-file caller silently got the first file's
+    /// edits spliced into an unrelated buffer in release builds (the guard below
+    /// is a `debug_assert!`).  Callers holding a batch must use
+    /// [`Self::apply_for_file_counted`].
+    #[must_use = "apply_single_file returns the rewritten source and count"]
+    pub fn apply_single_file<'s>(&self, source: &'s str) -> (Cow<'s, str>, usize) {
         let anchor = self.edits.first().map(|e| e.span.file);
         debug_assert!(
             anchor.is_none_or(|f| self.edits.iter().all(|e| e.span.file == f)),
-            "FixSet::apply_counted called on a multi-file set; use apply_for_file_counted",
+            "FixSet::apply_single_file called on a multi-file set; use apply_for_file_counted",
         );
         match anchor {
             Some(file) => self.apply_for_file_counted(source, file),
@@ -502,7 +509,7 @@ pub fn apply_fixes<'src, 's>(
     hints: FixHints,
 ) -> (Cow<'s, str>, usize) {
     let set = FixSet::collect(diags, hints);
-    set.apply_counted(source)
+    set.apply_single_file(source)
 }
 
 /// Single-file convenience: collects once, then applies one file.
@@ -895,7 +902,7 @@ mod tests {
             .with_suggestions(vec![sug]);
         let set = FixSet::collect(&[diag], FixHints::All);
         assert_eq!(set.len(), 1, "collect has no source and cannot filter");
-        let (out, applied) = set.apply_counted(src);
+        let (out, applied) = set.apply_single_file(src);
         assert_eq!(applied, 0);
         assert_eq!(out, src);
     }

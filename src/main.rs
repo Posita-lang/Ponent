@@ -95,7 +95,7 @@ fn attach_source_to_diags<'src>(
 ) {
     for diag in diags.iter_mut() {
         if diag.source().is_none() {
-            diag.set_source(Some(source));
+            diag.set_source(source);
         }
         if diag.file_name() == "<input>" {
             diag.set_file_name(file_name);

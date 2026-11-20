@@ -15,6 +15,7 @@ comptime-internal = 编译期内部错误：{ $e }
 comptime-call-stack-header = 编译期调用栈（最近调用在前）：
 comptime-frame = { $reason }
 comptime-frame-offset = { $reason }（偏移 { $offset }）
+comptime-frame-bullet = ·
 trait-solver-error = trait 求解器错误：{ $msg }
 type-mismatch = 类型不匹配：期望 `{ $expected }`，得到 `{ $found }`
 type-mismatch-reason = { type-mismatch } — { $reason }
@@ -102,7 +103,7 @@ unknown-error = 未知错误
 
 # Batch trailers / fold marker / call-chain header (renderers)
 suppressed-note = 抑制了 { $count } 个额外错误
-fold-marker-lines = 省略了 { $gap } 行
+fold-marker-lines = （省略 { $gap } 行）
 chain-header = 被引用于:
 html-doc-title = Ponent 编译器诊断
 html-h1 = Ponent 编译器诊断

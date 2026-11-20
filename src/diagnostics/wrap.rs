@@ -499,7 +499,7 @@ fn wrap_optimal_with<'a>(
             out.push(Cow::Borrowed(if para.is_ascii() { "" } else { para }));
             continue;
         }
-        for range in wrap_dp(&words, max_width, tables, scratch) {
+        for range in wrap_dp(&words, max_width, tables, None, scratch) {
             out.push(Cow::Borrowed(&para[range]));
         }
         scratch.words = words;
@@ -581,8 +581,14 @@ pub(crate) fn wrap_optimal_reserved<'a>(
     let core = text.strip_suffix('\n').unwrap_or(text);
     // Paragraph line counts are additive (`solution.md` §1.4): every paragraph
     // before the last is unconditional, so only the final one sees the reserve.
-    let (head, last_para) = match core.rsplit_once('\n') {
-        Some((head, last)) => (Some(head), last),
+    //
+    // Split **keeping** the separator (`..=i`): `wrap_optimal` treats a
+    // trailing `\n` as a terminator, so dropping it would delete the empty
+    // paragraph that the byte itself represents — `"a\n\nb"` would become
+    // `["a", "b"]` instead of `["a", "", "b"]`.  `wrap_optimal("a\n\n")` is
+    // `["a", ""]`, i.e. every preceding paragraph, empty ones included.
+    let (head, last_para) = match core.rfind('\n') {
+        Some(i) => (Some(&core[..=i]), &core[i + 1..]),
         None => (None, core),
     };
     let mut out: SmallVec<[Cow<'a, str>; 4]> = SmallVec::new();
@@ -689,12 +695,17 @@ fn reserved_ranges(
     let ranges = match split {
         // P1: no legal layout — the last word alone overruns the last line's
         // budget.  Wrap at the full measure; the locator overflows this one row.
-        None => wrap_dp(&words, max_width, tables, scratch),
+        None => wrap_dp(&words, max_width, tables, None, scratch),
         Some(j) => {
+            // The suffix line's class is known before the prefix is laid out:
+            // `acc` is that line's width (the backward scan ends on the smallest
+            // feasible `j`, i.e. the longest suffix).  Passing it makes the
+            // prefix's own last line a middle line in the cost model.
+            let suffix_class = fitness_class(acc, max_width);
             let mut ranges = if j == 0 {
                 SmallVec::new()
             } else {
-                wrap_dp(&words[..j], max_width, tables, scratch)
+                wrap_dp(&words[..j], max_width, tables, Some(suffix_class), scratch)
             };
             // The suffix line: everything from word `j` to the last word, with
             // the caller's reserve left free.  `Word::end` already excludes the
@@ -1426,10 +1437,22 @@ impl WrapScratch {
     }
 }
 
+/// `tail` is the fitness class of the line that will follow this word run, or
+/// `None` when this run's last line really is the last line of the paragraph.
+///
+/// The reserved-layout path lays out a *prefix* whose final line is a **middle**
+/// line: the suffix line (with the reserve) follows it.  Scoring that prefix as
+/// a standalone paragraph was wrong twice — its last line got intrinsic slack for
+/// free (`is_last_line`), and the fitness jump *into* the suffix line was never
+/// charged.  Both terms are now applied: `Some(class)` charges
+/// `badness_tab[lw]` on the final line and adds `JUMP[class][last_class]` in the
+/// terminal selection, so the prefix is the minimizer of the published cost
+/// model rather than of the standalone-paragraph cost.
 fn wrap_dp(
     words: &[Word],
     max_width: usize,
     tables: Option<&WrapTables>,
+    tail: Option<u8>,
     scratch: &mut WrapScratch,
 ) -> SmallVec<[Range<usize>; 4]> {
     let n = words.len();
@@ -1567,7 +1590,7 @@ fn wrap_dp(
     // only the few words that fit roughly two lines.
     let mut i_lo = 0usize;
     for j in 1..=n {
-        let is_last_line = j == n;
+        let is_last_line = j == n && tail.is_none();
         // Hoisted per `j`: every candidate line ending at `j` measures
         // `base_j - pws[i]`, and `base_j` is independent of `i`.
         let base_j = pws[j] - words[j - 1].trailing_space as usize;
@@ -1759,10 +1782,17 @@ fn wrap_dp(
     }
 
     // Cheapest terminal state, then walk the `prev` links back to the
-    // paragraph start and reverse into source order.
+    // paragraph start and reverse into source order.  With a known successor
+    // line the terminal class must also pay the fitness jump into it (see
+    // `tail`), so the prefix minimises the composed layout's cost rather than
+    // its own standalone cost.
+    let terminal_cost = |class: usize| match tail {
+        Some(next) => dp[n * N_FITNESS + class] + JUMP[next as usize][class],
+        None => dp[n * N_FITNESS + class],
+    };
     let mut c = 0usize;
     for cand in 1..N_FITNESS {
-        if dp[n * N_FITNESS + cand] < dp[n * N_FITNESS + c] {
+        if terminal_cost(cand) < terminal_cost(c) {
             c = cand;
         }
     }
@@ -2111,6 +2141,168 @@ mod tests {
         }
     }
 
+    /// The head of the reserved split must keep the separator byte: an empty
+    /// paragraph immediately before the last one is represented *by* that byte,
+    /// and `rsplit_once`'s separator-stripping head would delete it
+    /// (`"a\n\nb"` → `["a", "b"]` instead of `["a", "", "b"]`).
+    #[test]
+    fn reserved_split_keeps_interior_blank_paragraphs() {
+        // Nothing needs to rewrap: every line fits, and the blank survives.
+        assert_eq!(
+            wrap_optimal_reserved("a\n\nb c", 80, 4, 6).as_slice(),
+            [Cow::Borrowed("a"), Cow::Borrowed(""), Cow::Borrowed("b c")].as_slice()
+        );
+        // Two blank lines in a row, and the reserved last paragraph actually
+        // wrapping under the narrowed measure.
+        let out = wrap_optimal_reserved("a\n\n\nd e f", 8, 4, 6);
+        assert_eq!(out.first().map(Cow::as_ref), Some("a"), "{out:?}");
+        assert!(out.iter().any(|l| l.is_empty()), "blank lost: {out:?}");
+        assert_eq!(out.last().map(Cow::as_ref), Some("f"), "{out:?}");
+        // Parity with the unreserved path when the reserve changes no line
+        // count: the blank-paragraph structure must be identical.
+        for text in ["a\n\nb", "a\n\n\nb", "\n\nb", "a\n\n"] {
+            let reserved = wrap_optimal_reserved(text, 80, 4, 6);
+            let plain = wrap_optimal(text, 80, 4);
+            assert_eq!(reserved.as_slice(), plain.as_slice(), "text: {text:?}");
+        }
+    }
+
+    /// The reserved path lays out a prefix whose last line is a **middle** line:
+    /// the suffix line follows it.  Scoring that prefix as a standalone paragraph
+    /// gives its last line free slack and never charges the fitness jump into the
+    /// suffix.  `tail = Some(suffix_class)` fixes both, so the composed cost of
+    /// the chosen layout can only go down: the tail-aware DP minimises exactly
+    /// that cost over the same candidate set, which still contains the layout the
+    /// standalone scoring picked.
+    #[test]
+    fn reserved_prefix_is_scored_as_a_continuation() {
+        let tab_width = 4;
+        // Deterministic LCG: the sweep is a fixed corpus, not a random draw.
+        let mut seed = 0x5EED_1234_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize
+        };
+        let mut cases: Vec<(String, usize, usize)> = vec![
+            ("aa bb cc dd ee ff gg hh ii jj kk ll".to_string(), 14, 5),
+            (
+                "alpha bravo charlie delta echo foxtrot golf hotel".to_string(),
+                18,
+                6,
+            ),
+            (
+                "one two three four five six seven eight nine ten eleven".to_string(),
+                16,
+                5,
+            ),
+            (
+                "xx yyy zzzz wwww vvvv uuuu tttt ssss rrrr".to_string(),
+                20,
+                7,
+            ),
+        ];
+        for _ in 0..80 {
+            let mw = 12 + next() % 13; // 12..=24
+            let reserve = 3 + next() % 6; // 3..=8
+            let n_words = 6 + next() % 14; // 6..=19
+            let mut para = String::new();
+            for k in 0..n_words {
+                if k > 0 {
+                    para.push(' ');
+                }
+                for _ in 0..1 + next() % 8 {
+                    para.push('a');
+                }
+            }
+            cases.push((para, mw, reserve));
+        }
+        let n_cases = cases.len();
+        let mut improved = false;
+        for (para, mw, reserve) in cases {
+            let words = collect_words(&para, mw, tab_width, None);
+            let budget_last = mw.saturating_sub(reserve);
+            let last = words.len() - 1;
+            let mut acc = words[last].width as usize;
+            let mut split = (acc <= budget_last).then_some(last);
+            for idx in (0..last).rev() {
+                acc += words[idx].width as usize + words[idx].trailing_space as usize;
+                if acc <= budget_last {
+                    split = Some(idx);
+                }
+            }
+            let Some(j) = split.filter(|&j| j > 0) else {
+                continue;
+            };
+            let prefix = &words[..j];
+            let suffix_class = fitness_class(acc, mw);
+            let tables = wrap_tables(mw);
+
+            // Word index each byte range ends on, so a layout can be scored
+            // without re-measuring the source text.
+            let widths_of = |ranges: &[std::ops::Range<usize>]| -> Vec<usize> {
+                let mut out = Vec::new();
+                let mut k = 0usize;
+                for r in ranges {
+                    let start = k;
+                    while k + 1 < prefix.len() && prefix[k].end as usize != r.end {
+                        k += 1;
+                    }
+                    let mut w = 0usize;
+                    for m in start..=k {
+                        w += prefix[m].width as usize;
+                        if m < k {
+                            w += prefix[m].trailing_space as usize;
+                        }
+                    }
+                    out.push(w);
+                    k += 1;
+                }
+                out
+            };
+            // Middle-line intrinsic badness plus every fitness jump, including
+            // the one into the suffix line — the quantity the tail-aware DP
+            // minimises.
+            let composed = |widths: &[usize]| -> f64 {
+                let inv = 1.0 / mw.max(1) as f64;
+                let mut total = 0.0;
+                let mut prev: Option<u8> = None;
+                for (k, &lw) in widths.iter().enumerate() {
+                    let class = fitness_class(lw, mw);
+                    if let Some(p) = prev {
+                        total += JUMP[class as usize][p as usize];
+                    }
+                    total += intrinsic_badness(lw, mw, inv, false);
+                    if k + 1 == widths.len() {
+                        total += JUMP[suffix_class as usize][class as usize];
+                    }
+                    prev = Some(class);
+                }
+                total
+            };
+
+            let mut s1 = WrapScratch::new();
+            let mut s2 = WrapScratch::new();
+            let with_tail = wrap_dp(prefix, mw, tables.as_deref(), Some(suffix_class), &mut s1);
+            let standalone = wrap_dp(prefix, mw, tables.as_deref(), None, &mut s2);
+            let (cw, cs) = (
+                composed(&widths_of(&with_tail)),
+                composed(&widths_of(&standalone)),
+            );
+            assert!(
+                cw <= cs + 1e-9,
+                "tail-aware prefix is worse than the standalone layout: {para:?} {cw} > {cs}"
+            );
+            improved |= cw < cs - 1e-9;
+        }
+        assert!(
+            improved,
+            "none of the {n_cases} swept cases distinguished the two scoring models; \
+             the pin is vacuous"
+        );
+    }
+
     #[test]
     fn whitespace_only_paragraph_memo_round_trips() {
         // `" \n"` produces a `Cow::Borrowed("")` whose pointer lives in
@@ -2276,6 +2468,7 @@ mod tests {
                             &words,
                             max_width,
                             wrap_tables(max_width).as_deref(),
+                            None,
                             &mut scratch,
                         ) {
                             want.push(&para[r]);
@@ -2640,5 +2833,45 @@ mod tests {
                 )
             })
             .sum()
+    }
+
+    /// Measurement probe for the Larmore–Schieber decision (the analysis lives
+    /// in `wrap_dp`'s comment: crossover is `n* ≈ 10–15` words, and the current
+    /// window wins below it).
+    ///
+    /// Run with `cargo test --bin ponent --release -- --ignored --nocapture
+    /// perf_wrap_optimal`.  CI runs it in the `benchmark` job and prints the
+    /// numbers; nothing here asserts a threshold, because shared runners are too
+    /// noisy for wall-clock gates.
+    #[test]
+    #[ignore = "measurement only"]
+    fn perf_wrap_optimal() {
+        // Three shapes: diagnostic-scale prose, the review's "long explanation
+        // body", and a pathological short-word paragraph (large n * k).
+        for (words, width) in [(130usize, 80usize), (500, 80), (1000, 100)] {
+            let mut text = String::new();
+            for i in 0..words {
+                if i > 0 {
+                    text.push(' ');
+                }
+                for _ in 0..(2 + (i * 7) % 6) {
+                    text.push('a');
+                }
+            }
+            let reps = 200;
+            let t0 = std::time::Instant::now();
+            let mut lines = 0usize;
+            for rep in 0..reps {
+                // Vary the measure so no memo keyed on (text, width) can serve
+                // the call: this must measure the DP, not a cache.
+                let w = width + rep % 3;
+                lines += wrap_optimal(std::hint::black_box(&text), w, 4).len();
+            }
+            let ns = t0.elapsed().as_secs_f64() * 1e9 / reps as f64;
+            println!(
+                "wrap_optimal: {words} words, width {width}: {ns:.0} ns/call (avg lines {})",
+                lines / reps
+            );
+        }
     }
 }

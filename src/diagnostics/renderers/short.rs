@@ -50,19 +50,21 @@ impl Default for ShortRenderer {
     }
 }
 
-/// Append `msg` with every layout byte removed — one pass, zero allocation.
+/// Reference implementation of the flattening rule — **test-only**.
 ///
-/// A maximal run of `\n`/`\r`/`\t` (so also `\r\n`) collapses to a single
-/// space; runs at the very start or end of the message are dropped outright,
-/// so a message that arrives with a trailing newline does not leave a
-/// dangling space before the output's own `\n`.  A tab is treated as a break
-/// run too: the one-line short format is a flat, field-delimited text stream,
-/// and a literal tab reaching the output could be misparsed as a field
-/// separator by tab-splitting consumers (editor error lists).  This is what
-/// keeps the one-line contract: a bare `\r` would otherwise make a terminal
-/// redraw the line, and some line-oriented parsers would truncate it.
+/// Production goes through [`push_sanitized_flattened`], which fuses sanitizing
+/// and flattening into one character pass; this two-stage form exists so the
+/// differential test has an independent oracle.  It used to be the production
+/// path, and its offset contract (a break offset into the *original* bytes) is a
+/// panic-on-misuse footgun if anyone revives that architecture, hence the
+/// assertion below.
 #[inline]
 fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
+    debug_assert!(
+        first.is_none_or(|o| o < msg.len() && msg.is_char_boundary(o)),
+        "push_flattened offset {first:?} is not a char boundary of a {} byte message",
+        msg.len()
+    );
     let bytes = msg.as_bytes();
 
     // Fast path: no break byte — straight copy.  The caller already scanned
@@ -128,13 +130,37 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
     }
 }
 
+/// Flatten one untrusted single-line component (`file` name, unknown code),
+/// borrowing when it is already clean.
+///
+/// The message path flattens inline (one pass straight into `out`); these two
+/// components need the same rule but are also *measured* for the reservation,
+/// so they materialize only when a break/control/bidi byte is present.  Clean
+/// input — the dominant case — stays borrowed and allocation-free, and the
+/// break-collapsing rules live in exactly one function
+/// (`push_sanitized_flattened`) instead of being implied by the sanitizer's
+/// break semantics.
+fn flatten_component(s: &str) -> Cow<'_, str> {
+    let dirty = s.chars().any(|c| {
+        matches!(c, '\n' | '\r' | '\t') || c.is_control() || crate::diagnostics::is_bidi_override(c)
+    });
+    if !dirty {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    push_sanitized_flattened(&mut out, s);
+    Cow::Owned(out)
+}
+
 impl Renderer for ShortRenderer {
     fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
         let file_raw = diag.file_name();
         // File names are untrusted (`set_file_name` / `with_file_name` are
-        // public): route through the terminal sanitizer like the code below,
-        // closing the only renderer without this guard.
-        let file_owned = super::super::sanitize_for_terminal(file_raw);
+        // public) and so are unknown codes, so both go through the same
+        // sanitize+flatten pass as the message: sanitizing alone would leave a
+        // `\n`/`\r`/`\t` in a component the one-line contract covers, and a
+        // `\r` in a file name would make a terminal redraw the row.
+        let file_owned = flatten_component(file_raw);
         let file = file_owned.as_ref();
         // The machine vocabulary follows rustc: fatal errors are spelled
         // `error` so CI summarisers gating on the `error` token do not
@@ -156,7 +182,7 @@ impl Renderer for ShortRenderer {
                 // Registry codes are validated ^[EW]\d{3}$ printable ASCII.
                 Some(Cow::Borrowed(s))
             } else {
-                Some(super::super::sanitize_for_terminal(s))
+                Some(flatten_component(s))
             }
         });
 
@@ -303,7 +329,7 @@ impl Renderer for ShortRenderer {
     }
 }
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::{FileId, Span};
@@ -441,9 +467,40 @@ mod tests {
             .with_span(Span::new(FileId::DUMMY, 0, 3));
         let opts = DiagOpts::default();
         let out = ShortRenderer::new().render(&diag, &ctx(&opts));
-        assert!(out.contains("<input>"), "{out}");
-        assert!(out.contains("error[E030]"), "{out}");
-        assert!(out.contains("boom"), "{out}");
+        // Exact shape: editor error-list parsers consume this, and a regression
+        // printing `0-3` / `[0,3)` or dropping the trailing `": "` would pass
+        // every `contains` assertion while breaking them.
+        assert_eq!(out, "<input>:0..3: error[E030]: boom\n");
+    }
+
+    /// Every untrusted component of the one-line format must be flattened, not
+    /// merely sanitized: a break byte in a file name or an unknown code would
+    /// otherwise split the row (and a `\r` would make a terminal redraw it).
+    #[test]
+    fn file_name_and_unknown_code_are_flattened() {
+        let diag = Diagnostic::error("boom")
+            .with_code_str("bad\tcode")
+            .with_file_name("a\nb\r c")
+            .with_span(Span::new(FileId::DUMMY, 0, 1))
+            .with_source("x\n");
+        let opts = DiagOpts::default();
+        let out = ShortRenderer::new().render(&diag, &ctx(&opts));
+        // Each break run collapses to one space; a literal space next to a break
+        // stays, so `a\nb\r c` flattens to `a b  c`.  Pinned exactly so the rule
+        // is the spec, not an accident.
+        assert_eq!(out, "a b  c:1:1: error[bad code]: boom\n");
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "component break split the row: {out:?}"
+        );
+    }
+
+    #[test]
+    fn separator_is_empty() {
+        // A non-empty separator would double-space the output and break the
+        // one-line contract the summary/suppressed hooks were given.
+        assert_eq!(ShortRenderer::new().render_separator(), "");
     }
 
     #[test]

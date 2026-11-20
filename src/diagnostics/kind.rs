@@ -37,9 +37,14 @@ pub enum TypeCtx {
 impl TypeCtx {
     /// Localized parenthetical label.  `Unspecified` is empty: callers skip
     /// the suffix entirely rather than emitting `()`.
-    pub fn label(&self) -> Cow<'static, str> {
+    ///
+    /// Returns `&'static str`, not `Cow`: the cache table is a `'static`
+    /// `OnceLock`, so the `Cow::Owned` branch was unreachable — a 32-byte shell
+    /// around a static slice on a per-frame path.  `level.rs`'s
+    /// `DiagnosticLevel::label` made the same move for the same reason.
+    pub fn label(&self) -> &'static str {
         let variant = match self {
-            TypeCtx::Unspecified => return Cow::Borrowed(""),
+            TypeCtx::Unspecified => return "",
             TypeCtx::Annotation => 1,
             TypeCtx::ReturnType => 2,
             TypeCtx::BinOp => 3,
@@ -49,7 +54,7 @@ impl TypeCtx {
             TypeCtx::Contract => 7,
             TypeCtx::Inference => 8,
         };
-        crate::diagnostics::i18n::cached_label! {
+        crate::diagnostics::i18n::cached_label_static! {
             n = 9,
             variant = variant,
             init = [
@@ -196,7 +201,7 @@ impl ComptimeReason {
     /// Human-readable description of this comptime context frame, resolved
     /// through Fluent so it follows the active
     /// [`Lang`](super::i18n::Lang).
-    pub fn as_str(&self) -> Cow<'static, str> {
+    pub fn as_str(&self) -> &'static str {
         // Explicit variant → slot mapping, like every other label site
         // (`level.rs`, `error_code.rs`, `chain.rs`): reordering the enum
         // below must be a compile error here, not a silent label swap.
@@ -209,7 +214,10 @@ impl ComptimeReason {
             ComptimeReason::TypeInfo => 5,
             ComptimeReason::LayoutOf => 6,
         };
-        crate::diagnostics::i18n::cached_label! {
+        // `cached_label!`'s `Owned` branch was unreachable here too: the table
+        // lives in a `'static OnceLock`, so borrow instead of wrapping a slice
+        // in a `Cow` once per traceback frame.
+        crate::diagnostics::i18n::cached_label_static! {
             n = 7,
             variant = variant,
             init = [
@@ -395,20 +403,27 @@ fn type_mismatch_message<'src>(
         (true, false) => "type-mismatch-ctx",
         (true, true) => "type-mismatch-ctx-reason",
     };
-    let mut pairs = smallvec![
-        ("expected", expected.clone()),
-        ("found", found.clone()),
-    ];
+    let mut pairs = smallvec![("expected", expected.clone()), ("found", found.clone()),];
     if let Some(label) = ctx_label {
-        // `TypeCtx::label()` already returns `Cow<'static, str>`; wrapping it
-        // again would produce `Cow<Cow<str>>`.
-        pairs.push(("ctx", label));
+        // `TypeCtx::label()` returns `&'static str`; the message slug wants a
+        // `Cow`, and borrowing is free (no copy, no refcount).
+        pairs.push(("ctx", Cow::Borrowed(label)));
     }
     if let Some(r) = reason {
         pairs.push(("reason", r.clone()));
     }
     DiagMessage::Slug { slug, pairs }
 }
+
+/// Frames rendered from a comptime traceback — message lines and secondary
+/// labels alike.
+///
+/// Comptime recursion depth is recursion- or attacker-controlled, so an
+/// unbounded traceback produces hundreds of message lines *and* hundreds of
+/// secondary labels for the renderer to lay out.  Every other unbounded surface
+/// in this crate has a budget (`cap_char_prefixes`, the size-guard tests); this
+/// is the traceback's.
+const MAX_TRACEBACK_FRAMES: usize = 16;
 
 fn comptime_message_with_traceback<'src>(
     kind: &ComptimeErrorKind,
@@ -423,15 +438,28 @@ fn comptime_message_with_traceback<'src>(
     s.push_str("\n\n");
     s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
     s.push('\n');
-    // Consecutive frames at the SAME span (comptime recursion produces runs of
-    // them) would render overlapping secondary labels; emit one per run.
+    // Dedup key is `(reason, span)`, not the span alone: comptime recursion
+    // produces runs of *identical* frames and collapsing those is the point,
+    // while two different reasons at one span (macro expansion can share a
+    // span) are distinct context and both belong in the message.  The labels
+    // path below collapses by span alone, because one underline cannot show two
+    // texts — that asymmetry is deliberate, not drift.
+    //
+    // `None` frames are emitted as a visible line here, so they legitimately
+    // interrupt a run; the labels path skips them *before* the run check, making
+    // them transparent there.  Each behaviour matches what its surface shows.
     let mut emitted = 0usize;
-    let mut prev: Option<Option<Span>> = None;
+    let mut prev: Option<(ComptimeReason, Option<Span>)> = None;
+    let mut truncated = false;
     for (reason, span) in traceback {
-        if prev == Some(*span) {
+        if emitted == MAX_TRACEBACK_FRAMES {
+            truncated = true;
+            break;
+        }
+        if prev == Some((*reason, *span)) {
             continue;
         }
-        prev = Some(*span);
+        prev = Some((*reason, *span));
         if emitted > 0 {
             s.push('\n');
         }
@@ -447,8 +475,21 @@ fn comptime_message_with_traceback<'src>(
             ),
             None => crate::diagnostics::i18n::fluent::comptime_frame(reason.as_str()),
         };
-        s.push_str("  · ");
+        // Indent is layout; the marker itself is locale-owned (a locale may
+        // prefer a bullet, a dash, or nothing).  It cannot live inside the frame
+        // templates because Fluent trims pattern edges, which would eat a
+        // leading space.
+        s.push_str("  ");
+        s.push_str(&crate::diagnostics::i18n::fluent::comptime_frame_bullet());
+        s.push(' ');
         s.push_str(&frame);
+    }
+    if truncated {
+        // Pure punctuation plus the locale's marker, so the truncation needs no
+        // translated words and cannot drift from the locales.
+        s.push_str("\n  ");
+        s.push_str(&crate::diagnostics::i18n::fluent::comptime_frame_bullet());
+        s.push_str(" …");
     }
     s.into()
 }
@@ -634,14 +675,30 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 // source area, not just in the message text.  `None`
                 // frames (the old `(0,0)` sentinel) have no position to
                 // point at and are message-only.
+                //
+                // Consecutive frames at the same span collapse to one label,
+                // exactly as `comptime_message_with_traceback` collapses them in
+                // the message: comptime recursion produces runs of identical
+                // frames, and emitting one label per frame stacked overlapping
+                // underlines the renderer then had to disambiguate.  Keeping the
+                // two paths on the same policy is the point.
+                let mut prev: Option<Span> = None;
                 for (reason, tb_span) in traceback {
                     let Some(tb) = tb_span else {
                         continue;
                     };
-                    if *tb == *span {
+                    // Same budget as the message path: label count must not be
+                    // recursion-controlled (one secondary label per positioned
+                    // frame means a deep traceback would hand the renderer
+                    // hundreds of overlapping underlines).
+                    if labels.len() > MAX_TRACEBACK_FRAMES {
+                        break;
+                    }
+                    if *tb == *span || prev == Some(*tb) {
                         continue;
                     }
-                    labels.push(Label::secondary(*tb, reason.as_str().lift()));
+                    prev = Some(*tb);
+                    labels.push(Label::secondary(*tb, reason.as_str()));
                 }
                 labels
             }
@@ -817,14 +874,24 @@ impl<'src> DiagnosticKind<'src> {
                 let message: DiagMessage<'src> = comptime_message_with_traceback(&kind, &traceback);
                 let mut labels = CovariantVec::new();
                 labels.push(Label::new(span, fluent::label_comptime_eval_error().lift()));
+                // Same run-dedup as the borrowing `labels()` arm: comptime
+                // recursion produces runs of frames at one span, and one label
+                // per frame stacks overlapping underlines.  This arm had lost
+                // the dedup (the differential corpus had no consecutive
+                // duplicate case, so the drift went unnoticed).
+                let mut prev: Option<Span> = None;
                 for (reason, tb_span) in &traceback {
                     let Some(tb) = tb_span else {
                         continue;
                     };
-                    if *tb == span {
+                    if labels.len() > MAX_TRACEBACK_FRAMES {
+                        break;
+                    }
+                    if *tb == span || prev == Some(*tb) {
                         continue;
                     }
-                    labels.push(Label::secondary(*tb, reason.as_str().lift()));
+                    prev = Some(*tb);
+                    labels.push(Label::secondary(*tb, reason.as_str()));
                 }
                 (message, labels, None, vec![])
             }
@@ -932,6 +999,56 @@ mod humanizer_differential_tests {
                 span: span(0, 1),
                 traceback: Vec::new(),
             },
+            // Traceback shapes: the differential test's only populated traceback
+            // used to have no consecutive-duplicate case, which is exactly how
+            // the consuming path lost its run-dedup unnoticed.  Each shape below
+            // exercises one branch of the run detectors in both paths.
+            DiagnosticKind::Comptime {
+                kind: ComptimeErrorKind::AssertionFailed("dup".into()),
+                span: span(0, 1),
+                traceback: vec![
+                    (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                    (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                ],
+            },
+            DiagnosticKind::Comptime {
+                kind: ComptimeErrorKind::AssertionFailed("dup-primary".into()),
+                span: span(0, 1),
+                traceback: vec![
+                    (ComptimeReason::Assertion, Some(span(0, 1))),
+                    (ComptimeReason::Assertion, Some(span(0, 1))),
+                    (ComptimeReason::ComptimeFnCall, Some(span(4, 6))),
+                ],
+            },
+            DiagnosticKind::Comptime {
+                kind: ComptimeErrorKind::AssertionFailed("none-interleaved".into()),
+                span: span(0, 1),
+                traceback: vec![
+                    (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                    (ComptimeReason::ComptimeBlock, None),
+                    (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                ],
+            },
+            DiagnosticKind::Comptime {
+                kind: ComptimeErrorKind::AssertionFailed("non-adjacent".into()),
+                span: span(0, 1),
+                traceback: vec![
+                    (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                    (ComptimeReason::Assertion, Some(span(2, 3))),
+                    (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                ],
+            },
+            // Distinct reasons at one span: the label path collapses them (one
+            // underline cannot show two texts) while the message keeps both
+            // lines; the asymmetry is pinned rather than accidental.
+            DiagnosticKind::Comptime {
+                kind: ComptimeErrorKind::AssertionFailed("distinct-reasons".into()),
+                span: span(0, 1),
+                traceback: vec![
+                    (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                    (ComptimeReason::Assertion, Some(span(7, 9))),
+                ],
+            },
         ]
     }
 
@@ -1009,6 +1126,79 @@ mod humanizer_differential_tests {
             "consecutive identical frames must be deduped: {out}"
         );
         assert!(out.contains("comptime call stack"), "{out}");
+        // The annotation set must follow the same run-dedup policy as the
+        // message, or the renderer gets overlapping underlines the message
+        // text does not explain.  Primary label + one collapsed frame.
+        assert_eq!(
+            repeated.labels().len(),
+            2,
+            "consecutive identical frames must collapse in labels too: {:?}",
+            repeated
+                .labels()
+                .iter()
+                .map(|l| l.message.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Comptime recursion depth is input-controlled, so the traceback is capped
+    /// in **both** surfaces (message lines and secondary labels) and the
+    /// truncation is marked.  Without the cap a 1000-deep traceback would emit a
+    /// thousand message lines and a thousand overlapping underlines.
+    #[test]
+    fn traceback_is_capped_in_message_and_labels() {
+        let traceback: Vec<(ComptimeReason, Option<Span>)> = (0..40usize)
+            .map(|i| (ComptimeReason::ComptimeFnDef, Some(span(i, i + 1))))
+            .collect();
+        let kind = DiagnosticKind::Comptime {
+            kind: ComptimeErrorKind::TypeError("boom".into()),
+            span: span(100, 101),
+            traceback,
+        };
+        let out = render(kind.message());
+        let marker = crate::diagnostics::i18n::fluent::comptime_frame_bullet();
+        let frame_lines = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with(&*marker))
+            .count();
+        assert_eq!(
+            frame_lines,
+            MAX_TRACEBACK_FRAMES + 1,
+            "capped frames + one truncation marker: {out}"
+        );
+        assert!(out.contains('…'), "truncation must be marked: {out}");
+        // Primary label + capped frames (the cap checks before pushing, so the
+        // bound is MAX + 1 frames plus at most the primary).
+        assert!(
+            kind.labels().len() <= MAX_TRACEBACK_FRAMES + 2,
+            "labels must be capped too: {}",
+            kind.labels().len()
+        );
+    }
+
+    /// The message path dedupes on `(reason, span)`: two *different* reasons at
+    /// one span are distinct context and both render.  (The labels path collapses
+    /// by span alone, because one underline cannot carry two texts — that
+    /// asymmetry is intentional.)
+    #[test]
+    fn distinct_reasons_at_one_span_are_not_deduped() {
+        let kind = DiagnosticKind::Comptime {
+            kind: ComptimeErrorKind::TypeError("boom".into()),
+            span: span(0, 1),
+            traceback: vec![
+                (ComptimeReason::ComptimeFnDef, Some(span(7, 9))),
+                (ComptimeReason::ComptimeBlock, Some(span(7, 9))),
+            ],
+        };
+        let out = render(kind.message());
+        assert!(
+            out.contains(ComptimeReason::ComptimeFnDef.as_str()),
+            "{out}"
+        );
+        assert!(
+            out.contains(ComptimeReason::ComptimeBlock.as_str()),
+            "{out}"
+        );
     }
 
     /// The borrowing `Humanizer` impl and the consuming `humanize_into`

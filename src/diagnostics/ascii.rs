@@ -5,26 +5,19 @@
 //! parsing, no grapheme segmentation. The renderers use these as fast-path
 //! gates; a `true` answer lets them skip the Unicode tables entirely.
 
-/// The control bytes a fast-path predicate admits.
+/// The byte set every fast path admits as *plain printable*: `0x20..=0x7E`.
 ///
-/// The three public predicates differ only by this set; encoding it as a type
-/// keeps their scalar tails and their documentation in lockstep.
-#[derive(Clone, Copy)]
-enum AllowedControls {
-    None,
-    Tab,
-    TabAndNewline,
-}
-
-impl AllowedControls {
-    #[inline]
-    const fn allows(self, b: u8) -> bool {
-        match self {
-            Self::None => matches!(b, 0x20..=0x7E),
-            Self::Tab => b == b'\t' || matches!(b, 0x20..=0x7E),
-            Self::TabAndNewline => b == b'\t' || b == b'\n' || matches!(b, 0x20..=0x7E),
-        }
-    }
+/// This used to be an `AllowedControls { None, Tab, TabAndNewline }` ladder that
+/// kept three scalar tails in lockstep.  Once the predicates became views of one
+/// `AsciiClass` classifier, only the `None` arm was still constructed and the
+/// other two were dead code describing classes the classifier expresses
+/// directly — so the ladder is gone and the invariant it carried lives here:
+/// **high bytes are never printable**.  The SIMD kernels rely on it (their `lt`
+/// masks catch signed-negative bytes) and the SWAR body relies on it
+/// independently (`x | (v - ONES)`), so admitting `>= 0x80` would break both.
+#[inline]
+const fn is_printable_byte(b: u8) -> bool {
+    matches!(b, 0x20..=0x7E)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -53,6 +46,14 @@ static LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn x86_level() -> u8 {
+    // Order is load-bearing: `swar_forced()` FIRST, cache second.  A forced
+    // thread must observe level 0 even when another thread already populated
+    // `LEVEL`; reading the cache first would return the detected level and send
+    // a forced-SWAR test straight into AVX2/AVX-512 (only the SSE2 arm carries
+    // its own `!swar_forced()` conjunct, because `x86_level_for` short-circuits
+    // `len < 32` without consulting it).  The TLS read this costs exists only
+    // under `test`/`bench-hooks`; in production `swar_forced()` folds to
+    // `false` and the cache load dominates either way.
     if swar_forced() {
         return 0;
     }
@@ -70,9 +71,17 @@ fn x86_level() -> u8 {
 #[cold]
 #[inline(never)]
 fn x86_level_init() -> u8 {
-    let level = if std::arch::is_x86_feature_detected!("avx512bw") {
+    // The AVX2 arm below only tests `level >= 2`, and the AVX-512 kernel's
+    // 32..63-byte tail defers *to that arm*.  So level 3 must imply AVX2, not
+    // merely assume the folklore that every AVX-512BW part also has AVX2 —
+    // probing `avx512bw` alone skips the `avx2` probe entirely, which would make
+    // the SAFETY comments literally false on a hypothetical BW-without-AVX2
+    // part (vpbroadcastb is AVX2; the tail would execute an illegal
+    // instruction).  One extra cached feature read, paid once per process.
+    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    let level = if std::arch::is_x86_feature_detected!("avx512bw") && has_avx2 {
         3
-    } else if std::arch::is_x86_feature_detected!("avx2") {
+    } else if has_avx2 {
         2
     } else {
         1
@@ -88,13 +97,21 @@ fn x86_level_init() -> u8 {
 ///
 /// Downclocking tradeoff, stated rather than assumed: on parts with AVX-512
 /// frequency licensing (Skylake-X, some Ice Lake server SKUs) the transition
-/// can cost more than the two AVX2 loads it saves for a single 64-byte row,
+/// can cost more than the 1 load it saves relative to the 2 AVX2 loads a
+/// 64-byte row requires,
 /// and the penalty lands on the surrounding non-AVX-512 code.  Modern parts
 /// (Sapphire Rapids, Zen 4) do not downclock at all.  Raising the threshold to
 /// 128 would make every 64–127-byte row take AVX2 instead, so it is kept at 64
 /// until a measurement on the target mix says otherwise — this constant is the
 /// knob, and no correctness argument depends on its value.
 const AVX512_MIN_LEN: usize = 64;
+
+// Structural, not a debug assert: the AVX-512 kernel's inner loop is one 64-byte
+// chunk and its tail re-enters the dispatcher, so a threshold below 64 would
+// re-dispatch at the same length and recurse until the stack dies.  In release
+// that would be a production stack overflow; here it is a build error.  One
+// assertion covers both dispatchers (`classify_ascii`, `next_non_ascii_byte`).
+const _: () = assert!(AVX512_MIN_LEN >= 64);
 
 #[cfg(any(test, feature = "bench-hooks"))]
 thread_local! {
@@ -140,10 +157,14 @@ fn swar_forced() -> bool {
 /// lane flagged, implies `return false` already happened, so a leak can never
 /// produce a false *reject* of the next chunk.
 ///
-/// On x86_64/aarch64/wasm32 the `u128` SWAR body below only handles the
-/// final <16 bytes (SIMD takes over at 16); it is the main body only on
-/// targets without a vector backend.
+/// On x86_64/aarch64/wasm32 the `u128` SWAR body below is **unreachable in
+/// production**: `len < 16` takes `classify_scalar` and `len >= 16` enters a
+/// vector kernel, whose tail is resolved by the next-narrower kernel and finally
+/// by `classify_scalar` — never by SWAR.  It is the main body only on targets
+/// with no vector backend, and on vector targets it runs only under the
+/// forced-SWAR test/bench tier.
 #[inline]
+#[must_use]
 pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
     // Defined by the class: one pass, no separate kernel family.
     matches!(classify_ascii(s), AsciiClass::Printable)
@@ -154,8 +175,10 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 /// `sanitize_for_terminal_multiline` needs: it preserves tab and newline as
 /// layout intent, replaces every other control (CR, C1, DEL) with U+FFFD.
 ///
-/// The SIMD kernels above implement this same [`AllowedControls`] set.  The
-/// SWAR body below is the fallback for the final short tail.  Its
+/// The SIMD kernels above implement this same byte set.  On targets with a
+/// vector backend the `u128` SWAR body below is reachable only under the
+/// forced-SWAR test/bench tier — production tails are resolved by narrower
+/// kernels and `classify_scalar`, never by SWAR.  Its
 /// `< 0x20`, tab and newline masks are **exact** (each minuend byte has its
 /// high bit forced with `x | HI`, so the word subtraction cannot borrow
 /// between lanes).  The high-byte/DEL rejection is deliberately *not* an
@@ -174,6 +197,7 @@ pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
 /// return below (without it, `b + 0x80 - 0x20` would overflow for large
 /// bytes).
 #[inline]
+#[must_use]
 pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
     // `!= Other` is the multiline set exactly: the fourth class is defined as
     // printable + tab + newline.
@@ -185,9 +209,10 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
 /// The gate for `render_line_merged_with`'s tab-aware byte-level fast path:
 /// source code is routinely tab-indented, and the pure-printable gate
 /// rejected tab (`0x09 < 0x20`), pushing every tab-indented row into the
-/// grapheme walk.  [`AllowedControls::Tab`] is the exact set; the SIMD kernels
+/// grapheme walk.  The exact set is `0x20..=0x7E` plus `0x09`; the SIMD kernels
 /// and the SWAR fallback both implement it.
 #[inline]
+#[must_use]
 pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
     // The two narrow classes are exactly the tab set.
     matches!(
@@ -200,26 +225,42 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
 ///
 /// The result is the **widest** accepted set: a newline anywhere outranks a tab,
 /// which outranks plain printable, and any offender wins over all three.
+///
+/// This is exactly `max` under [`AsciiClass`]'s severity order
+/// (`Printable < PrintableOrTab < PrintableOrTabNewline < Other`): the kernel's
+/// own contribution is the widest class its sightings justify, and `Other` tops
+/// the order, so an offending tail propagates without a special case (the old
+/// hand-rolled version special-cased it).  Naming it as `max` is what makes the
+/// `Ord` derive load-bearing, and it makes the empty-slice identity
+/// (`class(∅) = Printable`) follow from the monoid rather than being a special
+/// case.
 #[inline]
 fn compose_classify_tail(saw_tab: bool, saw_newline: bool, tail: AsciiClass) -> AsciiClass {
-    if tail == AsciiClass::Other {
-        return AsciiClass::Other;
-    }
-    let newline = saw_newline || tail == AsciiClass::PrintableOrTabNewline;
-    let tab = saw_tab || tail == AsciiClass::PrintableOrTab;
-    if newline {
+    let kernel = if saw_newline {
         AsciiClass::PrintableOrTabNewline
-    } else if tab {
+    } else if saw_tab {
         AsciiClass::PrintableOrTab
     } else {
         AsciiClass::Printable
-    }
+    };
+    kernel.max(tail)
 }
 
 /// Tri-state classification of one row, so callers that need both the
 /// printable and printable-or-tab predicates (the glyph fast path tested them
 /// sequentially) pay one SWAR pass instead of two.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The variant order is the severity order (`Printable` is the cleanest) and
+/// is pinned by `predicates_form_an_implication_lattice`; `Ord`/`Hash` exist so
+/// callers can sort or key on the class without a wrapper enum of their own.
+///
+/// `#[repr(u8)]` plus the `const` canary below make the order a compile-time
+/// property: `compose_classify_tail` *is* `max`, so an IDE "sort variants"
+/// refactor that permuted the severity order would otherwise fail only at
+/// runtime (via the randomized max-equivalence test) instead of failing the
+/// build.  The canonical discriminants also keep logs/debugging stable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
 pub(crate) enum AsciiClass {
     /// Every byte is printable ASCII (`0x20..=0x7E`).
     Printable,
@@ -232,18 +273,35 @@ pub(crate) enum AsciiClass {
     Other,
 }
 
-/// Scalar classification over the same set the vector and SWAR bodies
-/// implement ([`AllowedControls::TabAndNewline`]): the widest accepted class.
+// Compile-time canary for the severity order `compose_classify_tail` relies on
+// (`kernel.max(tail)`).  `Ord` compares discriminants, so this is exactly the
+// order the derive produces; permuting the variants now fails the build.
+const _: () = {
+    assert!((AsciiClass::Printable as u8) < (AsciiClass::PrintableOrTab as u8));
+    assert!((AsciiClass::PrintableOrTab as u8) < (AsciiClass::PrintableOrTabNewline as u8));
+    assert!((AsciiClass::PrintableOrTabNewline as u8) < (AsciiClass::Other as u8));
+};
+
+/// Scalar classification over the same byte set the vector and SWAR bodies
+/// implement — printable plus tab plus newline: the widest accepted class.
 #[inline]
 fn classify_scalar(s: &[u8]) -> AsciiClass {
     let mut saw_tab = false;
     let mut saw_newline = false;
     for &b in s {
+        // Common case first: a printable byte leaves in one fused range test,
+        // where testing tab and newline first charged it two failed compares.
+        // This runs per byte of every row shorter than 16 bytes (gutters,
+        // separators, short diff context), so the order is worth stating.
+        // The class is max-semantics, so check order cannot change the answer.
+        if is_printable_byte(b) {
+            continue;
+        }
         if b == b'\t' {
             saw_tab = true;
         } else if b == b'\n' {
             saw_newline = true;
-        } else if !AllowedControls::None.allows(b) {
+        } else {
             return AsciiClass::Other;
         }
     }
@@ -266,6 +324,12 @@ fn classify_scalar(s: &[u8]) -> AsciiClass {
 /// pinned by `classify_ascii_matches_predicates_on_random_bytes` and
 /// `newline_is_the_fourth_class_and_survives_the_vector_widths`.
 ///
+/// Formally `class(s)` is the `max`, over [`AsciiClass`]'s severity lattice, of
+/// the per-byte contributions; `Printable` is the identity for concatenation, so
+/// the empty slice's contribution is `Printable` — not a special case, and the
+/// reason `is_printable_ascii(&[])` is `true`.
+/// `classify_is_a_monoid_homomorphism` pins `class(a ++ b) = max(class(a), class(b))`.
+///
 /// One pass at the widest available vector width, SWAR for the tail.
 ///
 /// # SWAR lane proof
@@ -287,9 +351,17 @@ fn classify_scalar(s: &[u8]) -> AsciiClass {
 /// High bytes are rejected first: the `(x | HI) - SP` form is only exact when
 /// every lane is ≤ `0x7F` (otherwise `b + 0x80 - 0x20` overflows).
 #[inline]
+#[must_use]
 pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
-    // Scalar remainder, resolved inline like the other three predicates: a
-    // kernel's tail must not re-enter the dispatcher.
+    // Tail protocol, stated exactly: the **SWAR body** resolves its `< 16`
+    // remainder inline via `classify_scalar` and never re-enters the dispatcher.
+    // A **vector kernel's** tail deliberately *does* re-enter it (see the AVX2
+    // SAFETY note and the `AVX512_MIN_LEN` comment) — that is what lets every
+    // tier handle any length with one loop plus a single downward delegation.
+    // Recursion terminates because each tier's gate is strictly narrower than
+    // its parent's.  (An earlier wording claimed kernels must not re-enter; it
+    // contradicted the kernels and invited "fixing" them into decoding up to
+    // 63-byte tails scalar-ly.)
     if s.len() < 16 {
         return classify_scalar(s);
     }
@@ -297,23 +369,41 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
     let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
     if s.len() >= AVX512_MIN_LEN && level >= 3 {
+        // SAFETY: `level >= 3` iff `is_x86_feature_detected!("avx512bw")`
+        // succeeded inside `x86_level_init`; `avx512f` is implied by
+        // `avx512bw` on every part implementing both, which is exactly what
+        // the kernel's `#[target_feature(enable = "avx512f,avx512bw")]`
+        // requires.
         return unsafe { x86_64::classify_ascii_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
     if s.len() >= 32 && level >= 2 {
-        // SAFETY: runtime-checked AVX2; tail is deferred to this function.
-        return unsafe { x86_64::classify_ascii(s) };
+        // SAFETY: `level >= 2` iff `is_x86_feature_detected!("avx2")`
+        // succeeded; the kernel's 32-byte loads are AVX2-only.  The tail is
+        // deferred back to this function, so a kernel never re-enters the
+        // dispatcher for 16..31.
+        return unsafe { x86_64::classify_ascii_avx2(s) };
     }
     #[cfg(target_arch = "x86_64")]
     if !swar_forced() && s.len() >= 16 {
+        // SAFETY: SSE2 is baseline for every x86_64 target, so the 16-byte
+        // intrinsics need no runtime detection.  `!swar_forced()` is the
+        // test/bench tier switch; it lives on this arm because
+        // `x86_level_for` returns 0 for `len < 32` without consulting it.
         return unsafe { x86_64::classify_ascii_sse2(s) };
     }
     #[cfg(target_arch = "aarch64")]
     if !swar_forced() && s.len() >= 16 {
+        // SAFETY: NEON is baseline for every aarch64 target;
+        // `!swar_forced()` is the test/bench tier switch.
         return unsafe { neon::classify_ascii(s) };
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if !swar_forced() && s.len() >= 16 {
+        // SAFETY: `target_feature = "simd128"` is a compile-time gate; wasm
+        // has no runtime feature detection, so the module (and this arm) only
+        // exist when the binary is built for a SIMD-capable engine.  A
+        // runtime-only gate would be UB on an engine without vectors.
         return unsafe { wasm::classify_ascii(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
@@ -345,22 +435,12 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
         }
         i += 16;
     }
-    for &b in &s[i..] {
-        if b == b'\t' {
-            saw_tab = true;
-        } else if b == b'\n' {
-            saw_newline = true;
-        } else if !AllowedControls::None.allows(b) {
-            return AsciiClass::Other;
-        }
-    }
-    if saw_newline {
-        AsciiClass::PrintableOrTabNewline
-    } else if saw_tab {
-        AsciiClass::PrintableOrTab
-    } else {
-        AsciiClass::Printable
-    }
+    // One implementation of the byte-set rule for the tail: `classify_scalar`
+    // early-returns `Other` and is `#[inline]`, and `compose_classify_tail` is
+    // `max`, so an offending tail propagates exactly as the hand-rolled loop
+    // did.  A second copy of "printable ∪ {\t, \n}" here could drift (a future
+    // edit admitting `\r` in one place only would be silent).
+    compose_classify_tail(saw_tab, saw_newline, classify_scalar(&s[i..]))
 }
 
 /// Byte offset of the first byte ≥ 0x80 in `s`, or `usize::MAX` if `s` is
@@ -385,6 +465,7 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 /// byte; callers that resume mid-line must handle that (the lead-byte
 /// assumption only holds for a scan started at a char boundary).
 #[inline]
+#[must_use]
 pub(crate) fn next_non_ascii_byte(s: &[u8]) -> usize {
     // Same short-input reasoning as the predicate families: this is the *entry*
     // point (called per non-ASCII character from `char_col`'s sparse-table
@@ -392,32 +473,41 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> usize {
     // whole `cfg` chain to reach a `position()`.  `usize::MAX` is the sentinel
     // shared with every kernel tail.
     if s.len() < 16 {
-        return s
-            .iter()
-            .position(|&b| b >= 0x80)
-            .map_or(usize::MAX, |off| off);
+        return s.iter().position(|&b| b >= 0x80).unwrap_or(usize::MAX);
     }
     #[cfg(target_arch = "x86_64")]
     let level = x86_level_for(s.len());
     #[cfg(target_arch = "x86_64")]
     if s.len() >= AVX512_MIN_LEN && level >= 3 {
+        // SAFETY: `level >= 3` iff `is_x86_feature_detected!("avx512bw")`
+        // succeeded inside `x86_level_init`; `avx512f` is implied on every
+        // part implementing both.
         return unsafe { x86_64::next_non_ascii_byte_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
     if s.len() >= 32 && level >= 2 {
-        // SAFETY: runtime-checked AVX2; tail is deferred to this function.
-        return unsafe { x86_64::next_non_ascii_byte(s) };
+        // SAFETY: `level >= 2` iff `is_x86_feature_detected!("avx2")`
+        // succeeded; the 32-byte loads are AVX2-only.  Tail deferred here.
+        return unsafe { x86_64::next_non_ascii_byte_avx2(s) };
     }
     #[cfg(target_arch = "x86_64")]
     if !swar_forced() && s.len() >= 16 {
+        // SAFETY: SSE2 is baseline on x86_64; `!swar_forced()` is the
+        // test/bench tier switch, load-bearing because `x86_level_for`
+        // returns 0 for `len < 32` without consulting it.
         return unsafe { x86_64::next_non_ascii_byte_sse2(s) };
     }
     #[cfg(target_arch = "aarch64")]
     if !swar_forced() && s.len() >= 16 {
+        // SAFETY: NEON is baseline on aarch64; `!swar_forced()` is the
+        // test/bench tier switch.
         return unsafe { neon::next_non_ascii_byte(s) };
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if !swar_forced() && s.len() >= 16 {
+        // SAFETY: `target_feature = "simd128"` is a compile-time gate — wasm
+        // has no runtime feature detection, so the module is only built for
+        // an engine that guarantees vector support.
         return unsafe { wasm::next_non_ascii_byte(s) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
@@ -471,7 +561,7 @@ mod x86_64 {
     use std::arch::x86_64::*;
 
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
+    pub(super) unsafe fn classify_ascii_avx2(s: &[u8]) -> super::AsciiClass {
         let sp = _mm256_set1_epi8(0x20);
         let del = _mm256_set1_epi8(0x7F);
         let tab_v = _mm256_set1_epi8(0x09);
@@ -526,7 +616,7 @@ mod x86_64 {
     }
 
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn next_non_ascii_byte(s: &[u8]) -> usize {
+    pub(super) unsafe fn next_non_ascii_byte_avx2(s: &[u8]) -> usize {
         let mut i = 0usize;
         while i + 128 <= s.len() {
             let m0 = unsafe {
@@ -717,10 +807,20 @@ mod x86_64 {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+// `simd128` must be a *compile-time* feature: wasm has no runtime feature
+// detection, so a `#[target_feature(enable = "simd128")]` function compiled
+// into a module for a non-SIMD engine is either invalid or UB when invoked.
+// Gating the module keeps the emitted wasm free of vector opcodes unless the
+// build asked for them; the dispatcher arm carries the same `cfg`.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod wasm {
     use std::arch::wasm32::*;
 
+    /// `a & !b` — the **opposite** argument order from x86's
+    /// `_mm256_andnot_si256(a, b)`, which computes `!a & b`.  Both call sites
+    /// are correct today, but the inverted convention between backends is a
+    /// classic port-bug incubator, so it is documented (and pinned by
+    /// `andnot_is_a_and_not_b`) instead of left to memory.
     #[inline]
     unsafe fn andnot(a: v128, b: v128) -> v128 {
         unsafe { v128_and(a, v128_not(b)) }
@@ -840,6 +940,15 @@ mod neon {
 
     #[inline]
     unsafe fn first_high_lane(v: uint8x16_t) -> Option<usize> {
+        // The nibble-packing below assumes little-endian lane order: the lowest
+        // *input* lane must land in the lowest nibble of the 64-bit view.  On a
+        // big-endian aarch64 target (`aarch64_be-*`) that mapping flips and the
+        // `trailing_zeros() / 4` lane index would be silently wrong, so fail the
+        // build there instead of reporting bogus offsets.  Every other kernel in
+        // this module is endianness-safe by construction (the u128 SWAR body
+        // uses `from_le_bytes`; wasm is little-endian by spec).
+        #[cfg(target_endian = "big")]
+        compile_error!("ascii::neon lane extraction is unverified on big-endian aarch64");
         // `vcgeq_u8` yields 0xFF/0x00 per lane.  Reinterpreted as u16 lanes,
         // adjacent byte lanes form 0xFFFF / 0x00FF / 0xFF00 / 0x0000, and
         // `vshrn_n_u16(.., 4)` narrows each u16 to its top 4 bits per original
@@ -1073,10 +1182,13 @@ mod tests {
         }
     }
 
-    /// Deterministic LCG: covers every byte value and every length 0..=40,
-    /// so both the SWAR body and the ≤7-byte tail are exercised.
+    /// Deterministic LCG: covers every byte value and every length 0..=40, so
+    /// both the u128 SWAR body (len ≥ 16 under the forced tier) and the ≤15-byte
+    /// scalar tail are exercised.  Forced, because on x86_64/aarch64 an unforced
+    /// run would test SSE2/NEON and never reach the SWAR body this pins.
     #[test]
     fn swar_matches_scalar_on_random_slices() {
+        let _swar = ForceSwarGuard::new();
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = || {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1128,7 +1240,6 @@ mod tests {
                 );
             }
         }
-        SWAR_FORCED.with(|f| f.set(false));
     }
 
     #[test]
@@ -1244,7 +1355,75 @@ mod tests {
         ok[0] = b' ';
         ok[1] = b'~';
         assert!(is_printable_ascii(&ok));
-        SWAR_FORCED.with(|f| f.set(false));
+    }
+
+    /// The u64 SWAR tail after the u128 loop has its own
+    /// `trailing_zeros() / 8` arithmetic; the random-length tests only reach it
+    /// statistically, so pin it explicitly.  Calls the production
+    /// `next_non_ascii_byte` (not the test-local `Option` alias) so the
+    /// `usize::MAX` sentinel path is exercised.
+    #[test]
+    fn forced_swar_u64_tail_matches_scalar() {
+        let _swar = ForceSwarGuard::new();
+        // 24 bytes = one u128 chunk (0..16) + one u64 chunk (16..24).
+        for lane in 0..8 {
+            let mut v = [b'a'; 24];
+            v[16 + lane] = 0x80;
+            assert_eq!(super::next_non_ascii_byte(&v), 16 + lane, "lane {lane}");
+        }
+        // A high byte in the u128 chunk wins over the tail one.
+        let mut v = [b'a'; 24];
+        v[3] = 0x80;
+        v[20] = 0x80;
+        assert_eq!(super::next_non_ascii_byte(&v), 3);
+        // Last byte of the u64 chunk still lands in range.
+        let mut v = [b'a'; 24];
+        v[23] = 0xFF;
+        assert_eq!(super::next_non_ascii_byte(&v), 23);
+    }
+
+    /// A kernel that consumes the input exactly leaves an empty tail; the
+    /// dispatcher must handle that without falling back to a bogus scan.
+    #[test]
+    fn exact_kernel_widths_leave_a_clean_tail() {
+        for len in [16usize, 32, 64, 128, 256, 512] {
+            let v = vec![b'a'; len];
+            assert_eq!(classify_ascii(&v), AsciiClass::Printable, "len {len}");
+            assert_eq!(super::next_non_ascii_byte(&v), usize::MAX, "len {len}");
+            let mut w = v.clone();
+            w[len - 1] = 0x80;
+            assert_eq!(classify_ascii(&w), AsciiClass::Other, "len {len}");
+            assert_eq!(super::next_non_ascii_byte(&w), len - 1, "len {len}");
+        }
+    }
+
+    /// The documented "may return a continuation byte" contract must hold at
+    /// every dispatch tier, not only at the scalar entry: the offset arithmetic
+    /// is UTF-8-agnostic, so a mid-sequence start must still report the first
+    /// high byte.
+    ///
+    /// The emoji sits at the *start* of a long buffer and the slice keeps the
+    /// tail (`len - skip` bytes, ≥ 13), so each case enters a real vector kernel
+    /// — placing it last would leave a 1..3-byte slice, which always takes the
+    /// scalar short-circuit and would make the name a lie.
+    #[test]
+    fn next_non_ascii_from_mid_sequence_holds_across_tiers() {
+        for &len in &[16usize, 32, 64, 128, 256, 512] {
+            let mut v = vec![b'a'; len];
+            v[..4].copy_from_slice("😀".as_bytes()); // F0 9F 98 80
+            for skip in 1..4 {
+                assert_eq!(
+                    super::next_non_ascii_byte(&v[skip..]),
+                    0,
+                    "len {len} skip {skip}"
+                );
+            }
+            // Sanity: the unsliced buffer reports the lead byte.
+            assert_eq!(super::next_non_ascii_byte(&v), 0, "len {len}");
+            // And a buffer with no high byte reports the sentinel.
+            let ascii = vec![b'a'; len];
+            assert_eq!(super::next_non_ascii_byte(&ascii), usize::MAX, "len {len}");
+        }
     }
 
     #[test]
@@ -1338,7 +1517,6 @@ mod tests {
                 "{bytes:?}"
             );
         }
-        SWAR_FORCED.with(|f| f.set(false));
     }
 
     /// The multiline predicate is existentially "no control other than
@@ -1349,6 +1527,9 @@ mod tests {
     /// and tab/newline-dense chunks.
     #[test]
     fn multiline_matches_exists_reference_on_tab_newline_heavy_slices() {
+        // Forced so the tab/newline `movemask` tracking and `or_flagged` path
+        // under test are the SWAR body's, not a vector kernel's.
+        let _swar = ForceSwarGuard::new();
         let reference = |s: &[u8]| {
             s.iter()
                 .any(|&b| (b < 0x20 && b != b'\t' && b != b'\n') || b == 0x7F || b >= 0x80)
@@ -1393,14 +1574,17 @@ mod tests {
         }
     }
 
-    /// Every byte value at every position within an 8-byte window: pins the
-    /// SWAR's borrow-propagation corner (a non-printable byte's borrow must
-    /// not corrupt a neighbouring printable lane's result).
+    /// Every byte value at every position within a u128 chunk: pins the SWAR
+    /// borrow-propagation corner (a non-printable byte's borrow must not corrupt
+    /// a neighbouring printable lane's result).  Sixteen bytes is exactly one
+    /// chunk and the smallest input that reaches the SWAR body — an 8-byte
+    /// buffer would take the `len < 16` scalar short-circuit and pin nothing.
     #[test]
     fn swar_covers_every_byte_value_in_every_lane() {
+        let _swar = ForceSwarGuard::new();
         for b in 0u8..=0xFF {
-            for lane in 0..8 {
-                let mut v = [b'a'; 8];
+            for lane in 0..16 {
+                let mut v = [b'a'; 16];
                 v[lane] = b;
                 assert_eq!(
                     is_printable_ascii(&v),
@@ -1448,7 +1632,10 @@ mod tests {
     /// mask; `\x01` then space is the borrow-false-positive shape.
     #[test]
     fn exact_masks_classify_two_control_adjacency() {
-        for lane in 0..7 {
+        // Forced: these 16-byte buffers are exactly one u128 chunk, so the
+        // borrow shapes below only exist in the SWAR body.
+        let _swar = ForceSwarGuard::new();
+        for lane in 0..15 {
             let mut v = [b'a'; 16];
             v[lane] = 0x09;
             v[lane + 1] = 0x08;
@@ -1486,39 +1673,102 @@ mod tests {
 
     /// The `\t`-then-space borrow false positive: a genuine control at lane
     /// `k` flags lane `k+1` when it is `0x20`, and the flagged-lane loop must
-    /// not reject it. A whole 8-byte chunk is required to reach the SWAR body
-    /// (`b"\t "` alone is a ≤7-byte tail and would hide the bug).
+    /// not reject it.  Forced, and every case is ≥ 16 bytes: a shorter buffer is
+    /// a scalar short-circuit (no borrows at all), so the hazard this pins would
+    /// be untested.
     #[test]
     fn tab_predicate_tolerates_borrow_false_positive() {
-        assert!(is_printable_ascii_or_tab(b"\t abcdef"));
-        assert!(is_printable_ascii_or_tab(b"\t\t\t  \t  x"));
-        assert!(is_printable_ascii_or_tab(b"a\t b\t c\t "));
-        assert!(is_printable_ascii_or_tab(b"\t "));
+        let _swar = ForceSwarGuard::new();
+        assert!(is_printable_ascii_or_tab(b"\t abcdefghijklmno"));
+        assert!(is_printable_ascii_or_tab(b"\t\t\t  \t  xabcdefghi"));
+        assert!(is_printable_ascii_or_tab(b"a\t b\t c\t defghijkl"));
+        assert!(is_printable_ascii_or_tab(b"\t abcdefghijklm"));
         // A genuine non-tab control followed by a space must still reject.
-        assert!(!is_printable_ascii_or_tab(b"\t\x07 abcdef"));
-        assert!(!is_printable_ascii_or_tab(b"\x01 abcdef"));
-        assert!(!is_printable_ascii_or_tab(b"\t abcde\x7F"));
+        assert!(!is_printable_ascii_or_tab(b"\t\x07 abcdefghijklmn"));
+        assert!(!is_printable_ascii_or_tab(b"\x01 abcdefghijklmn"));
+        assert!(!is_printable_ascii_or_tab(b"\t abcde\x7Ffghijkl"));
     }
 
-    /// : the OR-form's borrow can carry out of lane 7 of one chunk into
-    /// lane 0 of the next. Pin that an offender at lane 7 of an 8-byte chunk
-    /// inside a longer buffer is still rejected for every possible next byte.
+    /// The OR-form's borrow can carry out of the top lane of one chunk into the
+    /// next.  Pin that an offender in the **last** lane of a chunk (byte 15 of
+    /// the first u128, byte 7 of the u64 tail) is rejected for every possible
+    /// next byte, and that the next chunk is not falsely rejected when the
+    /// borrow is discarded.
     #[test]
     fn or_form_lane7_borrow_out_covers_every_next_byte() {
+        let _swar = ForceSwarGuard::new();
         for b in 0u8..=255 {
-            let mut buf = [b'a'; 16];
-            // Offender in lane 7 of the first chunk.
-            buf[7] = 0x07;
-            buf[8] = b;
+            // Offender in the top lane of the first u128 chunk.
+            let mut buf = [b'a'; 32];
+            buf[15] = 0x07;
+            buf[16] = b;
             assert!(
                 !is_printable_ascii(&buf),
-                "lane-7 offender not rejected with next byte {b:#04x}"
+                "chunk-top offender not rejected with next byte {b:#04x}"
             );
-            // And the same offender at lane 0 of the second chunk.
-            let mut buf2 = [b'a'; 16];
-            buf2[8] = 0x07;
-            buf2[9] = b;
-            assert!(!is_printable_ascii(&buf2));
+            // A clean chunk whose *next* chunk starts with the same byte must
+            // only reject when that byte is itself an offender: the discarded
+            // borrow-out cannot leak into lane 0.
+            let mut buf2 = [b'a'; 32];
+            buf2[16] = b;
+            assert_eq!(
+                is_printable_ascii(&buf2),
+                ref_single(&buf2),
+                "borrow-out leaked into the next chunk for {b:#04x}"
+            );
+            // And the same shape at the u128/u64 seam used by
+            // `next_non_ascii_byte` (byte 16 starts the u64 chunk).
+            let mut buf3 = [b'a'; 24];
+            buf3[16] = b;
+            assert_eq!(
+                next_non_ascii(&buf3),
+                buf3.iter().position(|&x| x >= 0x80),
+                "seam {b:#04x}"
+            );
+        }
+    }
+
+    /// `class(s)` is a monoid homomorphism onto the severity lattice:
+    /// `class(a ++ b) == max(class(a), class(b))`, with `Printable` the identity
+    /// for the empty slice.  One property pins four contracts: the derived
+    /// `Ord` order (load-bearing via `compose_classify_tail`'s `max`), the tail
+    /// composition, the empty-slice identity, and the chunk-independence claim.
+    #[test]
+    fn classify_is_a_monoid_homomorphism() {
+        let empty = classify_ascii(&[]);
+        assert_eq!(empty, AsciiClass::Printable, "empty slice must be identity");
+        let mut seed: u64 = 0x0BAD_F00D_1234_5678;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(11);
+            seed
+        };
+        let alphabet = [b'a', b'\t', b'\n', b'\x01', 0x7F, 0x80, b' '];
+        // Chunk-boundary lengths (0, 15, 16, 17, 31, 32, 33) matter most: that
+        // is where a kernel hands its tail to the next tier.
+        for &(left, right) in &[
+            (0usize, 0usize),
+            (0, 16),
+            (16, 0),
+            (15, 1),
+            (1, 15),
+            (16, 17),
+            (17, 16),
+            (31, 33),
+            (33, 31),
+        ] {
+            for _ in 0..64 {
+                let a: Vec<u8> = (0..left).map(|_| alphabet[(next() as usize) % 7]).collect();
+                let b: Vec<u8> = (0..right)
+                    .map(|_| alphabet[(next() as usize) % 7])
+                    .collect();
+                let mut ab = a.clone();
+                ab.extend_from_slice(&b);
+                assert_eq!(
+                    classify_ascii(&ab),
+                    classify_ascii(&a).max(classify_ascii(&b)),
+                    "a={a:?} b={b:?}"
+                );
+            }
         }
     }
 

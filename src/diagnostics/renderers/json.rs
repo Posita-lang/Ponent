@@ -9,7 +9,28 @@ use std::io;
 
 /// JSON renderer — outputs diagnostics as a JSON array.
 /// Format inspired by Austral's `render_error_to_json`.
-/// Builds JSON manually without external dependencies.
+///
+/// # Contract
+///
+/// The bytes are assembled by hand into one streaming buffer (no intermediate
+/// document tree).  `memchr` is the **only** external dependency, used solely by
+/// the long-string escape scanner; the short-string path is pure SWAR.
+///
+/// * **`code` is absent, not `null`, when a diagnostic has no code at all.**
+///   `null` is reserved for a *present* code that the registry does not know
+///   (`title`/`category` become `null`), so the two states stay distinguishable
+///   without a sentinel.  Neither state requires a second consumer code path:
+///   both "absent" and "not a string" are handled by the same optional lookup.
+/// * **`line`/`column` are 1-based and derived from `LineIndex::linecol_display`,
+///   i.e. `column` counts *display* columns** (tab expansion and wide-character
+///   width are already applied), **not bytes, code points or UTF-16 units.**
+///   A consumer that needs LSP/UTF-16 offsets must convert from the byte
+///   `start` offset.  Every section resolves coordinates through
+///   `anchor_linecol`, so the policy (and the EOF clamping) is uniform.
+/// * **`additionalSpans`, `labels`, `suggestions[].span`, `children.span`,
+///   `children.labels` and `callChain` all carry the same field names** for
+///   offsets and coordinates; `file` is a resolved name and `fileId` a numeric
+///   fallback for a file the diagnostic cannot name.
 pub struct JsonRenderer {
     pretty: bool,
 }
@@ -47,12 +68,11 @@ impl Renderer for JsonRenderer {
     }
 
     fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String {
-        // A conservative capacity floor only: the exact hint lives in
-        // `write_diagnostic`, computed *after* humanization from the
-        // accessor views (the pre-humanize fields of a kind-built
-        // diagnostic are empty, so the old up-front sum undercounted by
-        // kilobytes on exactly the diagnostics that need it most).
-        let mut out = String::with_capacity(diag.message().len() + 128);
+        // One allocation: the same estimator the batch path uses.  The old form
+        // sized from `message().len() + 128` and then let `write_diagnostic`
+        // `reserve` a larger amount — a guaranteed realloc on any non-trivial
+        // diagnostic.
+        let mut out = String::with_capacity(Self::estimate_cap(diag));
         // Single-object output is not inside an array, so keep the brace at
         // column 0 (fields still one level in).
         self.write_diagnostic(diag, cx, 1, &mut out);
@@ -114,6 +134,34 @@ impl JsonRenderer {
         }
     }
 
+    /// Length-bounded capacity estimate for one diagnostic's JSON object.
+    ///
+    /// Sizing from collection *lengths* avoids a full traversal whose only
+    /// purpose would be to feed `reserve`, while still getting the common case
+    /// down to one allocation.  Every term is an average, so under-reserving
+    /// only costs normal amortized growth.
+    ///
+    /// `children`, `help` and `additionalSpans` used to be missing — and they
+    /// are exactly the sections that made label/child-heavy diagnostics
+    /// reallocate: `children` entries carry a message, styled parts, a span and
+    /// a full label array each.
+    fn estimate_cap(diag: &Diagnostic<'_>) -> usize {
+        192
+            + diag.message().len()
+            + diag.file_name().len() * 2
+            + 64
+            + diag.labels().len() * 128
+            + diag.suggestions().len() * 96
+            + diag.related_errors.len() * 96
+            + diag.help().map_or(0, |h| h.len() + 16)
+            + diag.children().len() * 160
+            + diag.spans.primary_ref().len().saturating_sub(1) * 96
+            + diag
+                .call_chain
+                .as_ref()
+                .map_or(0, |c| c.entries().len() * 80)
+    }
+
     /// Stream one diagnostic object into `out`.
     ///
     /// Fields are appended straight into the single output buffer in
@@ -132,27 +180,7 @@ impl JsonRenderer {
         // `{` sits at the *outer* indentation, so `}` aligns with it; the
         // fields sit one level deeper.
         let ind0 = Self::indent(indent_lvl.saturating_sub(1));
-        // Length-bounded capacity estimate: sizing from collection *lengths*
-        // avoids a full O(labels + suggestions + related) traversal whose only
-        // purpose was to feed `reserve`, while still getting the common case
-        // down to one allocation (`String` growth stays amortized for the
-        // pathological escape-dense inputs).
-        // Heuristic, not a guarantee: `* 2` covers quote/backslash escapes,
-        // while control bytes expand to 6 bytes (`\u00XX`) and the per-item
-        // multipliers are averages.  Under-reserving only causes normal
-        // amortized growth; the point is to avoid it on the common case.
-        let cap = 192
-            + diag.message().len()
-            + diag.file_name().len() * 2
-            + 64
-            + diag.labels().len() * 128
-            + diag.suggestions().len() * 96
-            + diag.related_errors.len() * 96
-            + diag
-                .call_chain
-                .as_ref()
-                .map_or(0, |c| c.entries().len() * 80);
-        out.reserve(cap);
+        out.reserve(Self::estimate_cap(diag));
         let mut obj = JsonContainer::object(out, &ind0, &ind, self.pretty);
 
         // Resolve the anchor source's line index once per diagnostic: the
@@ -161,6 +189,11 @@ impl JsonRenderer {
         // cache capacity, a full rescan).  `anchor_file` is the file those
         // line/column values are resolved against — a span from any *other*
         // file must not be mapped through this index.
+        // The anchor is the diagnostic's **first primary span**; `MultiSpan`
+        // holds only primary spans (secondaries live in `labels`), so `first()`
+        // is a primary by construction, and the top-level `file` field is
+        // derived from the same span below — the coordinates and the file name
+        // can therefore never name different files.
         let anchor_file = diag.spans.first().map(|s| s.file);
         // Every index consumer (primary span, additional spans, related errors,
         // call chain) first requires an anchor file; labels/suggestions/children
@@ -224,15 +257,13 @@ impl JsonRenderer {
                 sp.u64(span.start as u64);
                 sp.key("end");
                 sp.u64(span.end as u64);
-                if let Some(source) = diag.source()
-                    && let Some(idx) = idx.as_ref()
-                    && span.start_as_usize() <= source.len()
+                if let Some((line, col)) =
+                    anchor_linecol(idx.as_ref(), diag.source(), anchor_file, span)
                 {
-                    let (line, col) = idx.linecol_display(span.start_as_usize());
                     sp.key("line");
-                    sp.u64((line + 1) as u64);
+                    sp.u64(line);
                     sp.key("column");
-                    sp.u64((col + 1) as u64);
+                    sp.u64(col);
                 }
                 sp.close();
             }
@@ -268,20 +299,13 @@ impl JsonRenderer {
                 super::fmt::push_uint(o, sp.start as u64);
                 flat_key(o, "end");
                 super::fmt::push_uint(o, sp.end as u64);
-                if let Some(idx) = idx.as_ref()
-                    && let Some(source) = diag.source()
-                    // The line index is the *anchor* file's: resolving a
-                    // foreign span's offsets through it would emit
-                    // coordinates in the wrong file.
-                    && anchor_file == Some(sp.file)
+                if let Some((line, col)) =
+                    anchor_linecol(idx.as_ref(), diag.source(), anchor_file, *sp)
                 {
-                    // [1]17: clamp rather than omit for an EOF-crossing span;
-                    // the primary path does the same.
-                    let (line, col) = idx.linecol_display(sp.start_as_usize().min(source.len()));
                     flat_key(o, "line");
-                    super::fmt::push_uint(o, (line + 1) as u64);
+                    super::fmt::push_uint(o, line);
                     flat_key(o, "column");
-                    super::fmt::push_uint(o, (col + 1) as u64);
+                    super::fmt::push_uint(o, col);
                 }
                 o.push('}');
             }
@@ -302,6 +326,18 @@ impl JsonRenderer {
                 super::fmt::push_uint(o, lbl.span.start as u64);
                 flat_key(o, "end");
                 super::fmt::push_uint(o, lbl.span.end as u64);
+                // Resolved coordinates, same policy as every other section
+                // (`anchor_linecol`): a consumer must not have to reimplement
+                // offset → line mapping per section, and it must not have to
+                // handle "absent" and "clamped" as separate cases.
+                if let Some((line, col)) =
+                    anchor_linecol(idx.as_ref(), diag.source(), anchor_file, lbl.span)
+                {
+                    flat_key(o, "line");
+                    super::fmt::push_uint(o, line);
+                    flat_key(o, "column");
+                    super::fmt::push_uint(o, col);
+                }
                 // Resolve the label's `FileId` to the same file-name string the
                 // top-level `file` field uses; the numeric `FileId` is
                 // process-local and must not leak into stable output.  Only an
@@ -371,16 +407,13 @@ impl JsonRenderer {
                         // the span belongs to that same file (the common
                         // same-file case); a foreign span's offsets would
                         // otherwise be mapped through the wrong buffer.
-                        if let Some(idx) = idx.as_ref()
-                            && let Some(source) = diag.source()
-                            && anchor_file == Some(sp.file)
+                        if let Some((line, col)) =
+                            anchor_linecol(idx.as_ref(), diag.source(), anchor_file, *sp)
                         {
-                            let (line, col) =
-                                idx.linecol_display(sp.start_as_usize().min(source.len()));
                             flat_key(o, "line");
-                            super::fmt::push_uint(o, (line + 1) as u64);
+                            super::fmt::push_uint(o, line);
                             flat_key(o, "column");
-                            super::fmt::push_uint(o, (col + 1) as u64);
+                            super::fmt::push_uint(o, col);
                         }
                         o.push('}');
                     }
@@ -437,6 +470,14 @@ impl JsonRenderer {
                     super::fmt::push_uint(o, sp.start as u64);
                     flat_key(o, "end");
                     super::fmt::push_uint(o, sp.end as u64);
+                    if let Some((line, col)) =
+                        anchor_linecol(idx.as_ref(), diag.source(), anchor_file, sp)
+                    {
+                        flat_key(o, "line");
+                        super::fmt::push_uint(o, line);
+                        flat_key(o, "column");
+                        super::fmt::push_uint(o, col);
+                    }
                     match diag.file_name_for(sp.file) {
                         Some(name) => {
                             flat_key(o, "file");
@@ -461,6 +502,14 @@ impl JsonRenderer {
                         super::fmt::push_uint(o, lbl.span.start as u64);
                         flat_key(o, "end");
                         super::fmt::push_uint(o, lbl.span.end as u64);
+                        if let Some((line, col)) =
+                            anchor_linecol(idx.as_ref(), diag.source(), anchor_file, lbl.span)
+                        {
+                            flat_key(o, "line");
+                            super::fmt::push_uint(o, line);
+                            flat_key(o, "column");
+                            super::fmt::push_uint(o, col);
+                        }
                         match diag.file_name_for(lbl.span.file) {
                             Some(name) => {
                                 flat_key(o, "file");
@@ -515,6 +564,14 @@ impl JsonRenderer {
                     super::fmt::push_uint(o, sp.start as u64);
                     flat_key(o, "end");
                     super::fmt::push_uint(o, sp.end as u64);
+                    if let Some((line, col)) =
+                        anchor_linecol(idx.as_ref(), diag.source(), anchor_file, sp)
+                    {
+                        flat_key(o, "line");
+                        super::fmt::push_uint(o, line);
+                        flat_key(o, "column");
+                        super::fmt::push_uint(o, col);
+                    }
                     match diag.file_name_for(sp.file) {
                         Some(name) => {
                             flat_key(o, "file");
@@ -573,15 +630,19 @@ impl JsonRenderer {
                         }
                     }
                 }
-                if let (Some(idx), Some(span)) = (idx.as_ref(), entry.span)
-                    // Only an entry in the anchor file can be located with
-                    // the anchor's line index; a foreign entry's file/line
-                    // pair would be silently wrong.
-                    && anchor_file == Some(span.file)
+                if let Some(span) = entry.span
+                    && let Some((line, col)) =
+                        anchor_linecol(idx.as_ref(), diag.source(), anchor_file, span)
                 {
-                    let (line, col) = idx.linecol_display(span.start_as_usize());
+                    // Numeric fields a consumer can parse without splitting a
+                    // composite string: file names may contain `:` (Windows
+                    // drives, `ns::item`), which made `location` ambiguous.
+                    flat_key(o, "line");
+                    super::fmt::push_uint(o, line);
+                    flat_key(o, "column");
+                    super::fmt::push_uint(o, col);
                     flat_key(o, "location");
-                    flat_location(o, file_name, (line + 1) as u64, (col + 1) as u64);
+                    flat_location(o, file_name, line, col);
                 }
                 o.push('}');
             }
@@ -636,6 +697,14 @@ fn flat_location(out: &mut String, file: &str, line: u64, col: u64) {
 struct JsonContainer<'a> {
     out: &'a mut String,
     /// Separator written before every element but the first.
+    ///
+    /// The rule is **layout**, not style: a *multi-line* container (pretty mode
+    /// writes a newline + indent before each element) uses `","` — a `", "`
+    /// there would leave a trailing space at the end of the line before the
+    /// newline.  A *single-line* container (`compact_object`, and the flat
+    /// `{"k": v, …}` helpers) uses `", "` in both modes, since the space is the
+    /// only thing separating adjacent fields.  So the two spellings coexist by
+    /// design; this field documents which container is which.
     sep: &'static str,
     /// Indentation written before each element in pretty mode.
     elem_ind: &'a str,
@@ -768,36 +837,77 @@ impl<'a> JsonContainer<'a> {
 
 impl Drop for JsonContainer<'_> {
     fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        // A forgotten `close()` (an early `return`/`?` between `open` and
+        // `close`) used to emit an unclosed bracket — invalid JSON on the wire.
+        // Auto-close instead: the degradation becomes *valid* (empty) JSON, and
+        // the debug assert still makes the bug loud in development.
         debug_assert!(
-            self.closed,
-            "JsonContainer dropped without close() — invalid JSON would be emitted"
+            false,
+            "JsonContainer dropped without close() — auto-closing to keep the stream valid"
         );
+        if self.pretty && !self.first {
+            self.out.push('\n');
+            self.out.push_str(self.close_ind);
+        }
+        self.out.push(self.close);
+        self.closed = true;
     }
 }
 
-/// Index of the first byte JSON must escape — a control byte (`< 0x20`),
-/// `"` or `\` — or `None` if none qualifies.  One SWAR pass per 8-byte chunk
-/// instead of a scalar per-byte scan, so the common clean-string check (the
-/// hot path of [`JsonRenderer::push_json_str`]) costs a few ALU ops per chunk
-/// rather than ~8 branch-taken per byte, and the dirty path jumps straight to
-/// each escape site for a bulk `write_str` between them.
+/// Resolve a span anchor to 1-based `(line, column)` in the anchor file.
 ///
-/// `b < 0x20` uses Mycroft's `hasless` trick `((x - SP) & ~x & HI)`; `b == '"'`
-/// and `b == '\\'` use the `has_zero` trick `((q - LO) & ~q & HI)` on
-/// `q = x ^ V_broadcast`.  Each is correct for the "any byte" predicate: a
-/// cross-byte borrow can only produce a false positive at a byte equal to the
-/// threshold, which requires a preceding byte to have already triggered a true
-/// positive, so the lowest set lane in the combined mask is a true match.
-/// UTF-8 continuation bytes are all `≥ 0x80`, so no multi-byte character is
-/// mistaken for an escape candidate.
-#[cfg(test)]
+/// This is the **single** policy for every JSON section that emits coordinates:
+///
+/// * `None` when no index was built, when the anchor file has no attached
+///   source, or when the span belongs to a *foreign* file (the line index is the
+///   anchor's, so mapping a foreign offset through it would emit coordinates in
+///   the wrong file);
+/// * offsets past EOF are **clamped**, never omitted.  An EOF-crossing span is
+///   corrupt, but a clamped position is still placeable, and a machine consumer
+///   must not need two code paths ("absent" versus "clamped") for one corruption
+///   class.  The primary-span path used to omit, `additionalSpans`/
+///   `relatedErrors` clamped, and `callChain.location` did neither — with a
+///   comment claiming they agreed.
+fn anchor_linecol(
+    idx: Option<&crate::diagnostics::LineIndex<'_>>,
+    source: Option<&str>,
+    anchor: Option<crate::ast::FileId>,
+    span: crate::ast::Span,
+) -> Option<(u64, u64)> {
+    let idx = idx?;
+    let source = source?;
+    if anchor != Some(span.file) {
+        return None;
+    }
+    let (line, col) = idx.linecol_display(span.start_as_usize().min(source.len()));
+    Some(((line + 1) as u64, (col + 1) as u64))
+}
+
+/// First byte JSON must escape — a control byte (`< 0x20`), `"` or `\` — or
+/// `None` if none qualifies.
+///
+/// Adaptive dispatch, because the two regimes want different machinery:
+///
+/// * **≤ [`SHORT_FUSED_MAX`]** (diagnostic messages, labels, help text): the
+///   fused SWAR scan.  One pass over ≤8 vector-sized chunks finds all three
+///   classes at once; `memchr2`'s wider vectors cannot amortize their setup at
+///   this length.
+/// * **longer**: `memchr2` for the two structural bytes (wider than SWAR),
+///   then the control scan bounded to the first structural hit, so a string
+///   with an early quote never pays a full control pass.
+///
+/// Both alternatives are exact: the fused scan's combined mask flags the lowest
+/// *true* candidate (a cross-byte borrow can only add a lane above a true one,
+/// and `trailing_zeros` takes the lowest), and UTF-8 continuation bytes are all
+/// `≥ 0x80`, so no multi-byte character is a candidate.
 #[inline]
 fn next_json_escape_byte(b: &[u8]) -> Option<usize> {
-    // The two structural bytes (`"`, `\`) are found with a SIMD `memchr2`
-    // (wider than SWAR).  Control bytes are then scanned only up to the first
-    // structural hit, so a string with a quote early never pays the full
-    // control pass; a clean string pays one SIMD pass plus one SWAR pass,
-    // both cache-resident for the short diagnostic strings this sees.
+    if b.len() <= SHORT_FUSED_MAX {
+        return next_escape_swar(b);
+    }
     let structural = memchr::memchr2(b'"', b'\\', b);
     let limit = structural.unwrap_or(b.len());
     let ctrl = next_ctrl_byte(&b[..limit]);
@@ -805,6 +915,55 @@ fn next_json_escape_byte(b: &[u8]) -> Option<usize> {
         (Some(s), Some(c)) => Some(s.min(c)),
         (s, c) => s.or(c),
     }
+}
+
+/// Length at which the fused SWAR scan stops paying for itself and `memchr2`'s
+/// wider vectors take over.  A measurement decision (see the `benchmark` CI
+/// job), not a correctness one: both scanners return the same index.
+const SHORT_FUSED_MAX: usize = 64;
+
+/// First escape candidate in `b` via one fused SWAR pass.
+///
+/// Three predicates per 8-byte chunk — `b < 0x20` (Mycroft `hasless`),
+/// `b == '"'` and `b == '\\'` (both `has_zero` on an XOR broadcast) — OR'd into
+/// one mask.  The tail pads with `0xFF` lanes: they cannot flag (their `hasless`
+/// and `has_zero` masks are all zero, and the high-bit test clears them even
+/// when a borrow propagates out of a real lane).
+#[inline]
+fn next_escape_swar(b: &[u8]) -> Option<usize> {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const SP: u64 = 0x2020_2020_2020_2020;
+    const QUOTE: u64 = 0x2222_2222_2222_2222;
+    const BACKSLASH: u64 = 0x5C5C_5C5C_5C5C_5C5C;
+    #[inline]
+    fn has_zero(v: u64) -> u64 {
+        v.wrapping_sub(LO) & !v & HI
+    }
+    #[inline]
+    fn lane(mask: u64) -> usize {
+        (mask.trailing_zeros() / 8) as usize
+    }
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let hits = (x.wrapping_sub(SP) & !x & HI)
+            | has_zero(x ^ QUOTE)
+            | has_zero(x ^ BACKSLASH);
+        if hits != 0 {
+            return Some(i + lane(hits));
+        }
+        i += 8;
+    }
+    let n = b.len() - i;
+    if n == 0 {
+        return None;
+    }
+    let mut buf = [0xFFu8; 8];
+    buf[..n].copy_from_slice(&b[i..]);
+    let x = u64::from_le_bytes(buf);
+    let hits = (x.wrapping_sub(SP) & !x & HI) | has_zero(x ^ QUOTE) | has_zero(x ^ BACKSLASH);
+    (hits != 0).then(|| i + lane(hits))
 }
 
 /// First byte `< 0x20` in `b` (JSON control range), or `None`.
@@ -825,7 +984,24 @@ fn next_ctrl_byte(b: &[u8]) -> Option<usize> {
         }
         i += 8;
     }
-    b[i..].iter().position(|&c| c < 0x20).map(|j| i + j)
+    // Tail (0..=7 remaining bytes — the dominant case for diagnostic messages,
+    // labels and help text): pad into a stack buffer and run one SWAR pass
+    // instead of a per-byte scalar loop.
+    //
+    // `0xFF` filler lanes cannot produce a false hit: `(0xFF - 0x20) & !0xFF`
+    // is 0, so the high-bit test clears them even when a borrow from a real
+    // lane propagates into them.  And a borrow cannot make a *real* lane flag
+    // without a real `< 0x20` lane below it (the documented `hasless`
+    // argument), so the lowest flagged lane is always a true match.
+    let n = b.len() - i;
+    if n == 0 {
+        return None;
+    }
+    let mut buf = [0xFFu8; 8];
+    buf[..n].copy_from_slice(&b[i..]);
+    let x = u64::from_le_bytes(buf);
+    let ctrl = x.wrapping_sub(SP) & !x & HI;
+    (ctrl != 0).then(|| i + (ctrl.trailing_zeros() / 8) as usize)
 }
 
 /// Does `s` contain a byte that JSON must escape?  Test-only scalar-shaped
@@ -842,6 +1018,27 @@ fn needs_json_escape(s: &str) -> bool {
 /// loop; the clean case (no escapes) is a single `write_str`.
 fn push_json_escaped_str<W: std::fmt::Write>(out: &mut W, s: &str) {
     let bytes = s.as_bytes();
+    // Short strings (diagnostic messages, labels, help) take the fused scan:
+    // one pass finds all three escape classes, and `memchr2`'s wider vectors
+    // cannot amortize their setup below 64 bytes.  Each iteration resumes right
+    // after the previous escape, so the total remains linear in `len`.
+    if bytes.len() <= SHORT_FUSED_MAX {
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while let Some(rel) = next_escape_swar(&bytes[i..]) {
+            let at = i + rel;
+            if start < at {
+                let _ = out.write_str(&s[start..at]);
+            }
+            push_json_escaped(out, bytes[at] as char);
+            i = at + 1;
+            start = i;
+        }
+        if start < bytes.len() {
+            let _ = out.write_str(&s[start..]);
+        }
+        return;
+    }
     // Stateful merged scan: the structural iterator (`"` / `\`) advances only
     // when its byte is actually escaped, and the control scan runs only up to
     // the next structural position.  Re-deriving the structural hit from
@@ -1234,5 +1431,44 @@ mod tests {
         let out = sink.into_string();
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v, serde_json::Value::Array(Vec::new()));
+    }
+
+    /// An empty pretty batch closes as `[\n\n]\n`, **not** `[]`.
+    ///
+    /// Recorded decision, not an oversight: `begin` cannot know the element
+    /// count (the `Renderer` trait's batch hooks take no count and are called
+    /// unconditionally), and the leading `\n` has to be emitted before any
+    /// element — the parallel path stitches per-worker chunks by index, so no
+    /// single `render_into` may own the array prefix.  The alternatives were a
+    /// batch pre-scan (costs a full pass to save one newline on an empty batch)
+    /// or moving the prefix into the stitcher (breaks chunk independence).
+    /// `[\n]\n` is valid JSON and parses to the same empty array.
+    #[test]
+    fn empty_pretty_batch_is_valid_and_pinned() {
+        let mut sink = crate::diagnostics::sink::StringSink::new();
+        let r = JsonRenderer::new(true);
+        r.begin(&mut sink).unwrap();
+        r.end(&mut sink).unwrap();
+        let out = sink.into_string();
+        assert_eq!(out, "[\n\n]\n");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).expect("valid JSON"),
+            serde_json::Value::Array(Vec::new())
+        );
+
+        // Non-empty keeps the jq-style layout: `[\n` … `\n]\n`.
+        let mut sink = crate::diagnostics::sink::StringSink::new();
+        r.begin(&mut sink).unwrap();
+        let opts = crate::diagnostics::DiagOpts::default();
+        let cx = RenderCtx::new(&opts, None);
+        let diag = Diagnostic::error("boom").with_code_str(ErrCode::E030);
+        let mut body = String::new();
+        r.render_into(&diag, &cx, &mut body);
+        sink.write_str(&body).unwrap();
+        r.end(&mut sink).unwrap();
+        let out = sink.into_string();
+        assert!(out.starts_with("[\n"), "{out:?}");
+        assert!(out.ends_with("\n]\n"), "{out:?}");
+        serde_json::from_str::<serde_json::Value>(&out).expect("valid JSON");
     }
 }

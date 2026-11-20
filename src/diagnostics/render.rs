@@ -224,10 +224,21 @@ pub(crate) enum CtxCell<'a, T> {
 
 impl<T> CtxCell<'_, T> {
     pub(crate) fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
-        match self {
-            CtxCell::Owned(c) => c.borrow_mut(),
-            CtxCell::Borrowed(c) => c.borrow_mut(),
-        }
+        let cell = match self {
+            CtxCell::Owned(c) => c,
+            CtxCell::Borrowed(c) => c,
+        };
+        // The section scratch is borrowed for exactly one render; a nested
+        // render (foreign-file recursion) reaching it again is the invariant
+        // violation.  `RefCell`'s generic "already borrowed" panic forces the
+        // next person to bisect the borrow sites, so name the invariant here
+        // (the check itself is the same flag test either way).
+        cell.try_borrow_mut().unwrap_or_else(|_| {
+            panic!(
+                "section scratch re-entered: a renderer held the scratch borrow across a \
+                 nested render"
+            )
+        })
     }
 }
 
@@ -353,20 +364,21 @@ impl<'a> RenderCtx<'a> {
         let len = source.len();
         // Tier 0: tables prebuilt from the content-addressed cache.  The pair is
         // exact for this batch — the prebuild recorded the pointer of the very
-        // source string being rendered — so a hit cannot alias another
-        // allocation, and the debug fingerprint check guards the case where the
-        // allocator handed a *previous* batch's address to a new source.
+        // source string being rendered — *provided* the prebuilt list is this
+        // batch's.  It is cross-batch data keyed by pointer, so a stale list can
+        // see an address the allocator recycled for a different source; that is
+        // the "wrong line numbers, no crash" failure mode this cache stack is
+        // built to exclude.
+        //
+        // The fingerprint is therefore verified in **every** profile, not only
+        // under `debug_assertions`: ~24 sampled bytes plus the length against an
+        // avoided O(source_len) rescan.  A mismatch is treated as a miss (the
+        // LRU/shared/rebuild path is always correct), and `0` is the documented
+        // "unknown" sentinel for entries built without source text.
         if let Some(prebuilt) = self.prebuilt
             && let Some(e) = prebuilt.iter().find(|e| e.ptr == ptr && e.len == len)
+            && (e.fingerprint == 0 || e.fingerprint == source_fingerprint(source))
         {
-            #[cfg(debug_assertions)]
-            if e.fingerprint != 0 {
-                debug_assert_eq!(
-                    e.fingerprint,
-                    source_fingerprint(source),
-                    "(ptr,len) collision — prebuilt line table belongs to a different source"
-                );
-            }
             return LineIndex::from_shared(
                 source,
                 Arc::clone(&e.starts),
@@ -452,7 +464,7 @@ impl<'a> RenderCtx<'a> {
                         char_prefixes: Arc::clone(&e.char_prefixes),
                         generation: e.generation,
                         #[cfg(debug_assertions)]
-                        fingerprint: source_fingerprint(source),
+                        fingerprint,
                     },
                 );
                 let e = &cache[0];
@@ -612,6 +624,15 @@ impl<'a> RenderCtx<'a> {
     /// eviction below is live, so reseeding between renders would silently
     /// evict warm tables.
     pub(crate) fn preload_line_index(&mut self, entries: &[PreloadedSource]) {
+        // The documented coupling (`PRELOAD_SLOTS <= CACHE_SLOTS`, excess inserts
+        // would evict each other) is now executed: without this, an emitter
+        // passing more than the seeded slots loses the tail entries silently.
+        debug_assert!(
+            entries.len() <= PRELOAD_SLOTS,
+            "preload passed {} entries but only {PRELOAD_SLOTS} seeded slots exist — \
+             the tail would be evicted before the first render",
+            entries.len()
+        );
         let mut cache = self.source_index.borrow_mut();
         for e in entries.iter().rev() {
             if cache.len() >= CACHE_SLOTS {
@@ -652,12 +673,17 @@ impl<'a> RenderCtx<'a> {
             Some(slot) => slot,
             None => {
                 let mut map = self.file_urls.write().unwrap_or_else(|e| e.into_inner());
-                Arc::clone(map.entry(name.to_string()).or_default())
+                // Re-check under the write lock: a racing worker may have
+                // inserted the slot between the read-lock miss and here, and in
+                // that case the `to_string()` key would be built and dropped.
+                if let Some(slot) = map.get(name) {
+                    Arc::clone(slot)
+                } else {
+                    Arc::clone(map.entry(name.to_string()).or_default())
+                }
             }
         };
-        Arc::clone(
-            slot.get_or_init(|| Arc::from(path_to_file_url(std::path::Path::new(name)).as_str())),
-        )
+        Arc::clone(slot.get_or_init(|| path_to_file_url(std::path::Path::new(name))))
     }
 }
 

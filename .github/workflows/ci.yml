@@ -91,3 +91,31 @@ jobs:
           lake-package-directory: research/underline-lanes/lean
           use-github-cache: true
           use-mathlib-cache: true
+
+  benchmark:
+    name: Benchmarks (measurement data)
+    runs-on: ubuntu-latest
+    # These numbers are *data*, not gates.  Two decisions in the tree are
+    # explicitly waiting on them:
+    #   * `ascii.rs`'s dispatch tiers (`AVX512_MIN_LEN`, the `< 16` scalar tail)
+    #     and the four-class kernel tax on single-predicate callers — the file's
+    #     own comment calls them measurement decisions;
+    #   * `wrap_dp`'s Larmore–Schieber crossover (`n* ≈ 10–15` words) — the code
+    #     comment derives it, nothing measures it.
+    # Wall-clock assertions are deliberately absent: shared runners are far too
+    # noisy to gate on, so the job prints numbers into the log and the reviewer
+    # compares them against the recorded analysis.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+      - name: ASCII dispatch boundaries (vector vs SWAR)
+        run: cargo bench --bench ascii_dispatch --features bench-hooks
+      - name: Diagnostic hot paths (ignored measurement probes)
+        # Scoped to `diagnostics::` so the query-engine perf probes (12 ignored
+        # tests under `hir::query::defense_tests`) do not run in this job.
+        run: >
+          cargo test --bin ponent --release --locked --
+          --ignored --nocapture --test-threads=1 diagnostics::

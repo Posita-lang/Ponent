@@ -17,8 +17,12 @@ use super::term::path_to_file_url;
 /// `render_entries` (the actual cap) must agree, or a drift silently
 /// disables links for the rendered tail or under-reserves.
 const MAX_CHAIN_DEPTH: usize = 64;
-/// Upper bounds for the reserve-estimate walk.  Rendering itself is still
-/// bounded by `MAX_CHAIN_DEPTH`/the caller, but a hostile *wide* chain (many
+/// Upper bounds for the reserve-estimate walk.  Rendering itself is capped by
+/// *both* this constant and `MAX_CHAIN_DEPTH` (`render_entries` stops at
+/// `MAX_RESERVE_ENTRIES` rendered entries and emits a single `...`), so the
+/// scan and the renderer must agree on it exactly as they must on
+/// `MAX_CHAIN_DEPTH`; retuning one without the other desynchronises the reserve
+/// from the output.  The point of the cap is that a hostile *wide* chain (many
 /// entries at shallow depth) must not make `String::with_capacity` reserve
 /// megabytes before emitting a truncated `...`.
 const MAX_RESERVE_ENTRIES: usize = 64 * 1024;
@@ -322,18 +326,40 @@ impl std::fmt::Debug for CallChain<'_> {
     }
 }
 
-/// See [`CallChain`]'s `Debug`: `children` is a count, never a recursive walk.
+/// See [`CallChain`]'s `Debug`: `children` is a count, never a recursive walk,
+/// and the message is length-capped (see [`DebugMessage`]).
 impl std::fmt::Debug for ChainEntry<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChainEntry")
             .field("kind", &self.kind)
             .field("span", &self.span)
-            .field("message", &self.message)
+            .field("message", &DebugMessage(self.message.as_ref()))
             .field(
                 "nested_chains",
                 &self.children.as_ref().map_or(0, |c| c.len()),
             )
             .finish()
+    }
+}
+
+/// Characters of a chain message printed by `Debug` before eliding the rest.
+///
+/// `DEBUG_ENTRIES` bounds the number of entries; this bounds their *size*.  A
+/// hostile or fuzzer-built chain can carry a multi-megabyte message, and `Debug`
+/// is reachable from every `unwrap` panic, `assert_eq!` failure and tracing
+/// field — the very hazard the depth limit exists for, on the other axis.
+const DEBUG_MESSAGE_CHARS: usize = 64;
+
+struct DebugMessage<'a>(&'a str);
+
+impl std::fmt::Debug for DebugMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.0;
+        match s.char_indices().nth(DEBUG_MESSAGE_CHARS) {
+            // Short enough: quote it exactly (escaping is the `str` impl's job).
+            None => std::fmt::Debug::fmt(s, f),
+            Some((cut, _)) => write!(f, "{:?}… (+{} bytes)", &s[..cut], s.len() - cut),
+        }
     }
 }
 
@@ -362,6 +388,24 @@ fn percent_encode_high_bytes(s: &str) -> String {
         }
     }
     out
+}
+
+/// Everything a call-chain render needs besides the chain itself.
+///
+/// Replaces nine positional parameters.  Two pairs shared a type
+/// (`source`/`file_name` and `max_width`/`tab_width`), so a swapped pair
+/// compiled cleanly and produced subtly wrong output — a transposition hazard,
+/// not a style nit.  Named fields make every call site auditable.
+#[derive(Clone, Copy)]
+pub(crate) struct ChainRenderCtx<'a, 'src> {
+    pub(crate) use_color: bool,
+    pub(crate) source: Option<&'a str>,
+    pub(crate) file_name: &'a str,
+    pub(crate) idx: Option<&'a LineIndex<'src>>,
+    pub(crate) max_width: usize,
+    pub(crate) tab_width: usize,
+    pub(crate) cx: Option<&'a super::RenderCtx<'src>>,
+    pub(crate) anchor: Option<FileId>,
 }
 
 impl<'src> CallChain<'src> {
@@ -402,6 +446,11 @@ impl<'src> CallChain<'src> {
     /// could overflow the stack on a hostile deep chain before the render
     /// cap ever applied.
     fn scan(&self) -> ChainFacts {
+        // A value computed by this very call cannot be stale; only a
+        // *pre-existing* cache entry can be.  Recomputing in both cases paid
+        // double facts cost in debug builds for half the coverage.
+        #[cfg(debug_assertions)]
+        let had_cached = self.facts.get().is_some();
         let facts = *self.facts.get_or_init(|| self.compute_facts());
         // Memo canary: the soundness of this cache rests on three unstated
         // preconditions (`entries` stays private, `children` is immutable, and
@@ -411,7 +460,7 @@ impl<'src> CallChain<'src> {
         // estimate would go stale; recompute in debug builds so the first
         // render fails loudly instead.
         #[cfg(debug_assertions)]
-        {
+        if had_cached {
             let fresh = self.compute_facts();
             debug_assert_eq!(
                 facts, fresh,
@@ -576,6 +625,26 @@ impl<'src> CallChain<'src> {
     /// owns, so writing straight into that buffer avoids the per-chain
     /// `String` + copy that [`Self::render_with_index`] would otherwise do.
     ///
+    /// See [`ChainRenderCtx`] for the parameter bundle (and why it is a struct).
+    pub(crate) fn render_into(&self, ctx: &ChainRenderCtx<'_, '_>, out: &mut String) {
+        // Destructured immediately: the body keeps its short local names while
+        // callers get named fields and cannot transpose `source`/`file_name` or
+        // `max_width`/`tab_width`.
+        let ChainRenderCtx {
+            use_color,
+            source,
+            file_name,
+            idx,
+            max_width,
+            tab_width,
+            cx,
+            anchor,
+        } = *ctx;
+        self.render_into_parts(
+            use_color, source, file_name, idx, max_width, tab_width, cx, anchor, out,
+        )
+    }
+
     /// # Same-file assumption
     ///
     /// A chain is emitted for one diagnostic in one file, so every entry span is
@@ -586,7 +655,7 @@ impl<'src> CallChain<'src> {
     /// same-file assumption; `render`/`render_with_index` pass `None`.
     /// An entry without a span always falls back to its [`ChainEntryKind`]
     /// label and is unaffected.
-    pub(crate) fn render_into(
+    fn render_into_parts(
         &self,
         use_color: bool,
         source: Option<&str>,
@@ -632,9 +701,18 @@ impl<'src> CallChain<'src> {
         // not supply one (the public `render` path).  Every entry then pays
         // O(log n) instead of rescanning the source per entry.
         let owned_index;
+        // The index is read only by the `FileLineCol` suffix arm, which needs a
+        // spanned entry; with `any_spanned == false` no entry can reach that
+        // arm, so building the index (an O(source) scan) would be pure waste —
+        // the same argument that already gates `sanitize_filename`,
+        // `path_to_file_url` and `file_cols` below.
         let idx = if let (Some(src), None) = (source, idx) {
-            owned_index = LineIndex::new(src);
-            Some(&owned_index)
+            if facts.any_spanned {
+                owned_index = LineIndex::new(src);
+                Some(&owned_index)
+            } else {
+                None
+            }
         } else {
             idx
         };
@@ -674,9 +752,7 @@ impl<'src> CallChain<'src> {
         let file_url: Option<std::sync::Arc<str>> = if hyperlink_enabled {
             let candidate = match cx {
                 Some(cx) => cx.file_url(file_name),
-                None => {
-                    std::sync::Arc::from(path_to_file_url(std::path::Path::new(file_name)).as_str())
-                }
+                None => path_to_file_url(std::path::Path::new(file_name)),
             };
             // C1: enforce the OSC 8 invariant unconditionally (not with a
             // debug_assert that disappears in release).  ESC and the ST
@@ -849,6 +925,11 @@ impl<'src> CallChain<'src> {
                 return;
             }
             rendered.set(rendered.get() + 1);
+            // Test-only mirror of the renderer's visit count, so a differential
+            // test can assert `ChainFacts::entry_count == rendered entries`
+            // (the reserve estimate and the renderer are independent walks).
+            #[cfg(test)]
+            tests::note_rendered_entry();
             // One ASCII classification serves both sanitizer selection and the
             // fast-path gate: printable/tab-only input is untouched by the
             // multiline sanitizer, so scanning it twice was dead work.
@@ -1012,6 +1093,19 @@ impl<'src> Default for CallChain<'src> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Mirrors `render_entries`' visit count through the hook above.
+        static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn note_rendered_entry() {
+        RENDERED.with(|c| c.set(c.get() + 1));
+    }
+
+    fn take_rendered() -> usize {
+        RENDERED.with(|c| c.replace(0))
+    }
+
     #[test]
     fn empty_message_keeps_entry_indent_and_suffix() {
         let mut chain = CallChain::new();
@@ -1137,14 +1231,16 @@ mod tests {
         let idx = LineIndex::new(src);
         let mut out = String::new();
         chain.render_into(
-            false,
-            Some(src),
-            "file.ps",
-            Some(&idx),
-            100,
-            4,
-            None,
-            Some(FileId::DUMMY),
+            &ChainRenderCtx {
+                use_color: false,
+                source: Some(src),
+                file_name: "file.ps",
+                idx: Some(&idx),
+                max_width: 100,
+                tab_width: 4,
+                cx: None,
+                anchor: Some(FileId::DUMMY),
+            },
             &mut out,
         );
         assert!(
@@ -1292,6 +1388,78 @@ mod tests {
         drop(chain);
     }
 
+    /// A push after a render must invalidate the memo: `entry_count` and
+    /// `any_spanned` live in a `OnceLock`, and a stale value would under-reserve
+    /// or silently gate hyperlinks wrongly.
+    #[test]
+    fn push_invalidates_the_facts_memo() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(ChainEntryKind::Call, Some(span), "first"));
+        let out = chain.render(false, Some("abc\n"), "t.pon");
+        assert!(out.contains("first"), "out: {out}");
+        assert_eq!(chain.scan().entry_count, 1);
+        chain.push(ChainEntry::new(ChainEntryKind::Call, Some(span), "second"));
+        let out = chain.render(false, Some("abc\n"), "t.pon");
+        assert!(out.contains("second"), "out: {out}");
+        assert_eq!(chain.scan().entry_count, 2);
+    }
+
+    /// Hostile *wide* chains mirror the deep-chain tests on the other axis: the
+    /// reserve stays bounded and truncation emits exactly one marker.
+    #[test]
+    fn hostile_wide_chain_is_capped_with_one_marker() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        let mut chain = CallChain::new();
+        for i in 0..(MAX_RESERVE_ENTRIES + 1) {
+            chain.push(ChainEntry::new(
+                ChainEntryKind::Call,
+                Some(span),
+                format!("m{i}"),
+            ));
+        }
+        assert!(chain.scan().entry_count <= MAX_RESERVE_ENTRIES);
+        let out = chain.render(false, None, "");
+        assert_eq!(out.matches("...").count(), 1, "one truncation marker");
+        assert!(out.len() < (8 << 20), "bounded output, got {}", out.len());
+    }
+
+    /// The reserve estimate (`compute_facts`) and the renderer walk the tree
+    /// independently; they must agree on how many entries survive the caps, or
+    /// the pre-sizing silently desynchronises from the output.
+    #[test]
+    fn facts_entry_count_matches_rendered_entries() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        for &(width, depth) in &[(1usize, 0usize), (3, 0), (5, 1), (7, 2), (16, 3), (40, 5)] {
+            let mut chain = CallChain::new();
+            for w in 0..width {
+                let mut node = CallChain::new();
+                node.push(ChainEntry::new(
+                    ChainEntryKind::Call,
+                    Some(span),
+                    format!("m{w}"),
+                ));
+                for _ in 0..depth {
+                    let mut parent = CallChain::new();
+                    parent.push(
+                        ChainEntry::new(ChainEntryKind::Call, Some(span), "n")
+                            .with_children(vec![node]),
+                    );
+                    node = parent;
+                }
+                chain.entries.extend(node.entries.drain(..));
+            }
+            take_rendered();
+            let _ = chain.render(false, None, "");
+            let rendered = take_rendered();
+            assert_eq!(
+                chain.scan().entry_count,
+                rendered,
+                "width {width} depth {depth}"
+            );
+        }
+    }
+
     /// The derived `Debug` recursed one frame per nesting level — the same
     /// hazard the iterative `Drop` above removes, but reachable through any
     /// `unwrap` panic message or `assert_eq!` on a chain.
@@ -1318,6 +1486,22 @@ mod tests {
         );
         assert!(rendered.contains("nested_chains: 1"), "{rendered}");
         drop(chain);
+
+        // Size axis: one entry carrying a multi-megabyte message must not turn
+        // `format!("{chain:?}")` into megabytes of text (reachable from every
+        // `unwrap` panic and `assert_eq!` failure).
+        let huge = "m".repeat(4 * 1024 * 1024);
+        let chain = CallChain {
+            entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), &huge)],
+            facts: std::sync::OnceLock::new(),
+        };
+        let rendered = format!("{chain:?}");
+        assert!(
+            rendered.len() < 4_096,
+            "Debug output grew with message size: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.contains("+4194240 bytes"), "{rendered}");
     }
 
     /// A custom `RenderCtx::file_url` can hand back raw UTF-8; the OSC 8

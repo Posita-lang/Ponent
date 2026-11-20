@@ -53,6 +53,15 @@ impl<'a> Label<'a> {
         }
     }
 
+    /// An **inline help annotation** at a source position — rendered as
+    /// `| help: message` beside the underlined source, with no underline of its
+    /// own.
+    ///
+    /// Not to be confused with the diagnostic-level help text
+    /// (`Diagnostic::help`, the humanizer's `help()`): that is one suggestion
+    /// string for the whole diagnostic, while this is a positioned annotation
+    /// that belongs in `Diagnostic::labels`.  A help *text* string placed here
+    /// renders as a plausible-but-wrong source annotation.
     pub fn help(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
@@ -105,6 +114,18 @@ pub struct SourcePos {
     pub col: usize,
 }
 
+/// `line:col`, both **1-based** — the form every renderer prints.
+///
+/// The `+1` and the byte-column caveat above are the contract, so they live in
+/// one place instead of being re-derived per renderer.  `renderers::short`
+/// deliberately keeps its integer path (it fuses the digit widths into its
+/// capacity computation); everything else should format through this.
+impl std::fmt::Display for SourcePos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.line + 1, self.col + 1)
+    }
+}
+
 // ── Snippet: a contiguous slice of source code with annotations ──
 
 /// A contiguous slice of source code with its annotations, ready for
@@ -122,7 +143,11 @@ pub struct SourcePos {
 pub struct Snippet<'a> {
     /// Display name / file path of the source (e.g. `"src/main.pn"`).
     pub origin: Cow<'a, str>,
-    /// 1‑based line number of the first line in `source`.
+    /// **1-based** line number of the first line in `source` — deliberately the
+    /// opposite convention from [`SourcePos::line`], which is 0-based.  The two
+    /// exist for different consumers (snippets print human line numbers;
+    /// positions are index arithmetic), so the conversion happens once at the
+    /// boundary rather than inside either type.
     pub line_start: usize,
     /// The raw source text (may span multiple lines).
     pub source: &'a str,
@@ -165,5 +190,105 @@ impl<'a> Snippet<'a> {
     pub fn with_fold(mut self, fold: bool) -> Self {
         self.fold = fold;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::FileId;
+
+    fn span(a: u32, b: u32) -> Span {
+        Span::new(FileId::DUMMY, a, b)
+    }
+
+    /// `Display` is the single place the `+1` lives, so it is the single place a
+    /// renderer's 0-based→1-based drift can be caught.
+    #[test]
+    fn source_pos_display_is_one_based() {
+        assert_eq!(
+            SourcePos { line: 0, col: 0 }.to_string(),
+            "1:1",
+            "file start"
+        );
+        assert_eq!(SourcePos { line: 4, col: 7 }.to_string(), "5:8");
+        // Start of the second line (not the newline of the first): pins the
+        // line-index convention against a producer that counts newlines-as-lines.
+        assert_eq!(SourcePos { line: 1, col: 0 }.to_string(), "2:1");
+    }
+
+    /// Byte columns, not display columns: on a tab-indented line the two differ,
+    /// and a renderer switching to display columns must fail here.
+    #[test]
+    fn source_pos_col_is_a_byte_offset() {
+        let line = "\tx";
+        let byte_col = line.find('x').unwrap();
+        let pos = SourcePos {
+            line: 0,
+            col: byte_col,
+        };
+        assert_eq!(pos.to_string(), "1:2", "col is the byte offset");
+        // The *display* column of `x` is 5 (the tab advances to the next
+        // 4-column stop); a renderer that printed display columns would emit
+        // "1:5", so this guards the documented byte-column contract.
+        assert_ne!(pos.col + 1, 5, "col must not be the display column");
+    }
+
+    /// The glyph table is consumed by every renderer; swapping `~`/`-` must be a
+    /// loud failure.
+    #[test]
+    fn underline_chars_are_pinned() {
+        assert_eq!(AnnotationKind::Primary.underline_char(), '^');
+        assert_eq!(AnnotationKind::Secondary.underline_char(), '~');
+        assert_eq!(AnnotationKind::Note.underline_char(), '-');
+        // A placeholder: renderers must special-case `Help` instead of consuming
+        // the glyph (no underline, `| help: msg` prefix).
+        assert_eq!(AnnotationKind::Help.underline_char(), ' ');
+        let label = Label::secondary(span(0, 1), "s");
+        assert_eq!(label.underline_char(), '~');
+    }
+
+    #[test]
+    fn constructors_set_the_right_kind_and_keep_borrows() {
+        // A borrowed message must stay borrowed: an `Into<Cow>` impl that
+        // silently called `to_string()` would allocate on every static label.
+        let borrowed: Cow<'static, str> = Cow::Borrowed("static text");
+        let label = Label::new(span(0, 1), borrowed.clone());
+        assert!(matches!(label.message, Cow::Borrowed(_)), "{label:?}");
+        assert_eq!(label.kind, AnnotationKind::Primary);
+        assert_eq!(
+            Label::secondary(span(0, 1), borrowed.clone()).kind,
+            AnnotationKind::Secondary
+        );
+        assert_eq!(
+            Label::note(span(0, 1), borrowed.clone()).kind,
+            AnnotationKind::Note
+        );
+        assert_eq!(
+            Label::help(span(0, 1), borrowed).kind,
+            AnnotationKind::Help
+        );
+    }
+
+    #[test]
+    fn snippet_line_start_is_clamped_and_one_based() {
+        let src = "fn main() {}\n";
+        // Debug builds trip the assert; release clamps to 1.
+        let clamped = std::panic::catch_unwind(|| Snippet::new("f.pn", src).with_line_start(0));
+        match clamped {
+            Ok(s) => assert_eq!(s.line_start, 1),
+            // Debug builds: the invariant is caught loudly instead.
+            Err(_) => {}
+        }
+        assert_eq!(Snippet::new("f.pn", src).line_start, 1, "default is 1-based");
+        assert_eq!(Snippet::new("f.pn", src).with_line_start(5).line_start, 5);
+        assert_eq!(
+            Snippet::new("f.pn", src)
+                .with_line_start(1)
+                .with_annotations([Label::new(span(0, 2), "a"), Label::note(span(3, 4), "b")])
+                .annotations
+                .len(),
+            2
+        );
     }
 }

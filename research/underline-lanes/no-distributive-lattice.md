@@ -553,7 +553,7 @@ that the document and the code cannot drift apart. For example, the B
 contrast of §5 is a handful of lines:
 
 ```rust
-# [test]
+#[test]
 fn witness_b_pointwise_is_a_chain_but_refinement_is_not() {
     let g = Graph::new(4, &[(0, 1), (0, 2), (1, 2), (0, 3)]);
     let c = normalised(&g, 3, &[0, 1, 2]);            // c(x) ∈ {2, 3}

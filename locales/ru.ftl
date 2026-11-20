@@ -15,6 +15,7 @@ comptime-internal = внутренняя ошибка comptime: { $e }
 comptime-call-stack-header = стек вызовов comptime (сначала последний):
 comptime-frame = { $reason }
 comptime-frame-offset = { $reason } (смещение { $offset })
+comptime-frame-bullet = ·
 trait-solver-error = ошибка решателя трейтов: { $msg }
 type-mismatch = несоответствие типов: ожидался `{ $expected }`, найден `{ $found }`
 type-mismatch-reason = { type-mismatch } — { $reason }
@@ -131,13 +132,12 @@ suppressed-note =
         [many]  { $count } дополнительных ошибок скрыто
        *[other] { $count } дополнительной ошибки скрыто
     }
-fold-marker-lines =
-    { $gap ->
+fold-marker-lines = { " " }({ $gap ->
         [one]   { $gap } строка опущена
         [few]   { $gap } строки опущены
         [many]  { $gap } строк опущено
        *[other] { $gap } строки опущено
-    }
+    })
 chain-header = ссылки из:
 html-doc-title = Диагностика компилятора Ponent
 html-h1 = Диагностика компилятора Ponent

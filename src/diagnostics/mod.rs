@@ -257,7 +257,7 @@ impl Default for DiagOpts {
 /// into O(filter_size + diagnostics).  The common empty-filter case builds
 /// three empty hash sets and an empty vec, so a diagnostic pays no lookup
 /// work at all.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct DiagFilter {
     allow_codes: rustc_hash::FxHashSet<String>,
     only_codes: rustc_hash::FxHashSet<String>,
@@ -267,6 +267,22 @@ pub(crate) struct DiagFilter {
     /// `matches` into one predictable branch instead of four `is_empty()`
     /// checks per diagnostic.
     is_empty: bool,
+}
+
+impl Default for DiagFilter {
+    /// The derived `Default` produced `is_empty: false` with all four sets
+    /// empty — the exact state the field exists to preclude.  Behaviour stayed
+    /// correct (each guard fails), but the field's documented invariant is
+    /// load-bearing for `matches`'s fast path, so it is constructed explicitly.
+    fn default() -> Self {
+        Self {
+            allow_codes: rustc_hash::FxHashSet::default(),
+            only_codes: rustc_hash::FxHashSet::default(),
+            only_categories: rustc_hash::FxHashSet::default(),
+            only_files: Vec::new(),
+            is_empty: true,
+        }
+    }
 }
 
 impl DiagFilter {
@@ -326,6 +342,14 @@ impl DiagFilter {
     /// [`Diagnostic::matches_filter`] exactly, with hash lookups for the
     /// exact-match fields.
     pub(crate) fn matches(&self, diag: &Diagnostic<'_>) -> bool {
+        debug_assert!(
+            self.is_empty
+                == (self.allow_codes.is_empty()
+                    && self.only_codes.is_empty()
+                    && self.only_categories.is_empty()
+                    && self.only_files.is_empty()),
+            "DiagFilter::is_empty disagrees with the sets it summarises"
+        );
         if self.is_empty {
             return true;
         }
@@ -1052,8 +1076,18 @@ impl<'src> Diagnostic<'src> {
     pub fn related_errors_mut(&mut self) -> &mut Vec<RelatedError<'src>> {
         &mut self.related_errors
     }
-    pub fn set_source(&mut self, source: Option<&'src str>) {
-        self.source = source;
+    /// Attach the file segment this diagnostic came from.
+    ///
+    /// Takes `&'src str`, not `Option`: a diagnostic's source identifies *which
+    /// file segment* it came from, and a wrong one is structurally
+    /// undetectable at emission time (a wrong snippet looks exactly like a
+    /// right one).  Keeping the "source was cleared" state unrepresentable is
+    /// the only reliable defence, so there is deliberately no path that sets it
+    /// back to `None` — first attach wins, later ones are ignored by
+    /// [`DiagCtxt::attach_source`](crate::diagnostics::collector::DiagCtxt::attach_source)'s
+    /// `is_none` guard.
+    pub fn set_source(&mut self, source: &'src str) {
+        self.source = Some(source);
     }
     pub fn set_file_name(&mut self, file_name: impl AsRef<str>) {
         self.file_name = Cow::Owned(file_name.as_ref().to_owned());
@@ -1100,6 +1134,12 @@ impl<'src> Diagnostic<'src> {
     /// message, file_name)`, for tools to deduplicate / track diagnostics
     /// across runs.  `file_name` participates so identical code/spans/messages
     /// in different files do not collide.
+    ///
+    /// **`level` is deliberately excluded**: an error and a warning that share
+    /// code, span and message are the same *finding* at two severities, and a
+    /// `set_level` escalation should not change its identity (which is why
+    /// `set_level` is absent from the invalidation list below).  Consumers that
+    /// need to distinguish them must key on `(stable_id, level)`.
     ///
     /// Computed once with FNV-1a and cached in an [`AtomicU64`]; when the
     /// inputs are unchanged, a second call is just a relaxed load. Every
@@ -1633,6 +1673,15 @@ impl<'src> Diagnostic<'src> {
     /// labels — so attaching the kind first and the span second is the
     /// supported builder ordering.  `help`/`suggestions` are always
     /// re-derived from the kind.
+    ///
+    /// `message` is **kind-owned** as well: text passed to a message-taking
+    /// constructor (`Diagnostic::error("…")`) is a placeholder that this call
+    /// replaces with the kind-derived wording.  Stated because it is a decision,
+    /// not an accident: `help`/`suggestions`/`spans` carry `*_user_set` flags so
+    /// a deliberate override survives, but for `message` the kind *is* the
+    /// wording, and a flag would make every kind-built diagnostic keep its stale
+    /// placeholder forever (with no way to say "derive it").  Pinned by
+    /// `humanize_replaces_a_constructor_message`.
     pub fn humanize(&mut self) {
         let lang = crate::diagnostics::i18n::Lang::current() as u8;
         if self.humanized {
@@ -1791,10 +1840,19 @@ impl<'src> Diagnostic<'src> {
     /// progressively enriching a diagnostic as it passes through compiler
     /// passes (the "context augmentation" pattern inspired by Austral).
     pub fn augment(&mut self, other: &Diagnostic<'src>) {
+        // Copy **every** primary span, not just the first: `augment` exists for
+        // context augmentation, and multi-location diagnostics (duplicate
+        // definition + previous definition, built with `with_additional_span`)
+        // are exactly where it is used.  Keeping only `first()` silently dropped
+        // every location after the anchor.
+        let other_primary = other.spans.primary_ref();
         if self.spans.first().is_none()
-            && let Some(span) = other.spans.first()
+            && let Some(&first_span) = other_primary.first()
         {
-            self.spans = MultiSpan::new(span);
+            self.spans = MultiSpan::new(first_span);
+            for &span in &other_primary[1..] {
+                self.spans.push(span);
+            }
             self.spans_user_set = true;
             self.invalidate_stable_id();
         }
@@ -1906,20 +1964,16 @@ pub fn adorn_with_span<'src, T>(
     if result.is_err() {
         // The closure may have returned `Err` from a *suppressed* warning
         // push (which records nothing) — or from a check that failed without
-        // pushing at all.  In both cases `last_mut()` would return an
-        // *earlier, unrelated* diagnostic and corrupt its span/source, so
+        // pushing at all.  In both cases augmenting the last diagnostic would
+        // touch an *earlier, unrelated* one and corrupt its span/source, so
         // augment only when the closure actually grew the context.
-        if ctxt.len() > before
-            && let Some(diag) = ctxt.last_mut()
-        {
-            if diag.spans.first().is_none() {
-                diag.spans = MultiSpan::new(span);
-                diag.spans_user_set = true;
-                diag.invalidate_stable_id();
-            }
-            if diag.source.is_none() {
-                diag.source = source;
-            }
+        //
+        // `augment_last_diagnostic` is the collector's purpose-built mutator:
+        // this call site needs the span/source fields, and a raw
+        // `&mut Diagnostic` would also expose level rewrites that silently
+        // desynchronise the O(1) severity tallies.
+        if ctxt.len() > before {
+            ctxt.augment_last_diagnostic(span, source);
         }
     }
     result
@@ -1943,29 +1997,20 @@ impl fmt::Display for Diagnostic<'_> {
             "Display on a kind-built Diagnostic before humanize(): message is empty"
         );
         let code_str = self.code.as_ref().map(|c| c.code()).unwrap_or("?");
-        let level_str = self.level.label().to_uppercase();
+        // `label_upper` is the per-language cached Unicode-uppercased label: the
+        // old `label().to_uppercase()` allocated a fresh `String` per render for
+        // a value fully determined by `(level, language)`.
+        let level_str = self.level.label_upper();
 
-        // Inline span-writing — avoids one extra allocation per diagnostic
-        // vs calling location_string().
-        let span_part = self.spans.first().map(|s| format!("at {s}"));
-
-        if let Some(ref span_str) = span_part {
-            writeln!(
+        // Write the span straight into the formatter instead of
+        // `format!("at {s}")` into a temporary — same bytes, no allocation.
+        match self.spans.first() {
+            Some(span) => writeln!(
                 f,
-                "[{code} {level}] {msg} {span}",
-                code = code_str,
-                level = level_str,
+                "[{code_str} {level_str}] {msg} at {span}",
                 msg = self.message,
-                span = span_str,
-            )?;
-        } else {
-            writeln!(
-                f,
-                "[{code} {level}] {msg}",
-                code = code_str,
-                level = level_str,
-                msg = self.message,
-            )?;
+            )?,
+            None => writeln!(f, "[{code_str} {level_str}] {msg}", msg = self.message)?,
         }
 
         // Labels
@@ -2613,7 +2658,11 @@ fn suggest_top3_direct(needle: &str) -> ArrayVec<(usize, usize, &'static str), 3
         && matches!(nb[0], b'E' | b'W')
         && nb[1..].iter().all(u8::is_ascii_digit);
     if !shaped {
-        let max_dist = std::cmp::max(1, nb.len() / 3);
+        // Character count, matching `suggest_code`'s own radius derivation.
+        // Using the *byte* length here made an unshaped multi-byte needle
+        // (4 chars, 8 bytes) get twice the radius the scan reference uses, so
+        // the differential equivalence held only for ASCII inputs.
+        let max_dist = std::cmp::max(1, needle.chars().count() / 3);
         return suggest_top3_scan(needle, max_dist, needle.chars().count());
     }
     /// Resolve one candidate slot (if a known code) into the top-3.
@@ -2890,8 +2939,11 @@ pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>
     // Bidi formatting characters (U+202A–U+202E, U+2066–U+2069) are neither
     // controls nor visible, so the byte-level scan cannot see them — they are
     // probed separately (see [`sanitize_for_terminal`] for the spoofing
-    // rationale) and must reach the owned path for removal.
-    if has_high && !dirty && !has_c1 && !has_bidi_override_bytes(bytes) {
+    // rationale) and must reach the owned path for removal.  Hoisted above both
+    // guards, like the plain variant: the owned branch used to re-run the same
+    // O(n) probe on the bidi-present path.
+    let bidi = has_high && has_bidi_override_bytes(bytes);
+    if has_high && !dirty && !has_c1 && !bidi {
         return (Cow::Borrowed(s), break_at);
     }
     // Layout-only ASCII (`\n`/`\r`/`\t` are the only controls) is already
@@ -2901,7 +2953,7 @@ pub(crate) fn sanitize_for_terminal_flatten_with_break(s: &str) -> (Cow<'_, str>
     // [`sanitize_filename`] and the source-row renderer: they carry no
     // content, only rendering direction, so replacement would just inject
     // noise while `\n`/`\r`/`\t` survive for the flattening caller.
-    let owned: String = if has_bidi_override_bytes(bytes) {
+    let owned: String = if bidi {
         s.chars()
             .filter(|c| !is_bidi_override(*c))
             .map(|c| {
@@ -3025,8 +3077,16 @@ fn scan_terminal_control_flags(s: &[u8]) -> (bool, bool, bool) {
     let mut i = 0;
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
-        has_high |= x & HI != 0;
-        has_c1 |= c1_in_chunk(s, i, x);
+        let high = x & HI != 0;
+        has_high |= high;
+        // A C1 control needs a leading `0xC2` — a byte with the high bit set —
+        // so a chunk with no high bit cannot contain one.  Gating the probe
+        // (≈5 ops: xor, sub, and, and) on the high-bit test removes it from the
+        // pure-ASCII chunks that dominate every rendered string, while an
+        // all-ASCII chunk keeps its exact answer (`c1_in_chunk` would be false).
+        if high {
+            has_c1 |= c1_in_chunk(s, i, x);
+        }
         // C0: any byte < 0x20 (existentially exact).
         dirty |= x.wrapping_sub(SP) & !x & HI != 0;
         // DEL: any byte == 0x7F (exact — any flag implies a real lane).
@@ -3106,8 +3166,16 @@ pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool, bo
     let mut i = 0;
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
-        has_high |= x & HI != 0;
-        has_c1 |= c1_in_chunk(s, i, x);
+        let high = x & HI != 0;
+        has_high |= high;
+        // A C1 control needs a leading `0xC2` — a byte with the high bit set —
+        // so a chunk with no high bit cannot contain one.  Gating the probe
+        // (≈5 ops: xor, sub, and, and) on the high-bit test removes it from the
+        // pure-ASCII chunks that dominate every rendered string, while an
+        // all-ASCII chunk keeps its exact answer (`c1_in_chunk` would be false).
+        if high {
+            has_c1 |= c1_in_chunk(s, i, x);
+        }
         // DEL: exact — any flag implies a genuine 0x7F lane.
         let q = x ^ DEL;
         if q.wrapping_sub(ONES) & !q & HI != 0 {
@@ -3161,8 +3229,16 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, Option<us
     let mut i = 0;
     while i + 8 <= s.len() {
         let x = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
-        has_high |= x & HI != 0;
-        has_c1 |= c1_in_chunk(s, i, x);
+        let high = x & HI != 0;
+        has_high |= high;
+        // A C1 control needs a leading `0xC2` — a byte with the high bit set —
+        // so a chunk with no high bit cannot contain one.  Gating the probe
+        // (≈5 ops: xor, sub, and, and) on the high-bit test removes it from the
+        // pure-ASCII chunks that dominate every rendered string, while an
+        // all-ASCII chunk keeps its exact answer (`c1_in_chunk` would be false).
+        if high {
+            has_c1 |= c1_in_chunk(s, i, x);
+        }
         let q = x ^ DEL;
         if q.wrapping_sub(ONES) & !q & HI != 0 {
             dirty = true;
@@ -3509,6 +3585,15 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool, u64) {
 /// queried non-ASCII line and never evicts, so a long-lived process rendering
 /// a very large CJK-heavy source would creep toward ~10 MB per cached index.
 /// Past the cap the map clears wholesale — a query then rebuilds one line's
+/// Uppercase hex digits for percent-encoding (`%XX`) in URLs.
+///
+/// One definition for the whole diagnostic layer: `term` (local `file://`
+/// links), `error_code` (`--explain` URLs) and the renderer primitives all
+/// encode path segments.  A shared const is the only way two encoders cannot
+/// drift, and living here — rather than inside a renderer module — keeps
+/// non-renderer subsystems from importing a table *through* a renderer.
+pub(crate) const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
 /// sparse table, the same cost as the first query for that line, so the
 /// regression is bounded and only reaches files that genuinely have thousands
 /// of distinct non-ASCII lines.
@@ -3559,8 +3644,15 @@ fn cap_char_prefixes(cache: &mut FxHashMap<usize, crate::diagnostics::render::Ch
             .iter()
             .map(|(key, entry)| (*key, entry.last_used()))
             .collect();
-        victims.sort_unstable_by_key(|(_, tick)| *tick);
-        for (key, _) in victims.into_iter().take(CHAR_PREFIXES_EVICT) {
+        // Only the `CHAR_PREFIXES_EVICT` oldest entries are wanted, so select
+        // them instead of sorting: `select_nth_unstable_by_key` is O(n) where the
+        // full sort was ~50k compares plus a 64 KB temp allocation per eviction.
+        // LRU tie-breaking stays approximate — it already was.
+        let k = CHAR_PREFIXES_EVICT.min(victims.len());
+        if k > 0 && k < victims.len() {
+            victims.select_nth_unstable_by_key(k - 1, |(_, tick)| *tick);
+        }
+        for (key, _) in victims.into_iter().take(k) {
             cache.remove(&key);
         }
     }
@@ -4496,6 +4588,36 @@ mod tests {
         );
     }
 
+    /// `humanize` replaces a constructor-supplied message with the kind-derived
+    /// wording.  Pinned because it is a *decision* (see `humanize`'s doc): unlike
+    /// spans/help/suggestions there is no `message_user_set` flag, so the kind is
+    /// the single owner of the message text.  A regression here would silently
+    /// keep a placeholder in user-visible output.
+    #[test]
+    fn humanize_replaces_a_constructor_message() {
+        let mut diag = Diagnostic::error("placeholder text").with_kind(
+            DiagnosticKind::TypeMismatch {
+                expected: Cow::Borrowed("Int<32>"),
+                found: Cow::Borrowed("Str"),
+                span: Span::new(FileId::DUMMY, 0, 3),
+                found_span: None,
+                reason: None,
+                context: None,
+            },
+        );
+        diag.humanize();
+        assert!(
+            diag.message().contains("type mismatch"),
+            "kind must own the message: {:?}",
+            diag.message()
+        );
+        assert!(
+            !diag.message().contains("placeholder"),
+            "constructor text must not survive humanize: {:?}",
+            diag.message()
+        );
+    }
+
     #[test]
     fn humanize_preserves_user_set_multiple_spans() {
         // `with_span` + `with_additional_span` on a kind-built diagnostic:
@@ -5141,7 +5263,7 @@ mod tests {
 
         let mut d = base.clone();
         d.set_level(DiagnosticLevel::Warning);
-        d.set_source(Some("ignored"));
+        d.set_source("ignored");
         // C9: `stable_id` hashes the file NAME, so a rename must invalidate
         // the cache and yield a new id (the old code returned the stale id,
         // reintroducing cross-file collisions).

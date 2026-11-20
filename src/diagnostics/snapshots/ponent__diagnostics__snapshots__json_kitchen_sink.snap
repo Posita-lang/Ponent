@@ -15,9 +15,9 @@ expression: out
     {"file": "example.ps", "start": 73, "end": 74, "line": 4, "column": 9}
   ],
   "labels": [
-    {"start": 43, "end": 68, "file": "example.ps", "message": "this is Bool", "kind": "Primary"},
-    {"start": 0, "end": 8, "file": "example.ps", "message": "declared to return Int<32>", "kind": "Secondary"},
-    {"start": 9, "end": 69, "file": "example.ps", "message": "spans four lines", "kind": "Primary"}
+    {"start": 43, "end": 68, "line": 3, "column": 2, "file": "example.ps", "message": "this is Bool", "kind": "Primary"},
+    {"start": 0, "end": 8, "line": 1, "column": 1, "file": "example.ps", "message": "declared to return Int<32>", "kind": "Secondary"},
+    {"start": 9, "end": 69, "line": 1, "column": 10, "file": "example.ps", "message": "spans four lines", "kind": "Primary"}
   ],
   "relatedErrors": [
     {"file": "example.ps", "code": "E019", "message": "duplicate definition of `i`", "span": {"start": 43, "end": 56, "line": 3, "column": 2}}
@@ -30,6 +30,6 @@ expression: out
     {"message": "cast with `as`", "applicability": "Unspecified", "style": "ShowAlways"}
   ],
   "callChain": [
-    {"label": "main", "kind": "Call", "file": "example.ps", "location": "example.ps:1:1"}
+    {"label": "main", "kind": "Call", "file": "example.ps", "line": 1, "column": 1, "location": "example.ps:1:1"}
   ]
 }

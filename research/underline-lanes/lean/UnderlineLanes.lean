@@ -121,7 +121,12 @@ def Step {n : ℕ} (E : Finset (Fin n × Fin n)) (a b : Fin n) : Prop :=
 instance decStep {n : ℕ} (E : Finset (Fin n × Fin n)) (a b : Fin n) : Decidable (Step E a b) :=
   inferInstanceAs (Decidable (a = b ∨ Adj E a b))
 
-/-- Walk connectivity for graphs on ≤ 5 vertices (four hops suffice). -/
+/-- Walk connectivity for graphs on ≤ 5 vertices.
+
+`p : Fin 4 → Fin n` supplies four intermediates, so the definition allows a path
+of five edges (`v → p 0 → p 1 → p 2 → p 3 → w`).  That is still a bound, not an
+exact statement: a connected `n`-vertex graph has a path with at most `n - 1`
+edges, so five steps cover every `n ≤ 6`. -/
 def Conn5 {n : ℕ} (E : Finset (Fin n × Fin n)) : Prop :=
   ∀ v w : Fin n, ∃ p : Fin 4 → Fin n, Step E v (p 0) ∧ Step E (p 0) (p 1) ∧
     Step E (p 1) (p 2) ∧ Step E (p 2) (p 3) ∧ Step E (p 3) w
