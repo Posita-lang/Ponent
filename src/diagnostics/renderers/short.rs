@@ -65,11 +65,9 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
         "push_flattened offset {first:?} is not a char boundary of a {} byte message",
         msg.len()
     );
-    let bytes = msg.as_bytes();
-
     // Fast path: no break byte — straight copy.  The caller already scanned
     // for the first break while sanitizing, so this needs no second memchr3.
-    let Some(first) = first else {
+    let Some(_first) = first else {
         out.push_str(msg);
         return;
     };
@@ -78,15 +76,24 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
     // skipping them *is* the run-collapsing rule — no second buffer needed.
     // Seed the loop with the offset the fast path already found instead of
     // re-scanning the prefix.
+    // Segment edges abut a break, so a space there is part of the run: trim the
+    // trailing spaces of every segment that a break follows and the leading
+    // spaces of every segment that a break precedes, drop what is left empty,
+    // and join with exactly one space.  This is the rule the fused path above
+    // implements in one pass; the differential test pins them together.
+    let mut segs = msg.split(['\n', '\r', '\t']).peekable();
     let mut first_seg = true;
-    let mut start = 0;
-    let mut offset = Some(first);
-    while start < bytes.len() {
-        let end = match offset {
-            Some(o) => start + o,
-            None => bytes.len(),
-        };
-        let seg = &msg[start..end];
+    let mut index = 0usize;
+    while let Some(raw) = segs.next() {
+        // `peek` is the last-segment test, so no collection is needed.
+        let is_last = segs.peek().is_none();
+        let mut seg = raw;
+        if index > 0 {
+            seg = seg.trim_start_matches(' ');
+        }
+        if !is_last {
+            seg = seg.trim_end_matches(' ');
+        }
         if !seg.is_empty() {
             if !first_seg {
                 out.push(' ');
@@ -94,11 +101,7 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
             out.push_str(seg);
             first_seg = false;
         }
-        if offset.is_none() {
-            break;
-        }
-        start = end + 1;
-        offset = memchr::memchr3(b'\n', b'\r', b'\t', &bytes[start..]);
+        index += 1;
     }
 }
 
@@ -110,6 +113,11 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
 fn push_sanitized_flattened(out: &mut String, msg: &str) {
     let mut wrote = false;
     let mut pending_break = false;
+    // Whether the last emitted char was a literal space, so a break run adjacent
+    // to spaces still joins with exactly one.  Without it `"a\t b"` emitted
+    // `"a  b"` and `"a \tb"` emitted `"a  b"` — the run-collapsing rule the
+    // oracle (`push_flattened`) already implemented, drifting from the fast path.
+    let mut prev_space = false;
     for c in msg.chars() {
         if crate::diagnostics::is_bidi_override(c) {
             continue;
@@ -120,13 +128,19 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
         }
         let c = if c.is_control() { '\u{FFFD}' } else { c };
         if pending_break {
-            if wrote {
+            // A space on either side of the break belongs to the run: absorb a
+            // trailing one, and suppress the joiner after a leading one.
+            if c == ' ' {
+                continue;
+            }
+            if wrote && !prev_space {
                 out.push(' ');
             }
             pending_break = false;
         }
         out.push(c);
         wrote = true;
+        prev_space = c == ' ';
     }
 }
 
@@ -485,10 +499,11 @@ mod tests {
             .with_source("x\n");
         let opts = DiagOpts::default();
         let out = ShortRenderer::new().render(&diag, &ctx(&opts));
-        // Each break run collapses to one space; a literal space next to a break
-        // stays, so `a\nb\r c` flattens to `a b  c`.  Pinned exactly so the rule
-        // is the spec, not an accident.
-        assert_eq!(out, "a b  c:1:1: error[bad code]: boom\n");
+        // A maximal break run collapses to one space, and a literal space that
+        // abuts a break belongs to that run — so `a\nb\r c` flattens to `a b c`
+        // (the space before `c` is absorbed).  Pinned exactly in both the fused
+        // and the reference path.
+        assert_eq!(out, "a b c:1:1: error[bad code]: boom\n");
         assert_eq!(
             out.lines().count(),
             1,
@@ -567,7 +582,7 @@ mod tests {
         for (raw, expect) in [
             ("a\tb", "a b"),
             ("a\t\tb", "a b"),
-            ("a\t b", "a  b"),
+            ("a\t b", "a b"),
             ("\ta", "a"),
             ("a\t", "a"),
             ("a\n\tb", "a b"),

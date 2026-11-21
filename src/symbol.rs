@@ -9,7 +9,7 @@
 // hashing, no pointer chasing.
 
 use arrayvec::ArrayString;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fmt;
 use std::num::NonZeroU32;
 
@@ -113,7 +113,7 @@ impl From<&str> for Symbol {
 /// the whole process anyway.
 struct Interner {
     /// Map from string content to its `Symbol` (stable index).
-    map: HashMap<String, Symbol>,
+    map: FxHashMap<&'static str, Symbol>,
     /// Arena: each interned string is stored exactly once.  Symbol id `n`
     /// indexes `arena[n - 1]` (`0` is the `Option` niche, never a symbol).
     arena: Vec<&'static str>,
@@ -122,7 +122,7 @@ struct Interner {
 impl Interner {
     fn new() -> Self {
         Interner {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             arena: Vec::new(),
         }
     }
@@ -140,9 +140,22 @@ impl Interner {
             // fail closed rather than silently aliasing the `Option` niche.
             return Symbol::INVALID;
         };
+        // `u32::MAX` is reserved for `Symbol::INVALID`, and `NonZeroU32::new`
+        // happily accepts it: without this the (4-billionth, i.e. never in
+        // practice, therefore never tested) identifier would compare equal to
+        // every error slot and resolve to `<invalid>`.  The reservation has to be
+        // structural, not just "anything past `u32::MAX`".
+        if raw.get() == u32::MAX {
+            return Symbol::INVALID;
+        }
         let sym = Symbol(raw);
-        self.map.insert(s.to_string(), sym);
-        self.arena.push(Box::leak(s.to_string().into_boxed_str()));
+        // One allocation per identifier: the map key *is* the leaked arena entry
+        // (keys are borrowed from `s` only on the miss path, which is once per
+        // distinct identifier).  Storing `s.to_string()` twice doubled both the
+        // allocations and the resident bytes.
+        let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+        self.map.insert(leaked, sym);
+        self.arena.push(leaked);
         sym
     }
 

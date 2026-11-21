@@ -140,7 +140,7 @@ pub(crate) fn wrap_optimal<'a>(
     // degradation: emit its hard-newline segments verbatim instead.  Keep the
     // debug assertion as the loud signal for fuzzed/测试 inputs.
     if text.len() > u32::MAX as usize {
-        return text.split_terminator('\n').map(Cow::Borrowed).collect();
+        return width_bounded_fallback(text, max_width);
     }
     debug_assert!(
         text.len() <= u32::MAX as usize,
@@ -241,7 +241,7 @@ pub(crate) fn wrap_optimal<'a>(
     // representable.  The fallback is the same always-valid line preserving
     // layout the DP uses on a backtrack failure.
     if text.len() >= u32::MAX as usize / N_FITNESS {
-        return text.split_terminator('\n').map(Cow::Borrowed).collect();
+        return width_bounded_fallback(text, max_width);
     }
     // The DP scratch lives in a per-thread `thread_local!` (mirroring
     // `WRAP_TABLES`): a diagnostic wraps a *dozen* labels/help/child
@@ -274,18 +274,43 @@ pub(crate) fn wrap_optimal<'a>(
     {
         return hit;
     }
+    // The layout records the byte range of every segment it emits, so the memo
+    // never re-derives offsets from `Cow` pointers: pointer subtraction was a
+    // release-mode hazard (a future `Cow::Owned` path would have produced
+    // garbage offsets guarded only by a `debug_assert`).
+    let mut memo_ranges: SmallVec<[Range<usize>; 4]> = SmallVec::new();
+    let want_ranges = memo_key.is_some();
     let result = if WRAP_IN_USE.get() {
         let mut local = WrapScratch::new();
-        wrap_optimal_with(text, max_width, tab_width, tables.as_deref(), &mut local)
+        wrap_optimal_with(
+            text,
+            max_width,
+            tab_width,
+            tables.as_deref(),
+            &mut local,
+            want_ranges.then_some(&mut memo_ranges),
+        )
     } else {
         WRAP_IN_USE.set(true);
         let _reset = WrapInUseGuard;
         WRAP_SCRATCH.with_borrow_mut(|scratch| {
-            wrap_optimal_with(text, max_width, tab_width, tables.as_deref(), scratch)
+            wrap_optimal_with(
+                text,
+                max_width,
+                tab_width,
+                tables.as_deref(),
+                scratch,
+                want_ranges.then_some(&mut memo_ranges),
+            )
         })
     };
-    if let Some(key) = memo_key {
-        wrap_memo_put(key, text, &result);
+    if let Some(key) = memo_key
+        // One range per segment, or the entry is not admissible: the nested
+        // call fallback (and any future owned-segment path) leaves the list
+        // short, and a short list must miss rather than mis-slice.
+        && memo_ranges.len() == result.len()
+    {
+        wrap_memo_put(key, text, memo_ranges);
     }
     result
 }
@@ -331,10 +356,32 @@ fn wrap_shared() -> bool {
     SHARED_WRAP.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
-type WrapMemoMap = rustc_hash::FxHashMap<
-    (u64, usize, usize),
-    Vec<(std::sync::Arc<str>, SmallVec<[Range<usize>; 4]>)>,
->;
+/// One memo key's wrapped ranges plus the stamp the eviction policy ranks by.
+struct MemoSlot {
+    /// Monotonic access stamp; the lowest is evicted.  An atomic rather than a
+    /// `Cell` because a lookup holds only a read borrow / read lock — taking a
+    /// write lock just to rank the key would put contention back on the hit path
+    /// (which is the whole point of `wrap_tables`' read fast path).
+    stamp: std::sync::atomic::AtomicU64,
+    entries: Vec<(std::sync::Arc<str>, SmallVec<[Range<usize>; 4]>)>,
+}
+
+impl Default for MemoSlot {
+    fn default() -> Self {
+        Self {
+            stamp: std::sync::atomic::AtomicU64::new(next_stamp()),
+            entries: Vec::new(),
+        }
+    }
+}
+
+/// Monotonic clock for [`MemoSlot::stamp`].
+fn next_stamp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+type WrapMemoMap = rustc_hash::FxHashMap<(u64, usize, usize), MemoSlot>;
 
 thread_local! {
     static WRAP_MEMO: std::cell::RefCell<WrapMemoMap> =
@@ -349,8 +396,15 @@ fn memo_lookup<'a>(
     key: (u64, usize, usize),
     text: &'a str,
 ) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
-    let entries = memo.get(&key)?;
-    let (_, ranges) = entries.iter().find(|(content, _)| &**content == text)?;
+    let slot = memo.get(&key)?;
+    let (_, ranges) = slot
+        .entries
+        .iter()
+        .find(|(content, _)| &**content == text)?;
+    // Real hit: record the access so `memo_insert` evicts the coldest key
+    // instead of an arbitrary hash-order one.
+    slot.stamp
+        .store(next_stamp(), std::sync::atomic::Ordering::Relaxed);
     Some(
         ranges
             .iter()
@@ -381,36 +435,33 @@ fn memo_insert(
     ranges: SmallVec<[Range<usize>; 4]>,
 ) {
     if memo.len() >= 256
-        && let Some(victim) = memo.keys().next().copied()
+        // Coldest key, not an arbitrary hash-order one: the budget is tiny
+        // (256 keys) and a batch re-wraps the same few widths/messages, so
+        // evicting by recency is what keeps the hits that matter.
+        && let Some((&victim, _)) = memo
+            .iter()
+            .min_by_key(|(_, slot)| slot.stamp.load(std::sync::atomic::Ordering::Relaxed))
     {
         memo.remove(&victim);
     }
-    let entries = memo.entry(key).or_default();
-    if !entries.iter().any(|(content, _)| &**content == text) {
-        entries.push((std::sync::Arc::from(text), ranges));
+    let slot = memo.entry(key).or_default();
+    slot.stamp
+        .store(next_stamp(), std::sync::atomic::Ordering::Relaxed);
+    if !slot.entries.iter().any(|(content, _)| &**content == text) {
+        slot.entries.push((std::sync::Arc::from(text), ranges));
     }
 }
 
-fn wrap_memo_put(key: (u64, usize, usize), text: &str, result: &[Cow<'_, str>]) {
-    let ranges: SmallVec<[Range<usize>; 4]> = result
-        .iter()
-        .map(|seg| {
-            let s = seg.as_ref();
-            // Whitespace-only paragraphs push the `""` literal, which lives in
-            // `.rodata`, not inside `text`; its pointer must not be turned into
-            // an offset into the input.  `&text[0..0]` is the same empty slice.
-            let off = if s.is_empty() {
-                0
-            } else {
-                (s.as_ptr() as usize).saturating_sub(text.as_ptr() as usize)
-            };
-            debug_assert!(
-                off + s.len() <= text.len(),
-                "wrap memo requires segments borrowed from the input text"
-            );
-            off..off + s.len()
-        })
-        .collect();
+/// Record one emitted segment's byte range when the caller asked for them.
+fn push_range(out: &mut Option<&mut SmallVec<[Range<usize>; 4]>>, r: Range<usize>) {
+    if let Some(list) = out.as_mut() {
+        list.push(r);
+    }
+}
+
+/// Insert a layout into the memo.  `ranges` comes straight from the layout, so
+/// it cannot disagree with the segments it describes.
+fn wrap_memo_put(key: (u64, usize, usize), text: &str, ranges: SmallVec<[Range<usize>; 4]>) {
     if wrap_shared() {
         let mut memo = SHARED_MEMO
             .get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashMap::default()))
@@ -431,11 +482,19 @@ fn wrap_optimal_with<'a>(
     tab_width: usize,
     tables: Option<&WrapTables>,
     scratch: &mut WrapScratch,
+    ranges_out: Option<&mut SmallVec<[Range<usize>; 4]>>,
 ) -> SmallVec<[Cow<'a, str>; 4]> {
     let mut out: SmallVec<[Cow<'a, str>; 4]> = SmallVec::new();
+    let mut ranges_out = ranges_out;
+    // Byte offset of the current paragraph.  Advanced by index arithmetic, so
+    // the ranges recorded below are correct by construction.
+    let mut cursor = 0usize;
     for para in text.split_terminator('\n') {
+        let para_start = cursor;
+        cursor = para_start + para.len() + 1;
         if para.is_empty() {
             out.push(Cow::Borrowed(""));
+            push_range(&mut ranges_out, para_start..para_start);
             continue;
         }
         // Whole paragraph's core fits `max_width` ⇒ the DP emits it as one
@@ -473,6 +532,13 @@ fn wrap_optimal_with<'a>(
         };
         if !trimmed.is_empty() && !edges_have_whitespace(trimmed) && fits_and_clean {
             out.push(Cow::Borrowed(trimmed));
+            // `trim_matches(' ')` only strips spaces, so the leading count is
+            // exact and needs no pointer arithmetic.
+            let lead = para.len() - para.trim_start_matches(' ').len();
+            push_range(
+                &mut ranges_out,
+                para_start + lead..para_start + lead + trimmed.len(),
+            );
             continue;
         }
         let mut words = std::mem::take(&mut scratch.words);
@@ -496,10 +562,20 @@ fn wrap_optimal_with<'a>(
             // A non-empty paragraph with no words is whitespace-only.
             // ASCII spaces/tabs are layout noise; non-ASCII whitespace such
             // as NBSP/U+3000 is content and must survive verbatim.
-            out.push(Cow::Borrowed(if para.is_ascii() { "" } else { para }));
+            if para.is_ascii() {
+                out.push(Cow::Borrowed(""));
+                push_range(&mut ranges_out, para_start..para_start);
+            } else {
+                out.push(Cow::Borrowed(para));
+                push_range(&mut ranges_out, para_start..para_start + para.len());
+            }
             continue;
         }
         for range in wrap_dp(&words, max_width, tables, None, scratch) {
+            push_range(
+                &mut ranges_out,
+                para_start + range.start..para_start + range.end,
+            );
             out.push(Cow::Borrowed(&para[range]));
         }
         scratch.words = words;
@@ -1112,6 +1188,46 @@ fn push_words_ascii(
 /// offset `offset`, byte length `len`) straight into `words`.  A grapheme
 /// boundary is every byte, so the grapheme walk of [`push_split_oversized`]
 /// reduces to fixed-width byte slicing.
+/// Last-resort layout for input too large for the `u32` word offsets.
+///
+/// The old fallback returned each hard-newline segment verbatim, which broke the
+/// documented "at most `max_width` display columns per line" contract for a
+/// paragraph between ~1 GiB and 4 GiB.  This chunks at `max_width` *bytes*: a
+/// chunk of at most `max_width` bytes cannot exceed `max_width` columns (a char
+/// is at least one byte and never wider than its byte count), the cut points are
+/// char boundaries by construction, and a single cluster wider than the limit is
+/// still emitted whole because the contract is unsatisfiable there and forward
+/// progress wins.
+fn width_bounded_fallback<'a>(text: &'a str, max_width: usize) -> SmallVec<[Cow<'a, str>; 4]> {
+    let limit = max_width.max(1);
+    let mut out: SmallVec<[Cow<'a, str>; 4]> = SmallVec::new();
+    for seg in text.split_terminator('\n') {
+        if seg.len() <= limit {
+            out.push(Cow::Borrowed(seg));
+            continue;
+        }
+        let mut start = 0usize;
+        while start < seg.len() {
+            let mut end = (start + limit).min(seg.len());
+            while end > start && !seg.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == start {
+                end = start + 1;
+                while !seg.is_char_boundary(end) {
+                    end += 1;
+                }
+            }
+            out.push(Cow::Borrowed(&seg[start..end]));
+            start = end;
+        }
+    }
+    if out.is_empty() {
+        out.push(Cow::Borrowed(""));
+    }
+    out
+}
+
 fn push_split_oversized_ascii(
     words: &mut SmallVec<[Word; 16]>,
     offset: usize,
@@ -1385,8 +1501,23 @@ fn wrap_tables(max_width: usize) -> Option<std::sync::Arc<WrapTables>> {
         return None;
     }
     if wrap_shared() {
-        let mut slot = SHARED_TABLES
-            .get_or_init(|| std::sync::RwLock::new(SmallVec::new()))
+        let tables = SHARED_TABLES.get_or_init(|| std::sync::RwLock::new(SmallVec::new()));
+        // Read-lock fast path.  A hit is the overwhelmingly common case (one
+        // render touches ~6 distinct widths, so nearly every call hits), and a
+        // hit needs no reordering — yet the write guard used to serialize *every*
+        // wrapped message of a parallel batch (`~a dozen per diagnostic`) just to
+        // rotate the LRU.  Eviction therefore degrades from LRU to FIFO across the
+        // eight shared slots; no test pins eviction order, and FIFO is immaterial
+        // at six live widths.
+        if let Some(hit) = tables
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|t| t.max_width == max_width)
+        {
+            return Some(std::sync::Arc::clone(hit));
+        }
+        let mut slot = tables
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Some(table_from_slot(&mut slot, max_width))

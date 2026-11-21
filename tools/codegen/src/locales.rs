@@ -462,7 +462,14 @@ pub fn generate_fluent_functions(dir: &Path) -> String {
         rs.push_str("] = [const { [const { std::sync::OnceLock::new() }; 3] }; ");
         rs.push_str(&zero_arg.len().to_string());
         rs.push_str("];\n\n");
-        rs.push_str("pub(crate) fn zero_arg_slug(slug: &str) -> Option<Cow<'static, str>> {\n");
+        // Language-explicit accessor: the caller names the language slot, so a
+        // label cache can be filled *for* the slot it is being stored in rather
+        // than re-resolving the global `Lang` inside the init closure (which let
+        // a `Lang::set` race write one language's strings into another language's
+        // slot, permanently, in release).
+        rs.push_str(
+            "pub(crate) fn zero_arg_slug_at(slug: &str, lang_idx: usize) -> Option<&'static str> {\n",
+        );
         rs.push_str("    let idx = match slug {\n");
         for (i, s) in zero_arg.iter().enumerate() {
             let _ = std::fmt::Write::write_fmt(&mut rs, format_args!("        {s:?} => {i},\n"));
@@ -470,19 +477,23 @@ pub fn generate_fluent_functions(dir: &Path) -> String {
         rs.push_str("        _ => return None,\n");
         rs.push_str("    };\n");
         rs.push_str(
-            // #4: `Lang::index()` is zero-based; the old `as usize - 1`
-            // underflowed if `En` ever took the default discriminant 0.
-            // #10: per-(slug, lang) `OnceLock` instead of eagerly translating
-            // all three languages on the first access to any one of them.
-            "    let li = super::Lang::current().index();\n\
-             \x20   Some(Cow::Borrowed(\n\
+            // The table has one column per language; clamping keeps an
+            // out-of-range index from becoming a slice panic (the caller asserts
+            // the range in debug).
+            "    debug_assert!(lang_idx < 3, \"language index out of range\");\n\
+             \x20   let li = lang_idx.min(2);\n\
+             \x20   Some(\n\
              \x20       ZERO_ARG_TABLE[idx][li]\n\
              \x20           .get_or_init(|| match super::format_slug(super::lang_id_at(li), slug, None) {\n\
              \x20               Some(s) => s,\n\
              \x20               None => slug.to_string(),\n\
              \x20           })\n\
              \x20           .as_str(),\n\
-             \x20   ))\n\
+             \x20   )\n\
+             }\n\n\
+             /// Current-language convenience wrapper over [`zero_arg_slug_at`].\n\
+             pub(crate) fn zero_arg_slug(slug: &str) -> Option<Cow<'static, str>> {\n\
+             \x20   zero_arg_slug_at(slug, super::Lang::current().index()).map(Cow::Borrowed)\n\
              }\n\n",
         );
     }

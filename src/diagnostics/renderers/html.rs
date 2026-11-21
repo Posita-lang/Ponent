@@ -2,7 +2,7 @@
 
 use crate::ast::FileId;
 use crate::ast::Span;
-use crate::diagnostics::emitter::stylesheet::dark_css_min_cached;
+use crate::diagnostics::emitter::stylesheet::dark_css;
 
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::DiagnosticLevel;
@@ -107,7 +107,7 @@ impl Renderer for HtmlRenderer {
         let template = "<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='utf-8'>\n\
              <title>__PONENT_TITLE__</title>\n\
              <style>\n";
-        let dark = dark_css_min_cached();
+        let dark = dark_css();
         let rest = "\n\
              body { font-family: 'DejaVu Sans Mono', monospace; background: var(--bg); color: var(--fg); padding: 20px; }\n\
              #theme-toggle { position: fixed; top: 12px; right: 12px; z-index: 100; }\n\

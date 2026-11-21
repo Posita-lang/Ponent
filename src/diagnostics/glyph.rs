@@ -231,13 +231,11 @@ impl Styles {
 
 // ── GlyphRenderer ───────────────────────────────────────────────
 
-/// What a source section actually drew (1.2). `drew_rows` means the section
-/// emitted anything; `drew_primary` means the primary span's start line was
-/// inside the drawn window — the only case in which the location is visible
-/// and the caller may suppress its fallback note.
+/// What a source section actually drew (1.2). `drew_primary` means the primary
+/// span's start line was inside the drawn window — the only case in which the
+/// location is visible and the caller may suppress its fallback note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SectionOutcome {
-    drew_rows: bool,
     drew_primary: bool,
 }
 
@@ -531,7 +529,12 @@ impl GlyphRenderer {
     /// case allocation-free.)
     fn wrap_msg<'a>(&self, msg: &'a str, prefix_cols: usize) -> SmallVec<[Cow<'a, str>; 4]> {
         if self.no_wrap {
-            return msg.split('\n').map(Cow::Borrowed).collect();
+            // `split_terminator`, not `split`: `wrap_optimal` treats a trailing
+            // newline as a terminator, so `"a\n"` is one line either way.
+            // With `split` the no-wrap path emitted a phantom blank gutter row,
+            // i.e. toggling `--no-wrap` changed the line *structure*, not just
+            // the wrapping.
+            return msg.split_terminator('\n').map(Cow::Borrowed).collect();
         }
         // `max(1)` only guarantees forward progress for absurdly deep
         // indents.  Narrow *configurations* are clamped at construction
@@ -931,12 +934,16 @@ impl GlyphRenderer {
                     anchor_sanitized.as_ref(),
                     diag.level,
                     folded_lines,
+                    // Only the first section repeats the file name...
                     i == 0,
+                    // ...but every anchor section's `:line:col` stays a link.
+                    true,
                     &mut label_rendered,
                     line_num_width,
                     &diag.suggestions,
                     &anchor_suggestion_lines,
                     &mut suggestion_rendered,
+                    cx,
                 );
                 // An empty anchor source returns before drawing the
                 // `file:line:col` header.  Keep the primary location visible
@@ -1085,11 +1092,13 @@ impl GlyphRenderer {
                             diag.level,
                             None,
                             true,
+                            true,
                             &mut label_rendered,
                             f_line_num_width,
                             &diag.suggestions,
                             &suggestion_lines_buf,
                             &mut suggestion_rendered,
+                            cx,
                         );
                         for i in set_indices {
                             suggestion_lines_buf[i] = None;
@@ -1147,8 +1156,20 @@ impl GlyphRenderer {
                 // gutter, wrapping, note color, and continuation padding.
                 let suffix = match pos {
                     Some(pos) => {
-                        let display_col =
-                            byte_offset_to_display(idx.line(pos.line), pos.col, self.tab_width);
+                        // Same batch-scoped table as the header: a diagnostic with
+                        // N labelled notes would otherwise walk the line prefix N
+                        // times.
+                        let display_col = match cx {
+                            Some(ctx) => ctx.display_col_in_line(
+                                idx.line(pos.line),
+                                pos.line,
+                                pos.col,
+                                self.tab_width,
+                            ),
+                            None => {
+                                byte_offset_to_display(idx.line(pos.line), pos.col, self.tab_width)
+                            }
+                        };
                         format!("{}:{}", pos.line + 1, display_col + 1)
                     }
                     None => lbl.span.to_string(),
@@ -1665,6 +1686,12 @@ impl GlyphRenderer {
         // When `false` (subsequent section of a multi-span diagnostic), the
         // location header omits the filename and shows just `:line:col`.
         show_filename: bool,
+        // Whether the location header carries the OSC 8 hyperlink.  Always
+        // `true` for a section of the anchor file, including the later
+        // sections of a multi-span diagnostic: only the *duplicated* file
+        // name is suppressed there, the `:line:col` text is still a clickable
+        // jump target.
+        allow_hyperlink: bool,
         // Per-label "already emitted inline" flags shared across the render's
         // sections (indexed like `merged_labels`); see `render_diagnostic`
         // for why a line-range test is not enough.
@@ -1684,20 +1711,20 @@ impl GlyphRenderer {
         // lookup per section per suggestion.
         suggestion_lines: &[Option<(usize, usize)>],
         suggestion_rendered: &mut [bool],
+        // Batch-scoped ctx, used for the one column conversion that used to cost a
+        // full grapheme walk per diagnostic (the location header).  `None` on the
+        // paths that render without a ctx, which fall back to the direct walk.
+        render_ctx: Option<&RenderCtx<'_>>,
     ) -> SectionOutcome {
         // Empty source has no rows to draw. `text_line_count()` reports 1
         // for `""` (str::lines-style), so guard on the source itself rather
         // than materializing every line just to test for emptiness.
-        // Returns whether anything was rendered: the caller must not mark
-        // the file as "already shown" when nothing was drawn, or the
-        // fallback loops would silently drop that file's annotations.
         // `drew_primary` distinguishes "drew context rows" from "drew the
         // primary span the caller asked about": a foreign primary past EOF
-        // draws only context, and registering the file on `drew_rows` would
-        // silently swallow that span.
+        // draws only context, and treating that as shown would silently
+        // swallow the span.
         if source.is_empty() {
             return SectionOutcome {
-                drew_rows: false,
                 drew_primary: false,
             };
         }
@@ -1810,7 +1837,7 @@ impl GlyphRenderer {
         // per batch in `RenderCtx`), so control characters in a filename
         // cannot terminate the sequence early or inject further terminal
         // escapes.
-        let hyperlink = matches!(file_url, Some(_) if show_filename);
+        let hyperlink = matches!(file_url, Some(_) if allow_hyperlink);
         if hyperlink && let Some(url) = file_url {
             out.push_str("\x1b]8;;");
             out.push_str(url);
@@ -1820,8 +1847,18 @@ impl GlyphRenderer {
             out.push_str(filename_display);
             out.push(':');
         }
-        let header_display_col =
-            byte_offset_to_display(idx.line(start_pos.line), start_pos.col, self.tab_width);
+        let header_display_col = match render_ctx {
+            // One table per `(line, tab width)` per batch instead of a fresh
+            // grapheme walk per diagnostic (measured at ~55 ms per call on a
+            // 200 KB line, against ~0.4 ms for a whole diagnostic's render).
+            Some(cx) => cx.display_col_in_line(
+                idx.line(start_pos.line),
+                start_pos.line,
+                start_pos.col,
+                self.tab_width,
+            ),
+            None => byte_offset_to_display(idx.line(start_pos.line), start_pos.col, self.tab_width),
+        };
         push_uint(out, start_pos.line as u64 + 1);
         out.push(':');
         push_uint(out, header_display_col as u64 + 1);
@@ -1858,6 +1895,11 @@ impl GlyphRenderer {
         let label_start_cols = &mut scratch.label_start_cols;
         label_start_cols.clear();
         label_start_cols.resize(all_labels.len(), None);
+        // A label's start column is resolved once, but several labels can start
+        // on the *same* line (a wide table row, a one-line file with many
+        // diagnostics): one `LineColumns` table per line replaces a full
+        // grapheme walk per label.
+        let mut line_cols = LineColumnsCache::default();
 
         // Display-column-aware source line rendering loop.  The `String`
         // scratch buffers are `mem::take`-n into owned locals so format macros
@@ -1939,8 +1981,23 @@ impl GlyphRenderer {
             // such a row.  `suggestion_covered_row_renders_like_a_plain_row`
             // pins the equivalence, and the per-row table plus its O(S·rows)
             // fill are gone.
+            // Fold this row into the label window *before* choosing the
+            // render path.  Advancing is idempotent in `line_idx`, so the
+            // annotated path's own `advance` (inside
+            // `compute_line_annotation_ranges`) stays a no-op — but hoisting
+            // the call means no row can ever be rendered against a stale
+            // window, and the old `is_idle_for` guard (which only existed to
+            // prove the skipped advance was a no-op on context rows) is gone.
+            // `is_idle_for` is load-bearing for the *branch*, not only for the
+            // `advance`: a row outside the span that nevertheless carries a
+            // starting/active label must take the annotated path, or its
+            // labels and markers are dropped entirely (that regression showed up
+            // as "one caret row for two spans" and a missing inline marker).
             let context_only = (line_idx < start_pos.line || line_idx > primary_end_line)
                 && label_window.is_idle_for(line_idx);
+            if !context_only {
+                label_window.advance(line_idx);
+            }
             // One grapheme walk converts this row's byte ranges to display
             // columns, measures the line's width, and emits the highlighted
             // source text — replacing the three separate passes over the
@@ -2094,7 +2151,12 @@ impl GlyphRenderer {
                     let col = match label_start_cols[i] {
                         Some(c) => c,
                         None => {
-                            let c = byte_offset_to_display(start_line, start_off, self.tab_width);
+                            let c = line_cols.display(
+                                start_line_idx,
+                                start_line,
+                                self.tab_width,
+                                start_off,
+                            );
                             label_start_cols[i] = Some(c);
                             c
                         }
@@ -2424,6 +2486,14 @@ impl GlyphRenderer {
                 continue;
             }
             let old_line = idx.line(sug_first);
+            // `starts` has one entry per line; `sug_first` comes from the
+            // same index, so the lookup must be in range (a mismatch would
+            // panic below).
+            debug_assert!(
+                sug_first < starts.len(),
+                "suggestion line {sug_first} out of start-table range ({})",
+                starts.len()
+            );
             let line_start = starts[sug_first] as usize;
             let span_start_in_line = span
                 .start_as_usize()
@@ -2648,7 +2718,6 @@ impl GlyphRenderer {
         scratch.hl_buf = hl_buf;
         scratch.meta_buf = meta_buf;
         SectionOutcome {
-            drew_rows: true,
             // The primary is visible only when its start line is inside the
             // drawn window; an EOF primary with only context rows must not
             // suppress the fallback location note.
@@ -2836,6 +2905,12 @@ impl GlyphRenderer {
                 // `prefix_cols` (where the first line's message started).
                 // `push_spaces` writes straight into `out` — a one-line child
                 // never wraps, and a wrapped child allocates no throwaway pad.
+                //
+                // Deliberately *unstyled*, matching this arm's first line: only
+                // the `= <prefix>` part is coloured above, so the message body is
+                // the terminal's default colour on both lines.  (The note/help
+                // writers do colour their body, which is why their continuations
+                // carry the SGR run and this one must not.)
                 out.push_str(self.s.dim);
                 out.push_str(self.bc.v);
                 out.push_str(self.s.reset);
@@ -2903,17 +2978,26 @@ impl GlyphRenderer {
                 out.push_str(self.s.reset);
             } else {
                 // Built only on the wrap path — a one-line note never wraps.
+                // The continuation repeats the first line's SGR run: without it a
+                // wrapped note rendered coloured on line 1 and default-coloured
+                // from line 2 on (`wrap_msg`'s contract is a full open/reset pair
+                // per segment).
                 out.push_str(self.s.dim);
                 out.push_str(self.bc.v);
                 out.push_str(self.s.reset);
                 push_spaces(out, prefix_cols - 1);
+                out.push_str(self.s.note);
                 out.push_str(seg.as_ref());
+                out.push_str(self.s.reset);
             }
             if i == last
                 && let Some(suffix) = suffix
             {
+                // Inside the coloured run: the locator belongs to the note.
+                out.push_str(self.s.note);
                 out.push_str(" at ");
                 out.push_str(suffix);
+                out.push_str(self.s.reset);
             }
             out.push('\n');
         }
@@ -2941,11 +3025,14 @@ impl GlyphRenderer {
                 out.push('\n');
             } else {
                 // Built only on the wrap path — a one-line help never wraps.
+                // Same per-segment SGR contract as line 1 (see `wrap_msg`).
                 out.push_str(self.s.dim);
                 out.push_str(self.bc.v);
                 out.push_str(self.s.reset);
                 push_spaces(out, prefix_cols - 1);
+                out.push_str(self.s.help);
                 out.push_str(seg.as_ref());
+                out.push_str(self.s.reset);
                 out.push('\n');
             }
         }
@@ -3090,9 +3177,19 @@ impl<'a> LabelWindow<'a> {
             order.sort_by_key(|&i| label_lines[i].0);
         } else {
             let prefix_len = sorted_prefix.len();
-            if prefix_len >= n {
-                order.extend_from_slice(sorted_prefix);
+            debug_assert!(
+                prefix_len <= n,
+                "pre-sorted prefix ({prefix_len}) exceeds the label count ({n})"
+            );
+            if prefix_len > n {
+                // Unreachable in a correct caller (asserted above): copy the
+                // usable part through instead of indexing `label_lines` out of
+                // range, which is what the merge path would do.
+                order.extend_from_slice(&sorted_prefix[..n]);
             } else {
+                // `prefix_len == n` (every label pre-sorted) routes through
+                // here too: `extras` is then empty and the merge degenerates
+                // to the same copy, so the two cases cannot drift apart.
                 let mut extras: SmallVec<[usize; 16]> = (prefix_len..n).collect();
                 extras.sort_by_key(|&i| label_lines[i].0);
                 let mut a = 0usize;
@@ -3126,6 +3223,19 @@ impl<'a> LabelWindow<'a> {
 
     /// Fold `line_idx` into the window. Rows must be visited in ascending
     /// order (the renderers iterate `first_line..=last_line`).
+    /// `true` when no label can touch this row: nothing is active and the next
+    /// label starts *after* it.  Used to keep such a row out of the annotated
+    /// path (skipping `advance` alone is not enough — the branch also decides
+    /// whether connectors/markers are drawn).
+    fn is_idle_for(&self, line: usize) -> bool {
+        self.scratch.active.is_empty()
+            && self
+                .scratch
+                .order
+                .get(self.cursor)
+                .is_none_or(|&i| self.label_lines[i].0 > line)
+    }
+
     pub(crate) fn advance(&mut self, line_idx: usize) {
         let lines = self.label_lines;
         let scratch = &mut self.scratch;
@@ -3269,18 +3379,6 @@ impl<'a> LabelWindow<'a> {
     pub(crate) fn active(&self) -> &[usize] {
         &self.scratch.active
     }
-
-    /// True when no label is active and the next label starts after
-    /// `line_idx`; advancing the window would be a no-op.
-    pub(crate) fn is_idle_for(&self, line_idx: usize) -> bool {
-        if !self.scratch.active.is_empty() {
-            return false;
-        }
-        self.scratch
-            .order
-            .get(self.cursor)
-            .is_none_or(|&i| self.label_lines[i].0 > line_idx)
-    }
 }
 
 // ── Helper: compute underlines for a single line ───────────────
@@ -3349,10 +3447,21 @@ pub(crate) fn compute_line_annotation_ranges<'a, 'src>(
 
     // The synthetic primary's message is empty (`""`), matching the old
     // `Label { message: String::new(), kind: Primary, .. }` placeholder.
-    let primary_ann = (primary, AnnotationKind::Primary.underline_char(), None);
-    let label_anns = window.active().iter().map(|&i| {
+    let primary_ann = (
+        primary,
+        AnnotationKind::Primary
+            .underline_char()
+            .expect("the primary annotation always underlines"),
+        None,
+    );
+    // `Help` has no underline glyph (`underline_char` is `None`) — it renders as
+    // a note line — so it must contribute no underline range at all.  Filtering
+    // *here* keeps `ranges_buf` and `meta_buf` aligned: the two pushes below are
+    // parallel, so a skipped range has to skip its glyph too.  Before `Option`
+    // this path pushed a run of spaces, i.e. invisible corruption.
+    let label_anns = window.active().iter().filter_map(|&i| {
         let l = labels[i];
-        (l.span, l.underline_char(), Some(i))
+        l.underline_char().map(|c| (l.span, c, Some(i)))
     });
     for (span, underline_char, label_idx) in std::iter::once(primary_ann).chain(label_anns) {
         let span_start = span.start_as_usize();
@@ -3531,26 +3640,25 @@ fn line_needs_sanitize(line: &str) -> bool {
 /// Emit bytes `[a, b)` of a printable-ASCII+tab line, splitting at tabs:
 /// non-tab runs go through `emit` verbatim, each tab expands to `push_spaces`
 /// with its precomputed stop width.  Part of `render_line_merged_with`'s
-/// tab-aware fast path; `tab_pos`/`tab_w` come from the caller's one-pass tab
-/// scan (sorted, parallel arrays).
+/// tab-aware fast path; `tabs` (`(byte offset, stop width)` pairs) comes from
+/// the caller's one-pass tab scan and is sorted by offset.
 fn emit_tab_run<F: FnMut(&mut String, &str)>(
     rendered: &mut String,
     line: &str,
     a: usize,
     b: usize,
-    tab_pos: &[usize],
-    tab_w: &[usize],
+    tabs: &[(usize, usize)],
     emit: &mut F,
 ) {
     let mut a = a;
     loop {
-        let k = tab_pos.partition_point(|&t| t < a);
-        if k < tab_pos.len() && tab_pos[k] < b {
-            let t = tab_pos[k];
+        let k = tabs.partition_point(|&(t, _)| t < a);
+        if k < tabs.len() && tabs[k].0 < b {
+            let (t, w) = tabs[k];
             if t > a {
                 emit(rendered, &line[a..t]);
             }
-            push_spaces(rendered, tab_w[k]);
+            push_spaces(rendered, w);
             a = t + 1;
         } else {
             if b > a {
@@ -3719,21 +3827,30 @@ pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
         // the tab), exactly as `grapheme_width_cached` does for the walk.
         // Guard the clamp here too so `% tab_width` cannot divide by zero.
         let tab_width = tab_width.max(1);
-        let mut tab_pos: SmallVec<[usize; 8]> = SmallVec::new();
-        let mut tab_w: SmallVec<[usize; 8]> = SmallVec::new();
-        let mut tab_extra: SmallVec<[usize; 8]> = SmallVec::new(); // extra *after* each tab
+        // Per-row tab scan.  Its two scratch arrays live in the caller's
+        // reused buffers instead of fresh per-row `SmallVec`s: `display_buf`
+        // holds `(byte offset, stop width)` and `order_buf` the cumulative
+        // extra width after each tab.  Neither is touched anywhere else on
+        // this byte-level path (both belong to the grapheme walk below), so a
+        // row with more than eight tabs no longer heap-allocates per row.
+        let tabs: &mut Vec<(usize, usize)> = &mut *display_buf;
+        let tab_extra: &mut Vec<usize> = &mut *order_buf;
+        tabs.clear();
+        tab_extra.clear();
         let mut extra = 0usize; // extra_before of the tab being scanned
         for i in memchr::memchr_iter(b'\t', line.as_bytes()) {
             let w = tab_width - (content_start_col + i + extra) % tab_width;
             extra += w - 1;
-            tab_pos.push(i);
-            tab_w.push(w);
-            tab_extra.push(extra);
+            tabs.push((i, w));
+            tab_extra.push(extra); // extra *after* this tab
         }
+        // Read-only views for the walks below.
+        let tabs: &[(usize, usize)] = &tabs[..];
+        let tab_extra: &[usize] = &tab_extra[..];
         // Display column of byte offset `b` (≤ len): byte index plus the
         // cumulative expansion of every tab strictly before `b`.
         let disp = |b: usize| -> usize {
-            let k = tab_pos.partition_point(|&t| t < b);
+            let k = tabs.partition_point(|&(t, _)| t < b);
             b + if k > 0 { tab_extra[k - 1] } else { 0 }
         };
 
@@ -3758,7 +3875,7 @@ pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
         // skip the empty interval walk entirely (the common shape for
         // "previous definition here" rows in tab-indented source).
         if primary_ranges.is_empty() {
-            emit_tab_run(rendered, line, 0, len, &tab_pos, &tab_w, &mut emit);
+            emit_tab_run(rendered, line, 0, len, tabs, &mut emit);
             return disp(len);
         }
         let mut in_primary = false;
@@ -3774,14 +3891,14 @@ pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
                     rendered.push_str(highlight_off);
                     in_primary = false;
                 }
-                emit_tab_run(rendered, line, cursor, ps, &tab_pos, &tab_w, &mut emit);
+                emit_tab_run(rendered, line, cursor, ps, tabs, &mut emit);
             }
             if ps < pe {
                 if !in_primary {
                     rendered.push_str(highlight_on);
                     in_primary = true;
                 }
-                emit_tab_run(rendered, line, ps, pe, &tab_pos, &tab_w, &mut emit);
+                emit_tab_run(rendered, line, ps, pe, tabs, &mut emit);
             }
             cursor = pe;
         }
@@ -3790,7 +3907,7 @@ pub(crate) fn render_line_merged_with<F: FnMut(&mut String, &str)>(
                 rendered.push_str(highlight_off);
                 in_primary = false;
             }
-            emit_tab_run(rendered, line, cursor, len, &tab_pos, &tab_w, &mut emit);
+            emit_tab_run(rendered, line, cursor, len, tabs, &mut emit);
         }
         if in_primary {
             rendered.push_str(highlight_off);
@@ -4297,6 +4414,142 @@ pub(crate) fn compute_primary_cols(
     }
 }
 
+/// One state of [`exact_component_assign`]'s sweep.
+struct SweepState {
+    /// Lane of every currently active interval, sorted by interval index — the
+    /// part of the assignment that constrains future colour choices.
+    key: SmallVec<[(usize, usize); 4]>,
+    /// Minimum `Σ w·lane` accumulated by any assignment that reaches this key.
+    cost: usize,
+    /// Full lane-per-interval assignment that attained `cost`, returned to the
+    /// caller so the row's lanes can be rebuilt.
+    assign: SmallVec<[usize; 8]>,
+}
+
+/// Merge `(key, cost, assign)` into `states`, keeping the cheapest assignment per
+/// key (ties keep the incumbent, so the sweep stays deterministic).
+fn merge_sweep_state(
+    states: &mut SmallVec<[SweepState; 8]>,
+    key: SmallVec<[(usize, usize); 4]>,
+    cost: usize,
+    assign: SmallVec<[usize; 8]>,
+) {
+    if let Some(slot) = states.iter_mut().find(|s| s.key == key) {
+        if cost < slot.cost {
+            slot.cost = cost;
+            slot.assign = assign;
+        }
+        return;
+    }
+    states.push(SweepState { key, cost, assign });
+}
+
+/// Exact IGMRC optimum for one connected component with `χ ≤ 3`, via the sweep
+/// DP of `research/underline-lanes/no-distributive-lattice.md` §9.
+///
+/// `ivs` holds the component's `(start, end, weight)`; `lanes` the lane indices it
+/// occupies (its greedy `χ`).  Returns the lane of every interval under a
+/// minimum-`Σ w·lane` **proper** colouring, or `None` when the tier does not
+/// apply (`χ > 3`, a degenerate interval, or no colouring found).
+///
+/// Why the state is sufficient: the active set at any coordinate is a clique
+/// (Helly for intervals), so the lanes already taken by active intervals are
+/// exactly the colours a starting interval may not reuse.  Merging equal active
+/// assignments keeps the state count at `≤ χ! = 6`, giving `O(n · χ! · χ)`.
+///
+/// Ends are processed before starts at the same coordinate because lanes are
+/// half-open `[start, end)`: annotations that merely touch may share a lane.
+fn exact_component_assign(
+    ivs: &[(usize, usize, usize)],
+    lanes: &[usize],
+) -> Option<SmallVec<[usize; 8]>> {
+    const UNASSIGNED: usize = usize::MAX;
+    if lanes.len() > 3 || lanes.is_empty() || ivs.is_empty() {
+        return None;
+    }
+    if ivs.iter().any(|&(s, e, _)| s >= e) {
+        // Zero-width annotations are promoted to one-cell markers upstream; a
+        // degenerate span here means the caller's geometry is not what this tier
+        // assumes, so let the relabelling path handle it.
+        return None;
+    }
+    // (coordinate, kind, index) with kind 0 = end, 1 = start.
+    let mut events: SmallVec<[(usize, u8, usize); 16]> = SmallVec::new();
+    for (i, &(start, end, _)) in ivs.iter().enumerate() {
+        events.push((end, 0, i));
+        events.push((start, 1, i));
+    }
+    events.sort_unstable_by_key(|&(coord, kind, i)| (coord, kind, i));
+
+    let mut assign: SmallVec<[usize; 8]> = SmallVec::new();
+    assign.resize(ivs.len(), UNASSIGNED);
+    let mut states: SmallVec<[SweepState; 8]> = SmallVec::new();
+    states.push(SweepState {
+        key: SmallVec::new(),
+        cost: 0,
+        assign,
+    });
+
+    for &(_, kind, i) in events.iter() {
+        let mut next: SmallVec<[SweepState; 8]> = SmallVec::new();
+        for state in states.iter() {
+            if kind == 1 {
+                let w = ivs[i].2;
+                for &lane in lanes {
+                    if state.key.iter().any(|&(_, taken)| taken == lane) {
+                        continue;
+                    }
+                    let mut key = state.key.clone();
+                    key.push((i, lane));
+                    key.sort_unstable_by_key(|&(idx, _)| idx);
+                    let mut next_assign = state.assign.clone();
+                    next_assign[i] = lane;
+                    merge_sweep_state(&mut next, key, state.cost + w * lane, next_assign);
+                }
+            } else {
+                let mut key = state.key.clone();
+                key.retain(|entry| entry.0 != i);
+                merge_sweep_state(&mut next, key, state.cost, state.assign.clone());
+            }
+        }
+        states = next;
+    }
+    let best = states.into_iter().min_by_key(|s| s.cost)?;
+    if best.assign.iter().any(|&lane| lane == UNASSIGNED) {
+        return None;
+    }
+    Some(best.assign)
+}
+
+/// Advance `p` to the next lexicographic permutation, returning `false` when
+/// it already is the last one (descending).  Drives the exhaustive
+/// per-component relabel search in [`UnderlineLanes::assign`], where `p` is at
+/// most five entries long (120 candidates).
+fn next_permutation(p: &mut [usize]) -> bool {
+    if p.len() < 2 {
+        return false;
+    }
+    // Rightmost position whose successor is larger: the suffix after it is
+    // descending (the last arrangement of that tail).
+    let mut i = p.len() - 1;
+    while i > 0 && p[i - 1] >= p[i] {
+        i -= 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    let pivot = i - 1;
+    // Smallest entry in the descending tail that still exceeds the pivot.
+    let mut j = p.len() - 1;
+    while p[j] <= p[pivot] {
+        j -= 1;
+    }
+    p.swap(pivot, j);
+    // The tail was descending, so reversing it yields the next arrangement.
+    p[i..].reverse();
+    true
+}
+
 /// Non-overlapping underline lanes for one source row.
 ///
 /// Built by [`assign`](Self::assign), which colours the row's annotations
@@ -4319,10 +4572,25 @@ pub(crate) struct UnderlineLanes {
     /// Linear active set for rows with ≤4 underlines; a heap's sift cost
     /// dominates at that size.
     small_active: SmallVec<[(usize, usize); 4]>,
-    /// Reused weight-sort scratch for `assign`.
+    /// Reused `(weight, position)` sort scratch for the component relabel.
     weights: SmallVec<[(usize, usize); 8]>,
     /// Start-sorted index scratch.
     order: Vec<usize>,
+    /// `(start, end, underline index, lane)` for every entry on the used
+    /// lanes, sorted by `(start, end, index)`: the relabel's component
+    /// decomposition sweeps exactly this list.
+    entries: SmallVec<[(usize, usize, usize, usize); 8]>,
+    /// Target lane per `entries` position, written by the component relabel
+    /// and consumed by the rebuild that follows it.
+    target: SmallVec<[usize; 8]>,
+    /// `(lane, component weight)` for the component currently being relabelled.
+    comp_weights: SmallVec<[(usize, usize); 8]>,
+    /// Ascending lane indices the current component occupies — the set of
+    /// indices any permutation of that component must fill.
+    comp_lanes: SmallVec<[usize; 8]>,
+    /// Permutation scratch: `perm[p]` is the rank in `comp_lanes` given to
+    /// `comp_weights[p]`.
+    perm: SmallVec<[usize; 8]>,
     /// Lanes used by the last `assign`.
     count: usize,
 }
@@ -4335,6 +4603,11 @@ impl UnderlineLanes {
             small_active: SmallVec::new(),
             weights: SmallVec::new(),
             order: Vec::new(),
+            entries: SmallVec::new(),
+            target: SmallVec::new(),
+            comp_weights: SmallVec::new(),
+            comp_lanes: SmallVec::new(),
+            perm: SmallVec::new(),
             count: 0,
         }
     }
@@ -4353,11 +4626,21 @@ impl UnderlineLanes {
             small_active,
             weights,
             order,
+            entries,
+            target,
+            comp_weights,
+            comp_lanes,
+            perm,
             count,
         } = self;
         active.clear();
         small_active.clear();
         weights.clear();
+        entries.clear();
+        target.clear();
+        comp_weights.clear();
+        comp_lanes.clear();
+        perm.clear();
         for lane in lanes.iter_mut() {
             lane.clear();
         }
@@ -4495,53 +4778,177 @@ impl UnderlineLanes {
         // χ), and the clique LP is not value-exact, so no LP/flow engine
         // replaces the DP here. That machinery is not worth it for the
         // n ≤ ~50, χ ≤ ~5 rows. Below we only relabel the greedy's
-        // single colouring — the rearrangement-inequality optimum on
-        // that subgraph, which is a heuristic, not an exact optimum:
+        // single colouring, component by component — exact over that
+        // colouring's own lane permutations, but still a heuristic over
+        // colourings, not an exact optimum:
         // e.g. [(0,2),(0,2),(3,5)] with w = (1,2,1) keeps cost 6 against
         // an optimum of 5 (research/igmrc/README.md, §2 of the
         // underline-lanes note).
-        // ── Relabel lanes by descending visual weight ─────────────────
-        // The greedy numbers lanes in opening order, which has nothing to
-        // do with the visual weight each lane carries.  Under the
+        // ── Relabel lanes per overlap component ──────────────────────
+        // The greedy numbers lanes in opening order, which has nothing to do
+        // with the visual weight each lane carries.  Under the
         // weighted-depth-sum objective — minimise Σ width(u) · lane(u) — a
         // heavier lane should get a smaller row index (closer to the source
-        // line).  Sorting the lanes by descending total weight is the
-        // rearrangement-inequality optimum for the fixed interval→lane
-        // assignment the greedy produced: it never changes the lane count
-        // (the set of intervals sharing a row is untouched) and strictly
-        // reduces the weighted depth sum whenever a later-opened lane ends
-        // up heavier than an earlier one.
+        // line).
+        //
+        // The row's intervals decompose into the connected components of
+        // their overlap graph, found by one sweep over the start-sorted
+        // entries: a component runs on while the next start does not exceed
+        // the running maximum end.  Distinct components are pairwise disjoint
+        // in columns, so permuting the lane indices a single component
+        // occupies keeps the colouring proper (each lane's new content is a
+        // union of mutually disjoint pieces), and the objective is separable
+        // over components — so each component can be relabelled on its own.
+        // Every global lane permutation is representable per component, so
+        // this strictly dominates the previous global sort: two disjoint
+        // overlapping pairs with per-component weights (10, 1) and (1, 10)
+        // share lanes 0/1, cost 11 under the greedy numbering and 11 under a
+        // global sort (the global lane weights tie, so it changes nothing),
+        // but 2 once each pair is sorted within its own component.  For a
+        // component using two lanes there are exactly two proper
+        // 2-colourings, so that swap is the exact optimum.
         if n > 1 {
-            weights.extend((0..n).map(|l| {
-                let w: usize = lanes[l]
-                    .iter()
-                    .map(|&i| {
-                        let (_, ulen, _, label_idx) = underlines[i];
-                        // Width dominates; a labelled underline also
-                        // carries a rendered message, giving it slightly
-                        // more visual weight than a bare synthetic one.
-                        ulen + usize::from(label_idx.is_some())
-                    })
-                    .sum();
-                (w, l)
-            }));
-            // Descending weight → heaviest first.  Tie-break on the original
-            // lane index for deterministic output.
-            weights.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            // Permute the first `n` lanes in place: no `Vec` allocation, and
-            // stale lanes beyond `n` keep their relative position so their
-            // capacity survives for the next call.  `inv[old] = new`, then
-            // rotate each cycle with `swap`.
-            let mut inv: SmallVec<[usize; 8]> = (0..n).collect();
-            for (pos, &(_, old_l)) in weights.iter().enumerate() {
-                inv[old_l] = pos;
-            }
-            for i in 0..n {
-                while inv[i] != i {
-                    let j = inv[i];
-                    lanes.swap(i, j);
-                    inv.swap(i, j);
+            for (lane_idx, lane) in lanes.iter().enumerate().take(n) {
+                for &i in lane.iter() {
+                    let (col, ulen, ..) = underlines[i];
+                    entries.push((col, col + ulen, i, lane_idx));
                 }
+            }
+            entries.sort_unstable_by_key(|&(start, end, i, _)| (start, end, i));
+            target.resize(entries.len(), 0);
+
+            let mut comp_start = 0usize;
+            while comp_start < entries.len() {
+                // Ascending start order, so components are relabelled in a
+                // deterministic order.
+                let mut comp_end = comp_start + 1;
+                let mut max_end = entries[comp_start].1;
+                while comp_end < entries.len() && entries[comp_end].0 <= max_end {
+                    max_end = max_end.max(entries[comp_end].1);
+                    comp_end += 1;
+                }
+                // The weight this component contributes to each lane it uses.
+                comp_weights.clear();
+                for &(_, _, i, lane_idx) in &entries[comp_start..comp_end] {
+                    let (_, ulen, _, label_idx) = underlines[i];
+                    // Width dominates; a labelled underline also carries a
+                    // rendered message, giving it slightly more visual
+                    // weight than a bare synthetic one.
+                    let w = ulen + usize::from(label_idx.is_some());
+                    match comp_weights.iter_mut().find(|(used, _)| *used == lane_idx) {
+                        Some(entry) => entry.1 += w,
+                        None => comp_weights.push((lane_idx, w)),
+                    }
+                }
+                let k = comp_weights.len();
+                // Ascending lane order: with this alignment the identity
+                // permutation reproduces the greedy's current numbering, so
+                // "keep the current labelling on a tie" is a no-op.
+                comp_weights.sort_unstable_by_key(|&(lane_idx, _)| lane_idx);
+                // The lane indices the component must fill: any relabel is a
+                // bijection of this set onto itself.
+                comp_lanes.clear();
+                comp_lanes.extend(comp_weights.iter().map(|&(lane_idx, _)| lane_idx));
+                comp_lanes.sort_unstable();
+                // C2: exact tier for χ ≤ 3.  The permutation search below only
+                // renumbers the greedy colouring, while a component can have a
+                // *different* proper colouring with strictly lower WDS.  The
+                // sweep DP explores all of them, so for the shape that dominates
+                // real rows (caret + one or two secondary lanes) this is the exact
+                // IGMRC optimum rather than the best relabelling.
+                if comp_lanes.len() <= 3 {
+                    let mut ivs: SmallVec<[(usize, usize, usize); 8]> = SmallVec::new();
+                    for pos in comp_start..comp_end {
+                        let (start, end, i, _) = entries[pos];
+                        let (_, ulen, _, label_idx) = underlines[i];
+                        ivs.push((start, end, ulen + usize::from(label_idx.is_some())));
+                    }
+                    if let Some(assigned) = exact_component_assign(&ivs, &comp_lanes) {
+                        for (pos, &lane) in (comp_start..comp_end).zip(assigned.iter()) {
+                            target[pos] = lane;
+                        }
+                        comp_start = comp_end;
+                        continue;
+                    }
+                }
+                // Identity = the greedy's own numbering, which is also what a
+                // tie keeps.
+                let mut best_perm = [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+                let mut best: usize = (0..k).map(|p| comp_weights[p].1 * comp_lanes[p]).sum();
+                if k > 1 && k <= best_perm.len() {
+                    // Both branches write through `perm`; seed it once.
+                    perm.clear();
+                    perm.extend(0..k);
+                    if k <= 5 {
+                        // Exhaustive: k! ≤ 120 at k = 5, still trivial per
+                        // row, and it needs no proof beyond "try them all".
+                        loop {
+                            let cost: usize = (0..k)
+                                .map(|p| comp_weights[p].1 * comp_lanes[perm[p]])
+                                .sum();
+                            if cost < best {
+                                best = cost;
+                                best_perm[..k].copy_from_slice(&perm);
+                            }
+                            if !next_permutation(perm) {
+                                break;
+                            }
+                        }
+                    } else {
+                        // Rearrangement inequality: the heaviest lane wants
+                        // the smallest index.  This is the old global
+                        // permutation, restricted to the component.
+                        perm.clear();
+                        perm.extend(0..k);
+                        weights.clear();
+                        weights.extend((0..k).map(|p| (comp_weights[p].1, p)));
+                        weights.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                        for (rank, &(_, p)) in weights.iter().enumerate() {
+                            perm[p] = rank;
+                        }
+                        let cost: usize = (0..k)
+                            .map(|p| comp_weights[p].1 * comp_lanes[perm[p]])
+                            .sum();
+                        if cost < best {
+                            best_perm[..k].copy_from_slice(&perm);
+                        }
+                    }
+                }
+                // Map every entry of this component to its new lane.
+                for pos in comp_start..comp_end {
+                    let lane_idx = entries[pos].3;
+                    let slot = comp_weights.iter().position(|&(used, _)| used == lane_idx);
+                    debug_assert!(
+                        slot.is_some(),
+                        "lane {lane_idx} missing from its own component"
+                    );
+                    // `best_perm[slot]` is a position in `comp_lanes`, whose
+                    // entries are the lane indices this component occupies —
+                    // NOT a lane index itself.  Treating it as one remapped a
+                    // component on lanes {1,2} onto {0,1}, colliding with
+                    // whatever already lived there (two overlapping carets on one
+                    // lane).
+                    let new_lane = slot.map_or(lane_idx, |slot| {
+                        best_perm
+                            .get(slot)
+                            .and_then(|&p| comp_lanes.get(p).copied())
+                            .unwrap_or(lane_idx)
+                    });
+                    target[pos] = new_lane;
+                }
+                comp_start = comp_end;
+            }
+
+            // Rebuild the used lanes from the computed targets.  A component
+            // only permutes the lane indices it occupies, so the used set is
+            // unchanged and every lane in `0..n` stays non-empty; clearing
+            // then refilling preserves each lane's capacity.  Entries are
+            // visited in start order, so every lane stays column-sorted.
+            for lane in lanes.iter_mut().take(n) {
+                lane.clear();
+            }
+            for (pos, &(_, _, i, _)) in entries.iter().enumerate() {
+                lanes[target[pos]].push(i);
             }
         }
 
@@ -5066,10 +5473,91 @@ pub(crate) fn visible_width_with_tab(s: &str, tab_width: usize) -> usize {
 /// Display column of `byte_offset` within `line` (production helper for
 /// multi-line connector geometry).  Expands to the containing grapheme's
 /// start, matching `byte_range_to_display`'s start column.
+/// Precomputed byte→display-column table for one line.
+///
+/// The per-query helper used to re-walk the line's grapheme clusters from byte
+/// zero on *every* call, so a diagnostic with `N` labels on one long line paid
+/// `N` full cluster walks.  Building the table once and binary-searching it makes
+/// each query `O(log clusters)` on a table that is already cache-hot, and lets a
+/// caller consult several offsets of the same line for a single walk.
+pub(crate) struct LineColumns {
+    /// `(B_k, C_k)` for `k = 0..=n`: `B_k` is the byte end of the first `k`
+    /// clusters (`B_0 = 0`, strictly increasing) and `C_k` the display column
+    /// after them.
+    bounds: Vec<(usize, usize)>,
+}
+
+impl LineColumns {
+    pub(crate) fn new(line: &str, tab_width: usize) -> Self {
+        // `grapheme_width` already clamps a zero tab width; normalise here too so
+        // the table cannot disagree with that rule for a caller-supplied 0.
+        let tab_width = tab_width.max(1);
+        // A cluster is at least one byte, so `len + 1` is an exact upper bound —
+        // no reallocation, and for pure ASCII this is the only allocation.
+        let mut bounds = Vec::with_capacity(line.len() + 1);
+        bounds.push((0, 0));
+        let mut col = 0usize;
+        let mut byte = 0usize;
+        for g in line.graphemes(true) {
+            col += grapheme_width(g, col, tab_width);
+            byte += g.len();
+            bounds.push((byte, col));
+        }
+        Self { bounds }
+    }
+
+    /// Display column of `byte_offset`, i.e. `C_{max{k : B_k <= byte_offset}}`.
+    ///
+    /// An offset inside a cluster resolves to that cluster's *start* column, and
+    /// an offset past the end to the line's full width — exactly the grapheme
+    /// expansion the previous loop implemented, now without the walk.
+    pub(crate) fn display(&self, byte_offset: usize) -> usize {
+        let k = self.bounds.partition_point(|&(b, _)| b <= byte_offset);
+        // `bounds[0] == (0, 0)` and `0 <= byte_offset`, so `k >= 1`.
+        self.bounds[k - 1].1
+    }
+}
+
+/// One-entry memo over [`LineColumns`].
+///
+/// Span streams are sorted, so consecutive queries overwhelmingly hit the same
+/// line; a single slot removes the repeated walk with no map and no per-line
+/// allocation retained after the line changes.
+#[derive(Default)]
+pub(crate) struct LineColumnsCache(Option<(usize, LineColumns)>);
+
+impl LineColumnsCache {
+    pub(crate) fn display(
+        &mut self,
+        line_idx: usize,
+        line: &str,
+        tab_width: usize,
+        byte_offset: usize,
+    ) -> usize {
+        if let Some((cached_idx, cols)) = &self.0
+            && *cached_idx == line_idx
+        {
+            return cols.display(byte_offset);
+        }
+        let cols = LineColumns::new(line, tab_width);
+        let col = cols.display(byte_offset);
+        self.0 = Some((line_idx, cols));
+        col
+    }
+}
+
+/// Single-shot variant of [`LineColumns::display`].
+///
+/// Deliberately allocation-free: for one offset a grapheme walk beats building a
+/// bounds table, so this stays the helper for callers with a *single* query.
+/// Callers that resolve several offsets on the same line should hold a
+/// [`LineColumnsCache`] instead — that is the case the table exists for.
 pub(crate) fn byte_offset_to_display(line: &str, byte_offset: usize, tab_width: usize) -> usize {
     let mut col = 0usize;
     let mut byte = 0usize;
     for g in line.graphemes(true) {
+        // Stop at the cluster that *contains* `byte_offset`: its start column is
+        // the answer (a boundary inside a cluster expands outwards).
         if byte + g.len() > byte_offset {
             break;
         }
@@ -5419,6 +5907,12 @@ pub(crate) fn highlight_code_with_backticks(line: &str, use_color: bool) -> Cow<
 /// intermediate `String` per highlighted line.  Returns `true` when a
 /// highlight was applied (the caller then uses `out`'s tail); `false` means
 /// nothing was written and the caller should push `line` verbatim.
+///
+/// Precondition: `line` must already be sanitized for terminal output (see
+/// [`crate::diagnostics::sanitize_for_terminal`]) — the highlighter copies
+/// every non-token byte through verbatim, so an ESC or other C0/DEL/C1 byte
+/// in the input would reach the terminal unsanitized.  Tabs and newlines are
+/// allowed (the sanitizers keep them as layout bytes).
 pub fn highlight_code_into(line: &str, use_color: bool, out: &mut String) -> bool {
     if !use_color {
         return false;
@@ -5615,6 +6109,10 @@ fn pass_run_len(bytes: &[u8]) -> usize {
 /// returns whether any highlight was emitted.  When `false`, nothing was
 /// appended and the caller copies `line` verbatim (the Cow wrappers then
 /// return `Cow::Borrowed(line)` with zero allocation).
+///
+/// `line` must already be sanitized (see [`highlight_code_into`]): the
+/// pass-through arms copy bytes verbatim, so a terminal control byte would
+/// survive into `out`.
 fn highlight_code_impl_into(
     line: &str,
     use_color: bool,
@@ -5622,6 +6120,17 @@ fn highlight_code_impl_into(
     out: &mut String,
 ) -> bool {
     debug_assert!(use_color, "callers gate on use_color before this point");
+    // Assert the sanitize-first precondition above in debug builds only: one
+    // SWAR pass (cheaper than the scanner's own loop), no release cost.
+    // `\t`/`\n` are excluded from the dirty set — the sanitizers keep them as
+    // layout bytes and the PASS arm copies them through.
+    debug_assert!(
+        {
+            let (_, dirty, has_c1) = super::scan_terminal_control_flags_multiline(line.as_bytes());
+            !dirty && !has_c1
+        },
+        "highlight input must be sanitized first, got {line:?}"
+    );
     // No separate "line has no ASCII letter" pre-scan: every rewrite arm
     // already funnels through `has_highlight`, so a line that triggers no
     // highlight (punctuation-only, digit-only, plain prose — the common
@@ -5937,6 +6446,62 @@ mod tests {
     /// C6: `grapheme_width` is `pub(crate)` and reached directly by
     /// `expand_tabs_from_col` / test oracles, so a caller-supplied
     /// `tab_width == 0` must not divide by zero.
+    /// `LineColumns` must be byte-for-byte equivalent to the per-query walk it
+    /// replaces — including mid-cluster offsets, offsets past the end, tab
+    /// expansion and the zero-tab-width clamp.
+    #[test]
+    fn line_columns_matches_the_single_query_walk() {
+        for line in [
+            "",
+            "a",
+            "abc",
+            "\t\t",
+            "a\tb\tc",
+            "日本語テキスト",
+            "a日b",
+            "e\u{301}x",
+            "👩‍👩‍👧‍👦y",
+            "\ta\t日\tb",
+            "  \t  x",
+        ] {
+            for tab_width in [1usize, 2, 4, 8] {
+                let cols = LineColumns::new(line, tab_width);
+                for off in 0..=line.len() + 2 {
+                    assert_eq!(
+                        cols.display(off),
+                        byte_offset_to_display(line, off, tab_width),
+                        "line {line:?} tab {tab_width} off {off}"
+                    );
+                }
+            }
+            // A zero tab width follows `grapheme_width`'s clamp.
+            assert_eq!(
+                LineColumns::new(line, 0).display(line.len()),
+                byte_offset_to_display(line, line.len(), 1),
+                "zero tab width must clamp like grapheme_width: {line:?}"
+            );
+        }
+    }
+
+    /// The one-slot cache must answer every offset of a line exactly like a fresh
+    /// table, and must not serve a stale line.
+    #[test]
+    fn line_columns_cache_matches_fresh_tables() {
+        let mut cache = LineColumnsCache::default();
+        let lines = ["aaa\tb", "日x\tc", "z"];
+        for (idx, line) in lines.iter().enumerate() {
+            for off in 0..=line.len() {
+                let want = LineColumns::new(line, 4).display(off);
+                assert_eq!(cache.display(idx, line, 4, off), want, "{idx} {off}");
+            }
+        }
+        // Revisit line 0 after others: the slot must have been replaced.
+        for off in 0..=lines[0].len() {
+            let want = LineColumns::new(lines[0], 4).display(off);
+            assert_eq!(cache.display(0, lines[0], 4, off), want, "revisit {off}");
+        }
+    }
+
     #[test]
     fn grapheme_width_clamps_zero_tab_width() {
         assert_eq!(grapheme_width("\t", 5, 0), 1);
@@ -7758,7 +8323,125 @@ mod tests {
         );
     }
 
-    // ── Lane relabelling by descending visual weight ──
+    // ── Lane relabelling per overlap component ──
+
+    /// Per-lane visual weight used by the weighted-depth-sum objective:
+    /// width dominates, a labelled underline also carries a rendered message.
+    fn lane_weight(underlines: &[(usize, usize, char, Option<usize>)], i: usize) -> usize {
+        underlines[i].1 + usize::from(underlines[i].3.is_some())
+    }
+
+    /// Weighted depth sum (WDS) of an assignment: Σ over lanes of
+    /// `lane weight × lane index`.
+    fn wds(
+        lanes: &UnderlineLanes,
+        underlines: &[(usize, usize, char, Option<usize>)],
+        n: usize,
+    ) -> usize {
+        (0..n)
+            .map(|l| {
+                let w: usize = lanes.lanes[l]
+                    .iter()
+                    .map(|&i| lane_weight(underlines, i))
+                    .sum();
+                w * l
+            })
+            .sum()
+    }
+
+    /// Overlap components of an assignment, each as `(lane, component weight)`
+    /// pairs in ascending lane order.
+    ///
+    /// Recomputed here from the finished lanes rather than shared with
+    /// `UnderlineLanes::assign`, so the exhaustive oracle below stays an
+    /// independent check: the components are the runs of the start-sorted
+    /// entries that keep overlapping (`next.start <= running max end`).
+    fn assignment_components(
+        lanes: &UnderlineLanes,
+        underlines: &[(usize, usize, char, Option<usize>)],
+        n: usize,
+    ) -> Vec<Vec<(usize, usize)>> {
+        // `(start, end, lane, index)` of every entry on a used lane.
+        let mut items: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for l in 0..n {
+            for &i in lanes.lanes[l].iter() {
+                let (col, ulen, ..) = underlines[i];
+                items.push((col, col + ulen, l, i));
+            }
+        }
+        items.sort_unstable_by_key(|&(start, end, lane, i)| (start, end, lane, i));
+
+        let mut out: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut start = 0usize;
+        while start < items.len() {
+            let mut end = start + 1;
+            let mut max_end = items[start].1;
+            while end < items.len() && items[end].0 <= max_end {
+                max_end = max_end.max(items[end].1);
+                end += 1;
+            }
+            let mut weights: Vec<(usize, usize)> = Vec::new();
+            for &(_, _, lane, i) in &items[start..end] {
+                let w = lane_weight(underlines, i);
+                match weights.iter_mut().find(|(used, _)| *used == lane) {
+                    Some(entry) => entry.1 += w,
+                    None => weights.push((lane, w)),
+                }
+            }
+            weights.sort_unstable();
+            out.push(weights);
+            start = end;
+        }
+        out
+    }
+
+    /// Minimum WDS over *all* per-component relabelings of an assignment:
+    /// every bijection of each component's lane-index set is tried.  Written
+    /// with its own recursion (not the production `next_permutation`) so a
+    /// bug in either enumerator cannot hide the other.
+    fn brute_force_component_min(
+        lanes: &UnderlineLanes,
+        underlines: &[(usize, usize, char, Option<usize>)],
+        n: usize,
+    ) -> usize {
+        fn rec(
+            k: usize,
+            cur: &mut Vec<usize>,
+            used: &mut [bool],
+            visit: &mut impl FnMut(&[usize]),
+        ) {
+            if cur.len() == k {
+                visit(cur);
+                return;
+            }
+            for i in 0..k {
+                if !used[i] {
+                    used[i] = true;
+                    cur.push(i);
+                    rec(k, cur, used, visit);
+                    cur.pop();
+                    used[i] = false;
+                }
+            }
+        }
+
+        let mut total = 0usize;
+        for comp in assignment_components(lanes, underlines, n) {
+            let lane_set: Vec<usize> = comp.iter().map(|&(lane, _)| lane).collect();
+            let weight: Vec<usize> = comp.iter().map(|&(_, w)| w).collect();
+            let k = lane_set.len();
+            let mut best = usize::MAX;
+            let mut visit = |perm: &[usize]| {
+                let cost: usize = (0..k).map(|p| weight[p] * lane_set[perm[p]]).sum();
+                best = best.min(cost);
+            };
+            let mut cur = Vec::with_capacity(k);
+            let mut used = vec![false; k];
+            rec(k, &mut cur, &mut used, &mut visit);
+            total += best;
+        }
+        total
+    }
 
     /// The greedy numbers lanes in opening order; the weighted-depth-sum
     /// objective wants the *heaviest* lane at index 0.  One wide primary
@@ -7819,12 +8502,19 @@ mod tests {
         );
     }
 
-    /// After `assign`, the used lanes are monotonically non-increasing in
-    /// total visual weight (the rearrangement-inequality orientation for the
-    /// fixed interval→lane assignment), and the assignment itself stays
+    /// After `assign`, each overlap component's own lanes are non-increasing in
+    /// the component's visual weight (the rearrangement-inequality orientation
+    /// for the fixed interval→lane assignment), and the assignment itself stays
     /// well-formed: every underline appears exactly once across lanes.
+    ///
+    /// The claim is per *component*, not global: disjoint components reuse the
+    /// same lane indices, so a global monotonicity assertion would contradict
+    /// the per-component optimum (the witness in
+    /// `lane_relabel_per_component_matches_exhaustive_search` leaves global
+    /// lane weights (20, 2) — still sorted — but a row whose components are
+    /// lighter-left/heavier-right legitimately is not).
     #[test]
-    fn relabel_keeps_lane_weights_non_increasing_and_assignment_wellformed() {
+    fn relabel_keeps_component_lane_weights_non_increasing_and_assignment_wellformed() {
         let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
         let mut next = || {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -7843,19 +8533,18 @@ mod tests {
             let mut lanes = UnderlineLanes::new();
             let n = lanes.assign(&underlines);
 
-            // Lanes non-increasing in weight.
-            let mut prev = usize::MAX;
-            for l in 0..n {
-                let w: usize = lanes.lanes[l]
-                    .iter()
-                    .map(|&i| underlines[i].1 + usize::from(underlines[i].3.is_some()))
-                    .sum();
-                assert!(
-                    w <= prev,
-                    "lane {l} weight {w} exceeds lane {} weight {prev}",
-                    l.saturating_sub(1)
-                );
-                prev = w;
+            // Within each component, weight is non-increasing with the lane
+            // index: the heaviest lane sits closest to the source line.
+            for comp in assignment_components(&lanes, &underlines, n) {
+                let mut prev = usize::MAX;
+                for &(lane, w) in comp.iter() {
+                    assert!(
+                        w <= prev,
+                        "component lane {lane} weight {w} exceeds the previous {prev}: {:?}",
+                        comp
+                    );
+                    prev = w;
+                }
             }
 
             // Well-formed: every *distinct* annotation appears exactly once —
@@ -7878,6 +8567,211 @@ mod tests {
                 "assignment lost distinct entries"
             );
         }
+    }
+
+    /// The per-component relabel must reach the exact minimum of the
+    /// weighted-depth-sum objective over all per-component labelings, checked
+    /// against an independent brute force on small random interval families,
+    /// plus a hand-verifiable witness.
+    #[test]
+    /// C2's exactness pin.
+    ///
+    /// For a row whose every component has `χ ≤ 3`, the sweep DP must return the
+    /// minimum `Σ w·lane` over **all proper colourings**, not merely over
+    /// relabellings of the greedy's — that distinction is invisible to
+    /// `lane_relabel_per_component_matches_exhaustive_search`, which searches
+    /// bijections only.  The oracle here re-derives the components with its own
+    /// union-find, enumerates every colouring of each component into the lane set
+    /// that component actually occupies, keeps the proper ones, and takes the
+    /// per-component minimum (components are column-disjoint, so the objective
+    /// separates).
+    #[test]
+    fn exact_tier_matches_brute_force_over_all_proper_colourings() {
+        let mut seed: u64 = 0x00C2_5EED_0BAD_1234;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        for _ in 0..300 {
+            let count = 2 + (next() % 5) as usize; // 2..=6
+            let mut underlines: Vec<(usize, usize, char, Option<usize>)> = Vec::new();
+            for i in 0..count {
+                let start = (next() % 20) as usize;
+                let width = 1 + (next() % 5) as usize;
+                let ch = ['^', '~', '-'][i % 3];
+                underlines.push((start, width, ch, if i % 4 == 0 { None } else { Some(i) }));
+            }
+            underlines.sort_by_key(|&(c, w, _, _)| (c, c + w));
+
+            let mut lanes = UnderlineLanes::new();
+            let n = lanes.assign(&underlines);
+            if n == 0 || n > 3 {
+                continue; // the tier only covers χ ≤ 3
+            }
+            let mut lane_of = vec![usize::MAX; underlines.len()];
+            for (l, members) in lanes.lanes.iter().enumerate().take(n) {
+                for &i in members {
+                    lane_of[i] = l;
+                }
+            }
+            assert!(
+                lane_of.iter().all(|&l| l != usize::MAX),
+                "every interval must sit in a lane"
+            );
+
+            fn root(parent: &mut [usize], mut x: usize) -> usize {
+                while parent[x] != x {
+                    parent[x] = parent[parent[x]];
+                    x = parent[x];
+                }
+                x
+            }
+            let mut parent: Vec<usize> = (0..underlines.len()).collect();
+            for i in 0..underlines.len() {
+                for j in (i + 1)..underlines.len() {
+                    let (si, wi, ..) = underlines[i];
+                    let (sj, wj, ..) = underlines[j];
+                    if si < sj + wj && sj < si + wi {
+                        let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                        parent[a] = b;
+                    }
+                }
+            }
+            let mut expected = 0usize;
+            let mut seen = vec![false; underlines.len()];
+            for i in 0..underlines.len() {
+                if seen[i] {
+                    continue;
+                }
+                let r = root(&mut parent, i);
+                let members: Vec<usize> = (0..underlines.len())
+                    .filter(|&j| root(&mut parent, j) == r)
+                    .collect();
+                for &m in &members {
+                    seen[m] = true;
+                }
+                let mut lane_set: Vec<usize> = members.iter().map(|&m| lane_of[m]).collect();
+                lane_set.sort_unstable();
+                lane_set.dedup();
+                let k = lane_set.len();
+                let mut best = usize::MAX;
+                let mut code = vec![0usize; members.len()];
+                loop {
+                    let mut proper = true;
+                    for a in 0..members.len() {
+                        for b in (a + 1)..members.len() {
+                            let (ia, ib) = (members[a], members[b]);
+                            let (sa, wa, ..) = underlines[ia];
+                            let (sb, wb, ..) = underlines[ib];
+                            if sa < sb + wb
+                                && sb < sa + wa
+                                && lane_set[code[a]] == lane_set[code[b]]
+                            {
+                                proper = false;
+                            }
+                        }
+                    }
+                    if proper {
+                        let cost: usize = members
+                            .iter()
+                            .enumerate()
+                            .map(|(pos, &m)| lane_weight(&underlines, m) * lane_set[code[pos]])
+                            .sum();
+                        best = best.min(cost);
+                    }
+                    let mut k2 = 0;
+                    while k2 < members.len() {
+                        code[k2] += 1;
+                        if code[k2] < k {
+                            break;
+                        }
+                        code[k2] = 0;
+                        k2 += 1;
+                    }
+                    if k2 == members.len() {
+                        break;
+                    }
+                }
+                expected += best;
+            }
+            assert_eq!(
+                wds(&lanes, &underlines, n),
+                expected,
+                "χ≤3 tier must be exact: {underlines:?}"
+            );
+        }
+    }
+
+    fn lane_relabel_per_component_matches_exhaustive_search() {
+        // (a) Deterministic LCG (no `rand` crate): ≤ 6 intervals over 24
+        // columns, so a row tops out at a handful of lanes.
+        let mut seed: u64 = 0x0BAD_F00D_1234_5678;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        for _ in 0..300 {
+            let count = 2 + (next() % 5) as usize; // 2..=6
+            let mut underlines: Vec<(usize, usize, char, Option<usize>)> = Vec::new();
+            for i in 0..count {
+                let start = (next() % 24) as usize;
+                let width = 1 + (next() % 6) as usize;
+                // Rotating the underline char keeps most entries distinct
+                // through `assign`'s duplicate pass; a collapse would only
+                // shrink the row, never invalidate the comparison.
+                let ch = ['^', '~', '-'][i % 3];
+                underlines.push((start, width, ch, if i % 4 == 0 { None } else { Some(i) }));
+            }
+            underlines.sort_by_key(|&(c, w, _, _)| (c, c + w));
+
+            // (b) The assignment, as `assign` produced it.
+            let mut lanes = UnderlineLanes::new();
+            let n = lanes.assign(&underlines);
+            assert!(n <= count, "χ cannot exceed the interval count");
+
+            // (c) Against the brute-force minimum over per-component
+            // relabelings.
+            let got = wds(&lanes, &underlines, n);
+            let want = brute_force_component_min(&lanes, &underlines, n);
+            assert_eq!(
+                got, want,
+                "WDS {got} != per-component optimum {want} for {underlines:?} (lanes: {:?})",
+                lanes.lanes
+            );
+        }
+
+        // (d) Witness, verifiable by hand: two *disjoint* overlapping pairs on
+        // one row with component weights (10, 1) and (1, 10).  The greedy
+        // reuses lane 1 for the second component's first interval (lane 1's
+        // end is the smallest and already past it) and lane 0 for its second,
+        // so both components span lanes 0/1 and the global lane weights are
+        // 11 / 11 — a global descending-weight sort ties and changes nothing,
+        // WDS 11.  Relabelling each pair within itself costs 1 + 1 = 2.
+        let witness: Vec<(usize, usize, char, Option<usize>)> = vec![
+            (0, 10, '^', None),  // component A, weight 10 → lane 0
+            (2, 1, '~', None),   // component A, weight 1  → lane 1
+            (11, 10, '^', None), // component B, weight 10 → lane 1 (reused)
+            (12, 1, '~', None),  // component B, weight 1  → lane 0 (reused)
+        ];
+        let mut lanes = UnderlineLanes::new();
+        assert_eq!(lanes.assign(&witness), 2, "both pairs fit in two lanes");
+        assert_eq!(
+            wds(&lanes, &witness, 2),
+            2,
+            "per-component relabel must reach WDS 2, lanes: {:?}",
+            lanes.lanes
+        );
+        // Both components end up sorted on their own: the heavy entries share
+        // lane 0.
+        assert!(
+            lanes.lanes[0].iter().all(|&i| witness[i].1 == 10),
+            "lane 0 must hold both heavy entries: {:?}",
+            lanes.lanes
+        );
     }
 
     // ── Regression tests: context window, diff block, no-source labels ──

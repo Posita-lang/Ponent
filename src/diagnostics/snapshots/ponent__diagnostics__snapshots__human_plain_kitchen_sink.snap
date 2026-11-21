@@ -17,8 +17,8 @@ expression: out
 |  | duplicate definition of `i` [E019]
 |  |          |
 |4 |    return i;
-|  | ^^^^^     ^
-|  | ^^^^^^
+|  | ^^^^^^    ^
+|  | ^^^^^
 |  | |
 |  | | this is Bool
 |  | |

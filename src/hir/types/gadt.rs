@@ -246,7 +246,7 @@ impl<'input> GadtContext<'input> {
     }
 
     /// ψ(node) in the current arm (`None` ⇒ the implicit singleton `{node}`,
-/// §3.1's `{t}^t`).  Read-only: the ledger is pure metadata, so a query never
+    /// §3.1's `{t}^t`).  Read-only: the ledger is pure metadata, so a query never
     /// mutates inference state.
     pub(crate) fn set_of_current(&self, node: TypeId) -> Option<SmallVec<[TypeId; 4]>> {
         self.ambivalent

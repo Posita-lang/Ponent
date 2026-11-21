@@ -21,18 +21,6 @@ const fn is_printable_byte(b: u8) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline]
-fn x86_level_for(len: usize) -> u8 {
-    // The `len < 32` short-circuit deliberately does NOT consult
-    // `swar_forced`: that is why each SSE2 dispatch arm below keeps its own
-    // `!swar_forced()` conjunct.  For `len < 32` the level is 0 without a
-    // forced check, so without the arm-level conjunct a forced-SWAR run would
-    // silently execute SSE2 for `len >= 16`, defeating the forced path — the
-    // conjunct is load-bearing, not redundant.
-    if len < 32 { 0 } else { x86_level() }
-}
-
-#[cfg(target_arch = "x86_64")]
 static LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Cached ISA level: `3` = AVX-512BW, `2` = AVX2, `1` = SSE2 baseline.
@@ -49,11 +37,11 @@ fn x86_level() -> u8 {
     // Order is load-bearing: `swar_forced()` FIRST, cache second.  A forced
     // thread must observe level 0 even when another thread already populated
     // `LEVEL`; reading the cache first would return the detected level and send
-    // a forced-SWAR test straight into AVX2/AVX-512 (only the SSE2 arm carries
-    // its own `!swar_forced()` conjunct, because `x86_level_for` short-circuits
-    // `len < 32` without consulting it).  The TLS read this costs exists only
-    // under `test`/`bench-hooks`; in production `swar_forced()` folds to
-    // `false` and the cache load dominates either way.
+    // a forced-SWAR test straight into AVX2/AVX-512 (the SSE2 arms therefore
+    // carry their own `!swar_forced()` conjunct, and the `16..31` band never
+    // consults the level at all — its arm is length-gated below 32).  The TLS
+    // read this costs exists only under `test`/`bench-hooks`; in production
+    // `swar_forced()` folds to `false` and the cache load dominates either way.
     if swar_forced() {
         return 0;
     }
@@ -90,28 +78,64 @@ fn x86_level_init() -> u8 {
     level
 }
 
-/// AVX-512 processes 64 bytes per instruction, so the 1× 64-byte loop already
-/// covers `[64, 256)`; entering at 64 spends the wider kernel instead of the
-/// 32-byte AVX2 one with no correctness change (every kernel handles any
-/// length through its own loop plus the deferred parent tail).
+/// Vector-tier thresholds, **measured** with
+/// `cargo bench --bench ascii_dispatch`, comparing the `predicates/` (dispatch)
+/// and `swar_forced/` (SWAR body pinned) tiers in the same run.
 ///
-/// Downclocking tradeoff, stated rather than assumed: on parts with AVX-512
-/// frequency licensing (Skylake-X, some Ice Lake server SKUs) the transition
-/// can cost more than the 1 load it saves relative to the 2 AVX2 loads a
-/// 64-byte row requires,
-/// and the penalty lands on the surrounding non-AVX-512 code.  Modern parts
-/// (Sapphire Rapids, Zen 4) do not downclock at all.  Raising the threshold to
-/// 128 would make every 64–127-byte row take AVX2 instead, so it is kept at 64
-/// until a measurement on the target mix says otherwise — this constant is the
-/// knob, and no correctness argument depends on its value.
-const AVX512_MIN_LEN: usize = 64;
+/// The two predicates cross over in opposite directions, so they get their own
+/// knobs:
+///
+/// `classify_ascii` (dispatch vs SWAR, ns):
+///
+/// | len | vector tier | SWAR  |
+/// |-----|-------------|-------|
+/// | 16  |  6.87       |  7.15 |
+/// | 31  | 16.20       | 12.29 |
+/// | 32  | 13.24       |  9.03 |
+/// | 63  | 22.74       | 16.32 |
+/// | 64  | 13.36       | 12.76 |
+/// | 127 | 24.59       | 23.77 |
+/// | 128 | 14.71       | 20.41 |
+/// | 255 | 27.74       | 38.75 |
+///
+/// **These numbers predate two changes and must be re-measured before any
+/// threshold moves**: the `8..=15` reference now shares the `u64` SWAR step
+/// (`classify_word8`) instead of `classify_scalar`, which removes the scalar
+/// remainder the `/31`, `/63`, `/127` rows include, and the bounded-classification
+/// early exit is a new branch per chunk.  The `/63` note below is a leftover from
+/// when AVX2 started at 64.
+///
+/// What the table did establish, and what the dispatch still encodes: a 32-byte
+/// AVX2 step saves little over SSE2's 16 below 128, and AVX-512 wins clearly from
+/// 128 up.  So `classify` uses SSE2 from [`CLASSIFY_SSE2_MIN_LEN`] and the wide
+/// tiers from [`CLASSIFY_AVX2_MIN_LEN`] / [`CLASSIFY_AVX512_MIN_LEN`] — 16 and
+/// 128.  A re-measurement may move the SSE2 floor up (the `/31`, `/32` rows
+/// favoured SWAR under the *old* tail); it is a one-line change here.
+///
+/// The tail protocol also changed: a `classify` kernel delegates its remainder to
+/// [`classify_ascii_bounded`], which re-selects a narrower tier (so a 127-byte
+/// input can still run AVX2 → SSE2 → SWAR).  `next_non_ascii_byte` kernels inline
+/// one 16-byte SSE2 step before reaching the SWAR short path, because there the
+/// re-dispatch chain measured 3× the cost of the neighbouring length.
+///
+/// `next_non_ascii_byte` measures the other way — it returns early, so the
+/// kernel's fixed cost dominates and the wide loads pay for themselves: 32 B
+/// 5.30 ns (AVX2), 63 B 17.12, 64 B 5.61 (AVX-512), 128 B 6.84.  It therefore
+/// keeps AVX2 from 32 and AVX-512 from 64.
+///
+/// No correctness argument depends on any of these values; they are the knobs.
+const CLASSIFY_SSE2_MIN_LEN: usize = 16;
+const CLASSIFY_AVX2_MIN_LEN: usize = 128;
+const CLASSIFY_AVX512_MIN_LEN: usize = 128;
+const NNA_AVX2_MIN_LEN: usize = 32;
+const NNA_AVX512_MIN_LEN: usize = 64;
 
 // Structural, not a debug assert: the AVX-512 kernel's inner loop is one 64-byte
 // chunk and its tail re-enters the dispatcher, so a threshold below 64 would
 // re-dispatch at the same length and recurse until the stack dies.  In release
-// that would be a production stack overflow; here it is a build error.  One
-// assertion covers both dispatchers (`classify_ascii`, `next_non_ascii_byte`).
-const _: () = assert!(AVX512_MIN_LEN >= 64);
+// that would be a production stack overflow; here it is a build error.
+const _: () = assert!(CLASSIFY_AVX512_MIN_LEN >= 64);
+const _: () = assert!(NNA_AVX512_MIN_LEN >= 64);
 
 #[cfg(any(test, feature = "bench-hooks"))]
 thread_local! {
@@ -143,11 +167,12 @@ fn swar_forced() -> bool {
 
 /// `true` when every byte is printable ASCII (`0x20..=0x7E`).
 ///
-/// The widest available SIMD path handles full chunks; the `u128` SWAR body
-/// below is the fallback for short tails.  The SWAR lane proof is
+/// The widest available SIMD path handles full chunks; the remainder re-enters
+/// this entry, which re-selects a narrower tier and reaches the `u128` SWAR body
+/// (and its `u64` `8..=15` step) below 16 bytes.  The SWAR lane proof is
 /// width-independent — the exact-mask forms have no inter-lane borrow, and the
-/// `hasless` form's top-lane borrow-out implies that lane already flagged — so
-/// the scalar tail is only the final bytes below the selected vector width.
+/// `hasless` form's top-lane borrow-out implies that lane already flagged — which
+/// is what makes the same rule reusable at every width.
 ///
 /// # Chunk independence
 ///
@@ -166,8 +191,11 @@ fn swar_forced() -> bool {
 #[inline]
 #[must_use]
 pub(crate) fn is_printable_ascii(s: &[u8]) -> bool {
-    // Defined by the class: one pass, no separate kernel family.
-    matches!(classify_ascii(s), AsciiClass::Printable)
+    // Defined by the class: one pass, no separate kernel family.  `stop_at` is
+    // the *first* class that already answers this predicate, so a tab or newline
+    // anywhere ends the scan at the chunk that contains it — tab-indented source
+    // lines used to be scanned to the end even though byte 0 settled them.
+    classify_ascii_bounded(s, AsciiClass::PrintableOrTab) == AsciiClass::Printable
 }
 
 /// `true` when every byte is printable ASCII **or** the two layout controls
@@ -214,11 +242,9 @@ pub(crate) fn is_printable_ascii_multiline(s: &[u8]) -> bool {
 #[inline]
 #[must_use]
 pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
-    // The two narrow classes are exactly the tab set.
-    matches!(
-        classify_ascii(s),
-        AsciiClass::Printable | AsciiClass::PrintableOrTab
-    )
+    // The two narrow classes are exactly the tab set, so the first newline (or
+    // offender) settles the answer.
+    classify_ascii_bounded(s, AsciiClass::PrintableOrTabNewline) <= AsciiClass::PrintableOrTab
 }
 
 /// Combine a kernel's accumulated tab/newline sightings with its tail's class.
@@ -234,16 +260,43 @@ pub(crate) fn is_printable_ascii_or_tab(s: &[u8]) -> bool {
 /// `Ord` derive load-bearing, and it makes the empty-slice identity
 /// (`class(∅) = Printable`) follow from the monoid rather than being a special
 /// case.
+/// Would the class accumulated so far already settle a `stop_at`-bounded query?
+///
+/// Each predicate needs one bit: `is_printable_ascii` only cares whether the
+/// class is *exactly* `Printable`, `is_printable_ascii_or_tab` whether it is at
+/// most `PrintableOrTab`.  Any class `>= stop_at` therefore answers it, which is
+/// what lets a tab-indented line stop at the chunk holding the indentation
+/// instead of scanning the whole line.
+///
+/// The `saw_*` flags are *running*, so a tab seen earlier pins the class at
+/// `PrintableOrTab` for every later chunk — monotone, as the `max` in
+/// [`compose_classify_tail`] requires.
 #[inline]
-fn compose_classify_tail(saw_tab: bool, saw_newline: bool, tail: AsciiClass) -> AsciiClass {
-    let kernel = if saw_newline {
+/// The class implied by the flags accumulated so far.
+///
+/// One home for the three-arm mapping (`newline` outranks `tab`), so `reached`
+/// and `compose_classify_tail` cannot drift apart.  The ordering itself is the
+/// `Ord` canary `AsciiClass` documents:
+/// `Printable < PrintableOrTab < PrintableOrTabNewline < Other`.
+#[inline]
+fn running_class(saw_tab: bool, saw_newline: bool) -> AsciiClass {
+    if saw_newline {
         AsciiClass::PrintableOrTabNewline
     } else if saw_tab {
         AsciiClass::PrintableOrTab
     } else {
         AsciiClass::Printable
-    };
-    kernel.max(tail)
+    }
+}
+
+#[inline]
+fn reached(saw_tab: bool, saw_newline: bool, stop_at: AsciiClass) -> Option<AsciiClass> {
+    let class = running_class(saw_tab, saw_newline);
+    (class >= stop_at).then_some(class)
+}
+
+fn compose_classify_tail(saw_tab: bool, saw_newline: bool, tail: AsciiClass) -> AsciiClass {
+    running_class(saw_tab, saw_newline).max(tail)
 }
 
 /// Tri-state classification of one row, so callers that need both the
@@ -348,55 +401,141 @@ fn classify_scalar(s: &[u8]) -> AsciiClass {
 ///   mask cannot occur here because the minuend never borrows); `nl` likewise
 ///   with 0x0A.
 ///
-/// High bytes are rejected first: the `(x | HI) - SP` form is only exact when
-/// every lane is ≤ `0x7F` (otherwise `b + 0x80 - 0x20` overflows).
+/// Load 8 bytes as a little-endian word — the lane order every SWAR step here
+/// assumes.
 #[inline]
-#[must_use]
+fn load_word8(s: &[u8]) -> u64 {
+    u64::from_le_bytes(s[..8].try_into().unwrap())
+}
+
+/// One u64 SWAR step of the `classify_ascii` byte-set rule.
+///
+/// `Some((saw_tab, saw_newline))` when all eight lanes are printable or `\t`/
+/// `\n`; `None` when any lane is not.  Two callers share this: the `8..=15`
+/// dispatch remainder and the SWAR body's own tail.  The algebra is the u128
+/// loop one register narrower — the per-lane borrow proofs never reference the
+/// word width, which is what makes this a copy rather than a second rule.
+#[inline]
+fn classify_word8(word: u64) -> Option<(bool, bool)> {
+    const HI64: u64 = 0x8080_8080_8080_8080;
+    const SP64: u64 = 0x2020_2020_2020_2020;
+    const TAB64: u64 = 0x0909_0909_0909_0909;
+    const NL64: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+    const DEL64: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const ONES64: u64 = 0x0101_0101_0101_0101;
+    let v = word ^ DEL64;
+    if (word | v.wrapping_sub(ONES64)) & HI64 != 0 {
+        // Non-ASCII (high bit) or exactly DEL.
+        return None;
+    }
+    let lt20 = !((word | HI64).wrapping_sub(SP64)) & HI64;
+    if lt20 == 0 {
+        // All eight lanes are plain printable ASCII.
+        return Some((false, false));
+    }
+    let tab = !(((word ^ TAB64) | HI64).wrapping_sub(ONES64)) & HI64;
+    let nl = !(((word ^ NL64) | HI64).wrapping_sub(ONES64)) & HI64;
+    // A `< 0x20` lane that is neither tab nor newline is an offender.
+    if (lt20 & !tab & !nl) != 0 {
+        return None;
+    }
+    Some((tab != 0, nl != 0))
+}
+
 pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
+    classify_ascii_bounded(s, AsciiClass::Other)
+}
+
+/// [`classify_ascii`] with an early exit as soon as the class reaches `stop_at`.
+///
+/// `stop_at == AsciiClass::Other` is exactly the old behaviour (the class can
+/// only reach `Other` by an offender, which every tier already returns on), so
+/// `classify_ascii` stays the full-classification entry.
+fn classify_ascii_bounded(s: &[u8], stop_at: AsciiClass) -> AsciiClass {
     // Tail protocol, stated exactly: the **SWAR body** resolves its `< 16`
     // remainder inline via `classify_scalar` and never re-enters the dispatcher.
     // A **vector kernel's** tail deliberately *does* re-enter it (see the AVX2
-    // SAFETY note and the `AVX512_MIN_LEN` comment) — that is what lets every
-    // tier handle any length with one loop plus a single downward delegation.
+    // SAFETY note and the `CLASSIFY_*_MIN_LEN` thresholds) — that is what lets
+    // every tier handle any length with one loop plus a single downward
+    // delegation.
     // Recursion terminates because each tier's gate is strictly narrower than
     // its parent's.  (An earlier wording claimed kernels must not re-enter; it
     // contradicted the kernels and invited "fixing" them into decoding up to
     // 63-byte tails scalar-ly.)
     if s.len() < 16 {
-        return classify_scalar(s);
+        // `8..=15` gets one u64 SWAR step before falling through to scalar.
+        // Measured on the CI mix: `printable/15` cost 13.09 ns against 6.87 ns at
+        // 16 bytes — the cliff is this entry path, not the vector loop.  The
+        // same run's `/31`, `/63`, `/127`, `/255` spikes are the *vector tails*
+        // re-entering here with 15 bytes, so this step serves both.
+        let (mut saw_tab, mut saw_newline) = (false, false);
+        let mut i = 0usize;
+        if s.len() >= 8 {
+            match classify_word8(load_word8(s)) {
+                Some((tab, nl)) => {
+                    saw_tab = tab;
+                    saw_newline = nl;
+                }
+                None => return AsciiClass::Other,
+            }
+            i = 8;
+            if let Some(done) = reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
+        }
+        if s.len() >= 9 {
+            // Second, overlapping word: for `len <= 16` the two windows overlap,
+            // so bytes `0..8` plus `len-8..len` cover the whole input and the
+            // per-byte scalar tail disappears from the entire `9..=15` band.
+            // Overlap is idempotent under the max-semantics of the class, and the
+            // `reached` check above stays where it is: for `stop_at < Other` it
+            // already settled the answer, for `Other` both words are exact.
+            match classify_word8(load_word8(&s[s.len() - 8..])) {
+                Some((tab, nl)) => {
+                    saw_tab |= tab;
+                    saw_newline |= nl;
+                }
+                None => return AsciiClass::Other,
+            }
+            return compose_classify_tail(saw_tab, saw_newline, AsciiClass::Printable);
+        }
+        return compose_classify_tail(saw_tab, saw_newline, classify_scalar(&s[i..]));
     }
+    // Each arm consults `x86_level()` *behind* its length gate, and `&&`
+    // short-circuits: the `16..127` band — the hottest diagnose-line tier —
+    // therefore never touches the level cache line, and the cold cpuid probe
+    // defers until a row that can actually use a vector kernel arrives.
     #[cfg(target_arch = "x86_64")]
-    let level = x86_level_for(s.len());
-    #[cfg(target_arch = "x86_64")]
-    if s.len() >= AVX512_MIN_LEN && level >= 3 {
+    if s.len() >= CLASSIFY_AVX512_MIN_LEN && x86_level() >= 3 {
         // SAFETY: `level >= 3` iff `is_x86_feature_detected!("avx512bw")`
         // succeeded inside `x86_level_init`; `avx512f` is implied by
         // `avx512bw` on every part implementing both, which is exactly what
         // the kernel's `#[target_feature(enable = "avx512f,avx512bw")]`
         // requires.
-        return unsafe { x86_64::classify_ascii_avx512(s) };
+        return unsafe { x86_64::classify_ascii_avx512(s, stop_at) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && level >= 2 {
+    if s.len() >= CLASSIFY_AVX2_MIN_LEN && x86_level() >= 2 {
         // SAFETY: `level >= 2` iff `is_x86_feature_detected!("avx2")`
         // succeeded; the kernel's 32-byte loads are AVX2-only.  The tail is
         // deferred back to this function, so a kernel never re-enters the
         // dispatcher for 16..31.
-        return unsafe { x86_64::classify_ascii_avx2(s) };
+        return unsafe { x86_64::classify_ascii_avx2(s, stop_at) };
     }
     #[cfg(target_arch = "x86_64")]
-    if !swar_forced() && s.len() >= 16 {
+    if !swar_forced() && s.len() >= CLASSIFY_SSE2_MIN_LEN {
         // SAFETY: SSE2 is baseline for every x86_64 target, so the 16-byte
         // intrinsics need no runtime detection.  `!swar_forced()` is the
-        // test/bench tier switch; it lives on this arm because
-        // `x86_level_for` returns 0 for `len < 32` without consulting it.
-        return unsafe { x86_64::classify_ascii_sse2(s) };
+        // test/bench tier switch; it lives on this arm because the `16..31`
+        // band never consults `x86_level()` (every level-gated arm is >= 32),
+        // so without this conjunct a forced run would execute SSE2 there.
+        return unsafe { x86_64::classify_ascii_sse2(s, stop_at) };
     }
     #[cfg(target_arch = "aarch64")]
     if !swar_forced() && s.len() >= 16 {
         // SAFETY: NEON is baseline for every aarch64 target;
         // `!swar_forced()` is the test/bench tier switch.
-        return unsafe { neon::classify_ascii(s) };
+        return unsafe { neon::classify_ascii(s, stop_at) };
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if !swar_forced() && s.len() >= 16 {
@@ -404,7 +543,7 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
         // has no runtime feature detection, so the module (and this arm) only
         // exist when the binary is built for a SIMD-capable engine.  A
         // runtime-only gate would be UB on an engine without vectors.
-        return unsafe { wasm::classify_ascii(s) };
+        return unsafe { wasm::classify_ascii(s, stop_at) };
     }
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
     const SP: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
@@ -434,12 +573,30 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
             saw_newline |= nl != 0;
         }
         i += 16;
+        if let Some(done) = reached(saw_tab, saw_newline, stop_at) {
+            return done;
+        }
     }
     // One implementation of the byte-set rule for the tail: `classify_scalar`
     // early-returns `Other` and is `#[inline]`, and `compose_classify_tail` is
     // `max`, so an offending tail propagates exactly as the hand-rolled loop
     // did.  A second copy of "printable ∪ {\t, \n}" here could drift (a future
     // edit admitting `\r` in one place only would be silent).
+    //
+    // The `8..=15` remainder shares [`classify_word8`] with the dispatch entry:
+    // the CI run's `/31`, `/63`, `/127`, `/255` spikes are exactly "k×16 + 15",
+    // i.e. a vector tail re-entering this function with 15 bytes, so both sites
+    // must take the same step.
+    if s.len() - i >= 8 {
+        match classify_word8(load_word8(&s[i..])) {
+            Some((tab, nl)) => {
+                saw_tab |= tab;
+                saw_newline |= nl;
+            }
+            None => return AsciiClass::Other,
+        }
+        i += 8;
+    }
     compose_classify_tail(saw_tab, saw_newline, classify_scalar(&s[i..]))
 }
 
@@ -469,23 +626,47 @@ pub(crate) fn classify_ascii(s: &[u8]) -> AsciiClass {
 pub(crate) fn next_non_ascii_byte(s: &[u8]) -> usize {
     // Same short-input reasoning as the predicate families: this is the *entry*
     // point (called per non-ASCII character from `char_col`'s sparse-table
-    // build), so a short remaining run must not pay `x86_level_for` plus the
-    // whole `cfg` chain to reach a `position()`.  `usize::MAX` is the sentinel
+    // build), so a short remaining run must not pay the whole `cfg` chain (and
+    // the level load) to reach a `position()`.  `usize::MAX` is the sentinel
     // shared with every kernel tail.
     if s.len() < 16 {
-        return s.iter().position(|&b| b >= 0x80).unwrap_or(usize::MAX);
+        // `8..=15` gets one u64 high-bit test first: measured `next_non_ascii/15`
+        // 10.58 ns against 4.98 ns at 16 bytes, the same entry cliff as
+        // `classify_ascii`.  The 8 bytes are re-scanned scalar-ly only when the
+        // word does contain a high bit, which is the rare path here.
+        if s.len() >= 8 {
+            let hi = load_word8(s) & 0x8080_8080_8080_8080;
+            if hi != 0 {
+                // Same lane mapping as every SWAR loop below: the lowest set
+                // high bit divided by 8 is the lowest offending byte.  A scalar
+                // `position` here would be branchier and inconsistent with them.
+                return (hi.trailing_zeros() / 8) as usize;
+            }
+            if s.len() == 8 {
+                return usize::MAX;
+            }
+            // Second, overlapping word: bytes `8..len-8` are empty for
+            // `len <= 16` and word 0 already ruled out `0..8`, so the first
+            // flagged lane here *is* the first non-ASCII byte.
+            let hi = load_word8(&s[s.len() - 8..]) & 0x8080_8080_8080_8080;
+            if hi != 0 {
+                return (s.len() - 8) + (hi.trailing_zeros() / 8) as usize;
+            }
+            return usize::MAX;
+        }
+        return s.iter().position(|&b| b >= 0x80).map_or(usize::MAX, |p| p);
     }
+    // Same shape as `classify_ascii_bounded`: the level is consulted behind the
+    // length gate, so a short run never loads it.
     #[cfg(target_arch = "x86_64")]
-    let level = x86_level_for(s.len());
-    #[cfg(target_arch = "x86_64")]
-    if s.len() >= AVX512_MIN_LEN && level >= 3 {
+    if s.len() >= NNA_AVX512_MIN_LEN && x86_level() >= 3 {
         // SAFETY: `level >= 3` iff `is_x86_feature_detected!("avx512bw")`
         // succeeded inside `x86_level_init`; `avx512f` is implied on every
         // part implementing both.
         return unsafe { x86_64::next_non_ascii_byte_avx512(s) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= 32 && level >= 2 {
+    if s.len() >= NNA_AVX2_MIN_LEN && x86_level() >= 2 {
         // SAFETY: `level >= 2` iff `is_x86_feature_detected!("avx2")`
         // succeeded; the 32-byte loads are AVX2-only.  Tail deferred here.
         return unsafe { x86_64::next_non_ascii_byte_avx2(s) };
@@ -493,8 +674,8 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> usize {
     #[cfg(target_arch = "x86_64")]
     if !swar_forced() && s.len() >= 16 {
         // SAFETY: SSE2 is baseline on x86_64; `!swar_forced()` is the
-        // test/bench tier switch, load-bearing because `x86_level_for`
-        // returns 0 for `len < 32` without consulting it.
+        // test/bench tier switch: the level-gated arms are all >= 32, so this
+        // is the only place that can send a forced run into SSE2.
         return unsafe { x86_64::next_non_ascii_byte_sse2(s) };
     }
     #[cfg(target_arch = "aarch64")]
@@ -548,20 +729,29 @@ pub(crate) fn next_non_ascii(s: &[u8]) -> Option<usize> {
 /// Runtime-dispatched SIMD kernels.
 ///
 /// `x86_64` uses AVX-512BW for 64-byte chunks, AVX2 for 32-byte chunks, and
-/// SSE2 for 16-byte chunks; `aarch64` uses NEON for 16-byte chunks.  The
-/// scalar SWAR body remains the tail for every kernel, so the lane proofs in
-/// this module stay the single source of truth below the vector width.
+/// SSE2 for 16-byte chunks; `aarch64` uses NEON for 16-byte chunks.
 ///
 /// Every kernel processes only full chunks.  The tail deliberately avoids a
-/// masked load: the fallback is one cached feature branch plus at most
-/// `width - 1` bytes of SWAR, while masked tails add unsafe edge cases for no
-/// measured gain on diagnostic-sized inputs.
+/// masked load, and what it does instead is per family:
+///
+/// * `classify_ascii_*` re-enters [`super::classify_ascii_bounded`] with the
+///   remaining bytes, so the dispatcher picks the next narrower tier (below 16
+///   bytes that is the SWAR body's `u64` step and then `classify_scalar`).  The
+///   SWAR lane proofs therefore stay the single source of truth below the vector
+///   width even though a kernel does not call SWAR directly.
+/// * `next_non_ascii_byte_*` inline one 16-byte SSE2 step — SSE2 is baseline, so
+///   no feature check — and only then hand the `< 16` remainder to the SWAR
+///   short path.  Re-entering the dispatcher there measured ~3× the cost of the
+///   neighbouring length (one 32-byte chunk + a full dispatch).
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use std::arch::x86_64::*;
 
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn classify_ascii_avx2(s: &[u8]) -> super::AsciiClass {
+    pub(super) unsafe fn classify_ascii_avx2(
+        s: &[u8],
+        stop_at: super::AsciiClass,
+    ) -> super::AsciiClass {
         let sp = _mm256_set1_epi8(0x20);
         let del = _mm256_set1_epi8(0x7F);
         let tab_v = _mm256_set1_epi8(0x09);
@@ -572,7 +762,11 @@ mod x86_64 {
         while i + 64 <= s.len() {
             let a = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
             let b = unsafe { _mm256_loadu_si256(s.as_ptr().add(i + 32) as *const __m256i) };
-            let classify = |v: __m256i| unsafe {
+            // Return the *mask vectors*, not their reductions: OR-ing the two
+            // halves before reducing is exact (a lane is set iff it is set in
+            // its own half) and halves the layout `movemask`s — the SSE2 kernel
+            // already ORs across four 16-byte chunks before reducing.
+            let masks = |v: __m256i| {
                 let lt = _mm256_cmpgt_epi8(sp, v);
                 let tab = _mm256_cmpeq_epi8(v, tab_v);
                 let nl = _mm256_cmpeq_epi8(v, nl_v);
@@ -581,38 +775,44 @@ mod x86_64 {
                 let allowed_ctrl = _mm256_or_si256(tab, nl);
                 let off = _mm256_andnot_si256(allowed_ctrl, lt);
                 let eq = _mm256_cmpeq_epi8(v, del);
-                (
-                    _mm256_or_si256(eq, off),
-                    _mm256_movemask_epi8(tab),
-                    _mm256_movemask_epi8(nl),
-                )
+                (_mm256_or_si256(eq, off), tab, nl)
             };
-            let (bad_a, tab_a, nl_a) = classify(a);
-            let (bad_b, tab_b, nl_b) = classify(b);
-            if unsafe { _mm256_movemask_epi8(_mm256_or_si256(bad_a, bad_b)) } != 0 {
+            let (bad_a, tab_a, nl_a) = masks(a);
+            let (bad_b, tab_b, nl_b) = masks(b);
+            if _mm256_movemask_epi8(_mm256_or_si256(bad_a, bad_b)) != 0 {
                 return super::AsciiClass::Other;
             }
-            saw_tab |= tab_a != 0 || tab_b != 0;
-            saw_newline |= nl_a != 0 || nl_b != 0;
+            saw_tab |= _mm256_movemask_epi8(_mm256_or_si256(tab_a, tab_b)) != 0;
+            saw_newline |= _mm256_movemask_epi8(_mm256_or_si256(nl_a, nl_b)) != 0;
             i += 64;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
         while i + 32 <= s.len() {
             // SAFETY: `i + 32 <= len`, and the caller checked AVX2 support.
-            let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i) };
-            let lt = unsafe { _mm256_cmpgt_epi8(sp, v) };
-            let tab = unsafe { _mm256_cmpeq_epi8(v, tab_v) };
-            let nl = unsafe { _mm256_cmpeq_epi8(v, nl_v) };
-            let off = unsafe { _mm256_andnot_si256(_mm256_or_si256(tab, nl), lt) };
-            let eq = unsafe { _mm256_cmpeq_epi8(v, del) };
-            let bad = unsafe { _mm256_or_si256(eq, off) };
-            if unsafe { _mm256_movemask_epi8(bad) } != 0 {
+            let v = _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i);
+            let lt = _mm256_cmpgt_epi8(sp, v);
+            let tab = _mm256_cmpeq_epi8(v, tab_v);
+            let nl = _mm256_cmpeq_epi8(v, nl_v);
+            let off = _mm256_andnot_si256(_mm256_or_si256(tab, nl), lt);
+            let eq = _mm256_cmpeq_epi8(v, del);
+            let bad = _mm256_or_si256(eq, off);
+            if _mm256_movemask_epi8(bad) != 0 {
                 return super::AsciiClass::Other;
             }
-            saw_tab |= unsafe { _mm256_movemask_epi8(tab) } != 0;
-            saw_newline |= unsafe { _mm256_movemask_epi8(nl) } != 0;
+            saw_tab |= _mm256_movemask_epi8(tab) != 0;
+            saw_newline |= _mm256_movemask_epi8(nl) != 0;
             i += 32;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
-        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(
+            saw_tab,
+            saw_newline,
+            super::classify_ascii_bounded(&s[i..], stop_at),
+        )
     }
 
     #[target_feature(enable = "avx2")]
@@ -649,6 +849,18 @@ mod x86_64 {
             }
             i += 32;
         }
+        if i + 16 <= s.len() {
+            // SSE2 is baseline on x86_64, so inline the 16-byte step instead of
+            // re-entering the dispatcher: that re-entry ran the SSE2 kernel and
+            // then the short path, which is the measured 48..63 / 96..127 cliff
+            // (one chunk plus a full dispatch for the remainder).
+            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
+            let mask = unsafe { _mm_movemask_epi8(v) };
+            if mask != 0 {
+                return i + mask.trailing_zeros() as usize;
+            }
+            i += 16;
+        }
         let tail = super::next_non_ascii_byte(&s[i..]);
         if tail == usize::MAX {
             usize::MAX
@@ -658,7 +870,10 @@ mod x86_64 {
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
-    pub(super) unsafe fn classify_ascii_avx512(s: &[u8]) -> super::AsciiClass {
+    pub(super) unsafe fn classify_ascii_avx512(
+        s: &[u8],
+        stop_at: super::AsciiClass,
+    ) -> super::AsciiClass {
         let sp = _mm512_set1_epi8(0x20);
         let del = _mm512_set1_epi8(0x7F);
         let tab_v = _mm512_set1_epi8(0x09);
@@ -685,6 +900,9 @@ mod x86_64 {
             saw_tab |= (ta | tb | tc | td) != 0;
             saw_newline |= (na | nb | nc | nd) != 0;
             i += 256;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
         while i + 64 <= s.len() {
             let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(i).cast()) };
@@ -699,8 +917,15 @@ mod x86_64 {
             saw_tab |= tab != 0;
             saw_newline |= nl != 0;
             i += 64;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
-        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(
+            saw_tab,
+            saw_newline,
+            super::classify_ascii_bounded(&s[i..], stop_at),
+        )
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
@@ -731,6 +956,18 @@ mod x86_64 {
             }
             i += 64;
         }
+        if i + 16 <= s.len() {
+            // SSE2 is baseline on x86_64, so inline the 16-byte step instead of
+            // re-entering the dispatcher: that re-entry ran the SSE2 kernel and
+            // then the short path, which is the measured 48..63 / 96..127 cliff
+            // (one chunk plus a full dispatch for the remainder).
+            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
+            let mask = unsafe { _mm_movemask_epi8(v) };
+            if mask != 0 {
+                return i + mask.trailing_zeros() as usize;
+            }
+            i += 16;
+        }
         let tail = super::next_non_ascii_byte(&s[i..]);
         if tail == usize::MAX {
             usize::MAX
@@ -740,7 +977,10 @@ mod x86_64 {
     }
 
     #[target_feature(enable = "sse2")]
-    pub(super) unsafe fn classify_ascii_sse2(s: &[u8]) -> super::AsciiClass {
+    pub(super) unsafe fn classify_ascii_sse2(
+        s: &[u8],
+        stop_at: super::AsciiClass,
+    ) -> super::AsciiClass {
         let sp = _mm_set1_epi8(0x20);
         let del = _mm_set1_epi8(0x7F);
         let tab_v = _mm_set1_epi8(0x09);
@@ -748,6 +988,42 @@ mod x86_64 {
         let mut saw_tab = false;
         let mut saw_newline = false;
         let mut i = 0usize;
+        // 64-byte groups: four loads, three OR-merged reductions, one branch.
+        //
+        // The 16-byte version spent three `movemask`s and a branch per 16 bytes
+        // (12 masks per 64).  Merging is exact — a lane is offending iff it is
+        // offending in its own vector, and OR-ing the mask vectors before the
+        // single `movemask` cannot lose or invent a lane — while the group form
+        // turns the same work into 3 masks and 1 branch per 64 bytes.  SSE2 is
+        // this dispatcher's tier for 16–127 bytes (the measured vector-tile
+        // thresholds put every wider kernel at ≥128), so this loop *is* the hot
+        // path for diagnostic line lengths.
+        while i + 64 <= s.len() {
+            let p = unsafe { s.as_ptr().add(i) } as *const __m128i;
+            let mut bad = unsafe { _mm_setzero_si128() };
+            let mut tab_acc = unsafe { _mm_setzero_si128() };
+            let mut nl_acc = unsafe { _mm_setzero_si128() };
+            for k in 0..4 {
+                let v = unsafe { _mm_loadu_si128(p.add(k)) };
+                let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
+                let tab = unsafe { _mm_cmpeq_epi8(v, tab_v) };
+                let nl = unsafe { _mm_cmpeq_epi8(v, nl_v) };
+                let off = unsafe { _mm_andnot_si128(_mm_or_si128(tab, nl), lt) };
+                let eq = unsafe { _mm_cmpeq_epi8(v, del) };
+                bad = unsafe { _mm_or_si128(bad, _mm_or_si128(eq, off)) };
+                tab_acc = unsafe { _mm_or_si128(tab_acc, tab) };
+                nl_acc = unsafe { _mm_or_si128(nl_acc, nl) };
+            }
+            if unsafe { _mm_movemask_epi8(bad) } != 0 {
+                return super::AsciiClass::Other;
+            }
+            saw_tab |= unsafe { _mm_movemask_epi8(tab_acc) } != 0;
+            saw_newline |= unsafe { _mm_movemask_epi8(nl_acc) } != 0;
+            i += 64;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
+        }
         while i + 16 <= s.len() {
             let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
             let lt = unsafe { _mm_cmpgt_epi8(sp, v) };
@@ -762,8 +1038,15 @@ mod x86_64 {
             saw_tab |= unsafe { _mm_movemask_epi8(tab) } != 0;
             saw_newline |= unsafe { _mm_movemask_epi8(nl) } != 0;
             i += 16;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
-        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(
+            saw_tab,
+            saw_newline,
+            super::classify_ascii_bounded(&s[i..], stop_at),
+        )
     }
 
     #[target_feature(enable = "sse2")]
@@ -847,7 +1130,7 @@ mod wasm {
     }
 
     #[target_feature(enable = "simd128")]
-    pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
+    pub(super) unsafe fn classify_ascii(s: &[u8], stop_at: super::AsciiClass) -> super::AsciiClass {
         let sp = u8x16_splat(0x20);
         let del = u8x16_splat(0x7F);
         let tab = u8x16_splat(0x09);
@@ -878,6 +1161,9 @@ mod wasm {
             saw_tab |= ta != 0 || tb != 0;
             saw_newline |= na != 0 || nb != 0;
             i += 32;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
         while i + 16 <= s.len() {
             let v = unsafe { v128_load(s.as_ptr().add(i).cast()) };
@@ -895,8 +1181,15 @@ mod wasm {
             saw_tab |= unsafe { u8x16_bitmask(tabm) != 0 };
             saw_newline |= unsafe { u8x16_bitmask(nlm) != 0 };
             i += 16;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
-        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(
+            saw_tab,
+            saw_newline,
+            super::classify_ascii_bounded(&s[i..], stop_at),
+        )
     }
 
     #[target_feature(enable = "simd128")]
@@ -958,13 +1251,16 @@ mod neon {
         // index.  Do not "simplify" the divisor to `/8`: that would be a byte
         // index into the packed word, not a lane index.
         let high = unsafe { vcgeq_u8(v, vdupq_n_u8(0x80)) };
-        let packed = unsafe { vshrn_n_u16(vreinterpretq_u16_u8(high), 4) };
+        // `vshrn_n_u16` is const-generic in `std::arch` (shift intrinsics have
+        // been since Rust 1.61, i.e. long before this crate's MSRV), so the
+        // shift count must be a generic argument, not a value argument.
+        let packed = unsafe { vshrn_n_u16::<4>(vreinterpretq_u16_u8(high)) };
         let bits = unsafe { vget_lane_u64(vreinterpret_u64_u8(packed), 0) };
         (bits != 0).then_some((bits.trailing_zeros() / 4) as usize)
     }
 
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn classify_ascii(s: &[u8]) -> super::AsciiClass {
+    pub(super) unsafe fn classify_ascii(s: &[u8], stop_at: super::AsciiClass) -> super::AsciiClass {
         let sp = unsafe { vdupq_n_s8(0x20) };
         let del = unsafe { vdupq_n_u8(0x7F) };
         let tab_v = unsafe { vdupq_n_u8(0x09) };
@@ -994,6 +1290,9 @@ mod neon {
             saw_tab |= tab_a || tab_b;
             saw_newline |= nl_a || nl_b;
             i += 32;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
         while i + 16 <= s.len() {
             let v = unsafe { vld1q_u8(s.as_ptr().add(i)) };
@@ -1008,8 +1307,15 @@ mod neon {
             saw_tab |= unsafe { any_nonzero(tab) };
             saw_newline |= unsafe { any_nonzero(nl) };
             i += 16;
+            if let Some(done) = super::reached(saw_tab, saw_newline, stop_at) {
+                return done;
+            }
         }
-        super::compose_classify_tail(saw_tab, saw_newline, super::classify_ascii(&s[i..]))
+        super::compose_classify_tail(
+            saw_tab,
+            saw_newline,
+            super::classify_ascii_bounded(&s[i..], stop_at),
+        )
     }
 
     #[target_feature(enable = "neon")]
@@ -1058,19 +1364,81 @@ mod tests {
     /// silently turning every later SWAR test on that thread into an SSE2 test
     /// (and hiding exactly the SWAR borrow-chain bugs those tests exist to
     /// catch).
-    struct ForceSwarGuard;
+    struct ForceSwarGuard(bool);
 
     impl ForceSwarGuard {
         fn new() -> Self {
-            SWAR_FORCED.with(|f| f.set(true));
-            Self
+            // Save the previous value: an unconditional `false` on drop would
+            // clobber an outer guard if these scopes ever nest.
+            Self(SWAR_FORCED.with(|f| f.replace(true)))
         }
     }
 
     impl Drop for ForceSwarGuard {
         fn drop(&mut self) {
-            SWAR_FORCED.with(|f| f.set(false));
+            SWAR_FORCED.with(|f| f.set(self.0));
         }
+    }
+
+    /// The early-exit bound must never change an answer.
+    ///
+    /// `is_printable_ascii` / `is_printable_ascii_or_tab` now stop at the first
+    /// chunk whose class already settles them; this pins that against the
+    /// unbounded classification over random bytes *and* over crafted inputs whose
+    /// tab/newline/offender sits at every interesting offset (the whole point of
+    /// the bound is that those offsets end the scan early).
+    #[test]
+    fn bounded_predicates_match_full_classification() {
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Alphabet weighted towards the classes the predicates actually split.
+        const ALPHABET: &[u8] = b"abcXYZ 019\t\n\r\x00\x7f\x80\xff";
+
+        let mut check = |s: &[u8]| {
+            let class = super::classify_ascii(s);
+            assert_eq!(
+                super::is_printable_ascii(s),
+                class == super::AsciiClass::Printable,
+                "is_printable_ascii disagrees at {s:?}"
+            );
+            assert_eq!(
+                super::is_printable_ascii_or_tab(s),
+                class <= super::AsciiClass::PrintableOrTab,
+                "is_printable_ascii_or_tab disagrees at {s:?}"
+            );
+            assert_eq!(
+                super::is_printable_ascii_multiline(s),
+                class != super::AsciiClass::Other,
+                "is_printable_ascii_multiline disagrees at {s:?}"
+            );
+        };
+
+        for len in 0..=140 {
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                v.push(ALPHABET[(next() % ALPHABET.len() as u64) as usize]);
+            }
+            check(&v);
+        }
+        // One special byte at every offset of a long line, with the rest plain
+        // printable: this is the shift that used to force a full scan.
+        for special in [b'\t', b'\n', b'\r', b'\x00', 0x80] {
+            for at in [
+                0usize, 1, 7, 8, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 129,
+            ] {
+                let mut v = vec![b'a'; 130];
+                v[at] = special;
+                check(&v);
+            }
+        }
+        // All-printable and empty edges.
+        check(b"");
+        check(b"the quick brown fox");
     }
 
     #[test]
@@ -1408,7 +1776,10 @@ mod tests {
     /// scalar short-circuit and would make the name a lie.
     #[test]
     fn next_non_ascii_from_mid_sequence_holds_across_tiers() {
-        for &len in &[16usize, 32, 64, 128, 256, 512] {
+        // `len` must stay ≥ 20: `skip = 3` leaves `len - 3` bytes, and a slice
+        // below 16 would take the scalar short-circuit — the case this test is
+        // named for is the *vector* path.
+        for &len in &[32usize, 64, 128, 256, 512] {
             let mut v = vec![b'a'; len];
             v[..4].copy_from_slice("😀".as_bytes()); // F0 9F 98 80
             for skip in 1..4 {
@@ -1428,7 +1799,9 @@ mod tests {
 
     #[test]
     fn next_non_ascii_covers_multi_block_offsets() {
-        for at in [8, 15, 16, 31, 32, 127, 128, 255, 256, 383, 512, 600, 1023] {
+        for at in [
+            8, 15, 16, 31, 32, 47, 48, 63, 64, 127, 128, 255, 256, 383, 512, 600, 1023,
+        ] {
             let mut v = vec![b'a'; 1088];
             v[at] = 0x80;
             assert_eq!(next_non_ascii_byte(&v), Some(at), "offset {at}");
@@ -1829,7 +2202,8 @@ mod tests {
     /// lane, including the second half of a 128-byte scan.
     #[test]
     fn next_non_ascii_covers_avx512_lanes() {
-        for lane in 0..128 {
+        // 256 covers the second half of the unrolled 256-byte AVX-512 loop.
+        for lane in 0..256 {
             let mut v = vec![b'a'; 256];
             v[lane] = 0x80;
             assert_eq!(next_non_ascii_byte(&v), Some(lane), "lane {lane}");

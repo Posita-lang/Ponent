@@ -97,18 +97,24 @@ fn accept_nonblocking(listener: &TcpListener) -> std::io::Result<TcpStream> {
 /// normal return, `?`, and panic unwinding all restore the caller's mode.
 struct RestoreNonblocking<'a> {
     listener: &'a TcpListener,
-    was_nonblocking: bool,
+    /// The previous non-blocking bit, when the platform lets us read it.
+    ///
+    /// Unix queries it.  Winsock has **no** way to read the bit, so `None` means
+    /// "unknown" and `Drop` leaves the socket alone.  The old code stored
+    /// `false` there, i.e. it unconditionally restored *blocking* — turning a
+    /// deliberately non-blocking listener into a blocking one on Windows, which
+    /// is worse than not restoring at all (the caller that set it up owns the
+    /// state on that platform).
+    was_nonblocking: Option<bool>,
 }
 
 impl<'a> RestoreNonblocking<'a> {
     fn new(listener: &'a TcpListener, nonblocking: bool) -> std::io::Result<Self> {
-        // Query first: if the query fails the listener is untouched.  Winsock
-        // has no way to read the non-blocking bit, so non-Unix falls back to
-        // the documented blocking-listener contract.
+        // Query first: if the query fails the listener is untouched.
         #[cfg(unix)]
-        let was_nonblocking = socket2::SockRef::from(listener).nonblocking()?;
+        let was_nonblocking = Some(socket2::SockRef::from(listener).nonblocking()?);
         #[cfg(not(unix))]
-        let was_nonblocking = false;
+        let was_nonblocking = None;
         listener.set_nonblocking(nonblocking)?;
         Ok(Self {
             listener,
@@ -121,7 +127,9 @@ impl Drop for RestoreNonblocking<'_> {
     fn drop(&mut self) {
         // Destructors must not panic (especially during unwinding): a failed
         // restore is best-effort, not a secondary abort.
-        let _ = self.listener.set_nonblocking(self.was_nonblocking);
+        if let Some(previous) = self.was_nonblocking {
+            let _ = self.listener.set_nonblocking(previous);
+        }
     }
 }
 
@@ -274,6 +282,14 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     let delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(not(unix))]
     let mut first_error: Option<std::io::Error> = None;
+    // Keep the last `poll` failure so the give-up path can report the real
+    // cause instead of a generic "no client connected" timeout.  `gave_up`
+    // distinguishes that path from a normal deadline/idle exit, after which a
+    // recovered transient error must not be reported as fatal.
+    #[cfg(unix)]
+    let mut last_poll_error: Option<std::io::Error> = None;
+    #[cfg(unix)]
+    let mut poll_gave_up = false;
 
     // A9.2: accept speculative preconnects into a poll-set instead of
     // servicing them serially.  A silent preconnect sends nothing, so `poll`
@@ -361,7 +377,9 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 // the wait while the browser may still connect.  Give up only
                 // after a sustained, consecutive error run.
                 poll_errors += 1;
+                last_poll_error = Some(e);
                 if poll_errors >= 100 {
+                    poll_gave_up = true;
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(poll_backoff_ms));
@@ -454,6 +472,12 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                             }
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        // Every other read/write loop in this file retries on
+                        // EINTR, and this is the one that runs on a foreground
+                        // terminal: `SIGWINCH` (a window resize), `SIGCHLD` or
+                        // `SIGCONT` landing mid-read used to kill a connection
+                        // that had already begun sending its request.
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => {
                             action = Some(PendingAction::Close);
                             break;
@@ -615,11 +639,14 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 // The accepted socket may be blocking; a preconnect that sends
                 // nothing would otherwise hold `drain_request` on a blocking
                 // `read` for the full 1 s budget (or indefinitely if the peer
-                // never closes).  Force non-blocking so the drain consumes
-                // only bytes that have already arrived.
-                // propagate the mode change instead of swallowing it. If it fails,
-                // `read` stays blocking with no timeout and the drain could
-                // wait forever, so skip the drain and just close.
+                // never closes).
+                //
+                // Force *non-blocking* so the drain consumes only bytes that
+                // have already arrived, so a silent peer cannot hold it on a
+                // blocking `read`.  The mode change is set, not merely
+                // propagated: if it fails, `read` would stay blocking with no
+                // timeout and the drain could wait forever, so skip the drain
+                // and just close.
                 if extra.set_nonblocking(true).is_err() {
                     let _ = extra.shutdown(Shutdown::Both);
                     drained += 1;
@@ -651,6 +678,19 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
         #[cfg(not(unix))]
         if let Some(error) = first_error {
             return Err(error);
+        }
+        #[cfg(unix)]
+        if poll_gave_up {
+            // The wait was cut short by a sustained `poll` failure, not by
+            // the deadline: report the underlying error instead of pretending
+            // no client connected.
+            let detail = match last_poll_error {
+                Some(e) => {
+                    format!("explain server: gave up after 100 consecutive poll failures: {e}")
+                }
+                None => "explain server: gave up after 100 consecutive poll failures".to_owned(),
+            };
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, detail));
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -685,9 +725,11 @@ const MAX_BODY_DRAIN: usize = 8 * 1024 * 1024;
 /// close happen with request bytes still unread .
 /// Resource caps shared by every HTTP backend.
 const MAX_HEADER: usize = 64 * 1024;
-/// A one-shot response is already on the wire; 150 ms is enough to avoid RST
-/// while the client drains it, without letting `thread::scope`'s join stall
-/// the accept loop for a full second.
+/// Linger after a one-shot response is already on the wire: long enough for a
+/// local browser to drain the final bytes (avoiding an RST that discards the
+/// response), short enough to bound the one-shot exit latency.  Also used by
+/// the 431/malformed half-close paths, which otherwise closed after only
+/// 50 ms and could truncate a large error body.
 const ONE_SHOT_LINGER: Duration = Duration::from_millis(150);
 
 #[derive(Default)]
@@ -909,6 +951,50 @@ impl HeaderFraming {
             remaining => RequestBody::Fixed { remaining },
         }
     }
+
+    /// Derive the framing/keep-alive decision **once**.
+    ///
+    /// The backends used to recompute "is there a body to drain?" and "may this
+    /// connection be reused?" independently — `drain_request_tracked`, the epoll
+    /// dispatcher and the request-head handoff each spelled the predicate out —
+    /// which is exactly the shape where the two answers drift apart (a
+    /// connection reused with an unread body gets RST; one closed unnecessarily
+    /// loses keep-alive).  Everything framing-derived now comes from here; a
+    /// caller may only add its *own* vetoes (the responder's status, whether
+    /// pipelined bytes follow).
+    ///
+    /// `already_read` counts body bytes that arrived in the same read as the
+    /// head; `http11` is the request's protocol version.
+    fn decide(self, already_read: usize, http11: bool) -> RequestDecision {
+        let body = self.body(already_read);
+        let body_remaining = match body {
+            RequestBody::Empty => Some(0),
+            RequestBody::Fixed { remaining } => Some(remaining),
+            // Framing cannot be trusted: only peer EOF (or the drain budget)
+            // ends the body, so there is no length to report.
+            RequestBody::Unframed => None,
+        };
+        let must_close = self.connection_close || !matches!(body, RequestBody::Empty);
+        RequestDecision {
+            body_remaining,
+            keep_alive_allowed: http11 && !must_close,
+            must_close,
+        }
+    }
+}
+
+/// Framing-derived connection decision — see [`HeaderFraming::decide`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestDecision {
+    /// Body bytes still to read; `None` when the framing is untrusted
+    /// ([`RequestBody::Unframed`]).
+    body_remaining: Option<usize>,
+    /// Framing alone permits another request on this connection (HTTP/1.1, no
+    /// `Connection: close`, empty body).  Callers AND their own vetoes on top.
+    keep_alive_allowed: bool,
+    /// The connection must be closed after the response, whatever the responder
+    /// decides.
+    must_close: bool,
 }
 
 /// One parsed request head shared between the poll handoff and the worker.
@@ -1095,29 +1181,15 @@ fn drain_after_head(
     budget: Duration,
 ) -> DrainOutcome {
     let deadline = Instant::now() + budget;
-    let mut sink = [0u8; 4096];
     if matches!(framing.body(already_read), RequestBody::Unframed) {
-        loop {
-            if Instant::now() >= deadline {
-                return DrainOutcome::HeadersOnly;
-            }
-            if arm_read_timeout_until(stream, deadline).is_err() {
-                return DrainOutcome::HeadersOnly;
-            }
-            match stream.read(&mut sink) {
-                Ok(0) => return DrainOutcome::Complete,
-                Ok(_) => {}
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    return DrainOutcome::HeadersOnly;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return DrainOutcome::HeadersOnly,
-            }
-        }
+        // One home for unframed-drain semantics.  This was a byte-identical
+        // inline copy of `drain_unframed`, so a timeout-budget or `EINTR` fix
+        // applied to one copy silently diverged the other — the exact drift
+        // shape the framing decision and `HeaderScan` were consolidated to
+        // avoid.
+        return drain_unframed(stream, deadline);
     }
+    let mut sink = [0u8; 4096];
     let mut remaining = framing
         .content_length
         .unwrap_or(0)
@@ -1193,6 +1265,12 @@ fn drain_request_with_head(
 /// request's body were already read (a pipelined next request).  The
 /// keep-alive loop forces a close when it is non-zero instead of silently
 /// discarding the second request .
+///
+/// `is_head` is derived from `collected.starts_with(b"HEAD ")`, and
+/// `collected` is seeded with `prefix`.  It is therefore only meaningful when
+/// `prefix` is empty (the shed path); with a non-empty prefix the request line
+/// is already behind it, so `is_head` is silently `false` and callers must not
+/// rely on it.
 fn drain_request_tracked(
     stream: &mut TcpStream,
     prefix: &[u8],
@@ -1280,9 +1358,17 @@ fn drain_request_tracked(
     let already_read = collected.len() - head_end;
     // Any body at all (declared, chunked, or unframable) means this path cannot
     // reuse the connection for a following request.
-    *wants_close =
-        framing.connection_close || !matches!(framing.body(already_read), RequestBody::Empty);
-    if matches!(framing.body(already_read), RequestBody::Unframed) {
+    // One derivation for "must we drain?" *and* "may we reuse?" — see
+    // `HeaderFraming::decide`.  The version is the request line's last token; an
+    // HTTP/1.0 request gets no implicit keep-alive, which is what the reactor
+    // already enforced and this path used to miss.
+    let http11 = collected
+        .split(|&b| b == b'\n')
+        .next()
+        .is_some_and(|line| line.trim_ascii_end().ends_with(b"HTTP/1.1"));
+    let decision = framing.decide(already_read, http11);
+    *wants_close = !decision.keep_alive_allowed;
+    if decision.body_remaining.is_none() {
         // Chunked/unsupported framing, conflicting or malformed
         // `Content-Length`, or a body over the cap: request framing cannot be
         // established, so `Complete` is only safe on peer EOF.  A budget
@@ -1414,7 +1500,7 @@ fn csp_style_src() -> &'static str {
     SRC.get_or_init(|| {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
-        let css = crate::diagnostics::emitter::stylesheet::dark_css_cached();
+        let css = crate::diagnostics::emitter::stylesheet::dark_css();
         let hash = |extra: &str| {
             let digest = Sha256::digest(page_style(css, extra).as_bytes());
             base64::engine::general_purpose::STANDARD.encode(digest)
@@ -2095,8 +2181,14 @@ fn linger_after_half_close_for(stream: &mut TcpStream, budget: Duration) {
     drain_until_eof(stream, budget, true);
 }
 
+/// Half-close linger for a complete response whose request body was not fully
+/// drained (the 431/malformed paths plus the `HeadersOnly`/shed-503 arms).
+/// Shares [`ONE_SHOT_LINGER`] with the one-shot `HeadersOnly` call sites: all
+/// write a complete response before draining, so they need the same
+/// browser-drain window (the old 50 ms was shorter than a slow local client's
+/// drain).
 fn linger_after_half_close(stream: &mut TcpStream) {
-    linger_after_half_close_for(stream, Duration::from_millis(50));
+    linger_after_half_close_for(stream, ONE_SHOT_LINGER);
 }
 
 /// Escape a string for HTML embedding.
@@ -2252,7 +2344,7 @@ fn page_head(title: &str, extra_css: &str) -> String {
 "#,
         title = escape_html(title),
         style = page_style(
-            crate::diagnostics::emitter::stylesheet::dark_css_cached(),
+            crate::diagnostics::emitter::stylesheet::dark_css(),
             extra_css
         ),
     )
@@ -2421,6 +2513,14 @@ fn serve_explain_persistent_impl(
     // Preserve the caller's listener mode: the Linux reactor flips it to
     // nonblocking below, and the guard restores the original on every return.
     let _restore = RestoreNonblocking::new(listener, false)?;
+    // On Linux the *only* path is the epoll reactor below, which enables
+    // `TCP_DEFER_ACCEPT` in its own scope.  Enabling it here as well stacked two
+    // guards on the same socket: benign (the inner guard restores to the outer's
+    // value, so drop order is LIFO-correct) but it made the socket's state
+    // depend on two `Drop` impls for no gain, and the second `setsockopt` was
+    // pure syscall overhead.  Non-Linux keeps it here because the
+    // thread-per-connection path is the one that continues below.
+    #[cfg(not(target_os = "linux"))]
     let _defer_accept = enable_tcp_defer_accept(listener);
     // Thread-per-connection: a slow client (its 500 ms read-timeout path, or
     // one that stalls mid-request) must not delay accepting the browser's
@@ -2724,11 +2824,7 @@ fn serve_explain_persistent_epoll(
     }
 
     impl Conn {
-        fn queue_bad_request(
-            &mut self,
-            fd: i32,
-            heap: &mut BinaryHeap<Reverse<(Instant, i32)>>,
-        ) {
+        fn queue_bad_request(&mut self, fd: i32, heap: &mut BinaryHeap<Reverse<(Instant, i32)>>) {
             self.response = Some(bad_request_response());
             self.conn_hdr = b"Connection: close\r\n\r\n";
             self.keep_alive = false;
@@ -2741,11 +2837,7 @@ fn serve_explain_persistent_epoll(
             arm_deadline(&mut *self, fd, Instant::now() + WRITE_TIMEOUT, heap);
         }
 
-        fn queue_too_large(
-            &mut self,
-            fd: i32,
-            heap: &mut BinaryHeap<Reverse<(Instant, i32)>>,
-        ) {
+        fn queue_too_large(&mut self, fd: i32, heap: &mut BinaryHeap<Reverse<(Instant, i32)>>) {
             self.response = Some(HttpResponse::from_cache(
                 "431 Request Header Fields Too Large",
                 "",
@@ -2942,7 +3034,10 @@ fn serve_explain_persistent_epoll(
                             // arm is then pruned as stale on the next peek.
                             deadline_heap.push(Reverse((first_byte_deadline, conn_fd)));
                             let mut conn_event = libc::epoll_event {
-                                events: if conns.get(&conn_fd).is_some_and(|c| c.state == ConnState::Writing) {
+                                events: if conns
+                                    .get(&conn_fd)
+                                    .is_some_and(|c| c.state == ConnState::Writing)
+                                {
                                     libc::EPOLLOUT as u32
                                 } else {
                                     libc::EPOLLIN as u32
@@ -3218,20 +3313,18 @@ fn serve_explain_persistent_epoll(
                     )
                 };
                 let already_read = conn.buf.len().saturating_sub(head_end);
-                conn.body_remaining =
-                    if matches!(framing.body(already_read), RequestBody::Unframed) {
-                        usize::MAX
-                    } else {
-                        framing
-                            .content_length
-                            .unwrap_or(0)
-                            .saturating_sub(already_read)
-                    };
-                let body = framing.body(already_read);
+                conn.body_remaining = if matches!(framing.body(already_read), RequestBody::Unframed)
+                {
+                    usize::MAX
+                } else {
+                    framing
+                        .content_length
+                        .unwrap_or(0)
+                        .saturating_sub(already_read)
+                };
+                let decision = framing.decide(already_read, http11);
                 let keep = response_allows_keep_alive(response.status)
-                    && matches!(body, RequestBody::Empty)
-                    && !framing.connection_close
-                    && http11
+                    && decision.keep_alive_allowed
                     && conn.buf.len() == head_end;
                 conn.keep_alive = keep;
                 if !keep {
@@ -3354,7 +3447,12 @@ fn serve_explain_persistent_epoll(
                         conn.progress = [0; 6];
                         conn.state = ConnState::Reading;
                         conn.header_deadline = None;
-                        arm_deadline(conn, fd, Instant::now() + KEEP_ALIVE_IDLE, &mut deadline_heap);
+                        arm_deadline(
+                            conn,
+                            fd,
+                            Instant::now() + KEEP_ALIVE_IDLE,
+                            &mut deadline_heap,
+                        );
                         let mut conn_event = libc::epoll_event {
                             events: libc::EPOLLIN as u32,
                             u64: fd as u64,
@@ -4958,6 +5056,63 @@ mod tests {
         // An encoded slash must not become a path separator and alias `/E030/`.
         assert_eq!(canonical_path_code("/E030%2F"), None);
         assert_eq!(canonical_path_code("//E030"), None);
+    }
+
+    /// `decide` is the single source of "must we drain?" / "may we reuse?", so
+    /// pin it against the predicates the backends used to spell out inline.  If
+    /// this matrix and those formulas ever disagree, one backend would reuse a
+    /// connection with an unread body (RST) or close one needlessly.
+    #[test]
+    fn decide_matches_the_inline_predicates_it_replaced() {
+        for &has_te in &[false, true] {
+            for &ambiguous in &[false, true] {
+                for &malformed in &[false, true] {
+                    for &oversized in &[false, true] {
+                        for &close in &[false, true] {
+                            for &content_length in &[None, Some(0usize), Some(5), Some(9)] {
+                                for &already_read in &[0usize, 3, 5, 9, 20] {
+                                    for &http11 in &[false, true] {
+                                        let framing = HeaderFraming {
+                                            content_length,
+                                            has_transfer_encoding: has_te,
+                                            ambiguous,
+                                            malformed,
+                                            oversized,
+                                            connection_close: close,
+                                        };
+                                        let body = framing.body(already_read);
+                                        // The two formulas the sites used.
+                                        let old_close =
+                                            close || !matches!(body, RequestBody::Empty);
+                                        let old_keep =
+                                            http11 && matches!(body, RequestBody::Empty) && !close;
+
+                                        let d = framing.decide(already_read, http11);
+                                        assert_eq!(
+                                            d.must_close, old_close,
+                                            "{framing:?} ar={already_read}"
+                                        );
+                                        assert_eq!(
+                                            d.keep_alive_allowed, old_keep,
+                                            "{framing:?} ar={already_read} http11={http11}"
+                                        );
+                                        assert_eq!(
+                                            d.body_remaining,
+                                            match body {
+                                                RequestBody::Empty => Some(0),
+                                                RequestBody::Fixed { remaining } => Some(remaining),
+                                                RequestBody::Unframed => None,
+                                            },
+                                            "{framing:?} ar={already_read}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

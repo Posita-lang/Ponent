@@ -75,6 +75,11 @@ const SLAB_ALIGN: usize = 64;
 /// a thread may keep using a stale `&FastSlab` after a newer slab has been
 /// published.  Each slab owns its own cursor; only `base` and `cap` are
 /// immutable after publication.
+// Cache-line aligned: `cursor` is CAS-ed by every worker, and the slab lives
+// inside bump memory whose neighbouring bytes are AST nodes other threads are
+// writing.  Without the alignment the CAS line is invalidated by those stores —
+// the same reason `Padded` exists.
+#[repr(align(64))]
 struct FastSlab {
     base: usize,
     cap: usize,
@@ -88,6 +93,15 @@ struct FastSlab {
 /// the other on every core.
 #[repr(align(64))]
 struct Padded<T>(T);
+
+thread_local! {
+    /// Number of live [`BumpScope`]s on this thread.  A scope takes
+    /// `alloc_lock`; taking it again on the same thread is a self-deadlock, so
+    /// the slow path checks this and panics instead of hanging.  Per-thread is
+    /// exactly the right scope: another thread blocking on the lock is the
+    /// normal, expected case.
+    static SCOPE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 /// A `Sync` (and `Send`) handle to a `bumpalo` arena.
 ///
@@ -197,6 +211,14 @@ impl<'a> SyncArena<'a> {
         // this for whole-file source buffers, so the copy dominates and we
         // avoid burning a slab on a per-file arena that only copies text.
         let dst = {
+            // A scope on this thread already owns the lock; `Mutex` is not
+            // reentrant, so this used to hang silently.  Every `SyncArena::alloc*`
+            // entry point that misses the fast path passes through here.
+            assert!(
+                SCOPE_DEPTH.with(std::cell::Cell::get) == 0,
+                "SyncArena: allocation inside a live BumpScope on the same thread would deadlock"
+            );
+
             let _guard = self.alloc_lock.0.lock();
             self.bump.alloc_layout(layout)
         };
@@ -258,12 +280,20 @@ impl<'a> SyncArena<'a> {
     /// small allocation installs its slab under `alloc_lock`, so it waits
     /// for the scope like any other slow-path allocation.)
     ///
-    /// **Do not** call [`SyncArena::alloc_str`] or allocate an over-large
-    /// value on the same thread while a scope is alive: those take
-    /// `alloc_lock`, which is not reentrant, so they would deadlock.  Do not
-    /// nest scopes for the same reason.
+    /// **Do not** call any `SyncArena::alloc*` method on the same thread while
+    /// a scope is alive.  Every one of them takes `alloc_lock` when it misses
+    /// the lock-free fast path — `alloc_str`, an over-large value, a small
+    /// allocation once the current slab is exhausted, and *any* small
+    /// allocation on a cold arena (installing the first slab) — and the lock is
+    /// not reentrant, so they would deadlock.  Only
+    /// [`BumpScope::bump_unchecked`] is safe inside a scope.  Do not nest
+    /// scopes for the same reason; both cases are caught by a same-thread
+    /// tripwire that panics instead of hanging.
     #[inline]
     pub fn scope(&'a self) -> BumpScope<'a> {
+        // Bump the depth *before* taking the lock so the slow path sees a live
+        // scope even if it is entered from the same thread between these lines.
+        SCOPE_DEPTH.with(|d| d.set(d.get() + 1));
         BumpScope {
             bump: self.bump,
             _guard: self.alloc_lock.0.lock(),
@@ -379,6 +409,15 @@ impl<'a> SyncArena<'a> {
 /// returned by [`bump_unchecked`](BumpScope::bump_unchecked) can be used for
 /// unsynchronized allocation for as long as the scope lives.  Drop it (or
 /// let it fall out of scope) to release the lock.
+impl Drop for BumpScope<'_> {
+    fn drop(&mut self) {
+        // Decremented before the guard unlocks (fields drop after a custom
+        // `Drop` body); the same thread performs no allocation in that window,
+        // and the flag is thread-local, so nothing else can observe it.
+        SCOPE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 pub struct BumpScope<'a> {
     bump: &'a Bump,
     /// Serializes access to the `Bump`'s cursor: held for the scope's whole

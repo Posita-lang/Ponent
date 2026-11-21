@@ -15,6 +15,7 @@
 //! [`TermCaps::detect`] is the escape hatch for callers that genuinely want a
 //! fresh probe.
 
+use crate::diagnostics::HEX_UPPER;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal};
@@ -81,7 +82,10 @@ impl TermCaps {
         let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
             .iter()
             .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
-        let term_dumb = term == Some("dumb");
+        // Case-insensitive like every other term comparison in this module
+        // (`COLORTERM`, TERM suffixes, JetBrains); `TERM=DUMB` on an embedded
+        // CI terminal would otherwise enable colour *and* box drawing.
+        let term_dumb = is_dumb_term(term);
         let columns = std::env::var_os("COLUMNS");
         TermCaps {
             color: caps.color,
@@ -141,6 +145,23 @@ fn ends_with_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> bool {
 /// `2` → 256, `3` **or any larger numeric value** → true colour.  Anything
 /// non-numeric (other than `true`/`false`/empty) carries no level.
 /// Matching is case-sensitive (`TRUE` is not `true`), mirroring Node.
+/// Optional sign plus an all-digit body.  `None` for an empty body or any
+/// non-digit byte.
+///
+/// The value is deliberately **not** materialised: both `FORCE_COLOR` callers
+/// classify by sign and by zero-ness/size class only, so classifying the digit
+/// string directly removes every `i128`/`u128` boundary at once.  The two
+/// separate parsers previously had to stay in sync by hand, and each had an
+/// overflow hole one magnitude further out than the other.
+fn signed_digits(s: &str) -> Option<(bool, &str)> {
+    let neg = s.starts_with('-');
+    let body = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(s);
+    (!body.is_empty() && body.bytes().all(|b| b.is_ascii_digit())).then_some((neg, body))
+}
+
 fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
     let s = v.to_str()?.trim();
     match s {
@@ -151,21 +172,27 @@ fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
         // Pinned by `force_color_true_and_empty_detect_depth`.
         "" | "true" => None,
         "false" => None,
-        _ => match s.parse::<u128>() {
-            Ok(0) => None,
-            Ok(1) => Some(ColorDepth::Sixteen),
-            Ok(2) => Some(ColorDepth::TwoFiftySix),
-            Ok(_) => Some(ColorDepth::TrueColor),
-            // All-digit input beyond `u128::MAX` is still a number ≥ 3, so the
-            // doc's "any larger numeric value → true colour" holds at *every*
-            // magnitude.  Without this arm a 40-digit generated CI string parsed
-            // as a failure and silently fell back to depth *detection* — the
-            // same boundary `force_color_is_off` solves by widening to `i128`.
-            Err(_) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
-                Some(ColorDepth::TrueColor)
+        _ => signed_digits(s).and_then(|(neg, digits)| {
+            // A negative value never pins a level (it means "off"; `force_color_is_off`
+            // owns that rule).
+            if neg {
+                return None;
             }
-            Err(_) => None,
-        },
+            match digits.trim_start_matches('0').len() {
+                0 => None,
+                1 => match digits.trim_start_matches('0').as_bytes()[0] {
+                    b'1' => Some(ColorDepth::Sixteen),
+                    b'2' => Some(ColorDepth::TwoFiftySix),
+                    // `0` is handled above, so this is 3..=9.
+                    _ => Some(ColorDepth::TrueColor),
+                },
+                // Any magnitude past a single significant digit is ≥ 10, i.e.
+                // "true colour" — including 40-digit CI-generated strings and
+                // a `+`-prefixed value, both of which the old `u128` fallback
+                // treated inconsistently.
+                _ => Some(ColorDepth::TrueColor),
+            }
+        }),
     }
 }
 
@@ -184,33 +211,36 @@ fn force_color_is_off(v: &OsStr) -> bool {
     let Some(s) = v.to_str().map(str::trim) else {
         return false;
     };
-    if s == "false" {
-        return true;
+    match signed_digits(s) {
+        // `supports-color` clamps `level < 0` to 0, i.e. OFF: a CI script setting
+        // `FORCE_COLOR=-1` means "silence colour".  Digit classification is exact
+        // at *every* magnitude, so a 40-digit negative no longer falls off an
+        // integer boundary and silently reads as "force on" (`i128` was the
+        // previous, one-boundary-short fix).  `-0` and `+0` are zero, hence off.
+        Some((neg, digits)) => neg || digits.bytes().all(|b| b == b'0'),
+        // Non-numeric values (`"abc"`, `"FALSE"`) mean force-on — not an
+        // explicit off request.  Case-sensitive `false` only, mirroring Node.
+        None => s == "false",
     }
-    // Modern `supports-color` clamps `level < 0` to 0, i.e. OFF: a CI script
-    // setting `FORCE_COLOR=-1` means "silence colour", not "force it on".
-    // Parsed as `i128`, not `i64`: a negative value *below* `i64::MIN` (a
-    // generated CI string, a `-99999999999999999999`) must still read as OFF.
-    // With `i64` the parse failed and fell through to "force on" — exactly the
-    // bug the clamping rule exists to prevent, one boundary further out.
-    // Non-numeric values (`"abc"`, `"FALSE"`) still mean force-on — they are
-    // not an explicit off request.
-    s.parse::<i128>().is_ok_and(|n| n <= 0)
 }
 
 /// Detect the terminal's colour depth from `FORCE_COLOR`, `COLORTERM` and
 /// `TERM`.
 ///
-/// Precedence, as implemented by [`color_depth_decision_with_terminal`] (which
-/// is the authoritative list — this summary must not drift from it):
-///   1. `FORCE_COLOR=1|2|3` → 16/256/24-bit respectively (Node/chalk levels).
+/// Precedence, as implemented by [`color_depth_decision_env`] (which is the
+/// authoritative list — this summary must not drift from it):
+///   1. `FORCE_COLOR=1|2|3` → 16/256/24-bit respectively (Node/chalk levels;
+///      any larger numeric value is 24-bit).
 ///   2. A terminal-family signal *before* `COLORTERM`: `WT_SESSION` (Windows
 ///      Terminal) → [`ColorDepth::TrueColor`], and an exact `TERM_PROGRAM` in
 ///      `{iTerm.app, WezTerm, vscode, WarpTerminal, Warp}` → [`ColorDepth::TrueColor`].
-///   3. `COLORTERM` contains `truecolor` or `24bit` → [`ColorDepth::TrueColor`]
-///   4. `TERM` ends with `truecolor` or `direct` → [`ColorDepth::TrueColor`]
-///   5. `TERM` ends with `256color` → [`ColorDepth::TwoFiftySix`]
-///   6. Otherwise → [`ColorDepth::Sixteen`]
+///   3. JetBrains `TERMINAL_EMULATOR=JetBrains-JediTerm` or a JetBrains
+///      `TERM` → [`ColorDepth::TrueColor`].
+///   4. `COLORTERM` contains `truecolor` or `24bit` → [`ColorDepth::TrueColor`]
+///   5. `TERM` ends with `truecolor`, `direct`, or is `xterm-kitty` →
+///      [`ColorDepth::TrueColor`]
+///   6. `TERM` ends with `256color` → [`ColorDepth::TwoFiftySix`]
+///   7. Otherwise → [`ColorDepth::Sixteen`]
 pub fn detect_color_depth() -> ColorDepth {
     detect_color_caps().depth
 }
@@ -380,27 +410,6 @@ pub(crate) fn color_caps_decision(env: &ColorEnv<'_>) -> ColorCaps {
     }
 }
 
-/// Pure decision core of [`detect_color`] (the colour-on/off half of
-/// [`ColorEnv`] only).
-pub(crate) fn color_decision(
-    no_color: bool,
-    clicolor: Option<&OsStr>,
-    clicolor_force: Option<&OsStr>,
-    force_color: Option<&OsStr>,
-    term: Option<&OsStr>,
-    stderr_is_tty: bool,
-) -> bool {
-    color_decision_env(&ColorEnv {
-        no_color,
-        clicolor,
-        clicolor_force,
-        force_color,
-        term: term.and_then(OsStr::to_str),
-        stderr_is_tty,
-        ..ColorEnv::default()
-    })
-}
-
 /// The single implementation behind [`color_decision`].
 pub(crate) fn color_decision_env(env: &ColorEnv<'_>) -> bool {
     if env.no_color {
@@ -411,12 +420,22 @@ pub(crate) fn color_decision_env(env: &ColorEnv<'_>) -> bool {
     // `NO_COLOR`/`WT_SESSION`/`NO_HYPERLINK` here and like anstream's
     // `anstyle-query`: templated CI matrices routinely materialise empty
     // strings, and force-on-empty pushed colour into piped logs.
+    //
+    // **``FORCE_COLOR=""`` deliberately does NOT follow this rule** — see the
+    // arm below: chalk compatibility makes an empty `FORCE_COLOR` mean
+    // force-on.  The two conventions collide inside this one function, so
+    // neither arm may be "fixed" into the other; pinned by
+    // `force_color_empty_diverges_from_clicolor_force_empty`.
     if let Some(v) = env.clicolor_force.and_then(env_trimmed)
         && v != "0"
     {
         return true;
     }
     if let Some(v) = env.force_color {
+        // Unlike `CLICOLOR_FORCE` above, `FORCE_COLOR=""` forces colour *on*
+        // (chalk/`supports-color` compatibility), and so does non-numeric
+        // garbage.  That is a deliberate divergence from the empty-means-unset
+        // rule one arm up — do not unify them without making it a decision.
         return !force_color_is_off(v);
     }
     if let Some(v) = env.clicolor.and_then(env_trimmed)
@@ -424,7 +443,7 @@ pub(crate) fn color_decision_env(env: &ColorEnv<'_>) -> bool {
     {
         return false;
     }
-    if env.term == Some("dumb") {
+    if is_dumb_term(env.term) {
         return false;
     }
     env.stderr_is_tty
@@ -451,6 +470,11 @@ pub fn detect_unicode() -> bool {
 }
 
 fn unicode_decision_os(locale: Option<&OsStr>, term_dumb: bool) -> bool {
+    // An empty locale name means "unset", not "set to something that is not
+    // UTF-8".  This rule used to live at two call sites (`unicode_decision` and
+    // `TermCaps::detect`), so a new caller of this function got the
+    // plausible-but-wrong answer instead of the documented one; own it here.
+    let locale = locale.filter(|v| !v.is_empty());
     if term_dumb {
         return false;
     }
@@ -460,13 +484,6 @@ fn unicode_decision_os(locale: Option<&OsStr>, term_dumb: bool) -> bool {
             contains_ignore_ascii_case(v, b"utf-8") || contains_ignore_ascii_case(v, b"utf8")
         }
         None => true,
-    }
-}
-
-pub(crate) fn unicode_decision(locale: Option<&str>, term_dumb: bool) -> bool {
-    match locale {
-        Some(v) if !v.is_empty() => unicode_decision_os(Some(OsStr::new(v)), term_dumb),
-        _ => unicode_decision_os(None, term_dumb),
     }
 }
 
@@ -489,7 +506,19 @@ pub fn detect_width() -> usize {
 pub(crate) fn width_decision(columns: Option<&str>, term_size: Option<usize>) -> usize {
     columns
         .map(str::trim)
-        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|s| {
+            s.parse::<usize>().ok().or_else(|| {
+                // Overflow is still a positive number: clamp to the documented
+                // ceiling instead of treating it as "unset" and silently falling
+                // back to the terminal size / default.  (`FORCE_COLOR` had the
+                // same class of bug; `force_color_level` is the model here.)
+                let body = s.strip_prefix('+').unwrap_or(s);
+                (!body.is_empty()
+                    && body.bytes().all(|b| b.is_ascii_digit())
+                    && body.bytes().any(|b| b != b'0'))
+                .then_some(u16::MAX as usize)
+            })
+        })
         .filter(|&w| w > 0)
         .map(|w| w.min(u16::MAX as usize))
         .or(term_size.filter(|&w| w > 0))
@@ -525,13 +554,16 @@ pub(crate) fn hyperlink_decision(no_hyperlink: bool, probe_on_stderr: bool) -> b
     !no_hyperlink && probe_on_stderr
 }
 
-/// Whether `b` may appear literally in a `file://` URL path (RFC 3986
-/// unreserved characters plus the path delimiters this crate emits).
-const URL_SAFE: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut i = 0;
+/// The `URL_SAFE` predicate as a 256-bit mask: four `u64` words, one cache line,
+/// versus 256 `bool`s spread over four.  `scan_url_path` touches it once per
+/// path byte, so the locality is free to improve.
+const URL_SAFE_BITS: [u64; 4] = {
+    let mut bits = [0u64; 4];
+    let mut i = 0usize;
     while i < 256 {
-        table[i] = matches!(
+        // RFC 3986 unreserved characters plus the path delimiters this crate
+        // emits.  This `matches!` is the single source of truth for the set.
+        if matches!(
             i as u8,
             b'A'..=b'Z'
                 | b'a'..=b'z'
@@ -542,18 +574,20 @@ const URL_SAFE: [bool; 256] = {
                 | b'_'
                 | b'.'
                 | b'~'
-        );
+        ) {
+            bits[i / 64] |= 1 << (i % 64);
+        }
         i += 1;
     }
-    table
+    bits
 };
 
 #[inline]
 fn is_url_safe(b: u8) -> bool {
-    URL_SAFE[b as usize]
+    // Bytes ≥ 0x80 are never safe (the set is ASCII), so the check also skips
+    // the load for non-ASCII paths.
+    b < 0x80 && URL_SAFE_BITS[(b >> 6) as usize] >> (b & 63) & 1 == 1
 }
-
-use crate::diagnostics::HEX_UPPER;
 
 /// Append the percent-encoded form of `s` to `out`.
 ///
@@ -603,19 +637,28 @@ fn scan_url_path(s: &[u8]) -> (usize, usize) {
     (first_unsafe, unsafe_count)
 }
 
+/// `TERM=dumb` is a veto: a terminal that cannot render control sequences gets
+/// neither colour nor box drawing.  ASCII case-insensitive like every other
+/// `TERM` comparison here (`TERM=DUMB` on an embedded CI console).
+fn is_dumb_term(term: Option<&str>) -> bool {
+    term.is_some_and(|t| t.eq_ignore_ascii_case("dumb"))
+}
+
 fn wsl_distro_name() -> Option<&'static str> {
     static WSL_DISTRO: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     WSL_DISTRO
         .get_or_init(|| {
-            let name = std::env::var("WSL_DISTRO_NAME")
-                .ok()
-                .filter(|s| !s.is_empty())?;
-            // No `/proc` to verify against on macOS/BSD, so a forwarded
-            // `WSL_DISTRO_NAME` (SSH/CI) would otherwise translate paths into
+            // Gate first: on macOS/BSD no `/proc` exists to verify against, so a
+            // forwarded `WSL_DISTRO_NAME` (SSH/CI) would translate paths into
             // `file://wsl.localhost/...` URLs that point nowhere on that host.
+            // Reading the env var before this check made those hosts pay an env
+            // read for a guaranteed `None`.
             if !cfg!(target_os = "linux") {
                 return None;
             }
+            let name = std::env::var("WSL_DISTRO_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())?;
             #[cfg(target_os = "linux")]
             {
                 // SSH/CI can forward WSL_DISTRO_NAME to a native Linux host.
@@ -637,14 +680,15 @@ fn wsl_distro_name() -> Option<&'static str> {
         .as_deref()
 }
 
-fn encode_scanned_path(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
+/// Append `s` percent-encoded to a **byte** buffer.
+///
+/// Bytes, not `String`: every emitted byte is ASCII by construction (the safe
+/// set is ASCII, and a percent escape is three ASCII bytes), so `String::push`
+/// re-checked a UTF-8 invariant that cannot fail, once per byte and three times
+/// per escaped byte.  The caller converts to `String` exactly once at the end.
+fn encode_scanned_path(out: &mut Vec<u8>, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
     out.reserve(s.len().saturating_add(unsafe_count.saturating_mul(2)));
-    // A safe byte is ASCII by construction (URL_SAFE only contains ASCII),
-    // so every safe run is valid UTF-8 and can be appended without a copy.
-    let push_safe = |out: &mut String, bytes: &[u8]| {
-        out.push_str(std::str::from_utf8(bytes).expect("URL-safe bytes are ASCII"));
-    };
-    push_safe(out, &s[..first_unsafe]);
+    out.extend_from_slice(&s[..first_unsafe]);
     let mut i = first_unsafe;
     while i < s.len() {
         if is_url_safe(s[i]) {
@@ -652,25 +696,42 @@ fn encode_scanned_path(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_c
             while i < s.len() && is_url_safe(s[i]) {
                 i += 1;
             }
-            push_safe(out, &s[start..i]);
+            out.extend_from_slice(&s[start..i]);
         } else {
             let b = s[i];
-            out.push('%');
-            out.push(HEX_UPPER[(b >> 4) as usize] as char);
-            out.push(HEX_UPPER[(b & 0xF) as usize] as char);
+            out.push(b'%');
+            out.push(HEX_UPPER[(b >> 4) as usize]);
+            out.push(HEX_UPPER[(b & 0xF) as usize]);
             i += 1;
         }
     }
 }
 
-fn encode_url_component_into(out: &mut String, s: &[u8]) {
+/// Scan statistics for `s[k..]`, derived from the full-path scan.
+///
+/// Every stripped prefix (`//`, `/mnt/X/`) consists only of `URL_SAFE` bytes
+/// (`/` and alphanumerics), so for a safe prefix of length `k`:
+/// `first_unsafe(sub) == first_unsafe(full) - k` and
+/// `unsafe_count(sub) == unsafe_count(full)`.  Re-scanning the sub-slice — which
+/// three branches of `format_file_url` did — was the second O(n) pass the
+/// encoder's own doc says must not exist.
+#[inline]
+fn sub_stats(full: (usize, usize), k: usize) -> (usize, usize) {
+    debug_assert!(
+        full.0 >= k,
+        "the stripped prefix must be URL-safe for this derivation"
+    );
+    (full.0 - k, full.1)
+}
+
+fn encode_url_component_into(out: &mut Vec<u8>, s: &[u8]) {
     for &b in s {
         if b == b'/' || !is_url_safe(b) {
-            out.push('%');
-            out.push(HEX_UPPER[(b >> 4) as usize] as char);
-            out.push(HEX_UPPER[(b & 0xF) as usize] as char);
+            out.push(b'%');
+            out.push(HEX_UPPER[(b >> 4) as usize]);
+            out.push(HEX_UPPER[(b & 0xF) as usize]);
         } else {
-            out.push(b as char);
+            out.push(b);
         }
     }
 }
@@ -680,9 +741,9 @@ fn encode_url_component_into(out: &mut String, s: &[u8]) {
 /// `format_file_url` scans the path anyway to size its buffer, so re-scanning
 /// here would be a second O(n) pass on exactly the long, heavily-encoded paths
 /// the reserve exists for.
-fn encode_file_url_path_pre(out: &mut String, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
+fn encode_file_url_path_pre(out: &mut Vec<u8>, s: &[u8], first_unsafe: usize, unsafe_count: usize) {
     if first_unsafe == s.len() {
-        out.push_str(std::str::from_utf8(s).expect("URL-safe bytes are ASCII"));
+        out.extend_from_slice(s);
     } else {
         encode_scanned_path(out, s, first_unsafe, unsafe_count);
     }
@@ -700,9 +761,10 @@ pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
         // As above: the safe set is ASCII, so this is valid UTF-8.
         return Cow::Borrowed(std::str::from_utf8(s).expect("URL-safe bytes are ASCII"));
     }
-    let mut out = String::with_capacity(s.len().saturating_add(unsafe_count.saturating_mul(2)));
+    let mut out: Vec<u8> =
+        Vec::with_capacity(s.len().saturating_add(unsafe_count.saturating_mul(2)));
     encode_scanned_path(&mut out, s, first_unsafe, unsafe_count);
-    Cow::Owned(out)
+    Cow::Owned(String::from_utf8(out).expect("percent-encoding emits ASCII by construction"))
 }
 
 /// Convert a file path to a `file://` URL, handling WSL path translation.
@@ -720,10 +782,12 @@ pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
 /// Windows without going through the WSL share.
 ///
 /// No path is canonicalised.  Relative paths are resolved with
-/// [`std::path::absolute`], which joins the process CWD lexically: no syscalls,
-/// no symlink resolution, and it works for a file that does not exist yet
+/// [`std::path::absolute`], which joins the process CWD lexically: no symlink
+/// resolution, no `stat` chain, and it works for a file that does not exist yet
 /// (`canonicalize` failed on those, which is why the old code paid the syscall
-/// chain and then re-joined the CWD anyway).
+/// chain and then re-joined the CWD anyway).  It does read the CWD
+/// (`getcwd`/`GetFullPathNameW`) for a relative input — *one* syscall, not a
+/// chain — and only on the path that produces a URL at all.
 ///
 /// Preserving symlinks is deliberate: this is a *diagnostics* system, not a
 /// sysroot/extern lookup — the hyperlink must open the file the diagnostic
@@ -744,10 +808,10 @@ pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
             Err(_) => return std::sync::Arc::from("file://"),
         }
     };
+    // `abs_path` cannot be empty here: an empty input returned above and
+    // `std::path::absolute` never produces an empty path.  (The old second check
+    // was unreachable; `standard_library_has_no_empty_absolute` documents that.)
     let raw = abs_path.as_os_str().as_encoded_bytes();
-    if raw.is_empty() {
-        return std::sync::Arc::from("file://");
-    }
 
     // `canonicalize()` on Windows returns verbatim paths (`\\?\C:\...`).
     // Strip the prefix byte-wise; the RFC 8089 canonical UNC form is
@@ -788,8 +852,10 @@ pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
         Cow::Borrowed(raw)
     };
 
-    let distro = wsl_distro_name();
-    file_url_cached(&bytes, distro)
+    // The cache reads the distro itself: taking it as a parameter let a future
+    // caller pass a different value for the same path and receive a stale URL,
+    // because the key is the path alone.
+    file_url_cached(&bytes)
 }
 
 /// Map `path` (already absolute, `/`-separated, verbatim prefix stripped) to its
@@ -802,30 +868,89 @@ pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
 ///
 /// Thread-local rather than a shared map: the emitter renders in parallel, and a
 /// global mutex on the per-diagnostic URL path would serialise it for no gain.
-/// Each worker warms its own table; the cap bounds a pathological run, and
-/// clearing is cheaper than an LRU for this access pattern (diagnostics cluster
-/// on a handful of files).
-fn file_url_cached(path: &[u8], distro: Option<&str>) -> std::sync::Arc<str> {
-    thread_local! {
-        static URLS: std::cell::RefCell<rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>> =
-            std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+/// Each worker warms its own table; an entry cap and a byte budget bound a
+/// pathological run.  Eviction demotes the hot generation into `cold` rather
+/// than clearing, so a working set slightly larger than the cap keeps hitting
+/// (clear-all thrashed to zero hits); a cold hit promotes back.
+fn file_url_cached(path: &[u8]) -> std::sync::Arc<str> {
+    /// Two-generation cache: the hot generation takes inserts, the cold one
+    /// holds the previous generation and is consulted second.
+    ///
+    /// `clear()` on reaching the cap gave a cyclically-accessed working set of
+    /// `CACHE_CAP + 1` distinct paths **zero** hits: each iteration cleared the
+    /// map just before inserting the next entry.  Demoting the hot map instead
+    /// keeps the previous generation reachable, and a cold hit promotes back to
+    /// hot (segmented FIFO — no per-entry recency bookkeeping, no LRU metadata).
+    struct UrlCache {
+        hot: rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>,
+        cold: rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>,
+        hot_bytes: usize,
     }
+    impl UrlCache {
+        fn new() -> Self {
+            Self {
+                hot: rustc_hash::FxHashMap::default(),
+                cold: rustc_hash::FxHashMap::default(),
+                hot_bytes: 0,
+            }
+        }
+        fn account(&mut self, key: &[u8], url: &str) {
+            self.hot_bytes = self
+                .hot_bytes
+                .saturating_add(key.len())
+                .saturating_add(url.len());
+        }
+    }
+    // Entry cap *and* byte budget: the cap bounds a pathological run, the budget
+    // bounds memory per worker thread (keys + percent-encoded URLs), which the
+    // old entry-only cap did not.
     const CACHE_CAP: usize = 1024;
+    const CACHE_MAX_BYTES: usize = 1 << 20;
+    thread_local! {
+        static URLS: std::cell::RefCell<UrlCache> = std::cell::RefCell::new(UrlCache::new());
+    }
     URLS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(hit) = cache.get(path) {
+        if let Some(hit) = cache.hot.get(path) {
             return std::sync::Arc::clone(hit);
         }
-        let url: std::sync::Arc<str> = std::sync::Arc::from(format_file_url(path, distro));
-        if cache.len() >= CACHE_CAP {
-            cache.clear();
+        if let Some(hit) = cache.cold.get(path) {
+            let url = std::sync::Arc::clone(hit);
+            // Promote: the working set has revisited this path.
+            if cache.hot.len() < CACHE_CAP {
+                cache.account(path, &url);
+                cache.hot.insert(
+                    path.to_vec().into_boxed_slice(),
+                    std::sync::Arc::clone(&url),
+                );
+            }
+            return url;
         }
-        cache.insert(
+        let url: std::sync::Arc<str> =
+            std::sync::Arc::from(format_file_url(path, wsl_distro_name()));
+        if cache.hot.len() >= CACHE_CAP || cache.hot_bytes >= CACHE_MAX_BYTES {
+            // Demote rather than clear: the previous generation stays reachable.
+            let hot = std::mem::take(&mut cache.hot);
+            cache.cold = hot;
+            cache.hot_bytes = 0;
+        }
+        cache.account(path, &url);
+        cache.hot.insert(
             path.to_vec().into_boxed_slice(),
             std::sync::Arc::clone(&url),
         );
         url
     })
+}
+
+/// Convert the byte buffer to `String`, asserting the encoding invariant.
+///
+/// Every byte this module emits is ASCII (`URL_SAFE_BITS` is ASCII and a percent
+/// escape is three ASCII bytes), so this validation cannot fail — one pass at the
+/// end instead of a UTF-8 length check per emitted byte.
+#[inline]
+fn finish(out: Vec<u8>) -> String {
+    String::from_utf8(out).expect("file:// URL construction emits ASCII by construction")
 }
 
 fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
@@ -841,10 +966,10 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
     // uncached WSL URL.  `distro.len() * 3` is the worst case for the encoded
     // distro; distros are short, so the over-reserve is bounded and the exact
     // arithmetic needs no second scan.
-    let mut out = String::with_capacity(
+    let mut out: Vec<u8> = Vec::with_capacity(
         path.len()
             + unsafe_count.saturating_mul(2)
-            + distro.map_or(0, |d| d.len().saturating_mul(3) + 21)
+            + distro.map_or(0, |d| d.len().saturating_mul(3).saturating_add(21))
             + 16,
     );
     if let Some(distro) = distro
@@ -860,34 +985,38 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
         // CIFS mount — which it usually cannot — and is slower even when it
         // can.  Windows can open the native UNC form directly.
         if let Some(rest) = path.strip_prefix(b"//") {
-            out.push_str("file://");
-            let (rest_first, rest_unsafe) = scan_url_path(rest);
+            out.extend_from_slice(b"file://");
+            // `//` is URL-safe, so the sub-slice statistics are derived from the
+            // full-path scan instead of a second O(n) pass.
+            let (rest_first, rest_unsafe) = sub_stats((first_unsafe, unsafe_count), 2);
             encode_file_url_path_pre(&mut out, rest, rest_first, rest_unsafe);
-            return out;
+            return finish(out);
         }
         if let Some(stripped) = path.strip_prefix(b"/mnt/") {
             // Bare drive root (`/mnt/c`, no trailing slash) translates too:
             // it becomes `/C:/`, the native-drive URL for the drive root.
             if stripped.len() == 1 && stripped[0].is_ascii_alphabetic() {
-                out.push_str("file:///");
-                out.push(stripped[0].to_ascii_uppercase() as char);
-                out.push_str(":/");
-                return out;
+                out.extend_from_slice(b"file:///");
+                out.push(stripped[0].to_ascii_uppercase());
+                out.extend_from_slice(b":/");
+                return finish(out);
             }
             if stripped.len() >= 2 && stripped[1] == b'/' && stripped[0].is_ascii_alphabetic() {
-                out.push_str("file:///");
-                out.push(stripped[0].to_ascii_uppercase() as char);
-                out.push(':');
+                out.extend_from_slice(b"file:///");
+                out.push(stripped[0].to_ascii_uppercase());
+                out.push(b':');
                 let tail = &stripped[1..];
-                let (tail_first, tail_unsafe) = scan_url_path(tail);
+                // `tail` is `path[6..]` (`/mnt/` + the drive byte), both
+                // URL-safe, so derive its statistics from the full scan.
+                let (tail_first, tail_unsafe) = sub_stats((first_unsafe, unsafe_count), 6);
                 encode_file_url_path_pre(&mut out, tail, tail_first, tail_unsafe);
-                return out;
+                return finish(out);
             }
         }
-        out.push_str("file://wsl.localhost/");
+        out.extend_from_slice(b"file://wsl.localhost/");
         encode_url_component_into(&mut out, distro.as_bytes());
         encode_file_url_path_pre(&mut out, path, first_unsafe, unsafe_count);
-        return out;
+        return finish(out);
     }
 
     // Windows drive letter: `C:/foo` → `file:///C:/foo` (three slashes).
@@ -895,13 +1024,26 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
     // a Windows path on POSIX); a lowercase `c:/x` is treated as an ordinary
     // POSIX directory name unless we are actually on Windows or a WSL distro
     // is in play.
+    //
+    // Consequently the final fallback below can only emit `file://c:/x` — whose
+    // `c` parses as a URL *host* — for input the public `path_to_file_url` cannot
+    // produce on POSIX (absolute POSIX paths start with `/`, so `path[1]` is
+    // never `:`).  It is a defensive/test-only shape, pinned by
+    // `format_file_url_wsl_and_windows`; do not "fix" it without deciding what a
+    // POSIX file literally named `c:` should link to.
     let looks_like_drive = path.len() >= 2
         && path[1] == b':'
         && (cfg!(windows) || distro.is_some() || path[0].is_ascii_uppercase());
     if looks_like_drive {
-        out.push_str("file:///");
+        out.extend_from_slice(b"file:///");
         encode_file_url_path_pre(&mut out, path, first_unsafe, unsafe_count);
-        return out;
+        if path.len() == 2 {
+            // Bare drive root (`C:`, e.g. from `\\?\C:` after the verbatim
+            // prefix is stripped): every other root form ends with `/`
+            // (`file:///C:/`), so append the one the strip removed.
+            out.push(b'/');
+        }
+        return finish(out);
     }
 
     // POSIX `//server/share/file` is the legacy authority spelling; emit the
@@ -912,40 +1054,198 @@ fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
             && rest[1] == b':'
             && (cfg!(windows) || distro.is_some() || rest[0].is_ascii_uppercase());
         if looks_like_drive {
-            out.push_str("file:///");
+            out.extend_from_slice(b"file:///");
         } else {
-            out.push_str("file://");
+            out.extend_from_slice(b"file://");
         }
-        let (rest_first, rest_unsafe) = scan_url_path(rest);
+        let (rest_first, rest_unsafe) = sub_stats((first_unsafe, unsafe_count), 2);
         encode_file_url_path_pre(&mut out, rest, rest_first, rest_unsafe);
-        return out;
+        return finish(out);
     }
 
-    out.push_str("file://");
+    out.extend_from_slice(b"file://");
     encode_file_url_path_pre(&mut out, path, first_unsafe, unsafe_count);
-    out
+    finish(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Build a [`ColorEnv`] from named test inputs.
+    ///
+    /// A struct, not six positional arguments: `clicolor_force` and
+    /// `force_color` are both `Option<&str>` and a swapped pair type-checks and
+    /// can even pass, which is exactly what `ColorEnv` exists to prevent.
+    fn env(
+        no_color: bool,
+        clicolor: Option<&'static str>,
+        clicolor_force: Option<&'static str>,
+        force_color: Option<&'static str>,
+        term: Option<&'static str>,
+        stderr_is_tty: bool,
+    ) -> ColorEnv<'static> {
+        ColorEnv {
+            no_color,
+            clicolor: clicolor.map(OsStr::new),
+            clicolor_force: clicolor_force.map(OsStr::new),
+            force_color: force_color.map(OsStr::new),
+            term,
+            stderr_is_tty,
+            ..ColorEnv::default()
+        }
+    }
+
     fn color(
         no_color: bool,
-        clicolor: Option<&str>,
-        clicolor_force: Option<&str>,
-        force_color: Option<&str>,
-        term: Option<&str>,
+        clicolor: Option<&'static str>,
+        clicolor_force: Option<&'static str>,
+        force_color: Option<&'static str>,
+        term: Option<&'static str>,
         tty: bool,
     ) -> bool {
-        color_decision(
+        color_decision_env(&env(
             no_color,
-            clicolor.map(OsStr::new),
-            clicolor_force.map(OsStr::new),
-            force_color.map(OsStr::new),
-            term.map(OsStr::new),
+            clicolor,
+            clicolor_force,
+            force_color,
+            term,
             tty,
-        )
+        ))
+    }
+
+    /// `unicode_decision_os` with an optional `&str` locale: the empty-means-unset
+    /// rule is owned by the core now, so tests exercise the same path production
+    /// does.
+    fn unicode(locale: Option<&str>, term_dumb: bool) -> bool {
+        unicode_decision_os(locale.map(OsStr::new), term_dumb)
+    }
+
+    /// Child mode for [`env_wiring_drives_term_caps`].
+    ///
+    /// A no-op unless the parent asks for it.  `TermCaps::detect` is memoized in
+    /// a process-wide `OnceLock`, so the *only* way to probe a given environment
+    /// is a fresh process — the test binary re-executes itself with a scrubbed
+    /// env instead.
+    #[test]
+    fn caps_probe_child() {
+        if std::env::var_os("PONENT_CAPS_PROBE").is_none() {
+            return;
+        }
+        let caps = TermCaps::detect();
+        let depth = match caps.depth {
+            ColorDepth::Sixteen => "16",
+            ColorDepth::TwoFiftySix => "256",
+            ColorDepth::TrueColor => "truecolor",
+        };
+        println!(
+            "caps color={} depth={depth} unicode={} width={} hyperlinks={}",
+            caps.color,
+            caps.unicode,
+            caps.width,
+            supports_hyperlinks(),
+        );
+    }
+
+    /// The env→`TermCaps` *wiring* is the half the pure decision-core tests
+    /// cannot reach: which variable feeds which field, the trim/filter rules and
+    /// the locale precedence.  A swapped field (`LANG` ↔ `LC_CTYPE`) or a typo
+    /// would pass every other test in this module.
+    #[test]
+    fn env_wiring_drives_term_caps() {
+        use std::collections::BTreeMap;
+
+        fn probe(vars: &[(&str, &str)]) -> BTreeMap<String, String> {
+            let mut cmd =
+                std::process::Command::new(std::env::current_exe().expect("test binary path"));
+            cmd.arg("--exact")
+                .arg("diagnostics::term::tests::caps_probe_child")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env_clear()
+                .env("PONENT_CAPS_PROBE", "1")
+                // Keep the child runnable without inheriting the developer's real
+                // terminal environment (that is the whole point).
+                .env("HOME", std::env::temp_dir());
+            if let Some(path) = std::env::var_os("PATH") {
+                cmd.env("PATH", path);
+            }
+            for (k, v) in vars {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("spawn caps probe child");
+            assert!(
+                out.status.success(),
+                "probe child failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let text = String::from_utf8_lossy(&out.stdout);
+            // libtest prints a test's captured output inline with its status
+            // line, so locate the payload by its own prefix rather than by the
+            // start of the line.
+            let start = text
+                .find("caps color=")
+                .unwrap_or_else(|| panic!("no caps payload in {text:?}"));
+            let line = &text[start..];
+            line.split_whitespace()
+                .skip(1)
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        }
+
+        // stderr is a pipe in the child, so `color` is only ever forced on by env.
+        let plain = probe(&[]);
+        assert_eq!(plain["color"], "false", "no tty and nothing forced");
+        assert_eq!(plain["depth"], "16");
+        assert_eq!(plain["unicode"], "true", "no locale means assume UTF-8");
+        assert_eq!(plain["width"], DEFAULT_MAX_WIDTH.to_string());
+        assert_eq!(plain["hyperlinks"], "false", "no tty, nothing forced");
+
+        // Colour: suppress beats force, force wins over no-tty, and the level
+        // feeds `depth` independently of the on/off bit.
+        assert_eq!(probe(&[("NO_COLOR", "1")])["color"], "false");
+        assert_eq!(probe(&[("FORCE_COLOR", "0")])["color"], "false");
+        let lvl1 = probe(&[("FORCE_COLOR", "1")]);
+        assert_eq!(
+            (lvl1["color"].as_str(), lvl1["depth"].as_str()),
+            ("true", "16")
+        );
+        let lvl3 = probe(&[("FORCE_COLOR", "3")]);
+        assert_eq!(
+            (lvl3["color"].as_str(), lvl3["depth"].as_str()),
+            ("true", "truecolor")
+        );
+        // `CLICOLOR_FORCE` also forces, but its empty value means unset.
+        assert_eq!(probe(&[("CLICOLOR_FORCE", "1")])["color"], "true");
+        assert_eq!(probe(&[("CLICOLOR_FORCE", "")])["color"], "false");
+        // A colour-capable terminal still needs a tty (or a force) to *emit*.
+        let ct = probe(&[("COLORTERM", "truecolor")]);
+        assert_eq!(ct["color"], "false");
+        assert_eq!(ct["depth"], "truecolor");
+
+        // `TERM=dumb` vetoes both colour and Unicode, case-insensitively.
+        for dumb in ["dumb", "DUMB"] {
+            let d = probe(&[("TERM", dumb), ("FORCE_COLOR", "0")]);
+            assert_eq!(d["color"], "false", "TERM={dumb}");
+            assert_eq!(d["unicode"], "false", "TERM={dumb}");
+        }
+
+        // Locale feeds `unicode` only.
+        assert_eq!(probe(&[("LANG", "ru_RU.UTF-8")])["unicode"], "true");
+        assert_eq!(probe(&[("LANG", "C")])["unicode"], "false");
+        assert_eq!(probe(&[("LC_ALL", "en_US.utf8")])["unicode"], "true");
+        // LC_ALL outranks LC_CTYPE outranks LANG.
+        let prec = probe(&[("LC_ALL", "C"), ("LANG", "ru_RU.UTF-8")]);
+        assert_eq!(prec["unicode"], "false", "LC_ALL wins over LANG");
+
+        // `COLUMNS` feeds `width`, including the overflow clamp.
+        assert_eq!(probe(&[("COLUMNS", "120")])["width"], "120");
+        assert_eq!(probe(&[("COLUMNS", &"9".repeat(25))])["width"], "65535");
+        assert_eq!(
+            probe(&[("COLUMNS", "0")])["width"],
+            DEFAULT_MAX_WIDTH.to_string()
+        );
     }
 
     #[test]
@@ -961,7 +1261,8 @@ mod tests {
         assert!(!color(true, None, None, None, None, true));
     }
 
-    /// C5: a relative path that does not exist yet cannot be canonicalised,
+    /// A relative path that does not exist yet still has to produce a usable
+    /// link: `std::path::absolute` joins the CWD lexically instead of failing,
     /// but must still become an absolute `file:///` URL — emitting
     /// `file://src/main.rs` would parse `src` as the URL *host*.
     #[test]
@@ -979,6 +1280,23 @@ mod tests {
             "first component leaked into the URL authority: {url}"
         );
         assert!(url.contains("definitely/missing/ponent_probe.rs"), "{url}");
+    }
+
+    /// The empty-string conventions collide inside `color_decision_env`:
+    /// `CLICOLOR_FORCE=""` is unset, `FORCE_COLOR=""` is force-**on** (chalk
+    /// compatibility).  Named so a future "cleanup" that unifies them fails
+    /// here instead of silently changing which CI matrices emit ANSI.
+    #[test]
+    fn force_color_empty_diverges_from_clicolor_force_empty() {
+        // Piped output, otherwise no reason to colour.
+        assert!(
+            color(false, None, None, Some(""), None, false),
+            "FORCE_COLOR=\"\" means force-on (chalk compat)"
+        );
+        assert!(
+            !color(false, None, Some(""), None, None, false),
+            "CLICOLOR_FORCE=\"\" means unset"
+        );
     }
 
     #[test]
@@ -1052,14 +1370,14 @@ mod tests {
 
     #[test]
     fn locale_utf8_detection() {
-        assert!(unicode_decision(Some("en_US.UTF-8"), false));
-        assert!(unicode_decision(Some("C.utf8"), false));
-        assert!(!unicode_decision(Some("C"), false));
-        assert!(!unicode_decision(Some("POSIX"), false));
+        assert!(unicode(Some("en_US.UTF-8"), false));
+        assert!(unicode(Some("C.utf8"), false));
+        assert!(!unicode(Some("C"), false));
+        assert!(!unicode(Some("POSIX"), false));
         // No locale information at all → assume UTF-8.
-        assert!(unicode_decision(None, false));
+        assert!(unicode(None, false));
         // `TERM=dumb` is a veto regardless of locale.
-        assert!(!unicode_decision(Some("en_US.UTF-8"), true));
+        assert!(!unicode(Some("en_US.UTF-8"), true));
     }
 
     #[test]
@@ -1173,6 +1491,63 @@ mod tests {
     /// A negative value outside `i64` must still read as OFF.  Parsed as `i64`
     /// the parse failed and fell through to "force on", defeating the very
     /// clamping rule the comment above it documents.
+    #[test]
+    fn force_color_classifies_any_magnitude() {
+        // 40 digits: longer than `i128`/`u128` can hold, in both directions and
+        // with an explicit `+`.  The old `i128`/`u128` parsers each had a hole
+        // one magnitude further out; digit classification is exact everywhere.
+        let long_pos = "9".repeat(40);
+        let long_neg = format!("-{}", "9".repeat(40));
+        assert_eq!(
+            force_color_level(OsStr::new(&long_pos)),
+            Some(ColorDepth::TrueColor)
+        );
+        assert_eq!(
+            force_color_level(OsStr::new(&format!("+{long_pos}"))),
+            Some(ColorDepth::TrueColor)
+        );
+        assert!(force_color_is_off(OsStr::new(&long_neg)));
+        assert!(!force_color_is_off(OsStr::new(&long_pos)));
+        // `-0` is zero, hence off; `+0`/`00` too.
+        for zero in ["-0", "+0", "0", "00", "000"] {
+            assert!(force_color_is_off(OsStr::new(zero)), "{zero}");
+            assert_eq!(force_color_level(OsStr::new(zero)), None, "{zero}");
+        }
+        // Leading zeros do not change the level class.
+        assert_eq!(
+            force_color_level(OsStr::new("03")),
+            Some(ColorDepth::TrueColor)
+        );
+        assert_eq!(
+            force_color_level(OsStr::new("0002")),
+            Some(ColorDepth::TwoFiftySix)
+        );
+    }
+
+    #[test]
+    fn columns_overflow_clamps_instead_of_unsetting() {
+        // 25 digits: past `usize`.  It is still a huge positive width, so the
+        // documented `u16::MAX` ceiling applies — not a silent fallback.
+        assert_eq!(
+            width_decision(Some(&"9".repeat(25)), None),
+            u16::MAX as usize
+        );
+        assert_eq!(width_decision(Some("+0"), Some(120)), 120);
+        assert_eq!(width_decision(Some("-80"), Some(120)), 120);
+        assert_eq!(width_decision(Some("0"), Some(120)), 120);
+    }
+
+    #[test]
+    fn dumb_term_is_case_insensitive() {
+        for t in ["dumb", "DUMB", "Dumb", "dUmB"] {
+            assert!(is_dumb_term(Some(t)), "{t}");
+        }
+        for t in ["xterm", "dumber", ""] {
+            assert!(!is_dumb_term(Some(t)), "{t}");
+        }
+        assert!(!is_dumb_term(None));
+    }
+
     #[test]
     fn force_color_off_survives_negative_overflow() {
         assert!(force_color_is_off(OsStr::new("-99999999999999999999")));
@@ -1291,7 +1666,7 @@ mod tests {
 
     #[test]
     fn empty_locale_and_needle_are_unset() {
-        assert!(unicode_decision(Some(""), false));
+        assert!(unicode(Some(""), false));
         assert!(contains_ignore_ascii_case(b"anything", b""));
     }
 
@@ -1365,6 +1740,129 @@ mod tests {
         let url = format_file_url(b"/tmp/caf\xE9.rs", None);
         assert_eq!(url, "file:///tmp/caf%E9.rs");
         assert!(!url.contains("%EF%BF%BD"));
+    }
+
+    #[test]
+    fn url_cache_promotes_and_survives_a_cycling_working_set() {
+        // A path count slightly above the hot cap used to thrash to zero hits
+        // (clear-all evicted the map just before each insert).  After one full
+        // cycle every path is either hot or cold, so a second cycle is all hits
+        // and every returned `Arc` is the same allocation.
+        let paths: Vec<String> = (0..40)
+            .map(|i| format!("/tmp/ponent-cache-{i}.pon"))
+            .collect();
+        let mut first: Vec<std::sync::Arc<str>> = Vec::new();
+        for p in &paths {
+            first.push(path_to_file_url(std::path::Path::new(p)));
+        }
+        for (p, prev) in paths.iter().zip(&first) {
+            let again = path_to_file_url(std::path::Path::new(p));
+            assert!(
+                std::sync::Arc::ptr_eq(prev, &again),
+                "{p} should be memoised, not rebuilt"
+            );
+        }
+    }
+
+    /// Independent restatement of the safe set, used as an oracle below.
+    fn expected_safe(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b"/:-_.~".contains(&b)
+    }
+
+    /// The 256-bit mask must agree with the set predicate on every byte value.
+    #[test]
+    fn url_safe_mask_matches_the_set_predicate() {
+        for b in 0u8..=255 {
+            assert_eq!(is_url_safe(b), expected_safe(b), "byte {b:#04x}");
+        }
+    }
+
+    /// Percent-decode a URL path for the round-trip property below.
+    fn percent_decode(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hi = (bytes[i + 1] as char).to_digit(16).expect("hex") as u8;
+                let lo = (bytes[i + 2] as char).to_digit(16).expect("hex") as u8;
+                out.push(hi << 4 | lo);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Full byte domain: every value is either emitted literally (iff it is in
+    /// the safe set) or as an uppercase `%XX`, the output stays pure ASCII with
+    /// no control bytes, and decoding recovers the input exactly.
+    #[test]
+    fn encoder_covers_the_full_byte_domain() {
+        for b in 0u8..=255 {
+            let path = [b'/', b'x', b];
+            let encoded = encode_file_url_path(&path).into_owned();
+            // `/` is safe in a *path* (the component encoder escapes it, the
+            // path encoder does not), so the oracle is the set predicate alone.
+            if expected_safe(b) {
+                assert_eq!(
+                    encoded.as_bytes(),
+                    &path[..],
+                    "safe byte {b:#04x} must be literal"
+                );
+            } else {
+                let escaped = format!("%{b:02X}");
+                assert!(
+                    encoded.ends_with(&escaped),
+                    "unsafe byte {b:#04x} must end with {escaped}: {encoded:?}"
+                );
+            }
+            assert!(
+                encoded.bytes().all(|c| c.is_ascii_graphic()),
+                "encoded output must be printable ASCII: {encoded:?}"
+            );
+            assert_eq!(
+                percent_decode(&encoded),
+                path.to_vec(),
+                "round trip failed for byte {b:#04x}"
+            );
+        }
+        // One path containing every byte value: still pure ASCII, still
+        // decodable, and `%` itself is escaped exactly once.
+        let mut all = vec![b'/'];
+        all.extend(0u8..=255);
+        let encoded = encode_file_url_path(&all).into_owned();
+        assert!(encoded.bytes().all(|c| c.is_ascii_graphic() || c == b'%'));
+        assert_eq!(percent_decode(&encoded), all);
+    }
+
+    #[test]
+    fn degenerate_paths_have_canonical_forms() {
+        assert_eq!(format_file_url(b"/", None), "file:///");
+        assert_eq!(format_file_url(b"//", None), "file://");
+        // A POSIX backslash is a filename byte: encoded, never a separator.
+        assert_eq!(
+            format_file_url(b"/tmp/a\\b.rs", None),
+            "file:///tmp/a%5Cb.rs"
+        );
+    }
+
+    #[test]
+    fn only_real_mnt_drives_translate() {
+        // `/mnt/cdrom` is not a drive: the second byte must be `/`.
+        assert_eq!(
+            format_file_url(b"/mnt/cdrom/x", Some("Ubuntu")),
+            "file://wsl.localhost/Ubuntu/mnt/cdrom/x"
+        );
+        // Uppercase drive letters are preserved as uppercase.
+        assert_eq!(format_file_url(b"/mnt/C/x", Some("Ubuntu")), "file:///C:/x");
+        // Bare `/mnt` and `/mnt/` are ordinary WSL paths, not drives.
+        assert_eq!(
+            format_file_url(b"/mnt", Some("Ubuntu")),
+            "file://wsl.localhost/Ubuntu/mnt"
+        );
     }
 
     #[test]

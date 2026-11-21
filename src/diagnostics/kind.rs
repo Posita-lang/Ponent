@@ -57,16 +57,18 @@ impl TypeCtx {
         crate::diagnostics::i18n::cached_label_static! {
             n = 9,
             variant = variant,
-            init = [
-                String::new(),
-                crate::diagnostics::i18n::fluent::type_ctx_annotation().into_owned(),
-                crate::diagnostics::i18n::fluent::type_ctx_return_type().into_owned(),
-                crate::diagnostics::i18n::fluent::type_ctx_binop().into_owned(),
-                crate::diagnostics::i18n::fluent::type_ctx_function_arg().into_owned(),
-                crate::diagnostics::i18n::fluent::type_ctx_field().into_owned(),
-                crate::diagnostics::i18n::fluent::type_ctx_type_alias().into_owned(),
-                crate::diagnostics::i18n::fluent::type_ctx_contract().into_owned(),
-                crate::diagnostics::i18n::fluent::type_ctx_inference().into_owned(),
+            // Slot 0 (`Unspecified`) is unreachable — it returns early above —
+            // but the empty slug keeps the array anchored to the discriminant.
+            slugs = [
+                "",
+                "type-ctx-annotation",
+                "type-ctx-return-type",
+                "type-ctx-binop",
+                "type-ctx-function-arg",
+                "type-ctx-field",
+                "type-ctx-type-alias",
+                "type-ctx-contract",
+                "type-ctx-inference",
             ],
         }
     }
@@ -220,14 +222,14 @@ impl ComptimeReason {
         crate::diagnostics::i18n::cached_label_static! {
             n = 7,
             variant = variant,
-            init = [
-                crate::diagnostics::i18n::fluent::comptime_reason_block().into_owned(),
-                crate::diagnostics::i18n::fluent::comptime_reason_fndef().into_owned(),
-                crate::diagnostics::i18n::fluent::comptime_reason_fncall().into_owned(),
-                crate::diagnostics::i18n::fluent::comptime_reason_test().into_owned(),
-                crate::diagnostics::i18n::fluent::comptime_reason_assert().into_owned(),
-                crate::diagnostics::i18n::fluent::comptime_reason_typeinfo().into_owned(),
-                crate::diagnostics::i18n::fluent::comptime_reason_layoutof().into_owned(),
+            slugs = [
+                "comptime-reason-block",
+                "comptime-reason-fndef",
+                "comptime-reason-fncall",
+                "comptime-reason-test",
+                "comptime-reason-assert",
+                "comptime-reason-typeinfo",
+                "comptime-reason-layoutof",
             ],
         }
     }
@@ -433,7 +435,7 @@ fn comptime_message_with_traceback<'src>(
     if traceback.is_empty() {
         return msg;
     }
-    let mut s = String::with_capacity(64 + traceback.len() * 64);
+    let mut s = String::with_capacity(64 + traceback.len().min(MAX_TRACEBACK_FRAMES + 1) * 64);
     msg.render_into_owned(&mut s);
     s.push_str("\n\n");
     s.push_str(&crate::diagnostics::i18n::fluent::comptime_call_stack_header());
@@ -452,12 +454,16 @@ fn comptime_message_with_traceback<'src>(
     let mut prev: Option<(ComptimeReason, Option<Span>)> = None;
     let mut truncated = false;
     for (reason, span) in traceback {
+        // Dedup **before** the cap: a frame identical to the last emitted one
+        // would be skipped anyway, so counting it against the budget both
+        // wasted a slot and — when it was the only remaining frame — printed a
+        // truncation marker for output that omitted nothing.
+        if prev == Some((*reason, *span)) {
+            continue;
+        }
         if emitted == MAX_TRACEBACK_FRAMES {
             truncated = true;
             break;
-        }
-        if prev == Some((*reason, *span)) {
-            continue;
         }
         prev = Some((*reason, *span));
         if emitted > 0 {

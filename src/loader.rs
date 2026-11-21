@@ -4,8 +4,16 @@
 //! read each file through a [`VfsBackend`], register it in the
 //! [`SourceMap`] (idempotently), and parse it on its own arena.
 //! Parsing is embarrassingly parallel — the `SourceMap` is
-//! concurrency-safe by design, and every file gets a private arena, so
-//! the only shared write point is `Symbol::intern` (sharded, safe).
+//! concurrency-safe by design, and every file gets a private arena, so the only
+//! shared *write* point is `Symbol::intern`.
+//!
+//! That interner is a **single process-global `RwLock`** ([`crate::symbol`]),
+//! not sharded: a hit takes the read lock (an uncontended word load in
+//! practice) and a miss takes the write lock.  This doc used to claim
+//! "sharded", which was never true.  Sharding is a real option if a flamegraph
+//! ever puts interning near the top of a large-tree parse, but it is not a free
+//! change: ids are assigned in interning order, so it needs an audit of
+//! everywhere a `Symbol` is used for ordering in user-visible output first.
 //!
 //! Lifetime strategy: the source text and each file's arena are
 //! `Box::leak`ed and tracked by the returned [`LoadedFile`].  `Box::leak` is
@@ -393,7 +401,11 @@ pub fn resolve_and_check(
             let from_name = from_names
                 .entry(site.from)
                 .or_insert_with(|| sourcemap.file_or_dummy(site.from).module_path.to_string());
-            let msg = format!("`{}` imports `{}`", &site.module, from_name);
+            // `site.module` is the imported target and `from_name` is the file
+            // holding the import, so the label reads "a imports b" — the old
+            // argument order printed it backwards, and the test only counted
+            // labels, never their text.
+            let msg = format!("`{from_name}` imports `{}`", &site.module);
             diag = if first {
                 first = false;
                 diag.with_span(site.span).with_label(site.span, msg)
@@ -575,19 +587,33 @@ fn cycles_in(edges: &[(FileId, FileId, &ImportSite)]) -> Vec<Vec<ImportSite>> {
     // Hamiltonian cycle (A→B, B→A, B→C, C→B is one SCC with no simple cycle
     // through all nodes), so walking a "ring" silently dropped edges.  Every
     // intra-SCC import edge contributes a label instead.
+    //
+    // One pass over the edges, bucketed by SCC: the previous shape rebuilt a set
+    // and re-filtered the whole edge list once per SCC, i.e. O(SCCs × E) on
+    // graphs with many small cycles (500 disjoint 2-cycles cost 500 full scans).
+    let mut scc_of: rustc_hash::FxHashMap<FileId, usize> = Default::default();
+    for (idx, scc) in sccs.iter().enumerate() {
+        for &f in scc {
+            scc_of.insert(f, idx);
+        }
+    }
+    let self_loops: rustc_hash::FxHashSet<FileId> = self_loop.iter().copied().collect();
+    let mut per_scc: Vec<Vec<ImportSite>> = vec![Vec::new(); sccs.len()];
+    for (from, to, site) in edges {
+        if let (Some(&a), Some(&b)) = (scc_of.get(from), scc_of.get(to))
+            && a == b
+        {
+            per_scc[a].push((*site).clone());
+        }
+    }
     let mut out = Vec::new();
-    for scc in &sccs {
+    for (idx, scc) in sccs.iter().enumerate() {
         let multi = scc.len() > 1;
-        let single_self = scc.len() == 1 && self_loop.contains(&scc[0]);
+        let single_self = scc.len() == 1 && self_loops.contains(&scc[0]);
         if !multi && !single_self {
             continue;
         }
-        let set: rustc_hash::FxHashSet<FileId> = scc.iter().copied().collect();
-        let mut sites: Vec<ImportSite> = edges
-            .iter()
-            .filter(|(from, to, _)| set.contains(from) && set.contains(to))
-            .map(|(_, _, site)| (*site).clone())
-            .collect();
+        let mut sites = std::mem::take(&mut per_scc[idx]);
         sites.sort_by_key(|s| (s.span.file.as_u32(), s.span.start, s.span.end));
         sites.dedup_by_key(|s| (s.span.file.as_u32(), s.span.start, s.span.end));
         if !sites.is_empty() {
@@ -635,6 +661,13 @@ pub fn plan_from_dir(
                 crate::vfs::VfsNodeKind::Directory
                 | crate::vfs::VfsNodeKind::Root
                 | crate::vfs::VfsNodeKind::SrcDirectory => {
+                    // `.git`, `.venv`, editor state: never module sources, but
+                    // they were walked (a `read_dir` syscall each) on every
+                    // plan.  A source tree that genuinely lives under a
+                    // dot-directory is not a supported layout.
+                    if entry.name.starts_with('.') {
+                        continue;
+                    }
                     stack.push((child, join_module(&prefix, &entry.name), depth + 1));
                 }
                 crate::vfs::VfsNodeKind::File => {
@@ -865,6 +898,24 @@ mod tests {
             "ring must carry secondary labels: {:?}",
             diags[0].labels()
         );
+        // The text, not just the count: the direction used to be inverted
+        // ("`b` imports `a`" on a's label), which no count-based assertion saw.
+        assert!(
+            diags[0]
+                .labels()
+                .iter()
+                .all(|l| l.message.contains("imports")),
+            "labels must name both ends: {:?}",
+            diags[0].labels()
+        );
+        let expected = ["`a` imports `b`", "`b` imports `a`"];
+        for want in expected {
+            assert!(
+                diags[0].labels().iter().any(|l| l.message.contains(want)),
+                "missing {want:?} in {:?}",
+                diags[0].labels()
+            );
+        }
     }
 
     #[test]

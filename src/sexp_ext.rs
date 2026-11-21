@@ -81,7 +81,20 @@ fn form_end(s: &str, start: usize) -> Result<usize, Box<sexp::Error>> {
                         return Ok(pos + clen);
                     }
                 }
-                _ if depth == 0 && (c.is_whitespace() || c == ';') => {
+                ';' => {
+                    // A `;` comment can hold unbalanced parens.  At depth 0 the
+                    // comment also ends the form, but *inside* a form its bytes
+                    // must never be counted: `(a ; )\n)` used to close on the
+                    // `)` inside the comment and then fail `sexp::parse` on the
+                    // truncated slice, while a stray `(` could swallow the forms
+                    // that followed.
+                    if depth == 0 {
+                        return Ok(pos);
+                    }
+                    pos = s[pos..].find('\n').map_or(s.len(), |nl| pos + nl + 1);
+                    continue;
+                }
+                _ if depth == 0 && c.is_whitespace() => {
                     return Ok(pos);
                 }
                 _ => {}
@@ -136,6 +149,19 @@ mod tests {
     fn test_parse_many_nested() {
         let input = "(foo (bar (baz 1))) (qux 2)";
         let forms = parse_many(input).unwrap();
+        assert_eq!(forms.len(), 2);
+    }
+
+    #[test]
+    fn form_end_ignores_parens_inside_comments() {
+        // `)` inside a comment must not close the form early…
+        let src = "(a ; )\n b)";
+        assert_eq!(form_end(src, 0).unwrap(), src.len());
+        // …and `(` inside one must not open a deeper level (which would swallow
+        // the following form).
+        let src = "(a ; ( \n) (b)";
+        assert_eq!(form_end(src, 0).unwrap(), 9);
+        let forms = parse_many(src).unwrap();
         assert_eq!(forms.len(), 2);
     }
 

@@ -40,6 +40,18 @@ struct Core {
     done: Condvar,
 }
 
+/// One-batch-at-a-time permit.
+///
+/// The zero-sized field is private to this module, so a token can only come from
+/// [`WorkerPool::new`] (the first one) or [`BatchWait::wait`] (the one returned
+/// by a completed batch).  [`WorkerPool::submit`] demanding one *by value* turns
+/// "submit again before waiting" into a compile error.  Previously that was a
+/// `debug_assert!` only, which left a release-mode UB path: a second `submit`
+/// overwrote `state.jobs` and reset `remaining`, running workers then decremented
+/// the new counter, `wait` could return early, and the caller touched `'t`
+/// borrows while jobs were still running.
+pub(crate) struct BatchToken(());
+
 pub(crate) struct WorkerPool {
     core: Arc<Core>,
     handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -48,7 +60,7 @@ pub(crate) struct WorkerPool {
 impl WorkerPool {
     /// Spawn the resident workers.  Called lazily by the emitter, so a CLI
     /// run that never reaches the parallel threshold spawns none.
-    pub(crate) fn new(workers: usize) -> Self {
+    pub(crate) fn new(workers: usize) -> (Self, BatchToken) {
         let core = Arc::new(Core {
             state: Mutex::new(State {
                 jobs: None,
@@ -67,10 +79,13 @@ impl WorkerPool {
                     .expect("failed to spawn diagnostic worker")
             })
             .collect();
-        Self {
-            core,
-            handles: Mutex::new(handles),
-        }
+        (
+            Self {
+                core,
+                handles: Mutex::new(handles),
+            },
+            BatchToken(()),
+        )
     }
 
     /// Enqueue one batch without blocking.  The caller must not touch any data
@@ -88,7 +103,13 @@ impl WorkerPool {
     ///   clears the queue.
     ///
     /// Therefore no `'t` borrow can outlive the frame that created the jobs.
-    pub(crate) fn submit<'t>(&self, jobs: Vec<SendJob<'t>>) -> BatchWait<'_> {
+    pub(crate) fn submit<'t>(&self, token: BatchToken, jobs: Vec<SendJob<'t>>) -> BatchWait<'_> {
+        // Consuming the token is the whole point: `submit` cannot be reached
+        // without one, and `wait` is the only way to get it back.
+        let _ = token;
+        // The token already proves no batch is in flight; keep the state check as
+        // defence in depth (a dropped `BatchWait` loses the token, and this is
+        // what would report the protocol violation instead of corrupting state).
         let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
         debug_assert!(
             state.jobs.is_none() && state.remaining == 0,
@@ -112,8 +133,10 @@ pub(crate) struct BatchWait<'a> {
 }
 
 impl BatchWait<'_> {
-    /// Block until every job has run and been dropped, then release the slot.
-    pub(crate) fn wait(self) {
+    /// Block until every job has run and been dropped, then release the slot and
+    /// return the permit for the next batch.
+    #[must_use = "the returned BatchToken is the only way to submit the next batch"]
+    pub(crate) fn wait(self) -> BatchToken {
         let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
         while state.remaining != 0 {
             state = self
@@ -123,6 +146,8 @@ impl BatchWait<'_> {
                 .unwrap_or_else(|e| e.into_inner());
         }
         state.jobs = None;
+        drop(state);
+        BatchToken(())
     }
 }
 
@@ -142,7 +167,9 @@ fn worker_main(core: Arc<Core>) {
         // A malformed diagnostic must not kill a worker or stall the latch.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()));
         state = core.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.remaining -= 1;
+        // Cannot reach zero twice under the token protocol; saturate so a latent
+        // protocol violation stalls the latch instead of wrapping `usize::MAX`.
+        state.remaining = state.remaining.saturating_sub(1);
         if state.remaining == 0 {
             core.done.notify_one();
         }
@@ -170,14 +197,14 @@ mod tests {
 
     #[test]
     fn jobs_run_and_workers_are_reused() {
-        let pool = WorkerPool::new(1);
+        let (pool, mut token) = WorkerPool::new(1);
         let tids = Arc::new(Mutex::new(Vec::new()));
         for _ in 0..2 {
             let tids = Arc::clone(&tids);
             let jobs = vec![SendJob::new(move || {
                 tids.lock().unwrap().push(std::thread::current().id());
             })];
-            pool.submit(jobs).wait();
+            token = pool.submit(token, jobs).wait();
         }
         let tids = tids.lock().unwrap();
         assert_eq!(tids.len(), 2);
@@ -186,7 +213,7 @@ mod tests {
 
     #[test]
     fn panic_does_not_deadlock_the_latch() {
-        let pool = WorkerPool::new(2);
+        let (pool, token) = WorkerPool::new(2);
         let ran = Arc::new(AtomicUsize::new(0));
         let first = Arc::clone(&ran);
         let second = Arc::clone(&ran);
@@ -199,7 +226,7 @@ mod tests {
                 second.fetch_add(1, Ordering::Relaxed);
             }),
         ];
-        pool.submit(jobs).wait();
+        let _ = pool.submit(token, jobs).wait();
         assert_eq!(
             ran.load(Ordering::Relaxed),
             2,
@@ -209,8 +236,8 @@ mod tests {
 
     #[test]
     fn empty_batch_is_a_noop() {
-        let pool = WorkerPool::new(1);
-        pool.submit(Vec::new()).wait();
-        pool.submit(vec![SendJob::new(|| {})]).wait();
+        let (pool, token) = WorkerPool::new(1);
+        let token = pool.submit(token, Vec::new()).wait();
+        let _ = pool.submit(token, vec![SendJob::new(|| {})]).wait();
     }
 }

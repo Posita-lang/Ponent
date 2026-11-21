@@ -191,6 +191,14 @@ pub struct DiagOpts {
     /// hard-coded `TAB_WIDTH`); projects using 2/8-space indents can override.
     pub tab_width: usize,
     pub only_codes: Vec<String>,
+    /// Keep only diagnostics whose error code belongs to one of these
+    /// categories.
+    ///
+    /// **A diagnostic with no code is excluded**, because a category is a
+    /// property of the code: `Diagnostic::error("...")` built without
+    /// `with_code` has nothing to classify.  `DiagnosticKind`-built
+    /// diagnostics that carry a code participate normally.  Callers that need
+    /// code-less findings to survive must not filter by category.
     pub only_categories: Vec<ErrorCategory>,
     pub only_files: Vec<String>,
     /// Codes to *suppress*, rustc `-A`-style: a diagnostic whose code is in
@@ -216,7 +224,9 @@ impl DiagOpts {
         DiagOpts {
             use_color: caps.color,
             use_unicode: caps.unicode,
-            max_width: caps.width,
+            // `max_width == 0` degenerates wrapping and tab expansion; a
+            // detected width of 0 means "unknown", not "zero columns".
+            max_width: caps.width.max(1),
             color_depth: caps.depth,
             tab_width: 4,
             ..Default::default()
@@ -259,10 +269,21 @@ impl Default for DiagOpts {
 /// work at all.
 #[derive(Debug, Clone)]
 pub(crate) struct DiagFilter {
-    allow_codes: rustc_hash::FxHashSet<String>,
-    only_codes: rustc_hash::FxHashSet<String>,
+    /// Code filters as **interned table slots** for every pattern that names a
+    /// registry code, plus the verbatim uppercased spelling for patterns that do
+    /// not.  Matching a diagnostic whose code is registered is then one `u16`
+    /// hash instead of hashing a string and possibly allocating an uppercased
+    /// copy of it.
+    allow_slots: rustc_hash::FxHashSet<u16>,
+    allow_verbatim: rustc_hash::FxHashSet<String>,
+    only_slots: rustc_hash::FxHashSet<u16>,
+    only_verbatim: rustc_hash::FxHashSet<String>,
     only_categories: rustc_hash::FxHashSet<ErrorCategory>,
     only_files: Vec<String>,
+    /// Prebuilt SIMD substring searchers for `only_files`: `str::contains` runs a
+    /// two-way setup per call on the per-diagnostic path, `memmem::FinderOwned`
+    /// pays that once at construction.
+    only_files_finders: Vec<memchr::memmem::Finder<'static>>,
     /// Precomputed "no filter is set": the common unfiltered batch turns
     /// `matches` into one predictable branch instead of four `is_empty()`
     /// checks per diagnostic.
@@ -276,10 +297,13 @@ impl Default for DiagFilter {
     /// load-bearing for `matches`'s fast path, so it is constructed explicitly.
     fn default() -> Self {
         Self {
-            allow_codes: rustc_hash::FxHashSet::default(),
-            only_codes: rustc_hash::FxHashSet::default(),
+            allow_slots: rustc_hash::FxHashSet::default(),
+            allow_verbatim: rustc_hash::FxHashSet::default(),
+            only_slots: rustc_hash::FxHashSet::default(),
+            only_verbatim: rustc_hash::FxHashSet::default(),
             only_categories: rustc_hash::FxHashSet::default(),
             only_files: Vec::new(),
+            only_files_finders: Vec::new(),
             is_empty: true,
         }
     }
@@ -294,35 +318,63 @@ impl DiagFilter {
         // canonical table spelling.  Collecting the raw CLI strings here made
         // `--allow e030` silently match nothing.  Canonicalize once at
         // construction; unknown codes stay verbatim so they still filter.
-        let canon = |pat: &str| -> String {
-            crate::diagnostics::error_code::lookup_uppercased(pat)
-                .map(|e| e.code.to_string())
-                .unwrap_or_else(|| pat.to_ascii_uppercase())
+        // A pattern that names a registry code becomes its table slot; one that
+        // does not keeps the uppercased spelling, so genuinely unknown codes
+        // still filter.
+        let classify = |pats: &[String]| {
+            let mut slots = rustc_hash::FxHashSet::default();
+            let mut verbatim: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+            for pat in pats {
+                match crate::diagnostics::error_code::lookup_uppercased(pat) {
+                    Some(e) => {
+                        slots.insert(e.slot);
+                    }
+                    None => {
+                        verbatim.insert(pat.to_ascii_uppercase());
+                    }
+                }
+            }
+            (slots, verbatim)
         };
-        let allow_codes: rustc_hash::FxHashSet<String> =
-            opts.allow_codes.iter().map(|s| canon(s)).collect();
-        let only_codes: rustc_hash::FxHashSet<String> =
-            opts.only_codes.iter().map(|s| canon(s)).collect();
+        let (allow_slots, allow_verbatim) = classify(&opts.allow_codes);
+        let (only_slots, only_verbatim) = classify(&opts.only_codes);
         let only_categories: rustc_hash::FxHashSet<ErrorCategory> =
             opts.only_categories.iter().copied().collect();
         let only_files = opts.only_files.clone();
-        let is_empty = allow_codes.is_empty()
-            && only_codes.is_empty()
+        let only_files_finders: Vec<memchr::memmem::Finder<'static>> = only_files
+            .iter()
+            .map(|pat| memchr::memmem::Finder::new(pat.as_bytes()).into_owned())
+            .collect();
+        let is_empty = allow_slots.is_empty()
+            && allow_verbatim.is_empty()
+            && only_slots.is_empty()
+            && only_verbatim.is_empty()
             && only_categories.is_empty()
             && only_files.is_empty();
         DiagFilter {
-            allow_codes,
-            only_codes,
+            allow_slots,
+            allow_verbatim,
+            only_slots,
+            only_verbatim,
             only_categories,
             only_files,
+            only_files_finders,
             is_empty,
         }
     }
 
     fn code_matches(
-        set: &rustc_hash::FxHashSet<String>,
+        slots: &rustc_hash::FxHashSet<u16>,
+        verbatim: &rustc_hash::FxHashSet<String>,
         code: &crate::diagnostics::error_code::ErrCode,
     ) -> bool {
+        // Registry codes: one `u16` lookup, no string hashing.
+        if let Some(entry) = code.entry()
+            && slots.contains(&entry.slot)
+        {
+            return true;
+        }
+        let set = verbatim;
         let canonical = code.canonical();
         if set.contains(canonical) {
             return true;
@@ -344,8 +396,10 @@ impl DiagFilter {
     pub(crate) fn matches(&self, diag: &Diagnostic<'_>) -> bool {
         debug_assert!(
             self.is_empty
-                == (self.allow_codes.is_empty()
-                    && self.only_codes.is_empty()
+                == (self.allow_slots.is_empty()
+                    && self.allow_verbatim.is_empty()
+                    && self.only_slots.is_empty()
+                    && self.only_verbatim.is_empty()
                     && self.only_categories.is_empty()
                     && self.only_files.is_empty()),
             "DiagFilter::is_empty disagrees with the sets it summarises"
@@ -356,15 +410,15 @@ impl DiagFilter {
         let code = diag.code();
         // Suppress list (rustc `-A` semantics): a code in `allow_codes` is
         // *dropped*.  Pinned by `allow_codes_suppresses_matching_diagnostics`.
-        if !self.allow_codes.is_empty()
+        if (!self.allow_slots.is_empty() || !self.allow_verbatim.is_empty())
             && let Some(c) = code
-            && Self::code_matches(&self.allow_codes, c)
+            && Self::code_matches(&self.allow_slots, &self.allow_verbatim, c)
         {
             return false;
         }
-        if !self.only_codes.is_empty() {
+        if !self.only_slots.is_empty() || !self.only_verbatim.is_empty() {
             match code {
-                Some(c) if Self::code_matches(&self.only_codes, c) => {}
+                Some(c) if Self::code_matches(&self.only_slots, &self.only_verbatim, c) => {}
                 _ => return false,
             }
         }
@@ -374,12 +428,12 @@ impl DiagFilter {
                 _ => return false,
             }
         }
-        if !self.only_files.is_empty() {
-            let file = diag.file_name();
+        if !self.only_files_finders.is_empty() {
+            let file = diag.file_name().as_bytes();
             if !self
-                .only_files
+                .only_files_finders
                 .iter()
-                .any(|pat| file.contains(pat.as_str()))
+                .any(|finder| finder.find(file).is_some())
             {
                 return false;
             }
@@ -639,10 +693,10 @@ impl MultiSpan {
     /// first entry instead of rescanning.
     pub fn first(&self) -> Option<Span> {
         if self.dirty {
-            if let Some(c) = self.sorted_cache.get() {
-                return c.first().copied();
-            }
-            self.primary.iter().min().copied()
+            // Route through `primary_ref`, which sorts once and caches: the old
+            // `iter().min()` rescanned `O(n)` on every call between pushes
+            // (`stable_id`, `augment` and every renderer call `first()`).
+            self.primary_ref().first().copied()
         } else {
             self.primary.first().copied()
         }
@@ -935,10 +989,24 @@ pub struct Diagnostic<'src> {
     /// Source file name displayed in the `┌─ <input>:1:1` location header.
     file_name: Cow<'src, str>,
     /// Child diagnostics (notes, help messages attached to this diagnostic).
+    /// Sub-diagnostics.
+    ///
+    /// Measured, not assumed (`diagnostic_size_bounded` prints all three):
+    /// `Diagnostic` is 392 bytes against a 416-byte guard, `Subdiag` is 88.  An
+    /// inline-1 shape (`enum Children { None, One(Subdiag), Many(Vec<Subdiag>) }`)
+    /// needs `max(88, 24) + 8 = 96` bytes where the `Vec` header uses 24, i.e.
+    /// `392 - 24 + 96 = 464` — 48 bytes past the guard.  The `One(Box<Subdiag>)`
+    /// variant that *would* fit (400 bytes) still heap-allocates, so it saves
+    /// nothing.  Hence this stays a `Vec` and the "one note" case pays one
+    /// allocation.
     children: Vec<Subdiag<'src>>,
     /// Related errors displayed alongside this diagnostic in a single merged box.
     related_errors: Vec<RelatedError<'src>>,
-    foreign_sources: Option<Box<Vec<(FileId, Cow<'src, str>, &'src str)>>>,
+    /// Copy-on-write: `augment` used to deep-copy the whole tuple vector even
+    /// when the target merely inherited the same source set, which is the common
+    /// case for a derived diagnostic.  `Arc` makes that a refcount bump and
+    /// `Arc::make_mut` clones only on a real mutation.
+    foreign_sources: Option<std::sync::Arc<Vec<(FileId, Cow<'src, str>, &'src str)>>>,
     /// Whether `spans` were set by a user-facing builder rather than left
     /// at the constructor default.  `humanize()` leaves them alone in that
     /// case instead of deriving fresh primary spans from the kind's labels.
@@ -1097,13 +1165,24 @@ impl<'src> Diagnostic<'src> {
         self.invalidate_stable_id();
     }
 
+    /// Mark the current spans as deliberately set, so a later [`humanize`]
+    /// keeps them instead of rebuilding them from the primary labels.
+    ///
+    /// [`humanize`]: Self::humanize
+    pub(crate) fn mark_spans_user_set(&mut self) {
+        self.spans_user_set = true;
+    }
+
     pub fn with_foreign_source(
         mut self,
         file: FileId,
         name: impl Into<Cow<'src, str>>,
         source: &'src str,
     ) -> Self {
-        let sources = self.foreign_sources.get_or_insert_with(Box::default);
+        let sources = self
+            .foreign_sources
+            .get_or_insert_with(std::sync::Arc::default);
+        let sources = std::sync::Arc::make_mut(sources);
         if !sources.iter().any(|(f, _, _)| *f == file) {
             sources.push((file, name.into(), source));
         }
@@ -1170,47 +1249,65 @@ impl<'src> Diagnostic<'src> {
             h ^= u64::from(b);
             h = h.wrapping_mul(FNV_PRIME);
         };
-        if let Some(c) = self.code() {
-            // `canonical`, not `code`: the latter echoes the verbatim spelling
-            // for `ErrCode::unknown("e030")`, while `PartialEq`/`Hash` treat
-            // it as `E030`.  Hashing the verbatim form would let two `==`
-            // diagnostics emit different ids, breaking the dedup contract this
-            // accessor exists for.
-            for b in c.canonical().as_bytes() {
-                feed(*b);
-            }
+        // Every variable-length field is length-prefixed rather than
+        // NUL-separated: a message containing `\0` used to shift the field
+        // boundaries, so `message = "a\0b", file = "c"` hashed identically to
+        // `message = "a", file = "b\0c"` and two distinct diagnostics collapsed
+        // in a tool's dedup set — exactly the failure `stable_id` exists to
+        // prevent.  (This changes every stable id once; the field is a
+        // cross-*run* key, not a persisted one.)
+        // A macro, not a second closure: `feed` already borrows `h` mutably.
+        macro_rules! feed_field {
+            ($field:expr) => {{
+                let field: &str = $field;
+                for b in (field.len() as u64).to_le_bytes() {
+                    feed(b);
+                }
+                for b in field.as_bytes() {
+                    feed(*b);
+                }
+            }};
         }
-        feed(0);
-        if let Some(span) = self.spans().first() {
-            for b in span.file.as_u32().to_le_bytes() {
-                feed(b);
+        match self.code() {
+            Some(c) => {
+                feed(1);
+                // `canonical`, not `code`: the latter echoes the verbatim
+                // spelling for `ErrCode::unknown("e030")`, while
+                // `PartialEq`/`Hash` treat it as `E030`.  Hashing the verbatim
+                // form would let two `==` diagnostics emit different ids,
+                // breaking the dedup contract this accessor exists for.
+                feed_field!(c.canonical());
             }
-            for b in span.start.to_le_bytes() {
-                feed(b);
-            }
-            for b in span.end.to_le_bytes() {
-                feed(b);
-            }
+            None => feed(0),
         }
-        feed(0);
+        match self.spans().first() {
+            Some(span) => {
+                feed(1);
+                for b in span.file.as_u32().to_le_bytes() {
+                    feed(b);
+                }
+                for b in span.start.to_le_bytes() {
+                    feed(b);
+                }
+                for b in span.end.to_le_bytes() {
+                    feed(b);
+                }
+            }
+            None => feed(0),
+        }
         // `message_unchecked`, not `message()`: `stable_id` is a public
         // accessor with no documented humanize precondition, so it must not
         // debug-panic on a kind-built diagnostic read before `humanize()`.
         // The cache is invalidated by `humanize`, so the id recomputes once
         // the real message is populated.
-        for b in self.message_unchecked().as_bytes() {
-            feed(*b);
-        }
+        feed_field!(self.message_unchecked());
         // The file NAME (not `FileId`, which is process-local) so two
         // diagnostics with identical code/span/message in different files do
         // not collide and silently suppress each other in a tool's dedupe
         // set.  `set_file_name`/`with_file_name` therefore invalidate the
         // cache: a caller that reads the id, renames, and reads again must see
         // a new id keyed to the new name (C9), not the stale one.
-        feed(0);
-        for b in self.file_name().as_bytes() {
-            feed(*b);
-        }
+        feed_field!(self.file_name());
         h
     }
 
@@ -1725,7 +1822,16 @@ impl<'src> Diagnostic<'src> {
         self.message = match message {
             DiagMessage::Static(cow) => cow,
             slug => {
-                let mut buf = String::new();
+                // Reuse the previous owned buffer: an LSP language switch
+                // re-humanizes every diagnostic, and each slug render used to
+                // allocate a fresh `String` and drop the old one.
+                let mut buf = match std::mem::take(&mut self.message) {
+                    Cow::Owned(mut s) => {
+                        s.clear();
+                        s
+                    }
+                    Cow::Borrowed(_) => String::new(),
+                };
                 slug.render_into_owned(&mut buf);
                 Cow::Owned(buf)
             }
@@ -1735,13 +1841,12 @@ impl<'src> Diagnostic<'src> {
         // are still the constructor default.  Spans attached by a builder
         // (`with_span`, `with_additional_span`, `augment`,
         // `adorn_with_span`) were set deliberately and are preserved.
-        if !self.spans_user_set {
+        // Spans are derived from the *same* label vector the block below
+        // consumes, so the population is folded into that loop (see
+        // `derive_spans`) instead of walking the labels twice.
+        let derive_spans = !self.spans_user_set;
+        if derive_spans {
             self.spans.clear();
-            for lbl in &labels {
-                if matches!(lbl.kind, AnnotationKind::Primary) {
-                    self.spans.push(lbl.span);
-                }
-            }
         }
         // Labels: replace exactly the previous kind-derived block and
         // re-append user labels after the fresh block — kind-derived first,
@@ -1765,6 +1870,9 @@ impl<'src> Diagnostic<'src> {
         }
         self.labels.truncate(0);
         for lbl in labels {
+            if derive_spans && matches!(lbl.kind, AnnotationKind::Primary) {
+                self.spans.push(lbl.span);
+            }
             self.labels.push(lbl);
         }
         debug_assert!(
@@ -1903,10 +2011,19 @@ impl<'src> Diagnostic<'src> {
             }
         }
         if let Some(other_sources) = other.foreign_sources.as_deref() {
-            for (file, name, source) in other_sources.iter() {
-                let self_sources = self.foreign_sources.get_or_insert_with(Box::default);
-                if !self_sources.iter().any(|(f, _, _)| *f == *file) {
-                    self_sources.push((*file, name.clone(), *source));
+            // Clone the tuples first: holding a borrow of `other.foreign_sources`
+            // while mutating ours is fine (different diagnostics), but the
+            // `Arc::make_mut` below may clone the vector, and the loop must not
+            // hold a borrow across that.
+            let to_add: Vec<(FileId, Cow<'src, str>, &'src str)> =
+                other_sources.iter().cloned().collect();
+            for (file, name, source) in to_add {
+                let self_sources = self
+                    .foreign_sources
+                    .get_or_insert_with(std::sync::Arc::default);
+                let self_sources = std::sync::Arc::make_mut(self_sources);
+                if !self_sources.iter().any(|(f, _, _)| *f == file) {
+                    self_sources.push((file, name, source));
                 }
             }
         }
@@ -1996,7 +2113,11 @@ impl fmt::Display for Diagnostic<'_> {
             self.kind.is_none() || self.humanized,
             "Display on a kind-built Diagnostic before humanize(): message is empty"
         );
-        let code_str = self.code.as_ref().map(|c| c.code()).unwrap_or("?");
+        // `canonical`, not `code`: filtering (`--allow`/`--only-codes`) and
+        // `stable_id` both key on the canonical spelling, so printing the
+        // verbatim one made `unknown("e030")` render as `e030` while behaving
+        // as `E030` — the same logical diagnostic looking like two.
+        let code_str = self.code.as_ref().map(|c| c.canonical()).unwrap_or("?");
         // `label_upper` is the per-language cached Unicode-uppercased label: the
         // old `label().to_uppercase()` allocated a fresh `String` per render for
         // a value fully determined by `(level, language)`.
@@ -2013,12 +2134,14 @@ impl fmt::Display for Diagnostic<'_> {
             None => writeln!(f, "[{code_str} {level_str}] {msg}", msg = self.message)?,
         }
 
-        // Labels
+        // Labels.  `underline_char` is an `Option` because `Help` has no
+        // underline; this flat text form keeps its historical single space for
+        // that case (the glyph renderer supplies the `| help:` form instead).
         for lbl in &self.labels {
             writeln!(
                 f,
                 "  {}--> {}: {}",
-                lbl.underline_char(),
+                lbl.underline_char().unwrap_or(' '),
                 lbl.span,
                 lbl.message
             )?;
@@ -2063,6 +2186,19 @@ pub fn explain_error_code(code_str: &str, use_color: bool) -> String {
 /// configured `--width`/`--tab-width` across multiple calls.  (Before P5 this
 /// hardcoded [`DEFAULT_MAX_WIDTH`], so `--width` narrowed diagnostics but not
 /// `--explain` output.)
+/// Whether an `--explain` body line is a code/example line.
+///
+/// The `CODE_TABLE` text format is "two spaces or one tab of indentation means
+/// code", and that contract was only half enforced: a tab-indented example fell
+/// through to the prose path, where it was word-wrapped and syntax-highlighted
+/// as ordinary text (visually breaking the example).  Both spellings are
+/// accepted here so a future entry cannot be mis-rendered by an invisible
+/// indentation choice.
+#[inline]
+fn explain_line_is_code(line: &str) -> bool {
+    (line.starts_with("  ") || line.starts_with('\t')) && !line.trim().is_empty()
+}
+
 pub fn explain_error_code_with_depth(
     code_str: &str,
     use_color: bool,
@@ -2131,7 +2267,7 @@ pub fn explain_error_code_with_depth(
 
     for line in explain.lines() {
         let trimmed = line.trim();
-        if line.starts_with("  ") && !trimmed.is_empty() {
+        if explain_line_is_code(line) {
             // Code/example line — apply syntax highlighting + background
             if !in_code_block {
                 let _ = writeln!(out);
@@ -2380,17 +2516,6 @@ fn format_code_ranges(codes: &[&str]) -> String {
     parts.join(", ")
 }
 
-/// Generate a "did you mean?" suggestion for an unknown error code.
-///
-/// Uses OSA (Damerau-Levenshtein) edit distance against every entry in `CODE_TABLE`
-/// and returns up to three closest candidates within a small radius
-/// (scaled by input length).  Comparison is case-insensitive so a
-/// lowercase typo like `e030` still matches `E030`.
-///
-/// Ranking, in order of priority:
-///   1. smaller edit distance
-///   2. longer common prefix with the input (so `E03` → `E030`, not `E003`)
-///   3. lexicographically smaller code (stable, deterministic output)
 /// Insert `(dist, prefix, code)` into a fixed-size top-3 by
 /// `(dist asc, prefix desc, code asc)` — the ranking `suggest_code` pins.
 ///
@@ -2402,11 +2527,6 @@ fn format_code_ranges(codes: &[&str]) -> String {
 /// first strictly-better position; `pos == 3` means no incumbent is worse, so
 /// the entry is discarded).
 #[inline]
-/// Insert `(dist, prefix, code)` into the fixed-size top-3, keeping the
-/// `(dist asc, prefix desc, code asc)` order.  Tie-break at the boundary:
-/// when the top is full (`pos == 3`), an entry that ties all three existing
-/// ones is *dropped* — "first encountered wins at the boundary", not a full
-/// re-sort of equal entries.  Only strictly-better entries evict.
 fn insert_top3<'a>(
     top: &mut ArrayVec<(usize, usize, &'a str), 3>,
     dist: usize,
@@ -2444,6 +2564,17 @@ fn digits_match_with_one_deletion(a: &[u8], b: &[u8]) -> bool {
     a[i + 1..] == b[i..]
 }
 
+/// Generate a "did you mean?" suggestion for an unknown error code.
+///
+/// Uses OSA (Damerau-Levenshtein) edit distance against every entry in `CODE_TABLE`
+/// and returns up to three closest candidates within a small radius
+/// (scaled by input length).  Comparison is case-insensitive so a
+/// lowercase typo like `e030` still matches `E030`.
+///
+/// Ranking, in order of priority:
+///   1. smaller edit distance
+///   2. longer common prefix with the input (so `E03` → `E030`, not `E003`)
+///   3. lexicographically smaller code (stable, deterministic output)
 fn suggest_code(input: &str, use_color: bool) -> CompactString {
     // Normalise case so `e030` matches the canonical `E030`.
     let mut needle = CompactString::from(input);
@@ -2776,8 +2907,20 @@ pub fn list_error_codes(use_color: bool) -> String {
 ///
 /// Diagnostics are humanized at the emitter's render boundary, so their
 /// i18n language resolves against the current `Lang` at emit time.
+/// Terminal caps are process-stable, so the three `emit_*` helpers share one
+/// snapshot instead of re-probing env vars and the terminal per call.
+fn detected_opts() -> DiagOpts {
+    static DETECTED: std::sync::OnceLock<DiagOpts> = std::sync::OnceLock::new();
+    DETECTED.get_or_init(DiagOpts::detect).clone()
+}
+
+/// Convenience wrapper that deliberately **ignores** write errors: a closed
+/// stdout pipe during a diagnostic dump is not actionable, so this path only
+/// best-effort reports.  Callers that need the failure must use
+/// [`emit_diagnostics_iter`], the entry point that propagates it as
+/// `io::Result`; the split is a recorded policy decision, not an oversight.
 pub fn emit_diagnostics(diags: &mut [Diagnostic<'_>], use_color: bool) {
-    let mut opts = DiagOpts::detect();
+    let mut opts = detected_opts();
     opts.use_color = use_color;
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
@@ -2789,8 +2932,13 @@ pub fn emit_diagnostics(diags: &mut [Diagnostic<'_>], use_color: bool) {
 ///
 /// Takes `&mut` because the emitter humanizes each diagnostic at its
 /// render boundary (see [`Diagnostic`]'s lazy-humanization contract).
+///
+/// Deliberately **ignores** write errors (e.g. a closed stdout pipe), matching
+/// [`emit_diagnostics`]: this is the batch convenience path, not a reporting
+/// API.  [`emit_diagnostics_iter`] is the entry point that propagates them as
+/// `io::Result`; the split is a recorded policy decision, not an oversight.
 pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
-    let mut opts = DiagOpts::detect();
+    let mut opts = detected_opts();
     opts.use_color = use_color;
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
@@ -2814,7 +2962,7 @@ where
     I: IntoIterator<Item = &'r mut Diagnostic<'src>>,
     I::IntoIter: DoubleEndedIterator,
 {
-    let mut opts = DiagOpts::detect();
+    let mut opts = detected_opts();
     opts.use_color = use_color;
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
@@ -3454,21 +3602,6 @@ pub(crate) struct LineIndex<'a> {
 /// this is never on the span-conversion hot path.
 static LINE_INDEX_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Fused newline-start collection and ASCII predicate in one `u64`-chunk
-/// pass, replacing the two `memchr_iter` scans plus `is_ascii` the old
-/// `LineIndex::new` ran.  Each 8-byte lane is tested for any high bit
-/// (non-ASCII) and any `0x0A` (newline) via the standard `has_zero` SWAR
-/// primitive (`(x ^ NL).wrapping_sub(ONES) & !(x ^ NL) & HI`).  The `Vec`
-/// starts at `with_capacity(16)` and grows amortised — the previous
-/// exact-capacity count pass is dropped because the combined scan already
-/// sees every newline, so the win is one fewer full pass over the source
-/// (the `is_ascii` SIMD scan), not a capacity saving.  For a ≥ 1 MB source
-/// this is measurable; for small files the difference is noise.
-///
-/// Newline starts are `u32`: a diagnostic source over 4 GiB is not a real
-/// input, and the halved table halves `line_of`'s binary-search cache
-/// footprint (the table is read on every span conversion).  The `debug_assert`
-/// guards the cast; sources are ≤ 4 GiB in every supported configuration.
 /// Word-at-a-time content hash: 8-byte chunks, one multiply+shift each.
 ///
 /// Used as the cross-batch identity of a source's text (the emitter's
@@ -3503,22 +3636,42 @@ pub(crate) fn content_hash_of(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Line-start table, ASCII flag and [`content_hash_of`] in **one** pass.
+/// Fused newline-start collection, ASCII predicate and [`content_hash_of`] in
+/// one `u64`-chunk pass, replacing the two `memchr_iter` scans plus `is_ascii`
+/// the old `LineIndex::new` ran.  Each 8-byte lane is tested for any high bit
+/// (non-ASCII) and any `0x0A` (newline) via the standard `has_zero` SWAR
+/// primitive (`(x ^ NL).wrapping_sub(ONES) & !(x ^ NL) & HI`).  The `Vec`
+/// starts at `with_capacity(16)` and grows amortised — the previous
+/// exact-capacity count pass is dropped because the combined scan already
+/// sees every newline, so the win is one fewer full pass over the source
+/// (the `is_ascii` SIMD scan), not a capacity saving.  For a ≥ 1 MB source
+/// this is measurable; for small files the difference is noise.
 ///
 /// The line scan already walks every 8-byte word, so folding the hash in costs
 /// a multiply+shift per word and saves the separate `O(len)` hashing pass the
 /// emitter used to pay on a cache miss.  The fused accumulation is bit-identical
 /// to [`content_hash_of`] (same chunking, same tail assembly, same avalanche),
 /// pinned by `fused_scan_hash_matches_the_standalone_function`.
+///
+/// Newline starts are `u32`: a diagnostic source over 4 GiB is not a real
+/// input, and the halved table halves `line_of`'s binary-search cache
+/// footprint (the table is read on every span conversion).  An `assert!`
+/// guards the cast in release too (see the body); sources are ≤ 4 GiB in
+/// every supported configuration.
 fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool, u64) {
     const HI: u64 = 0x8080_8080_8080_8080;
     const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
     const ONES: u64 = 0x0101_0101_0101_0101;
 
     let bytes = source.as_bytes();
-    debug_assert!(
+    // Enforced in release too.  The line table is `Vec<u32>`: a source past
+    // 4 GiB used to truncate every offset in release builds, making *every*
+    // downstream line/column wrong with no signal at all.  A loud panic is
+    // strictly better than silent corruption.  With this assertion the
+    // `as u32` casts below are provably in range (`off < len <= u32::MAX`).
+    assert!(
         bytes.len() <= u32::MAX as usize,
-        "scan_line_starts_and_ascii: source exceeds u32 offsets ({} bytes)",
+        "scan_line_starts_and_ascii: source exceeds the 4 GiB u32-offset limit ({} bytes)",
         bytes.len()
     );
     // Pre-size for large sources so the 16→2× growth chain doesn't pay ~16
@@ -3585,15 +3738,6 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool, u64) {
 /// queried non-ASCII line and never evicts, so a long-lived process rendering
 /// a very large CJK-heavy source would creep toward ~10 MB per cached index.
 /// Past the cap the map clears wholesale — a query then rebuilds one line's
-/// Uppercase hex digits for percent-encoding (`%XX`) in URLs.
-///
-/// One definition for the whole diagnostic layer: `term` (local `file://`
-/// links), `error_code` (`--explain` URLs) and the renderer primitives all
-/// encode path segments.  A shared const is the only way two encoders cannot
-/// drift, and living here — rather than inside a renderer module — keeps
-/// non-renderer subsystems from importing a table *through* a renderer.
-pub(crate) const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-
 /// sparse table, the same cost as the first query for that line, so the
 /// regression is bounded and only reaches files that genuinely have thousands
 /// of distinct non-ASCII lines.
@@ -3602,6 +3746,15 @@ const CHAR_PREFIXES_CAP: usize = 4 * 1024;
 /// once per `CHAR_PREFIXES_EVICT` insertions amortizes to ~O(1) per insert
 /// while keeping the write-lock hold bounded.
 const CHAR_PREFIXES_EVICT: usize = 256;
+
+/// Uppercase hex digits for percent-encoding (`%XX`) in URLs.
+///
+/// One definition for the whole diagnostic layer: `term` (local `file://`
+/// links), `error_code` (`--explain` URLs) and the renderer primitives all
+/// encode path segments.  A shared const is the only way two encoders cannot
+/// drift, and living here — rather than inside a renderer module — keeps
+/// non-renderer subsystems from importing a table *through* a renderer.
+pub(crate) const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 /// Per-thread memo of the last [`LineIndex::char_col`] lookup, so a run of
 /// span conversions on the same line of the same index skips the
@@ -3805,6 +3958,13 @@ impl<'a> LineIndex<'a> {
         // lock boundary.
         let line = self.line(line_idx);
         let b = byte_col.min(line.len());
+        // Every caller arrives through `floor_char_boundary`, but nothing
+        // enforced it: a mid-character `b` silently counts the containing
+        // char's full width.  Make the invariant loud under fuzzing/debug.
+        debug_assert!(
+            line.is_char_boundary(b),
+            "char_col: byte_col {byte_col} is not a char boundary on line {line_idx}"
+        );
         // Identity of this index's shared prefix map (see `LAST_CHAR_COL`).
         let index_id = std::sync::Arc::as_ptr(&self.char_prefixes) as usize;
         // Identity of the indexed buffer: the second half of the memo key,
@@ -3989,12 +4149,41 @@ impl<'a> LineIndex<'a> {
         let start = span.start_as_usize();
         let end = span.end_as_usize();
         let start_line = self.line_of(floor_char_boundary(self.source, start));
-        let end_line = if end > start {
-            self.line_of(floor_char_boundary(self.source, end - 1))
-        } else {
-            self.line_of(floor_char_boundary(self.source, end))
-        };
+        let end_offset = if end > start { end - 1 } else { end };
+        // The end is almost always on `start_line` or the next one, so this
+        // second lookup gallops from the first answer instead of running an
+        // independent `O(log L)` search (`line_of_from` re-anchors when the
+        // stream is descending, so it is exact for any input).
+        let end_line = self.line_of_from(floor_char_boundary(self.source, end_offset), start_line);
         (start_line, end_line)
+    }
+
+    /// [`Self::line_of`] with a starting hint: a line known to be at or before
+    /// the answer (an ascending render stream).
+    ///
+    /// Gallops forward over a short window first — consecutive spans of one
+    /// diagnostic are on the same or adjacent lines, so this is usually zero or
+    /// one comparisons — and falls back to `partition_point` for a hint that
+    /// overshot (a descending stream) or a jump past the window.
+    fn line_of_from(&self, offset: usize, hint: usize) -> usize {
+        let off = offset.min(self.source.len()) as u32;
+        let n = self.starts.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut k = hint.min(n - 1);
+        // `starts` is strictly ascending, so the answer is exactly
+        // `partition_point(.., <= off) - 1`; only the route differs.
+        const GALLOP: usize = 8;
+        let mut walked = 0;
+        while walked < GALLOP && k + 1 < n && self.starts[k + 1] <= off {
+            k += 1;
+            walked += 1;
+        }
+        if self.starts[k] > off || (k + 1 < n && self.starts[k + 1] <= off) {
+            k = self.starts.partition_point(|&s| s <= off).saturating_sub(1);
+        }
+        k
     }
 
     pub(crate) fn starts(&self) -> &[u32] {
@@ -4595,16 +4784,15 @@ mod tests {
     /// keep a placeholder in user-visible output.
     #[test]
     fn humanize_replaces_a_constructor_message() {
-        let mut diag = Diagnostic::error("placeholder text").with_kind(
-            DiagnosticKind::TypeMismatch {
+        let mut diag =
+            Diagnostic::error("placeholder text").with_kind(DiagnosticKind::TypeMismatch {
                 expected: Cow::Borrowed("Int<32>"),
                 found: Cow::Borrowed("Str"),
                 span: Span::new(FileId::DUMMY, 0, 3),
                 found_span: None,
                 reason: None,
                 context: None,
-            },
-        );
+            });
         diag.humanize();
         assert!(
             diag.message().contains("type mismatch"),
@@ -4668,6 +4856,73 @@ mod tests {
         // Empty list: no-op.
         let unfiltered = DiagOpts::default();
         assert!(suppressed.matches_filter(&unfiltered));
+    }
+
+    /// The slot-keyed filter must answer exactly like the string-set version it
+    /// replaced: the reference below is the old `canon` + `code_matches` logic,
+    /// evaluated over plain `Vec<String>` sets.
+    #[test]
+    fn slot_keyed_filter_matches_the_string_set_reference() {
+        fn canon(pats: &[&str]) -> Vec<String> {
+            pats.iter()
+                .map(|p| {
+                    crate::diagnostics::error_code::lookup_uppercased(p)
+                        .map(|e| e.code.to_string())
+                        .unwrap_or_else(|| p.to_ascii_uppercase())
+                })
+                .collect()
+        }
+        fn str_match(set: &[String], c: &crate::diagnostics::error_code::ErrCode) -> bool {
+            let canonical = c.canonical();
+            if set.iter().any(|s| s == canonical) {
+                return true;
+            }
+            if canonical.bytes().all(|b| !b.is_ascii_lowercase()) {
+                return false;
+            }
+            set.iter().any(|s| *s == canonical.to_ascii_uppercase())
+        }
+
+        // Built at runtime: `literal_codes_are_all_in_code_table` scans this
+        // source for code literals and correctly rejects an unregistered one, so
+        // the test cannot spell it out.
+        let unregistered = ["E", "999"].concat();
+        let diags = [
+            Diagnostic::error("a").with_code_str("E030"),
+            Diagnostic::error("b").with_code_str("e030"),
+            Diagnostic::error("c").with_code_str(&unregistered),
+            Diagnostic::error("d").with_code_str("w001"),
+            Diagnostic::error("e"),
+        ];
+        let cases: [&[&str]; 5] = [
+            &[],
+            &["e030"],
+            &["E999"],
+            &["e030", "E999"],
+            &["w001", "E0300"],
+        ];
+        for allow in cases {
+            for only in cases {
+                let mut opts = DiagOpts::default();
+                opts.allow_codes = allow.iter().map(|s| s.to_string()).collect();
+                opts.only_codes = only.iter().map(|s| s.to_string()).collect();
+                let filter = DiagFilter::from_opts(&opts);
+                let (allow_c, only_c) = (canon(allow), canon(only));
+                for d in &diags {
+                    let reference = match d.code() {
+                        Some(c) if str_match(&allow_c, c) => false,
+                        Some(c) => only_c.is_empty() || str_match(&only_c, c),
+                        None => only_c.is_empty(),
+                    };
+                    assert_eq!(
+                        filter.matches(d),
+                        reference,
+                        "allow {allow:?} only {only:?} diag {:?}",
+                        d.message()
+                    );
+                }
+            }
+        }
     }
 
     /// Filter codes resolve case-insensitively, like every other code API:
@@ -4907,6 +5162,28 @@ mod tests {
     /// byte), so renderers never attribute a label to a line they cannot
     /// draw it on. Zero-width spans have no covered byte and keep the
     /// position's own line.
+    /// `line_of_from` must be exact for *any* hint (ascending, descending, past
+    /// the answer), because `span_lines` feeds it the start line and a producer
+    /// may emit spans in any order.
+    #[test]
+    fn hinted_line_lookup_matches_binary_search_for_every_hint() {
+        let src = "aaa\nbb\n\ncccc\nd\n";
+        let idx = LineIndex::new(src);
+        let lines = idx.line_count();
+        for off in 0..=src.len() {
+            let want = idx.line_of(off);
+            for hint in 0..=lines {
+                assert_eq!(
+                    idx.line_of_from(off, hint),
+                    want,
+                    "offset {off} hint {hint}"
+                );
+            }
+            // A hint past the end must not escape the table either.
+            assert_eq!(idx.line_of_from(off, usize::MAX), want, "offset {off}");
+        }
+    }
+
     #[test]
     fn span_lines_end_on_line_start_belongs_to_previous_line() {
         let idx = LineIndex::new("aaa\nbbb\n");
@@ -5055,6 +5332,40 @@ mod tests {
             samples.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         perf_report("many_diags_cached(220KB,200 diags)", &mut samples, 0);
+    }
+
+    /// B3 isolation: is the section header's O(prefix) column walk worth a
+    /// per-`RenderCtx` [`LineColumns`] cache?
+    ///
+    /// Each rendered diagnostic asks `byte_offset_to_display` for a walk over the
+    /// line prefix (header, plus once per note locator).  On a long line that is
+    /// the same O(prefix) pass repeated per diagnostic, i.e. exactly what a
+    /// `(line, tab_width)`-keyed table amortises to one walk per line.  This
+    /// measures the walk alone, so its share of a render is visible without being
+    /// buried in the 200 KB line copy that every long-line render also pays.
+    #[test]
+    #[ignore = "perf probe (~70s in debug): run with --ignored --nocapture"]
+    fn perf_header_column_walk_on_long_line() {
+        let line = "x".repeat(200_000);
+        let offs: Vec<usize> = (0..200).map(|i| 150_000 + i * 3).collect();
+        for _ in 0..2 {
+            for &o in &offs {
+                let _ = std::hint::black_box(super::glyph::byte_offset_to_display(&line, o, 4));
+            }
+        }
+        let mut samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            for &o in &offs {
+                let _ = std::hint::black_box(super::glyph::byte_offset_to_display(&line, o, 4));
+            }
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        perf_report(
+            "byte_offset_to_display x200 (200KB line, offset 150KB)",
+            &mut samples,
+            0,
+        );
     }
 
     /// Micro-isolation of item 1: K indexed conversions near the end of
@@ -5224,6 +5535,24 @@ mod tests {
         assert_eq!(target.labels.len(), 1 + n);
     }
 
+    /// The `--explain` body format: two spaces **or** one tab means code.
+    /// A tab-indented example used to fall through to the prose path (wrapped
+    /// and highlighted as text), and nothing caught it because every registered
+    /// body happens to use spaces.
+    #[test]
+    fn explain_code_line_detection_accepts_both_indentations() {
+        assert!(explain_line_is_code("  let x = 1;"));
+        assert!(explain_line_is_code("\tlet x = 1;"));
+        assert!(explain_line_is_code("\t  nested();"));
+        // Prose, blank, and whitespace-only lines are not code.
+        assert!(!explain_line_is_code("plain prose"));
+        assert!(!explain_line_is_code(""));
+        assert!(!explain_line_is_code("  "));
+        assert!(!explain_line_is_code("\t"));
+        // A single leading space is prose (the format requires two).
+        assert!(!explain_line_is_code(" one space"));
+    }
+
     #[test]
     fn diagnostic_size_bounded() {
         let sz = std::mem::size_of::<Diagnostic<'static>>();
@@ -5231,8 +5560,10 @@ mod tests {
         let kind = std::mem::size_of::<DiagnosticKind<'static>>();
         println!(
             "[size] Diagnostic={sz}  MultiSpan={multi}  DiagnosticKind={kind}  \
-             Box<DiagnosticKind>={}",
-            std::mem::size_of::<Option<std::sync::Arc<DiagnosticKind<'static>>>>()
+             Box<DiagnosticKind>={}  Subdiag={}  RelatedError={}",
+            std::mem::size_of::<Option<std::sync::Arc<DiagnosticKind<'static>>>>(),
+            std::mem::size_of::<Subdiag<'static>>(),
+            std::mem::size_of::<RelatedError<'static>>()
         );
         assert!(sz <= 416, "Diagnostic grew to {sz} bytes");
         // 416 = the historical 384-byte bound + 16 B for `MultiSpan`'s
@@ -5505,9 +5836,13 @@ mod tests {
             } else if !expect.is_empty() {
                 expect.sort_unstable();
                 expect.dedup();
-                let mut got = ms.primary();
-                got.dedup();
+                // `primary()` is contractually sorted + deduped; deduping here
+                // would mask a regression in that invariant.
+                let got = ms.primary();
                 assert_eq!(got.as_slice(), expect.as_slice());
+                // `first()` must agree with the sorted view it exposed, and
+                // reading it here exercises the dirty-read cache path.
+                assert_eq!(ms.first(), expect.first().copied());
                 match ms.primary_ref() {
                     Cow::Borrowed(s) => assert_eq!(s, expect.as_slice()),
                     Cow::Owned(s) => assert_eq!(s, expect.as_slice()),
@@ -5548,6 +5883,61 @@ mod tests {
         assert_eq!(diag.labels.len(), 2);
         assert_eq!(diag.labels[0].span, kind_span);
         assert_eq!(diag.labels[1].span, user_span);
+    }
+
+    /// The `humanize` latch is keyed to [`Lang`]: a language change must
+    /// re-derive `message`/`labels` from the retained kind, and a kind-less
+    /// diagnostic must keep the message a caller set manually no matter how
+    /// often the language changes.  Pins the `humanized_lang != lang` branch
+    /// that no other test exercises.
+    ///
+    /// [`Lang`]: crate::diagnostics::i18n::Lang
+    #[test]
+    fn humanize_rederives_on_language_change_and_keeps_manual_messages() {
+        use crate::diagnostics::i18n::{Lang, acquire_test_lang_lock};
+        let _lang_guard = acquire_test_lang_lock();
+        let original_lang = Lang::current();
+        Lang::set(Lang::En);
+
+        let kind_span = Span::new(FileId::DUMMY, 0, 3);
+        let user_span = Span::new(FileId::DUMMY, 40, 45);
+        let mut diag = Diagnostic::error("placeholder")
+            .with_kind(DiagnosticKind::TypeMismatch {
+                expected: Cow::Borrowed("Int<32>"),
+                found: Cow::Borrowed("Str"),
+                span: kind_span,
+                found_span: None,
+                reason: None,
+                context: None,
+            })
+            .with_label(user_span, "user context");
+        diag.humanize();
+        let english = diag.message().to_string();
+
+        Lang::set(Lang::Zh);
+        diag.humanize();
+        assert_ne!(
+            diag.message(),
+            english.as_str(),
+            "a language change must re-derive the kind's message"
+        );
+        assert_eq!(diag.labels().len(), 2, "kind-derived + user label");
+        assert_eq!(diag.labels()[1].span, user_span);
+        assert_eq!(
+            diag.labels()[1].message,
+            "user context",
+            "the user-added label must survive re-humanization"
+        );
+
+        // Kind-less: there is nothing to re-resolve, so the manually set
+        // message is stable across a language change.
+        let mut manual = Diagnostic::error("hand-written message");
+        manual.humanize();
+        Lang::set(Lang::En);
+        manual.humanize();
+        assert_eq!(manual.message(), "hand-written message");
+
+        Lang::set(original_lang);
     }
 
     /// Regression: a closure that pushes a *suppressed* warning and returns

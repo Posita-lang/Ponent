@@ -17,8 +17,8 @@ expression: out
 \e[2m│\e[0m  \e[2m│\e[0m \e[1;91mduplicate definition of `i` [E019]\e[0m
 \e[2m│\e[0m  \e[2m│\e[0m \e[1;91m         |\e[0m
 \e[2m│\e[0m\e[2m4\e[0m \e[2m│\e[0m \e[48;5;236m   ret\e[49murn \e[48;5;236mi\e[49m;
-\e[2m│  │\e[0m \e[1;91m^^^^^\e[0m\e[1;91m     ^\e[0m
-\e[2m│  │\e[0m \e[1;91m^^^^^^\e[0m
+\e[2m│  │\e[0m \e[1;91m^^^^^^\e[0m\e[1;91m    ^\e[0m
+\e[2m│  │\e[0m \e[1;91m^^^^^\e[0m
 \e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m
 \e[2m│\e[0m  \e[2m│\e[0m \e[1;91m| \e[0m\e[1;91mthis \e[1mis\e[22m\e[39m\e[1;91m \e[94m`Bool`\e[22m\e[39m\e[1;91m\e[0m
 \e[2m│\e[0m  \e[2m│\e[0m \e[1;91m|\e[0m

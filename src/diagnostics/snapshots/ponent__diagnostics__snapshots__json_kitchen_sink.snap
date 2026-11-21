@@ -3,7 +3,7 @@ source: src/diagnostics/snapshots.rs
 expression: out
 ---
 {
-  "id": "0x07fe47ea46a79e5d",
+  "id": "0x4a9454d4d2a41b0b",
   "level": "error",
   "message": "return type mismatch",
   "code": "E030",

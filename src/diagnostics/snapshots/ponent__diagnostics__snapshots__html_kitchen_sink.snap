@@ -15,8 +15,8 @@ expression: out
 <span class='line-num'>  │ </span><span class='underline'>    ^^^^^^^^^^^^^^^^^^^^</span>
 <span class='line-num'>  │ </span><span class='label'>         |</span>
 <span class='line-num' data-location='example.ps:4' aria-label='Line 4'>4 │ </span><span class='highlight'>    ret</span>urn <span class='highlight'>i</span>;
-<span class='line-num'>  │ </span><span class='underline'>^^^^^^     ^</span>
-<span class='line-num'>  │ </span><span class='underline'>^^^^^^^</span>
+<span class='line-num'>  │ </span><span class='underline'>^^^^^^^    ^</span>
+<span class='line-num'>  │ </span><span class='underline'>^^^^^^</span>
 <span class='line-num'>  │ </span><span class='label'>| this is Bool</span>
 <span class='line-num'>  │ </span><span class='label'>| spans four lines</span>
 <span class='line-num' data-location='example.ps:5' aria-label='Line 5'>5 │ </span>}

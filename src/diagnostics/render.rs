@@ -260,6 +260,17 @@ pub struct RenderCtx<'a> {
     /// same source.  The cache is dropped with the ctx at the end of the
     /// batch, so no key can outlive its source.
     source_index: RefCell<SmallVec<[CachedSourceIndex; CACHE_SLOTS]>>,
+    /// Per-batch display-column table for the location header's and the note
+    /// locator's `byte offset → column` conversion, keyed by
+    /// `(line_no, tab_width)`.
+    ///
+    /// That conversion walks the line prefix grapheme by grapheme, and a
+    /// diagnostic performs it once for the header plus once per note locator.
+    /// Measured on a 200 KB single line it costs ~55 ms per call in a debug
+    /// build — roughly a hundred times a whole diagnostic's render — so one
+    /// table per line per batch is what makes long-line sources tractable.  A
+    /// single slot suffices: a render's sections sit on the same line range.
+    line_columns: RefCell<Option<(usize, usize, crate::diagnostics::glyph::LineColumns)>>,
     /// Cross-emit content-verified cache, present only on the hoisted
     /// single-diagnostic path.  Entries carry a source copy so a hit cannot
     /// alias a freed/reused allocation.
@@ -302,6 +313,7 @@ impl<'a> RenderCtx<'a> {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
+            line_columns: RefCell::new(None),
             line_cache: None,
             file_urls: Arc::default(),
             scratch: CtxCell::Owned(RefCell::new(SectionScratch::new())),
@@ -326,6 +338,7 @@ impl<'a> RenderCtx<'a> {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
+            line_columns: RefCell::new(None),
             line_cache: Some(&shared.line_cache),
             file_urls: Arc::clone(&shared.file_urls),
             scratch: CtxCell::Borrowed(&shared.scratch),
@@ -347,12 +360,40 @@ impl<'a> RenderCtx<'a> {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
+            line_columns: RefCell::new(None),
             line_cache: Some(&shared.line_cache),
             file_urls: Arc::clone(&shared.file_urls),
             scratch: CtxCell::Borrowed(&shared.scratch),
             shared: None,
             prebuilt: Some(prebuilt),
         }
+    }
+
+    /// Display column of `byte_in_line` inside `line` (whose 0-based line number
+    /// is `line_no`), sharing one [`LineColumns`] table per `(line, tab width)`
+    /// for the whole batch.
+    ///
+    /// Falls back to the one-shot walk only if the table cannot be built, which
+    /// it always can; the fallback exists so a future line representation can
+    /// decline without changing call sites.
+    pub(crate) fn display_col_in_line(
+        &self,
+        line: &str,
+        line_no: usize,
+        byte_in_line: usize,
+        tab_width: usize,
+    ) -> usize {
+        let mut slot = self.line_columns.borrow_mut();
+        if let Some((no, tab, cols)) = slot.as_ref()
+            && *no == line_no
+            && *tab == tab_width
+        {
+            return cols.display(byte_in_line);
+        }
+        let cols = crate::diagnostics::glyph::LineColumns::new(line, tab_width);
+        let col = cols.display(byte_in_line);
+        *slot = Some((line_no, tab_width, cols));
+        col
     }
 
     /// The line index for `source`, built at most once per source per batch.
@@ -910,6 +951,20 @@ pub trait Renderer: Send + Sync {
     /// array stays well-formed; HTML leaves the default empty separator.
     fn render_separator(&self) -> &str {
         ""
+    }
+
+    /// Append a placeholder for a diagnostic whose render panicked.
+    ///
+    /// The emitter catches render panics and substitutes this so one broken
+    /// diagnostic cannot abort a whole batch.  The default is the flat-text
+    /// marker the human and HTML formats want.
+    ///
+    /// A **structured** format must override this: prose spliced into a JSON
+    /// array produces output no consumer can parse, which is strictly worse than
+    /// omitting the item — the batch would fail at the parser instead of
+    /// surfacing one broken diagnostic.
+    fn render_internal_error(&self, out: &mut String) {
+        out.push_str(super::emitter::RENDER_PANIC_PLACEHOLDER);
     }
 
     /// Render the summary line.  Empty string means "no summary".

@@ -1668,10 +1668,7 @@ impl<'input> TypeContext<'input> {
         // real ambiguity became invisible.
         let mut distinct_proper: Vec<TypeId> = Vec::new();
         for t in proper {
-            if !distinct_proper
-                .iter()
-                .any(|d| self.ambivalent_equal(t, *d))
-            {
+            if !distinct_proper.iter().any(|d| self.ambivalent_equal(t, *d)) {
                 distinct_proper.push(t);
             }
         }
@@ -1737,9 +1734,21 @@ impl<'input> TypeContext<'input> {
             return true;
         }
         match (self.get(ra), self.get(rb)) {
-            (TypeData::Fn { params: p1, ret: r1 }, TypeData::Fn { params: p2, ret: r2 }) => {
+            (
+                TypeData::Fn {
+                    params: p1,
+                    ret: r1,
+                },
+                TypeData::Fn {
+                    params: p2,
+                    ret: r2,
+                },
+            ) => {
                 p1.len() == p2.len()
-                    && p1.iter().zip(p2.iter()).all(|(x, y)| self.ambivalent_equal(*x, *y))
+                    && p1
+                        .iter()
+                        .zip(p2.iter())
+                        .all(|(x, y)| self.ambivalent_equal(*x, *y))
                     && self.ambivalent_equal(*r1, *r2)
             }
             (
@@ -1756,11 +1765,17 @@ impl<'input> TypeContext<'input> {
             ) => {
                 d1 == d2
                     && a1.len() == a2.len()
-                    && a1.iter().zip(a2.iter()).all(|(x, y)| self.ambivalent_equal(*x, *y))
+                    && a1
+                        .iter()
+                        .zip(a2.iter())
+                        .all(|(x, y)| self.ambivalent_equal(*x, *y))
             }
             (TypeData::Tuple { elems: e1 }, TypeData::Tuple { elems: e2 }) => {
                 e1.len() == e2.len()
-                    && e1.iter().zip(e2.iter()).all(|(x, y)| self.ambivalent_equal(*x, *y))
+                    && e1
+                        .iter()
+                        .zip(e2.iter())
+                        .all(|(x, y)| self.ambivalent_equal(*x, *y))
             }
             _ => false,
         }

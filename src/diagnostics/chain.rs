@@ -12,10 +12,11 @@ use super::LineIndex;
 use super::term::path_to_file_url;
 
 /// Maximum rendered depth *offset*: frames at depth 0..=64 are emitted
-/// (65 nesting levels).  One module-level constant: `any_spanned` (hyperlink
-/// gating), `flattened_entry_count` (buffer pre-sizing) and
-/// `render_entries` (the actual cap) must agree, or a drift silently
-/// disables links for the rendered tail or under-reserves.
+/// (65 nesting levels).  One module-level constant: `ChainFacts::spanned_files`
+/// / `ChainFacts::has_span_in` (hyperlink gating), `scan()` (buffer pre-sizing
+/// — `flattened_entry_count` is test-only) and `render_entries` (the actual
+/// cap) must agree, or a drift silently disables links for the rendered tail
+/// or under-reserves.
 const MAX_CHAIN_DEPTH: usize = 64;
 /// Upper bounds for the reserve-estimate walk.  Rendering itself is capped by
 /// *both* this constant and `MAX_CHAIN_DEPTH` (`render_entries` stops at
@@ -197,12 +198,7 @@ impl ChainEntryKind {
         cached_label_static! {
             n = 4,
             variant = idx,
-            init = [
-                fluent::chain_call().into_owned(),
-                fluent::chain_inlined().into_owned(),
-                fluent::chain_reference().into_owned(),
-                fluent::chain_defines().into_owned(),
-            ],
+            slugs = ["chain-call", "chain-inlined", "chain-reference", "chain-defines"],
         }
     }
 
@@ -210,6 +206,10 @@ impl ChainEntryKind {
     /// Computing it at the suffix construction site (rather than caching a
     /// lang-unaware `[usize; 4]`) makes `width` and `as_static_str` observe the
     /// same language, so `cols()` cannot under/over-count after `Lang::set`.
+    ///
+    /// Test-only: `render_into_with_facts` builds its own `kind_labels`
+    /// table, so production code never calls this.
+    #[cfg(test)]
     pub fn label_width(&self) -> usize {
         visible_width(self.as_static_str())
     }
@@ -231,7 +231,20 @@ pub struct CallChain<'src> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChainFacts {
-    any_spanned: bool,
+    /// Up to two distinct files that carry a rendered entry span, pre-order.
+    ///
+    /// Two cover the overwhelming case (the anchor plus one foreign frame) at
+    /// no allocation and without giving up `Copy`; any further distinct file
+    /// sets [`Self::spanned_overflow`], which keeps the gate conservative
+    /// rather than wrong.  This replaces a single `any_spanned: bool`, which
+    /// over-approximated: the line index handed to `render_entries` is the
+    /// *anchor* file's, so a chain whose only spanned entries pointed at other
+    /// files enabled hyperlink construction and paid an O(source) index build
+    /// no entry could use.
+    spanned_files: [Option<FileId>; 2],
+    /// More than two distinct spanned files were seen; every anchor is then
+    /// conservatively treated as spanned.
+    spanned_overflow: bool,
     /// `FileId` of the first spanned entry in pre-order, within the same depth
     /// and entry caps the renderer applies.  Folded in here so the anchor
     /// derivation costs no second traversal *and* cannot name an entry the
@@ -241,6 +254,21 @@ struct ChainFacts {
     entry_count: usize,
     message_bytes: usize,
     indent_bytes: usize,
+}
+
+impl ChainFacts {
+    /// Whether any rendered entry's span lives in `anchor` (or, with
+    /// `anchor == None`, in any file at all — the legacy same-file assumption).
+    fn has_span_in(&self, anchor: Option<FileId>) -> bool {
+        let any = self.spanned_files[0].is_some();
+        if self.spanned_overflow {
+            return any;
+        }
+        match anchor {
+            Some(file) => self.spanned_files.iter().flatten().any(|f| *f == file),
+            None => any,
+        }
+    }
 }
 
 /// Read-only per-chain invariants threaded through the recursive entry walk.
@@ -371,7 +399,8 @@ impl std::fmt::Debug for DebugMessage<'_> {
 /// UTF-8.  Dropping the hyperlink there loses the link for a legitimate
 /// non-ASCII filename; encoding keeps it.
 fn percent_encode_high_bytes(s: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    // `super::HEX_UPPER`, not a private copy: the same table already lives in
+    // `diagnostics` and a second home is exactly how the two drift.
     // Exact capacity: every byte >= 0x80 becomes three bytes (`%XX`).  The
     // sibling `encode_url_path_segment` uses the same worst-case reasoning;
     // reserving `len + 8` reallocated ~log2(n) times on a fully non-ASCII URL.
@@ -380,8 +409,8 @@ fn percent_encode_high_bytes(s: &str) -> String {
     for &b in s.as_bytes() {
         if b >= 0x80 {
             out.push('%');
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0x0F) as usize] as char);
+            out.push(super::HEX_UPPER[(b >> 4) as usize] as char);
+            out.push(super::HEX_UPPER[(b & 0x0F) as usize] as char);
         } else {
             // ASCII only: `as char` is the identity on this branch.
             out.push(b as char);
@@ -471,7 +500,8 @@ impl<'src> CallChain<'src> {
     }
 
     fn compute_facts(&self) -> ChainFacts {
-        let mut any_spanned = false;
+        let mut spanned_files: [Option<FileId>; 2] = [None; 2];
+        let mut spanned_overflow = false;
         let mut first_file: Option<FileId> = None;
         let mut message_bytes = 0usize;
         let mut indent_bytes = 0usize;
@@ -517,7 +547,14 @@ impl<'src> CallChain<'src> {
                     .min(MAX_RESERVE_MESSAGE_BYTES);
             }
             if let Some(span) = entry.span {
-                any_spanned = true;
+                if !spanned_files.iter().flatten().any(|f| *f == span.file) {
+                    match spanned_files.iter_mut().find(|slot| slot.is_none()) {
+                        Some(slot) => *slot = Some(span.file),
+                        // Third distinct file: stop tracking exactly and let
+                        // `has_span_in` stay conservative.
+                        None => spanned_overflow = true,
+                    }
+                }
                 // Pre-order: the first spanned entry encountered is the anchor.
                 first_file = first_file.or(Some(span.file));
             }
@@ -531,7 +568,8 @@ impl<'src> CallChain<'src> {
             }
         }
         ChainFacts {
-            any_spanned,
+            spanned_files,
+            spanned_overflow,
             first_file,
             entry_count: visited,
             message_bytes,
@@ -701,13 +739,13 @@ impl<'src> CallChain<'src> {
         // not supply one (the public `render` path).  Every entry then pays
         // O(log n) instead of rescanning the source per entry.
         let owned_index;
-        // The index is read only by the `FileLineCol` suffix arm, which needs a
-        // spanned entry; with `any_spanned == false` no entry can reach that
-        // arm, so building the index (an O(source) scan) would be pure waste —
-        // the same argument that already gates `sanitize_filename`,
+        // The index is read only by the `FileLineCol` suffix arm, and only for
+        // an entry whose span lives in the *anchor* file (the index is the
+        // anchor's source).  With no such entry the O(source) scan is pure waste
+        // — the same argument that already gates `sanitize_filename`,
         // `path_to_file_url` and `file_cols` below.
         let idx = if let (Some(src), None) = (source, idx) {
-            if facts.any_spanned {
+            if facts.has_span_in(anchor) {
                 owned_index = LineIndex::new(src);
                 Some(&owned_index)
             } else {
@@ -731,7 +769,7 @@ impl<'src> CallChain<'src> {
         // A chain with no *located* entry never renders `file_name` (every
         // suffix falls back to its kind label), so the sanitize allocation and
         // the grapheme-width scan are dead there.
-        let located = source.is_some() && facts.any_spanned;
+        let located = source.is_some() && facts.has_span_in(anchor);
         let sanitized = if located {
             super::sanitize_filename(file_name)
         } else {
@@ -748,7 +786,7 @@ impl<'src> CallChain<'src> {
             && source.is_some()
             && super::term::supports_hyperlinks()
             && super::is_real_file_name(file_name)
-            && facts.any_spanned;
+            && facts.has_span_in(anchor);
         let file_url: Option<std::sync::Arc<str>> = if hyperlink_enabled {
             let candidate = match cx {
                 Some(cx) => cx.file_url(file_name),
@@ -900,7 +938,13 @@ impl<'src> CallChain<'src> {
             // One marker per render, not one per truncated branch: a
             // branching hostile chain must not grow output with its fanout.
             if !capped.replace(true) {
-                super::renderers::fmt::push_spaces(out, 4 + depth * 4);
+                // At the first over-cap depth `4 + depth * 4` is already
+                // ~264 columns, so an unclamped marker row is emitted far past
+                // the terminal width.  Keep it inside the measure instead: the
+                // marker stands for the truncated tail, it does not need the
+                // truncated branch's (unbounded) indent.
+                let marker_indent = (4 + depth * 4).min(max_width.saturating_sub(4));
+                super::renderers::fmt::push_spaces(out, marker_indent);
                 out.push_str("...\n");
             }
             return;

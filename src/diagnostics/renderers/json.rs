@@ -83,6 +83,29 @@ impl Renderer for JsonRenderer {
         if self.pretty { ",\n" } else { "," }
     }
 
+    fn render_internal_error(&self, out: &mut String) {
+        // A *structured* placeholder.  Splitting one item's render panic must
+        // not break the array: the flat-text marker would make the whole batch
+        // unparseable, turning "one diagnostic failed" into "the consumer sees
+        // nothing".  Emitting a normal object keeps the stream valid and names
+        // the failure where a machine consumer can see it.
+        // Lay the placeholder out exactly like a normal batch element, which
+        // `render_into` writes at `indent_lvl = 2`: the `{` sits at
+        // `indent(1)` under `[` and its fields at `indent(2)`.  The old form
+        // opened at column 0 with 2-space fields, visually breaking the array.
+        // The real indent helpers are reachable here (they are inherent on
+        // `JsonRenderer`), so no hardcoding is needed — bind them locally
+        // because `JsonContainer` borrows the strings for its whole lifetime.
+        let open_ind = Self::indent(1);
+        let field_ind = Self::indent(2);
+        let mut obj = JsonContainer::object(out, &open_ind, &field_ind, self.pretty);
+        obj.key("message");
+        obj.string("internal: diagnostic rendering panicked");
+        obj.key("level");
+        obj.string("error");
+        obj.close();
+    }
+
     fn render_summary(&self, _errors: usize, _warnings: usize) -> String {
         String::new()
     }
@@ -146,8 +169,7 @@ impl JsonRenderer {
     /// reallocate: `children` entries carry a message, styled parts, a span and
     /// a full label array each.
     fn estimate_cap(diag: &Diagnostic<'_>) -> usize {
-        192
-            + diag.message().len()
+        192 + diag.message().len()
             + diag.file_name().len() * 2
             + 64
             + diag.labels().len() * 128
@@ -374,6 +396,14 @@ impl JsonRenderer {
                 // error can point into a *different* file; name it (matching
                 // `labels`/`callChain`) instead of emitting a bare span the
                 // consumer cannot place.
+                // Absent optionals are *omitted*, never `null`.  That is the
+                // convention every other nested optional field already uses
+                // (`suggestions[].span`/`replacement`, `children[].span`,
+                // `callChain[].span`) and what the header contract states, so a
+                // consumer needs exactly one "missing" test per section.  An
+                // empty code counts as absent, matching `short.rs`, which drops
+                // it rather than rendering `error[]`.
+                let mut first = true;
                 if let Some(sp) = rel.span.as_ref() {
                     match diag.file_name_for(sp.file) {
                         Some(name) => {
@@ -385,19 +415,26 @@ impl JsonRenderer {
                             super::fmt::push_uint(o, sp.file.as_u32() as u64);
                         }
                     }
-                    flat_key(o, "code");
+                    first = false;
+                }
+                if let Some(c) = rel.code.as_ref().filter(|c| !c.code().is_empty()) {
+                    if first {
+                        flat_key0(o, "code");
+                        first = false;
+                    } else {
+                        flat_key(o, "code");
+                    }
+                    Self::push_json_str(o, c.code());
+                }
+                if first {
+                    flat_key0(o, "message");
                 } else {
-                    flat_key0(o, "code");
+                    flat_key(o, "message");
                 }
-                match &rel.code {
-                    Some(c) => Self::push_json_str(o, c.code()),
-                    None => o.push_str("null"),
-                }
-                flat_key(o, "message");
                 Self::push_json_str(o, &rel.message);
-                flat_key(o, "span");
                 match rel.span.as_ref() {
                     Some(sp) => {
+                        flat_key(o, "span");
                         o.push('{');
                         flat_key0(o, "start");
                         super::fmt::push_uint(o, sp.start as u64);
@@ -417,7 +454,7 @@ impl JsonRenderer {
                         }
                         o.push('}');
                     }
-                    None => o.push_str("null"),
+                    None => {}
                 }
                 o.push('}');
             }
@@ -619,7 +656,13 @@ impl JsonRenderer {
                 // that file's identity; otherwise its location is silently
                 // dropped and a JSON consumer cannot place it.
                 if let Some(span) = entry.span {
-                    match diag.file_name_for(span.file) {
+                    // Resolve the entry's owning file name *once* and use it
+                    // for both the `file`/`fileId` field and `location`, so a
+                    // single object can never name two different files (the
+                    // `file` field used to consult `file_name_for` while
+                    // `location` used the hoisted anchor `file_name`).
+                    let entry_file = diag.file_name_for(span.file);
+                    match entry_file {
                         Some(name) => {
                             flat_key(o, "file");
                             Self::push_json_str(o, name);
@@ -629,20 +672,20 @@ impl JsonRenderer {
                             super::fmt::push_uint(o, span.file.as_u32() as u64);
                         }
                     }
-                }
-                if let Some(span) = entry.span
-                    && let Some((line, col)) =
+                    if let Some((line, col)) =
                         anchor_linecol(idx.as_ref(), diag.source(), anchor_file, span)
-                {
-                    // Numeric fields a consumer can parse without splitting a
-                    // composite string: file names may contain `:` (Windows
-                    // drives, `ns::item`), which made `location` ambiguous.
-                    flat_key(o, "line");
-                    super::fmt::push_uint(o, line);
-                    flat_key(o, "column");
-                    super::fmt::push_uint(o, col);
-                    flat_key(o, "location");
-                    flat_location(o, file_name, line, col);
+                    {
+                        // Numeric fields a consumer can parse without splitting
+                        // a composite string: file names may contain `:`
+                        // (Windows drives, `ns::item`), which made `location`
+                        // ambiguous.
+                        flat_key(o, "line");
+                        super::fmt::push_uint(o, line);
+                        flat_key(o, "column");
+                        super::fmt::push_uint(o, col);
+                        flat_key(o, "location");
+                        flat_location(o, entry_file.unwrap_or(file_name), line, col);
+                    }
                 }
                 o.push('}');
             }
@@ -947,9 +990,7 @@ fn next_escape_swar(b: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i + 8 <= b.len() {
         let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        let hits = (x.wrapping_sub(SP) & !x & HI)
-            | has_zero(x ^ QUOTE)
-            | has_zero(x ^ BACKSLASH);
+        let hits = (x.wrapping_sub(SP) & !x & HI) | has_zero(x ^ QUOTE) | has_zero(x ^ BACKSLASH);
         if hits != 0 {
             return Some(i + lane(hits));
         }
@@ -1130,6 +1171,37 @@ mod tests {
     use crate::diagnostics::chain::{CallChain, ChainEntry, ChainEntryKind};
     use compact_str::CompactString;
 
+    /// Absent optionals inside `relatedErrors` are **omitted**, matching every
+    /// other nested optional field (`suggestions[].span/replacement`,
+    /// `children[].span`, `callChain[].span`) and the header contract's "absent,
+    /// not null".  An empty code counts as absent, like `short.rs`.
+    #[test]
+    fn related_errors_omit_absent_code_and_span() {
+        use crate::diagnostics::RelatedError;
+        let diag = Diagnostic::error("outer").with_related(RelatedError {
+            code: None,
+            message: "plain".into(),
+            span: None,
+            label: None,
+        });
+        let out = json_of(&diag, false);
+        let section = out
+            .split_once("\"relatedErrors\"")
+            .map(|(_, rest)| rest)
+            .expect("relatedErrors section present");
+        // `flat_key` writes `"key": ` (with a space) even in compact mode.
+        assert!(section.contains("\"message\""), "{section}");
+        assert!(section.contains("plain"), "{section}");
+        assert!(
+            !section.contains("\"code\""),
+            "absent code must be omitted, not null: {section}"
+        );
+        assert!(
+            !section.contains("\"span\""),
+            "absent span must be omitted, not null: {section}"
+        );
+    }
+
     fn json_of(diag: &Diagnostic<'_>, pretty: bool) -> String {
         let opts = crate::diagnostics::DiagOpts::default();
         let cx = crate::diagnostics::render::RenderCtx::new(&opts, None);
@@ -1274,6 +1346,57 @@ mod tests {
         let json = json_of(&diag, false);
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["callChain"][0]["kind"], "Call");
+    }
+
+    #[test]
+    fn call_chain_file_and_location_agree_under_file_name_override() {
+        // Anchor span in the diagnostic's own file, whose display name is
+        // overridden; the chain entry points into a foreign file.
+        let foreign = FileId::from_raw(2);
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(
+            ChainEntryKind::Call,
+            Some(Span::new(foreign, 0, 1)),
+            "from real.rs",
+        ));
+        let diag = Diagnostic::error("x")
+            .with_file_name("custom.pn")
+            .with_source("a\nb\n")
+            .with_span(Span::new(FileId::DUMMY, 0, 1))
+            .with_foreign_source(foreign, "real.rs", "a\nb\n")
+            .with_call_chain(chain);
+        let v: serde_json::Value =
+            serde_json::from_str(&json_of(&diag, false)).expect("valid JSON");
+        let entry = &v["callChain"][0];
+        assert_eq!(entry["file"], "real.rs", "{entry}");
+        // Coordinates are only emitted for spans in the anchor file (the line
+        // index is the anchor's), but if they were emitted they must describe
+        // the same file as `file` — both now come from one resolution.
+        if let Some(loc) = entry["location"].as_str() {
+            assert!(
+                loc.starts_with("real.rs:"),
+                "file/location disagree: {entry}"
+            );
+        }
+
+        // An entry in the anchor file takes the overridden name in both
+        // places.
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(
+            ChainEntryKind::Call,
+            Some(Span::new(FileId::DUMMY, 0, 1)),
+            "top",
+        ));
+        let diag = Diagnostic::error("x")
+            .with_file_name("custom.pn")
+            .with_source("a\nb\n")
+            .with_span(Span::new(FileId::DUMMY, 0, 1))
+            .with_call_chain(chain);
+        let v: serde_json::Value =
+            serde_json::from_str(&json_of(&diag, false)).expect("valid JSON");
+        let entry = &v["callChain"][0];
+        assert_eq!(entry["file"], "custom.pn", "{entry}");
+        assert_eq!(entry["location"], "custom.pn:1:1", "{entry}");
     }
 
     #[test]
@@ -1470,5 +1593,42 @@ mod tests {
         assert!(out.starts_with("[\n"), "{out:?}");
         assert!(out.ends_with("\n]\n"), "{out:?}");
         serde_json::from_str::<serde_json::Value>(&out).expect("valid JSON");
+    }
+
+    /// A render panic must not break the batch.  `Renderer::render_internal_error`
+    /// exists for exactly this: the flat-text marker the other formats use would
+    /// splice prose into the array and make the *whole* batch unparseable, so
+    /// JSON overrides it with a real object.
+    #[test]
+    fn internal_error_placeholder_stays_valid_json() {
+        for pretty in [true, false] {
+            let r = JsonRenderer::new(pretty);
+            let mut body = String::new();
+            r.render_internal_error(&mut body);
+            let value: serde_json::Value =
+                serde_json::from_str(&body).expect("the placeholder must parse as JSON");
+            assert_eq!(
+                value["level"], "error",
+                "the placeholder must name its severity: {body:?}"
+            );
+            assert!(
+                value["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("panicked")),
+                "the placeholder must name the failure: {body:?}"
+            );
+
+            // …and inside a batch the array still parses end to end.
+            let mut sink = crate::diagnostics::sink::StringSink::new();
+            r.begin(&mut sink).unwrap();
+            body.clear();
+            r.render_internal_error(&mut body);
+            sink.write_str(&body).unwrap();
+            r.end(&mut sink).unwrap();
+            let batch = sink.into_string();
+            serde_json::from_str::<serde_json::Value>(&batch).unwrap_or_else(|e| {
+                panic!("a panicking diagnostic must not corrupt the batch: {e}\n{batch:?}")
+            });
+        }
     }
 }

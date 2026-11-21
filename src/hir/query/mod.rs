@@ -1650,7 +1650,7 @@ where
         }
         for (r, i) in Self::admit_rows_of_hash(h).into_iter().enumerate() {
             let c = &self.admit[r * ADMIT_SKETCH_WIDTH + i];
-            let _ = c.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1));
+            let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1));
         }
     }
 
@@ -1755,9 +1755,11 @@ where
                         % ADMIT_SKETCH_SIZE;
                     for i in 0..chunk {
                         let idx = (start + i) % ADMIT_SKETCH_SIZE;
-                        let _ =
-                            self.admit[idx]
-                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x / 2));
+                        let _ = self.admit[idx].fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |x| Some(x / 2),
+                        );
                     }
                     return;
                 }

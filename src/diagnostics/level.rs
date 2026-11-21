@@ -83,7 +83,9 @@ impl DiagnosticLevel {
     /// `max_errors` gate.
     pub const fn is_error(&self) -> bool {
         matches!(self, DiagnosticLevel::Error | DiagnosticLevel::Fatal)
-    }    pub const fn prefix(&self) -> &'static str {
+    }
+
+    pub const fn prefix(&self) -> &'static str {
         match self {
             DiagnosticLevel::Fatal => "F",
             DiagnosticLevel::Error => "E",
@@ -144,28 +146,43 @@ impl DiagnosticLevel {
     /// per-language cache, so the `Cow::Owned` branch would be dead and the
     /// `Cow` shell pure overhead on the per-diagnostic hot path
     /// (`prefix_cols` / `write_header` / `Display`).
-    pub fn label(&self) -> &'static str {
-        // Explicit variant → index mapping: `*self as usize` would silently
-        // swap labels if the enum were ever reordered; a match arms the
-        // reorder into a non-exhaustive compile error instead.
-        let idx = match self {
+    /// Table slot for this level, in the order the label tables are indexed.
+    ///
+    /// Explicit arms rather than `*self as usize`: a reordering of the enum
+    /// becomes a non-exhaustive-match compile error instead of silently
+    /// swapping labels.  One mapping shared by [`Self::label`] and
+    /// [`Self::label_upper`], so the two tables cannot be aligned differently.
+    ///
+    /// Deliberately **not** `severity()`: the slot names a table position, and
+    /// coupling it to the severity ladder would silently swap labels if the
+    /// ladder were re-weighted.
+    #[inline]
+    const fn cache_slot(self) -> usize {
+        match self {
             DiagnosticLevel::Info => 0,
             DiagnosticLevel::Note => 1,
             DiagnosticLevel::Help => 2,
             DiagnosticLevel::Warning => 3,
             DiagnosticLevel::Error => 4,
             DiagnosticLevel::Fatal => 5,
-        };
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        // Explicit variant → index mapping: `*self as usize` would silently
+        // swap labels if the enum were ever reordered; a match arms the
+        // reorder into a non-exhaustive compile error instead.
+        let idx = self.cache_slot();
         crate::diagnostics::i18n::cached_label_static! {
             n = 6,
             variant = idx,
-            init = [
-                crate::diagnostics::i18n::fluent::level_info().into_owned(),
-                crate::diagnostics::i18n::fluent::level_note().into_owned(),
-                crate::diagnostics::i18n::fluent::level_help().into_owned(),
-                crate::diagnostics::i18n::fluent::level_warning().into_owned(),
-                crate::diagnostics::i18n::fluent::level_error().into_owned(),
-                crate::diagnostics::i18n::fluent::level_fatal().into_owned(),
+            slugs = [
+                "level-info",
+                "level-note",
+                "level-help",
+                "level-warning",
+                "level-error",
+                "level-fatal",
             ],
         }
     }
@@ -183,24 +200,17 @@ impl DiagnosticLevel {
         // table position, not `severity()`'s semantic weight (they coincide
         // today by construction and must not be coupled — a severity
         // re-weighting would otherwise silently swap labels).
-        let idx = match self {
-            DiagnosticLevel::Info => 0,
-            DiagnosticLevel::Note => 1,
-            DiagnosticLevel::Help => 2,
-            DiagnosticLevel::Warning => 3,
-            DiagnosticLevel::Error => 4,
-            DiagnosticLevel::Fatal => 5,
-        };
+        let idx = self.cache_slot();
         crate::diagnostics::i18n::cached_label_static! {
             n = 6,
             variant = idx,
-            init = [
-                crate::diagnostics::i18n::fluent::level_info().to_uppercase(),
-                crate::diagnostics::i18n::fluent::level_note().to_uppercase(),
-                crate::diagnostics::i18n::fluent::level_help().to_uppercase(),
-                crate::diagnostics::i18n::fluent::level_warning().to_uppercase(),
-                crate::diagnostics::i18n::fluent::level_error().to_uppercase(),
-                crate::diagnostics::i18n::fluent::level_fatal().to_uppercase(),
+            slugs_upper = [
+                "level-info",
+                "level-note",
+                "level-help",
+                "level-warning",
+                "level-error",
+                "level-fatal",
             ],
         }
     }
@@ -274,7 +284,10 @@ mod tests {
         // Ord follows severity, and Equal only for the same variant.
         let mut sorted = ALL;
         sorted.sort();
-        assert_eq!(sorted, ALL, "Ord must follow the declaration/severity order");
+        assert_eq!(
+            sorted, ALL,
+            "Ord must follow the declaration/severity order"
+        );
     }
 
     /// Golden English labels: distinctness alone cannot catch two swapped
@@ -316,7 +329,11 @@ mod tests {
         crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::Ru);
         let err = DiagnosticLevel::Error;
         assert_eq!(err.label_upper(), err.label().to_uppercase());
-        assert_ne!(err.label(), err.label_upper(), "ru error label is lowercase");
+        assert_ne!(
+            err.label(),
+            err.label_upper(),
+            "ru error label is lowercase"
+        );
         crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
     }
 

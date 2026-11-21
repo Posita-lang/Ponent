@@ -494,7 +494,19 @@ pub fn render_into<'msg, 'src>(
 /// machinery: duplicating the resolve/retry loop would be the drift risk the
 /// `render_into`/`try_fluent_into` pair exists to avoid.
 pub fn render_into_count(msg: &str, key: &'static str, n: u64, out: &mut String) {
-    if is_ftl_slug(msg) && fluent::zero_arg_slug(msg).is_none() {
+    if is_ftl_slug(msg) {
+        if let Some(cached) = fluent::zero_arg_slug(msg) {
+            // A zero-arg slug cannot consume a count.  Falling through (as this
+            // used to) pushed the *raw slug name* into user-visible output in
+            // both profiles; the sibling entry points either render the cached
+            // text or assert, so do both.
+            debug_assert!(
+                false,
+                "slug {msg:?} takes no arguments but was passed a numeric count"
+            );
+            out.push_str(&cached);
+            return;
+        }
         let lang_idx = Lang::current().index();
         let bundles = bundles();
         let primary = &bundles[lang_idx];
@@ -516,6 +528,14 @@ pub fn render_into_count(msg: &str, key: &'static str, n: u64, out: &mut String)
                 return;
             }
         }
+        // Tripwire parity with `try_fluent_into`: a slug that exists in `en` but
+        // fails to format here (a missing or misspelled argument) used to fall
+        // through to the raw slug with no assert at all.
+        debug_assert!(
+            en.get_message(msg).is_none(),
+            "slug {msg:?} exists but formatting failed (numeric-count path) — \
+             missing or misspelled argument?"
+        );
     }
     out.push_str(msg);
 }
@@ -697,6 +717,11 @@ pub fn render_into_slug<'msg, 'src>(
     out: &mut String,
 ) {
     if let Some(c) = fluent::zero_arg_slug(msg) {
+        debug_assert!(
+            pairs.is_empty(),
+            "slug {msg:?} is zero-arg but was passed {} argument(s) (owned path)",
+            pairs.len()
+        );
         out.push_str(&c);
         return;
     }
@@ -716,7 +741,17 @@ fn try_fluent_owned_into<'msg, 'src>(
     let primary = &bundles[lang_idx];
     let en = &bundles[0];
     if pairs.is_empty() {
-        return format_slug_in_into(primary, en, msg, None, out);
+        let ok = format_slug_in_into(primary, en, msg, None, out);
+        // Mirrors `known_slug_without_required_arguments_trips_the_tripwire` on
+        // the borrowed path: a slug that exists but produced no output means the
+        // caller passed no arguments to a parameterized message.  Without this
+        // the owned path pushed the raw slug name into user-visible output
+        // silently, in *both* profiles.
+        debug_assert!(
+            ok || bundles.iter().all(|b| b.get_message(msg).is_none()),
+            "slug {msg:?} exists but formatting failed on the owned zero-argument path"
+        );
+        return ok;
     }
     // Single-pass resolve (see `try_fluent`): one `get_message` hash lookup
     // per bundle.  The argument map is built once, only after a bundle with
@@ -780,17 +815,17 @@ macro_rules! cached_label {
     (
         n = $n:literal,
         variant = $variant:expr,
-        init = [$($init:expr),+ $(,)?],
+        slugs = [$($slug:literal),+ $(,)?],
     ) => {{
         // `cached_label_static!` is the single source of truth: it owns the
         // `OnceLock<[String; N]>` table, the index derivation, and the
-        // loud-failure assert.  `Cow::Borrowed` over its `'static` table entry
+        // language-explicit fill.  `Cow::Borrowed` over its `'static` table entry
         // is sound, so this used to duplicate ~30 lines of invariant code that
         // then drifted.
         ::std::borrow::Cow::Borrowed($crate::diagnostics::i18n::cached_label_static!(
             n = $n,
             variant = $variant,
-            init = [$($init),+],
+            slugs = [$($slug),+],
         ))
     }};
 }
@@ -798,16 +833,41 @@ pub(crate) use cached_label;
 
 /// Zero-wrapper variant of [`cached_label!`]: returns `&'static str` directly.
 ///
-/// `cached_label!` always produces `Cow::Borrowed` (the `init` expressions are
-/// `into_owned()` `String`s stored in a `OnceLock<[String; N]>`, so the borrow
-/// is `'static`), making the `Owned` branch dead and the `Cow` a 32-byte shell
-/// around a `&'static str`.  This macro skips the `Cow` entirely, returning
-/// `table[variant].as_str()` with the `'static` lifetime of the cached table.
+/// `cached_label!` always produces `Cow::Borrowed` (the table holds `String`s in
+/// a `OnceLock<[String; N]>`, so the borrow is `'static`), making the `Owned`
+/// branch dead and the `Cow` a 32-byte shell around a `&'static str`.  This
+/// macro skips the `Cow` entirely, returning `table[variant].as_str()` with the
+/// `'static` lifetime of the cached table.
+///
+/// `slugs` are Fluent slug names; `slugs_upper` additionally uppercases each
+/// label (needed for localized severity tags, where an ASCII-only fold would
+/// leave Cyrillic lowercase).  Both forms resolve through
+/// [`fluent::zero_arg_slug_at`] *at the slot's own language index*, so the fill
+/// cannot observe a different language than the slot it lands in.
 macro_rules! cached_label_static {
     (
         n = $n:literal,
         variant = $variant:expr,
-        init = [$($init:expr),+ $(,)?],
+        slugs = [$($slug:literal),+ $(,)?],
+    ) => {
+        $crate::diagnostics::i18n::cached_label_static!(
+            @build n = $n, variant = $variant, upper = false, slugs = [$($slug),+],
+        )
+    };
+    (
+        n = $n:literal,
+        variant = $variant:expr,
+        slugs_upper = [$($slug:literal),+ $(,)?],
+    ) => {
+        $crate::diagnostics::i18n::cached_label_static!(
+            @build n = $n, variant = $variant, upper = true, slugs = [$($slug),+],
+        )
+    };
+    (
+        @build n = $n:literal,
+        variant = $variant:expr,
+        upper = $upper:literal,
+        slugs = [$($slug:literal),+ $(,)?],
     ) => {{
         static CACHES: [::std::sync::OnceLock<[::std::string::String; $n]>; $crate::diagnostics::i18n::N_LANGS] =
             [const { ::std::sync::OnceLock::new() }; $crate::diagnostics::i18n::N_LANGS];
@@ -820,17 +880,28 @@ macro_rules! cached_label_static {
             "Lang index out of the cached range"
         );
         let table = CACHES[lang_idx].get_or_init(|| {
-            // The init expressions re-resolve `Lang` internally, so a
-            // `Lang::set` racing this closure would render one language's
-            // strings into another language's slot — permanently, and silently
-            // in release.  The slot was chosen from the index read above; make
-            // any divergence loud instead of poisoning the cache.
-            debug_assert!(
-                $crate::diagnostics::i18n::Lang::current().index() == lang_idx,
-                "language changed while initializing a cached label table — \
-                 the slot would serve the wrong language forever"
-            );
-            [$($init),+]
+            // Language-*explicit*: the strings are read at `lang_idx`, the same
+            // index that selected the slot, so a `Lang::set` racing this closure
+            // cannot write one language's labels into another language's slot.
+            // (The previous `init = [fluent::level_error(), …]` form re-resolved
+            // the global inside the closure and relied on an assertion to notice
+            // the divergence — a permanent, silent poisoning in release.)
+            [$({
+                let s = $crate::diagnostics::i18n::fluent::zero_arg_slug_at($slug, lang_idx)
+                    .unwrap_or($slug);
+                if $upper {
+                    // `to_ascii_uppercase` avoids the Unicode tables for the
+                    // en/ru labels that are pure ASCII; the localized (Cyrillic,
+                    // CJK) ones still need the full fold.
+                    if s.is_ascii() {
+                        s.to_ascii_uppercase()
+                    } else {
+                        s.to_uppercase()
+                    }
+                } else {
+                    s.to_string()
+                }
+            }),+]
         });
         table[$variant].as_str()
     }};

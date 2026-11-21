@@ -72,10 +72,20 @@ impl FixHints {
 ///
 /// 4 : 2 : 1 encodes "one MachineApplicable edit is worth two
 /// MaybeIncorrect edits and four placeholder/unspecified edits" — safety
-/// dominates count, but not absolutely: at `Review`, two narrow
-/// MaybeIncorrect fixes beat one wide MachineApplicable fix only when the
-/// latter is at most 2× wider.  This is a policy constant, not derived from
-/// a theorem; change it here if `--fix` grows an objective flag.
+/// dominates count, but not absolutely: two narrow MaybeIncorrect fixes
+/// *strictly* outweigh one wide MachineApplicable fix whenever the latter is
+/// more than 2× wider.
+///
+/// **At exactly 2× the totals tie, and geometry decides.**  The DP refuses to
+/// replace an equal total, so it keeps whichever set it reached first in the
+/// `(end, start)` consideration order — two configurations with identical
+/// weights and identical totals can resolve to opposite sets (pinned by
+/// `tie_at_double_width_keeps_the_wider_edit` and
+/// `tie_at_double_width_keeps_the_narrower_pair`).  This is a property of the
+/// documented rule, not of this table.
+///
+/// The constant is policy, not a theorem; change it here if `--fix` grows an
+/// objective flag.
 fn applicability_weight(app: Applicability) -> u64 {
     match app {
         Applicability::MachineApplicable => 4,
@@ -133,17 +143,26 @@ impl<'src> FixSet<'src> {
     ///
     /// **Conflict resolution maximises applicability weight.**  A set of
     /// pairwise-disjoint edits is chosen by weighted interval scheduling;
-    /// equal-weight ties retain the edit that ends first, then the one that
-    /// starts first (the deterministic `(end, start)` order).
+    /// same-span equal-weight ties retain the edit that ends first, then the one
+    /// that starts first (the deterministic `(end, start)` order).  Equal
+    /// *total-weight* ties between different geometries are resolved by that
+    /// consideration order rather than by a rule on widths — see
+    /// [`applicability_weight`] for the two pinned directions.
     pub fn collect(diags: &[Diagnostic<'src>], hints: FixHints) -> Self {
         let mut candidates: Vec<FixEdit<'src>> = Vec::new();
         for diag in diags {
             for sug in diag.suggestions() {
-                if matches!(
-                    sug.style,
-                    SuggestionStyle::HideCodeAlways | SuggestionStyle::CompletelyHidden
-                ) {
-                    continue;
+                match sug.style {
+                    // Invisible to the user: applying one would rewrite the
+                    // source in a way the output never mentioned.
+                    SuggestionStyle::HideCodeAlways | SuggestionStyle::CompletelyHidden => continue,
+                    // Every other style is user-visible (the message and/or the
+                    // code), so it participates.  Listing them explicitly keeps
+                    // a newly added style a compile error *here* instead of a
+                    // silent `--fix` policy change.
+                    SuggestionStyle::ShowAlways
+                    | SuggestionStyle::ShowCode
+                    | SuggestionStyle::HideCodeInline => {}
                 }
                 if !hints.accepts(sug.applicability) {
                     continue;
@@ -533,6 +552,61 @@ mod tests {
     use crate::ast::Span;
     use crate::diagnostics::Diagnostic;
     use crate::diagnostics::ErrCode;
+
+    /// Equal *total* weight (4 vs 2+2) resolved by geometry: the narrow pair
+    /// covers `[0,5)` completely, so both sets fit — and the wider edit wins
+    /// because the DP meets it before the pair completes.
+    #[test]
+    fn tie_at_double_width_keeps_the_wider_edit() {
+        let wide = diag_with_fix(
+            Span::new(FileId::DUMMY, 0, 5),
+            "WIDE",
+            Applicability::MachineApplicable, // 4
+        );
+        let left = diag_with_fix(
+            Span::new(FileId::DUMMY, 0, 3),
+            "L",
+            Applicability::MaybeIncorrect,
+        );
+        let right = diag_with_fix(
+            Span::new(FileId::DUMMY, 3, 5),
+            "R",
+            Applicability::MaybeIncorrect,
+        );
+        let set = FixSet::collect(&[wide, left, right], FixHints::All);
+        let got: Vec<&str> = set.iter().map(|e| e.replacement.as_ref()).collect();
+        assert_eq!(
+            got,
+            ["WIDE"],
+            "the end-earliest consideration order keeps it"
+        );
+    }
+
+    /// The same weights and the same 4-vs-4 total, a different geometry: the pair
+    /// completes *before* the wide edit is considered, so the pair survives.
+    /// Together with the test above this pins that exact-2× ties are decided by
+    /// `(end, start)` order, not by a width rule.
+    #[test]
+    fn tie_at_double_width_keeps_the_narrower_pair() {
+        let wide = diag_with_fix(
+            Span::new(FileId::DUMMY, 0, 5),
+            "WIDE",
+            Applicability::MachineApplicable, // 4
+        );
+        let left = diag_with_fix(
+            Span::new(FileId::DUMMY, 0, 3),
+            "L",
+            Applicability::MaybeIncorrect,
+        );
+        let right = diag_with_fix(
+            Span::new(FileId::DUMMY, 3, 4),
+            "R",
+            Applicability::MaybeIncorrect,
+        );
+        let set = FixSet::collect(&[wide, left, right], FixHints::All);
+        let got: Vec<&str> = set.iter().map(|e| e.replacement.as_ref()).collect();
+        assert_eq!(got, ["L", "R"], "the pair reaches the total first");
+    }
 
     fn diag_with_fix(
         span: Span,

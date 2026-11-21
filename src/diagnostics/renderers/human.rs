@@ -54,9 +54,19 @@ impl Renderer for HumanRenderer {
         //
         // Only build it when something consumes it: a source-attached diagnostic
         // with no spans, no labels and an empty call chain (summary-level errors
-        // do occur) would otherwise pay an O(file) scan on an LRU miss.  This
-        // mirrors the JSON renderer's `needs_index`, so the two renderers cannot
-        // drift on the policy.
+        // do occur) would otherwise pay an O(file) scan on an LRU miss.
+        //
+        // This deliberately does NOT mirror the JSON renderer's `needs_index`,
+        // which is `anchor_file.is_some()` only.  JSON narrowed to the anchor
+        // because none of its other consumers (labels, suggestions, children)
+        // ever read line/column, so the extra disjuncts only forced an O(n) scan
+        // for data it discards.  The glyph renderer *does* draw label markers
+        // and the call-chain footer against the source excerpt, so it needs the
+        // index for a span-less diagnostic that carries labels or a chain —
+        // dropping those disjuncts here would silently render such a diagnostic
+        // without line numbers.  Keep the policies divergent on purpose: this
+        // disjunction IS the pin, so narrowing it to match JSON is a rendering
+        // regression, not a cleanup.
         let needs_index = diag.spans().first().is_some()
             || !diag.labels().is_empty()
             || diag.call_chain().is_some_and(|c| !c.is_empty());

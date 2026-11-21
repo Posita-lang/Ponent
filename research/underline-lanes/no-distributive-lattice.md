@@ -57,11 +57,20 @@ strictly suboptimal already at `χ = 2`. With
 intervals (0,2) (0,2) (3,5),   w = (1, 2, 1),
 ```
 
-the greedy takes `{v₁}`, `{v₂}`, then `v₃` joins the first lane, so the
-post-pass returns 6 (`Σ w·lane = 1·1 + 2·2 + 1·1`), while the colouring
-`v₂ ↦ 1, v₁ ↦ 2, v₃ ↦ 2` costs 5. Reassigning lanes inside a fixed
-colouring cannot repair this, so the post-pass is a heuristic with an
-unmeasured corpus gap (§9, pinned in `verify_witnesses.py`).
+the greedy takes `{v₁}`, `{v₂}`, then `v₃` joins the first lane, so its own
+numbering costs 6 (`Σ w·lane = 1·1 + 2·2 + 1·1`). The 5-cost optimum is
+`v₂ ↦ 1, v₁ ↦ 2, v₃ ↦ 1` (`igmrc_dp` in `verify_witnesses.py` asserts the
+value 5): the isolated `v₃` keeps the lane it already had and the
+*overlapping pair* swaps. (An earlier revision of this paragraph cited
+`v₃ ↦ 2`, which sums to 6 — the erratum is corrected here.)
+
+The structure is the point: the optimum is a relabelling of **one connected
+component** of the overlap graph. A *global* rearrangement pass cannot reach
+it — the two lane sums tie at 11, so the global sort is the identity — while a
+per-component pass can, because components are column-disjoint and the
+objective separates over them. `UnderlineLanes::assign` relabels each component
+independently, so this witness is now exact in the code
+(`lane_relabel_per_component_matches_exhaustive_search` pins both directions).
 
 On interval graphs with `χ = ω = k ≤ n` the exact problem is NP-hard in
 general (padding reduction, [`../igmrc/README.md`](../igmrc/README.md) §1)
@@ -451,13 +460,17 @@ gauge, so the natural object is closer to a torsor than to a lattice.
   optimising a linear objective inside a single `C_D` is polynomial (§7), but
   the number of acyclic orientations is `(-1)^n χ_G(-1)` — exponential — so
   one cannot enumerate the `D`.
-- **Engineering decision (stated once).** Keep the greedy χ-lane assignment
-  plus the `O(n log n)` rearrangement post-pass of §2; it is optimal among
-  relabellings of the greedy colouring, and for the `n ≤ ~50`, `χ ≤ ~5` rows
-  in this codebase it avoids the DP/flow machinery. We have **not** measured
-  the remaining gap between the relabelling optimum and exact IGMRC on the
-  corpus, so this is a pragmatic complexity trade-off (`O(n log n)` versus
-  `O(n · k!)` plus bookkeeping), not a theorem that no further gain exists.
+- **Engineering decision (stated once).** Keep the greedy χ-lane assignment,
+  but relabel **per connected component of the overlap graph** instead of
+  globally: each component's colouring is relabelled independently over the
+  lanes it occupies (`O(n · χ!)` worst case — exhaustive for `χ ≤ 5`, and the
+  §2 rearrangement restricted to the component above that). This strictly
+  dominates the global post-pass in the WDS objective (the §2 witness is now
+  exact), and a two-lane component has exactly two proper 2-colourings, so
+  `χ = 2` rows — the common caret-plus-one-secondary shape — are optimal.
+  What remains unmeasured is the `χ ≥ 3` gap between this relabelling optimum
+  and exact IGMRC; the tiered χ = 3 sweep DP is therefore the natural next
+  step, not a substitute for the relabelling.
 
 ## 10. Notes
 

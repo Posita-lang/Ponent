@@ -14,13 +14,24 @@
 //!
 //! Atomicity is a *per-sink* property, not a trait guarantee:
 //!
-//! * [`StringSink`] is infallible, so a batch is always complete.
+//! * [`StringSink`] is infallible for `write_str`; `write_fmt` surfaces a
+//!   formatter error as `Err` like every other sink (a `Display` impl may
+//!   legally return `Err(fmt::Error)`), leaving any already-pushed prefix in
+//!   the buffer.
 //! * A generic `Write` sink (including `stderr`/`BufWriter`) can fail
-//!   mid-batch; the bytes written before the error stay written.  The
-//!   emitter stops the batch on the first error, so partial output is a
-//!   prefix, never an interleaving of later diagnostics.
-//! * [`ChannelSink`] deliberately streams one message per rendered chunk;
-//!   a receiver that drops mid-batch keeps the chunks it already received.
+//!   mid-batch.  For an **unbuffered** sink the bytes written before the error
+//!   stay written.  For a **buffered** sink (`BufWriter`) that is only true if
+//!   the emitter calls `flush()` before propagating a mid-batch error, and
+//!   propagates `flush()` errors at batch end — `BufWriter`'s `Drop` silently
+//!   *discards* unflushed bytes and cannot report the failure from `drop`.
+//!   The emitter contract therefore carries the guarantee; this module only
+//!   states it.
+//! * [`ChannelSink`] sends **one message per `write_str`/`write_fmt` call**,
+//!   not per diagnostic: renderers emit many small pieces (header, labels,
+//!   gutters), so a receiver sees fragments with no diagnostic boundary
+//!   marker.  Coalescing per diagnostic is the emitter's responsibility; until
+//!   it exists, a consumer that needs boundaries must frame them itself.
+//!   A receiver that drops mid-batch keeps the chunks it already received.
 //!   This is the desired LSP/streaming semantics, not a bug.
 //!
 //! Callers that need all-or-nothing output must render into a
@@ -100,9 +111,7 @@ impl sealed::Sealed for StringSink {}
 
 impl StringSink {
     pub fn new() -> Self {
-        StringSink {
-            buf: String::new(),
-        }
+        StringSink { buf: String::new() }
     }
 
     /// Start with `capacity` bytes reserved — one allocation for a
@@ -150,12 +159,23 @@ impl DiagnosticSink for StringSink {
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
         use std::fmt::Write as _;
         // Write straight into the internal buffer, avoiding a temporary
-        // `String`.  `String`'s `fmt::Write` cannot fail (it aborts on OOM
-        // rather than returning `Err`), but a silent `let _ =` would hide a
-        // future buffer swap that *can* fail — so the arm is explicit.
+        // `String`.
+        //
+        // This cannot be `unreachable!`: `String` does **not** override
+        // `fmt::Write::write_fmt`, so the default implementation propagates
+        // `fmt::write`'s result — any `Display` impl in the format chain that
+        // returns `Err(fmt::Error)` (entirely legal Rust) reaches here.  Newer
+        // std versions also return `Err` on allocation failure instead of
+        // aborting.
+        //
+        // Mapping to `io::Error` keeps the sinks uniform: the blanket
+        // `io::Write` path already reports formatter errors that way, and the
+        // partial-prefix invariant (bytes before the error stay in the buffer)
+        // then holds for every sink instead of "every sink but the one that
+        // claimed to be infallible".
         match self.buf.write_fmt(args) {
             Ok(()) => Ok(()),
-            Err(e) => unreachable!("String::write_fmt is infallible: {e}"),
+            Err(_) => Err(io::Error::new(io::ErrorKind::Other, "formatter error")),
         }
     }
 }
@@ -206,6 +226,12 @@ pub fn stderr_buffered() -> impl MakeSink<Sink = io::BufWriter<io::StderrLock<'s
 pub fn stderr_buffered_with(
     capacity: usize,
 ) -> impl MakeSink<Sink = io::BufWriter<io::StderrLock<'static>>> {
+    // `BufWriter::with_capacity(0, …)` is pathological: effectively unbuffered
+    // *plus* a flush attempt per write, i.e. strictly worse than plain
+    // `stderr()`.  A caller asking for 0 wants "no buffering", which the
+    // unbuffered factory already provides; clamping keeps this one a real
+    // buffer.
+    let capacity = capacity.max(1024);
     move || io::BufWriter::with_capacity(capacity, io::stderr().lock())
 }
 
@@ -248,6 +274,21 @@ impl DiagnosticSink for ChannelSink {
 }
 
 /// LSP sink factory: clone the sender for each batch.
+///
+/// **Backpressure is the sender's choice, not this factory's.**  `ChannelSink`
+/// uses a blocking `send`, so:
+///
+/// * built from [`crossbeam_channel::unbounded`], a stalled receiver lets every
+///   rendered chunk enqueue with nothing pushing back — memory can grow while
+///   the session still looks healthy;
+/// * built from [`crossbeam_channel::bounded`], `send` blocks once the bound is
+///   reached, which is real backpressure: the renderer waits instead of
+///   growing.  A wedged receiver then stalls the emitting thread rather than
+///   the allocator, and a dropped receiver still surfaces as `BrokenPipe`.
+///
+/// There is deliberately no wrapper factory that "adds" a bound: the bound
+/// belongs to the channel the caller creates, and a factory that silently
+/// wrapped a different one would make the actual depth invisible.
 pub fn channel(tx: crossbeam_channel::Sender<String>) -> impl MakeSink<Sink = ChannelSink> {
     move || ChannelSink(tx.clone())
 }
@@ -332,7 +373,7 @@ mod tests {
         let mut channel_sink = ChannelSink(tx);
         let mut channel_out = String::new();
 
-        for (i, chunk) in ["a", "beta\n", "γ"] .iter().enumerate() {
+        for (i, chunk) in ["a", "beta\n", "γ"].iter().enumerate() {
             string_sink.write_str(chunk).unwrap();
             DiagnosticSink::write_str(&mut direct, chunk).unwrap();
             channel_sink.write_str(chunk).unwrap();
@@ -359,7 +400,10 @@ mod tests {
         drop(rx);
         let err = sink.write_str("lost").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(sink.write_fmt(format_args!("x")).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            sink.write_fmt(format_args!("x")).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]

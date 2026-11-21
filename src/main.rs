@@ -267,6 +267,17 @@ fn main() {
         debug: cli.debug,
     };
 
+    // `--error-format` used to fall through to the human renderer on any typo.
+    // Validate it here, next to `--color`/`--fix-hints`, so all three share one
+    // discipline (and `--json` overriding it stays a documented precedence
+    // rather than a silent one).
+    match cli.error_format.as_str() {
+        "human" | "json" | "short" => {}
+        other => usage_error(format!(
+            "unknown --error-format value `{other}` (valid: human, json, short)"
+        )),
+    }
+
     let fix_hints = match cli.fix_hints.as_str() {
         "auto" => FixHints::Auto,
         "review" => FixHints::Review,
@@ -438,16 +449,25 @@ fn run_lex(file: &str) -> Result<(), Vec<Diagnostic<'static>>> {
     })?;
     let lexer = lexer::Token::lexer(&source_text);
     let mut errors = Vec::new();
+    // One lock for the whole dump: `println!` takes the stdout lock and flushes
+    // a line per token, i.e. tens of thousands of lock/flush pairs on a large
+    // file.  The buffer is flushed before returning so diagnostics that follow
+    // on stderr keep their relative order.
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
     for result in lexer {
         match result {
             Ok(token) => {
                 if token != lexer::Token::WhitespaceOrComment {
-                    println!("{:?}", token);
+                    let _ = writeln!(out, "{:?}", token);
                 }
             }
             Err(()) => errors.push(Diagnostic::error("invalid token")),
         }
     }
+    let _ = std::io::Write::flush(&mut out);
+    drop(out);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -459,11 +479,23 @@ fn run_lex(file: &str) -> Result<(), Vec<Diagnostic<'static>>> {
 ///
 /// Returns the diagnostics to render; never calls `process::exit`, so it is
 /// safe to invoke from a rayon worker.
-fn run_parse<'a>(
+/// The pipeline `parse`, `check` and `mir` share: read → register with a
+/// `SourceMap` → parse → resolve/expand → type-check, with every diagnostic
+/// attached to `source`.
+///
+/// Only what happens after a *successful* check differs, so that is the
+/// `on_checked` hook.  `require_main` is an explicit parameter rather than an
+/// implicit per-caller difference: `parse` and `check` compile a program and
+/// need an entry point, while `mir` only dumps a lowered body.  The previous
+/// three copies had already drifted — `mir` lacked the `main` check and `check`
+/// dropped the checker's warnings on the failure path — which is exactly what
+/// one implementation prevents.
+fn compile_frontend<'a>(
     file: &str,
-    ast: bool,
     opts: &CompilerOptions,
     sync_arena: &'a arena::SyncArena<'a>,
+    require_main: bool,
+    on_checked: impl FnOnce(&hir::hir::HirProgram<'a>),
 ) -> Result<(), Vec<Diagnostic<'a>>> {
     let source_text = fs::read_to_string(file).map_err(|e| {
         vec![Diagnostic::error(format!(
@@ -471,13 +503,10 @@ fn run_parse<'a>(
             file, e
         ))]
     })?;
-    // Register the file with a SourceMap so every span carries a real
-    // FileId, then copy the source into the leaked arena so the diagnostics
-    // that borrow it can outlive this call and be rendered by `main`.
+    // Copy the source into the leaked arena so the diagnostics that borrow it
+    // outlive this call and can be rendered by `main`; the owned `String` is
+    // dropped immediately after, so only one copy of each file is retained.
     let source: &'a str = sync_arena.alloc_str(&source_text);
-    // The owned `String` is dropped here: the arena owns the text now, so
-    // keeping the original alive for the rest of the function would retain
-    // a second full copy of every source file.
     drop(source_text);
     let mut source_map = sourcemap::SourceMap::new();
     let file_id = source_map.add_file(file, source).map_err(|e| {
@@ -495,25 +524,17 @@ fn run_parse<'a>(
             return Err(diagnostics);
         }
     };
-    if ast {
-        println!("{:#?}", program);
-        return Ok(());
-    }
-
     let target = match resolve_target(&opts.target) {
         Ok(t) => t,
         Err(msg) => return Err(vec![Diagnostic::error(msg)]),
     };
     let mut ctx = TypeContext::new_with_target(target.clone());
     // A `SyncArena`, not a bare `&Bump`: a bare `&Bump` makes `TypeContext`
-    // neither `Send` nor `Sync`, which is what blocked queries from being
-    // handed it.  See `crate::arena`.
+    // neither `Send` nor `Sync`, which is what blocked queries from being handed
+    // it.  See `crate::arena`.
     ctx.arena = Some(sync_arena);
     let local_crate_id = CrateId(DefId(0));
-
-    // Phase 1 → resolve → Phase 2 → incremental resolve, all inside a helper
-    // so each phase's `&mut ctx` borrow is scoped (the helper takes `ctx`
-    // once and the phases reborrow it sequentially).
+    // Phase-1 expansion → resolve → phase-2 expansion → incremental resolve.
     let (program, symbols, trait_env, mut all_diags, resolution_map) = resolve_and_expand(
         &mut ctx,
         program,
@@ -522,13 +543,9 @@ fn run_parse<'a>(
         file,
         opts.enable_experimental,
     );
-    // `resolve_and_expand` already attached `source` to every phase's
-    // diagnostics; the old second pass here re-walked the vector for nothing.
-
     // From here the session owns the pipeline state, so a query can be handed
     // all of it through one provider.
     let mut session = CompilerSession::new(ctx, symbols, trait_env, resolution_map, target);
-
     let has_main = session.resolution_map.has_main;
     let mut checker = TypeChecker::new_with_source(
         &mut session.ctx,
@@ -544,16 +561,14 @@ fn run_parse<'a>(
         Some(source),
     );
     let checker_result = checker.check_program(&program);
-    // Extract checker diagnostics (warnings, notes) even on success.
+    // Checker diagnostics (warnings, notes) are collected even on success.
     let mut checker_diag_vec = checker.take_diagnostics().into_inner();
     attach_source_to_diags(&mut checker_diag_vec, source, file);
     match checker_result {
-        Ok(_hir_program) => {
-            // Checker succeeded — report any resolver diagnostics.
+        Ok(hir_program) => {
             let mut diags = checker_diag_vec;
             diags.extend(all_diags);
-            // Verify that a `main` function exists.
-            if !has_main {
+            if require_main && !has_main {
                 let mut main_diag = vec![
                     Diagnostic::error("`main` function not found in crate")
                         .with_code_str(ErrCode::E062)
@@ -562,18 +577,61 @@ fn run_parse<'a>(
                 attach_source_to_diags(&mut main_diag, source, file);
                 diags.extend(main_diag);
             }
+            if diags.iter().any(|d| d.is_error()) {
+                return Err(diags);
+            }
+            on_checked(&hir_program);
             if diags.is_empty() { Ok(()) } else { Err(diags) }
         }
         Err(errors) => {
             let mut diags = errors.into_inner();
             attach_source_to_diags(&mut diags, source, file);
-            // Merge checker diagnostics (warnings accumulated before the
-            // fatal error) and resolver diagnostics — neither may be dropped.
+            // Merge the checker's pre-fatal warnings and the resolver's
+            // diagnostics — neither may be dropped.
             diags.extend(checker_diag_vec);
             diags.extend(all_diags);
             Err(diags)
         }
     }
+}
+
+fn run_parse<'a>(
+    file: &str,
+    ast: bool,
+    opts: &CompilerOptions,
+    sync_arena: &'a arena::SyncArena<'a>,
+) -> Result<(), Vec<Diagnostic<'a>>> {
+    if ast {
+        // `--ast` is a dump mode: it stops right after parsing, so it shares
+        // only the read/register/parse prefix with the full frontend.
+        let source_text = fs::read_to_string(file).map_err(|e| {
+            vec![Diagnostic::error(format!(
+                "failed to read `{}`: {}",
+                file, e
+            ))]
+        })?;
+        let source: &'a str = sync_arena.alloc_str(&source_text);
+        drop(source_text);
+        let mut source_map = sourcemap::SourceMap::new();
+        let file_id = source_map.add_file(file, source).map_err(|e| {
+            vec![Diagnostic::error(format!(
+                "failed to register `{}`: {}",
+                file, e
+            ))]
+        })?;
+        let mut parser = parser::Parser::new(source, file_id, sync_arena);
+        return match parser.parse_program() {
+            Ok(program) => {
+                println!("{:#?}", program);
+                Ok(())
+            }
+            Err(mut diagnostics) => {
+                attach_source_to_diags(&mut diagnostics, source, file);
+                Err(diagnostics)
+            }
+        };
+    }
+    compile_frontend(file, opts, sync_arena, true, |_| {})
 }
 
 /// Parse, resolve, and type-check a file.  Never calls `process::exit`.
@@ -582,98 +640,9 @@ fn run_check<'a>(
     opts: &CompilerOptions,
     sync_arena: &'a arena::SyncArena<'a>,
 ) -> Result<(), Vec<Diagnostic<'a>>> {
-    let source_text = fs::read_to_string(file).map_err(|e| {
-        vec![Diagnostic::error(format!(
-            "failed to read `{}`: {}",
-            file, e
-        ))]
-    })?;
-    let source: &'a str = sync_arena.alloc_str(&source_text);
-    // The owned `String` is dropped here: the arena owns the text now, so
-    // keeping the original alive for the rest of the function would retain
-    // a second full copy of every source file.
-    drop(source_text);
-    let mut source_map = sourcemap::SourceMap::new();
-    let file_id = source_map.add_file(file, source).map_err(|e| {
-        vec![Diagnostic::error(format!(
-            "failed to register `{}`: {}",
-            file, e
-        ))]
-    })?;
-
-    let mut parser = parser::Parser::new(source, file_id, sync_arena);
-    let program = match parser.parse_program() {
-        Ok(p) => p,
-        Err(mut diagnostics) => {
-            attach_source_to_diags(&mut diagnostics, source, file);
-            return Err(diagnostics);
-        }
-    };
-    let target = match resolve_target(&opts.target) {
-        Ok(t) => t,
-        Err(msg) => return Err(vec![Diagnostic::error(msg)]),
-    };
-    let mut ctx = TypeContext::new_with_target(target.clone());
-    ctx.arena = Some(sync_arena);
-    let local_crate_id = CrateId(DefId(0));
-    // Same phase pipeline as `run_parse`: phase-1 expansion → resolve →
-    // phase-2 expansion → incremental resolve.  Calling the resolver directly
-    // made `check` reject (or misresolve) files that `parse` accepts.
-    let (program, symbols, trait_env, mut all_diags, resolution_map) = resolve_and_expand(
-        &mut ctx,
-        program,
-        local_crate_id,
-        source,
-        file,
-        opts.enable_experimental,
-    );
-
-    // Same session plumbing as the `Parse` path above.
-    let mut session = CompilerSession::new(ctx, symbols, trait_env, resolution_map, target);
-
-    let has_main = session.resolution_map.has_main;
-
-    let mut checker = TypeChecker::new_with_source(
-        &mut session.ctx,
-        &session.symbols,
-        &mut session.trait_env,
-        // `TypeChecker` takes the map by value, so the session keeps its own
-        // copy for queries to read.
-        std::sync::Arc::clone(&session.resolution_map),
-        opts.strict,
-        opts.enable_experimental,
-        std::sync::Arc::clone(&opts.feature),
-        opts.debug,
-        Some(source),
-    );
-    let checker_result = checker.check_program(&program);
-    let mut checker_diag_vec = checker.take_diagnostics().into_inner();
-    attach_source_to_diags(&mut checker_diag_vec, source, file);
-    match checker_result {
-        Ok(_hir) => {
-            let mut diags = checker_diag_vec;
-            diags.extend(all_diags);
-            // `check` is a "compile this program" subcommand like `parse`;
-            // the old asymmetry (parse requires `main`, check does not) made
-            // `check library.po` succeed where `parse library.po` failed.
-            if !has_main {
-                let mut main_diag = vec![
-                    Diagnostic::error("`main` function not found in crate")
-                        .with_code_str(ErrCode::E062)
-                        .with_help("add a `def main() { ... }` function as the entry point"),
-                ];
-                attach_source_to_diags(&mut main_diag, source, file);
-                diags.extend(main_diag);
-            }
-            if diags.is_empty() { Ok(()) } else { Err(diags) }
-        }
-        Err(errors) => {
-            let mut diags = errors.into_inner();
-            attach_source_to_diags(&mut diags, source, file);
-            diags.extend(all_diags);
-            Err(diags)
-        }
-    }
+    // `check` compiles a program, so it requires an entry point exactly like
+    // `parse` does.
+    compile_frontend(file, opts, sync_arena, true, |_| {})
 }
 
 fn run_mir<'a>(
@@ -681,89 +650,22 @@ fn run_mir<'a>(
     opts: &CompilerOptions,
     sync_arena: &'a arena::SyncArena<'a>,
 ) -> Result<(), Vec<Diagnostic<'a>>> {
-    let source_text = fs::read_to_string(file).map_err(|e| {
-        vec![Diagnostic::error(format!(
-            "failed to read `{}`: {}",
-            file, e
-        ))]
-    })?;
-    let source: &'a str = sync_arena.alloc_str(&source_text);
-    // The owned `String` is dropped here: the arena owns the text now, so
-    // keeping the original alive for the rest of the function would retain
-    // a second full copy of every source file.
-    drop(source_text);
-    let mut source_map = sourcemap::SourceMap::new();
-    let file_id = source_map.add_file(file, source).map_err(|e| {
-        vec![Diagnostic::error(format!(
-            "failed to register `{}`: {}",
-            file, e
-        ))]
-    })?;
-
-    let mut parser = parser::Parser::new(source, file_id, sync_arena);
-    let program = match parser.parse_program() {
-        Ok(p) => p,
-        Err(mut diagnostics) => {
-            attach_source_to_diags(&mut diagnostics, source, file);
-            return Err(diagnostics);
-        }
-    };
-    let target = match resolve_target(&opts.target) {
-        Ok(t) => t,
-        Err(msg) => return Err(vec![Diagnostic::error(msg)]),
-    };
-    let mut ctx = TypeContext::new_with_target(target.clone());
-    ctx.arena = Some(sync_arena);
-    let local_crate_id = CrateId(DefId(0));
-    // Same phase pipeline as `run_parse`/`run_check` (generate expansion is
-    // part of the language, not a parse-only nicety).
-    let (program, symbols, trait_env, mut all_diags, resolution_map) = resolve_and_expand(
-        &mut ctx,
-        program,
-        local_crate_id,
-        source,
-        file,
-        opts.enable_experimental,
-    );
-
-    let mut session = CompilerSession::new(ctx, symbols, trait_env, resolution_map, target);
-
-    let mut checker = TypeChecker::new_with_source(
-        &mut session.ctx,
-        &session.symbols,
-        &mut session.trait_env,
-        std::sync::Arc::clone(&session.resolution_map),
-        opts.strict,
-        opts.enable_experimental,
-        std::sync::Arc::clone(&opts.feature),
-        opts.debug,
-        Some(source),
-    );
-    let checker_result = checker.check_program(&program);
-    let mut checker_diag_vec = checker.take_diagnostics().into_inner();
-    attach_source_to_diags(&mut checker_diag_vec, source, file);
-    match checker_result {
-        Ok(hir_program) => {
-            let mut diags = checker_diag_vec;
-            diags.extend(all_diags);
-            if diags.iter().any(|d| d.is_error()) {
-                return Err(diags);
+    // `mir` only dumps a lowered body, so it does **not** require an entry
+    // point — the one intentional difference from `parse`/`check`, now an
+    // explicit argument instead of a copy that forgot the check.
+    compile_frontend(file, opts, sync_arena, false, |hir_program| {
+        // One lock + buffer for the whole dump; `println!` per function locked
+        // and flushed stdout once per body on a large program.
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        for item in &hir_program.items {
+            if matches!(item, hir::hir::HirStmt::FunctionDef { .. }) {
+                let _ = writeln!(out, "{}", mir::build::lower_function(item).pretty());
             }
-            for item in &hir_program.items {
-                if matches!(item, hir::hir::HirStmt::FunctionDef { .. }) {
-                    println!("{}", mir::build::lower_function(item).pretty());
-                }
-            }
-            if diags.is_empty() { Ok(()) } else { Err(diags) }
         }
-        Err(errors) => {
-            let mut diags = errors.into_inner();
-            attach_source_to_diags(&mut diags, source, file);
-            diags.extend(checker_diag_vec);
-            diags.extend(all_diags);
-            Err(diags)
-        }
-    }
+        let _ = out.flush();
+    })
 }
 
 /// Show an error-code explanation (blocking while the explain server runs).
@@ -853,64 +755,6 @@ fn run_explain_serve(initial_code: Option<String>) {
 
 /// Open a URL in the user's default browser.
 
-/// Animate a one-line spinner on stderr while the explain server waits for
-/// the browser to connect, e.g.
-///
-/// ```text
-/// ⠋ opening E030 explanation on http://127.0.0.1:41234/explain/E030 …
-/// ```
-///
-/// The URL is wrapped in an OSC 8 hyperlink so terminals that support it
-/// make it clickable.  Frames are redrawn in place with a carriage return;
-/// the caller stops the thread via [`stop_explain_spinner`], which clears
-/// the line so the explanation text that follows stands alone.  Callers
-/// must gate spawning on stderr being a terminal.
-fn spawn_explain_spinner(
-    url: &str,
-    code: &str,
-) -> (
-    std::thread::JoinHandle<()>,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
-
-    // OSC 8 hyperlink: ST (`ESC \`) terminator, not BEL — the diagnostics
-    // layer's sanitizer rules out BEL for good reason, and ST is the
-    // better-supported form anyway.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
-    let url = url.to_string();
-    let code = code.to_string();
-    let handle = std::thread::spawn(move || {
-        let mut stderr = std::io::stderr().lock();
-        for frame in FRAMES.iter().cycle() {
-            if stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            let _ = write!(
-                stderr,
-                "\r{frame} opening {code} explanation on \
-                 \x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\ …\x1b[K"
-            );
-            let _ = stderr.flush();
-            std::thread::sleep(FRAME_INTERVAL);
-        }
-    });
-    (handle, stop)
-}
-
-/// Stop the spinner thread and erase its line from the terminal.
-fn stop_explain_spinner(handle: std::thread::JoinHandle<()>, stop: &std::sync::atomic::AtomicBool) {
-    // The thread checks the flag every frame (~80 ms), so the join below
-    // cannot block meaningfully.
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = handle.join();
-    let mut stderr = std::io::stderr().lock();
-    let _ = write!(stderr, "\r\x1b[2K");
-    let _ = stderr.flush();
-}
-
 #[cfg(target_os = "linux")]
 fn open_browser(url: &str) -> std::io::Result<()> {
     std::process::Command::new("xdg-open").arg(url).spawn()?;
@@ -930,7 +774,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         // empty title must be passed explicitly before the URL; otherwise
         // Windows opens an empty console instead of the page.
         .args(["/c", "start", "", url])
-        .spawn?;
+        .spawn()?;
     Ok(())
 }
 

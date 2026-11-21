@@ -89,6 +89,14 @@ pub struct DiagCtxt<'src> {
     /// audit.  Counted so tests can assert exactly-once without parsing stderr;
     /// like `suppressed_warnings` it is monotone and never reset by `clear`.
     internal_bugs: usize,
+    /// Conservative "some diagnostic may lack a source" marker, so
+    /// [`Self::audit_source_attachment`] can skip its O(suffix) scan on the
+    /// happy path.  Set by `push` when it sees a sourceless diagnostic, cleared
+    /// by [`Self::attach_source`] (which patches every one) and by the audit
+    /// itself when it finds nothing.  Staleness is sound in one direction only:
+    /// a stale `true` costs a scan, a stale `false` would skip a real audit, so
+    /// every mutator that can remove diagnostics leaves it set.
+    may_have_unsourced: bool,
 }
 
 /// The inline `SmallVec<[Diagnostic; 2]>` is what keeps a zero/one-diagnostic
@@ -138,6 +146,7 @@ impl<'src> DiagCtxt<'src> {
         DiagCtxt {
             diags: SmallVec::new(),
             reported_len: 0,
+            may_have_unsourced: false,
             can_emit_warnings: true,
             errors: 0,
             warnings: 0,
@@ -155,6 +164,14 @@ impl<'src> DiagCtxt<'src> {
     pub fn push(&mut self, diag: Diagnostic<'src>) -> EmissionGuarantee {
         match diag.level() {
             super::DiagnosticLevel::Fatal | super::DiagnosticLevel::Error => {
+                // Every tally, `From<Vec>`, `recount_derived_state` and
+                // `summary` agree only if `is_error()` also covers `Fatal`.
+                // That invariant lives in another module, so pin it here where
+                // the tallies are actually incremented.
+                debug_assert!(
+                    diag.is_error(),
+                    "a Fatal/Error diagnostic must report is_error() for the tallies"
+                );
                 self.errors += 1;
                 self.unreported_errors += 1;
             }
@@ -169,6 +186,12 @@ impl<'src> DiagCtxt<'src> {
                 self.unreported_warnings += 1;
             }
             _ => {}
+        }
+        // Conservative marker for `audit_source_attachment`: set when a
+        // diagnostic arrives without a source, cleared by `attach_source` (which
+        // patches every one).  Staleness only costs a scan, never a missed audit.
+        if diag.source().is_none() {
+            self.may_have_unsourced = true;
         }
         self.diags.push(diag);
         EmissionGuarantee::emitted()
@@ -222,19 +245,40 @@ impl<'src> DiagCtxt<'src> {
         // With warnings disabled every `Warning` in the batch is dropped at
         // `push`, so even an exact hint no longer bounds what is kept: reserve
         // nothing rather than capacity the push-time gate empties.
-        let hint = if self.can_emit_warnings {
-            match (lower, upper) {
+        if self.can_emit_warnings {
+            let hint = match (lower, upper) {
                 (l, Some(u)) if l == u => u,
                 (l, _) => l,
+            };
+            if hint > 0 {
+                self.diags.reserve(hint);
             }
-        } else {
-            0
-        };
-        if hint > 0 {
-            self.diags.reserve(hint);
+            for diag in iter {
+                self.push(diag);
+            }
+            return;
         }
-        for diag in iter {
-            self.push(diag);
+        // Warnings are dropped at `push`, so the pre-filter hint is not a bound
+        // on what is kept — but reserving *nothing* makes an all-error batch pay
+        // O(log N) reallocations, and that is exactly the batch a
+        // warnings-disabled build produces.  An exact-size source lets us count
+        // what `push` will keep in one pass; the intermediate `Vec` is a single
+        // exact allocation, cheaper than the growth chain it replaces.  An
+        // inexact iterator keeps the old reserve-nothing behaviour.
+        match (lower, upper) {
+            (l, Some(u)) if l == u => {
+                let items: Vec<Diagnostic<'src>> = iter.collect();
+                let kept = items.iter().filter(|d| !d.is_warning()).count();
+                self.diags.reserve(kept);
+                for diag in items {
+                    self.push(diag);
+                }
+            }
+            _ => {
+                for diag in iter {
+                    self.push(diag);
+                }
+            }
         }
     }
 
@@ -265,6 +309,14 @@ impl<'src> DiagCtxt<'src> {
                 diag.set_source(source);
             }
         }
+        // Post-condition: *every* diagnostic in the vector now carries a source
+        // (the loop is unconditional over the vector, and an already-sourced one
+        // is left alone), so the audit's "may be unsourced" marker is clear.
+        // Without this the flag stuck at its first `true` and every later
+        // `emit` on a long-lived context paid the O(suffix) audit forever —
+        // precisely the LSP re-publish loop the O(1) gate exists for.  A new
+        // sourceless `push` sets it again.
+        self.may_have_unsourced = false;
     }
 
     /// Total diagnostics (reported + unreported).
@@ -307,7 +359,13 @@ impl<'src> DiagCtxt<'src> {
     /// that would pay the humanization cost for diagnostics that may
     /// never be emitted.
     pub fn humanize_pending(&mut self) {
-        for diag in &mut self.diags[self.reported_len..] {
+        // *All* diagnostics, not just the suffix: `mark_all_reported` promotes
+        // diagnostics to the reported prefix without an emitter ever seeing
+        // them, so a `*_kind`-built one there would stay un-humanized forever —
+        // a debug panic (or an empty message in release) on the very inspection
+        // paths this method exists for.  `humanize` is latched and idempotent,
+        // so already-humanized diagnostics cost one branch.
+        for diag in &mut self.diags {
             diag.humanize();
         }
     }
@@ -433,19 +491,43 @@ impl<'src> DiagCtxt<'src> {
             return Ok(());
         }
         self.audit_source_attachment();
-        emitter.emit_all(&mut self.diags[self.reported_len..])?;
-        // The emitter only ever sees `HumanizeOnly`, so it cannot change a
-        // level; `into_diagnostic` is the one escape.  Recompute here so such a
-        // rewrite fails loudly next to the code that caused it instead of
-        // surfacing as a mystifying `check()` result.  Debug-only: the release
-        // contention is that no render path takes the escape (see
-        // `recount_derived_state`, which external checkpoint consumers may also
-        // call).
+        // Scan the *diagnostics* before and after the handover.  Comparing the
+        // collector's own tallies would be structurally dead: the emitter holds
+        // no reference to this context, so those fields cannot change across the
+        // call.  The raw `&mut [Diagnostic]` it receives is the real mutation
+        // surface (`render_into` takes `&mut Diagnostic`), and the post-condition
+        // this asserts is the one `augment_last_diagnostic`'s doc warns about
+        // ("`check()` can return `Ok` for a context holding an `Error`").
+        //
+        // A sampled `recount_derived_state` cannot substitute: it would rewrite
+        // the tallies from the post-mutation diagnostics and launder the flip.
+        // Debug-only, and deliberately unconditional — sampling here would
+        // reintroduce exactly that laundering.
         #[cfg(debug_assertions)]
-        self.recount_derived_state();
+        let pre_emit = scan_derived(&self.diags[self.reported_len..], 0);
+        emitter.emit_all(&mut self.diags[self.reported_len..])?;
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            scan_derived(&self.diags[self.reported_len..], 0),
+            pre_emit,
+            "emitter mutated a diagnostic's severity through the raw `&mut` slice"
+        );
+        // Repair path (not a detector): an external checkpoint consumer may
+        // have called `recount_derived_state` between emits, and this keeps the
+        // tallies consistent with the vectors it owns.  Sampled rather than
+        // unconditional: a context living across N modules with per-module
+        // emits would otherwise pay O(N²) full scans in debug builds (the
+        // release path's whole point is O(n) over the batch).  Sizes 1, 2, 4, …
+        // cost ≈ 2n total across the context's life, and A1's snapshot assert
+        // above stays unconditional.
+        #[cfg(debug_assertions)]
+        if self.diags.len().is_power_of_two() {
+            self.recount_derived_state();
+        }
         // Fold the suffix tallies into the prefix ones: the emitter only ever
-        // saw `diags[reported_len..]` through `HumanizeOnly`, so the prefix is
-        // unchanged and this keeps `errors == reported + unreported`.
+        // saw `diags[reported_len..]` (and a debug-only scan above proves it did
+        // not change their severity), so the prefix is unchanged and this keeps
+        // `errors == reported + unreported`.
         self.reported_errors += self.unreported_errors;
         self.reported_warnings += self.unreported_warnings;
         self.reported_len = self.diags.len();
@@ -486,6 +568,16 @@ impl<'src> DiagCtxt<'src> {
                 .for_each(f);
             return;
         }
+        if self.unreported_errors == 0 {
+            // Mirror of the branch above: nothing is unreported, so every error
+            // is in the reported prefix.  Post-emit inspection walks O(prefix)
+            // instead of O(total).
+            self.diags[..self.reported_len]
+                .iter()
+                .filter(|d| d.is_error())
+                .for_each(f);
+            return;
+        }
         self.iter().filter(|d| d.is_error()).for_each(f)
     }
 
@@ -496,6 +588,15 @@ impl<'src> DiagCtxt<'src> {
         }
         if self.warnings == self.unreported_warnings {
             self.diags[self.reported_len..]
+                .iter()
+                .filter(|d| d.is_warning())
+                .for_each(f);
+            return;
+        }
+        if self.unreported_warnings == 0 {
+            // Mirror of `for_each_error`: post-emit inspection walks O(prefix),
+            // not O(total) over an empty suffix.
+            self.diags[..self.reported_len]
                 .iter()
                 .filter(|d| d.is_warning())
                 .for_each(f);
@@ -543,15 +644,10 @@ impl<'src> DiagCtxt<'src> {
         // a diagnostic must keep the tally exact.  Release pays nothing.
         #[cfg(debug_assertions)]
         {
-            let mut e = 0usize;
-            let mut w = 0usize;
-            for d in &self.diags {
-                if d.is_error() {
-                    e += 1;
-                } else if d.is_warning() {
-                    w += 1;
-                }
-            }
+            // Reuse the same derivation `recount_derived_state` and
+            // `From<Vec>` use: a bespoke loop here could drift from them, which
+            // is exactly what `scan_derived`'s doc cites as its reason to exist.
+            let (e, w, _, _) = scan_derived(&self.diags, self.reported_len);
             debug_assert_eq!(
                 (self.errors, self.warnings),
                 (e, w),
@@ -596,7 +692,7 @@ impl<'src> DiagCtxt<'src> {
         };
         if diag.spans.first().is_none() {
             diag.spans = super::MultiSpan::new(span);
-            diag.spans_user_set = true;
+            diag.mark_spans_user_set();
             diag.invalidate_stable_id();
         }
         if let Some(source) = source
@@ -651,7 +747,8 @@ impl<'src> DiagCtxt<'src> {
     /// Recompute every derived tally from `diags` and `reported_len`.
     ///
     /// The emitter only ever receives `&mut diags[reported_len..]` through
-    /// [`HumanizeOnly`], so it cannot change a level or a source; the one escape
+    /// a raw slice, so the type system does *not* prevent it: the debug-only
+    /// before/after scan in [`Self::emit`] is what detects it.  The one escape
     /// is `into_diagnostic`.  This is therefore called
     /// * from [`Self::emit`] in **debug** builds (a cross-check that fails next
     ///   to the offending render path), and
@@ -810,15 +907,11 @@ impl<'src> DiagCtxt<'src> {
     /// Symmetric to [`Self::discard_reported`]; the O(1) tally path is the same
     /// one `truncate_unreported(0)` takes.
     pub fn discard_unreported(&mut self) {
-        let keep = self.reported_len;
-        if keep == self.diags.len() {
-            return;
-        }
-        self.diags.truncate(keep);
-        self.errors = self.reported_errors;
-        self.warnings = self.reported_warnings;
-        self.unreported_errors = 0;
-        self.unreported_warnings = 0;
+        // One tally algebra, not two: this is exactly `truncate_unreported(0)`
+        // (the early-return and the no-op cases coincide), and the two
+        // hand-maintained copies would have to be updated in lockstep for every
+        // future tally field.
+        self.truncate_unreported(0);
     }
 
     /// Warnings dropped by the `can_emit_warnings` gate since construction.
@@ -857,16 +950,31 @@ impl<'src> DiagCtxt<'src> {
     /// constructing an emitter.  Scans only the batch about to be emitted, so a
     /// long-lived context stays O(suffix) per emit rather than O(n).
     pub(crate) fn audit_source_attachment(&mut self) {
-        if let Some(i) = self.diags[self.reported_len..]
-            .iter()
-            .position(|d| d.source().is_none())
-        {
-            let msg = format!(
-                "diag #{} reached emission without a source",
-                self.reported_len + i
-            );
-            self.report_internal_bug(&msg);
+        if !self.may_have_unsourced {
+            // Every push carried a source and no later step can remove one, so
+            // the O(suffix) scan below is dead work on the happy path.
+            return;
         }
+        let start = self.reported_len;
+        let suffix = &self.diags[start..];
+        let Some(first) = suffix.iter().position(|d| d.source().is_none()) else {
+            // The flag was stale (a drain/discard may have removed the offender).
+            self.may_have_unsourced = false;
+            return;
+        };
+        // Bug state only, so the second pass is acceptable — and reporting just
+        // the first offender hid the blast radius exactly when it mattered
+        // (500 unsourced diagnostics used to read as one).
+        let total = suffix.iter().filter(|d| d.source().is_none()).count();
+        let msg = if total == 1 {
+            format!("diag #{} reached emission without a source", start + first)
+        } else {
+            format!(
+                "{total} diagnostics reached emission without a source (first: #{})",
+                start + first
+            )
+        };
+        self.report_internal_bug(&msg);
     }
 
     // ── Severity downgrades (inspired by Lean 4's MessageLog) ───────
@@ -880,6 +988,16 @@ impl<'src> DiagCtxt<'src> {
     /// Respects the push-time `can_emit_warnings` gate: when warnings are
     /// disabled, the conversion is a no-op rather than injecting warnings
     /// that `emit` would then print.
+    ///
+    /// **The gate check is deliberately asymmetric with
+    /// [`Self::warnings_to_infos`]**: this direction *creates* warnings, so
+    /// with the gate off it would manufacture output the gate exists to
+    /// suppress.  The other direction only relabels to `Info`, which is not
+    /// gated, and cannot create printable warnings from nothing.
+    ///
+    /// Neither direction can silence warnings pushed *before* the gate was
+    /// disabled — the gate is push-time only.  Use
+    /// [`Self::truncate_unreported`] at a checkpoint boundary for that.
     pub fn errors_to_warnings(&mut self) {
         if self.unreported_errors == 0 || !self.can_emit_warnings {
             return;
@@ -926,6 +1044,10 @@ impl<'src> DiagCtxt<'src> {
     }
 
     /// Downgrade all unreported warning-level diagnostics to information.
+    ///
+    /// Unlike [`Self::errors_to_warnings`] this does **not** consult the
+    /// push-time `can_emit_warnings` gate: `Info` is not gated output, so the
+    /// conversion cannot manufacture anything `emit` would have suppressed.
     pub fn warnings_to_infos(&mut self) {
         // Gate on the UNREPORTED tally, matching the sibling downgrades: with
         // every warning already in the reported prefix the loop below is dead
@@ -1001,6 +1123,8 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
             reported_warnings: 0,
             suppressed_warnings: 0,
             internal_bugs: 0,
+            // Any of these may lack a source; one scan at emission decides.
+            may_have_unsourced: true,
         }
     }
 }

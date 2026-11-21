@@ -66,8 +66,11 @@ impl Kind {
     }
 }
 
+// `9..=15` is its own tier: the two-overlapping-word fast path serves it, and
+// the band used to fall into a per-byte scalar tail.  9/11/13 sample it; 15
+// (just below the vector tier) stays as the boundary.
 const LENS: &[usize] = &[
-    15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+    9, 11, 13, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
 ];
 const KINDS: &[Kind] = &[Kind::Printable, Kind::Tab, Kind::HighByte, Kind::Cjk];
 

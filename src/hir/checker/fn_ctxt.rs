@@ -1573,95 +1573,81 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                 (guard_hir, body_hir, arm_body_ty, this_arm_discharged),
                 variant_reachable,
                 gadt_reachable,
-            ) = self.with_gadt_arm(
-                scrut_ty,
-                &arm.pattern,
-                *span,
-                |fctx, gadt_reachable| {
-                    // Always type-check the guard and body, regardless of
-                    // reachability, to ensure consistent diagnostics across
-                    // match, if-let, and while-let.
-                    let guard_hir = arm
-                        .guard
-                        .as_ref()
-                        .map(|g| {
-                            fctx.infer_expr(g, None).map(|(h, ty)| {
-                                if !fctx.checker.ctx.is_bool(ty) {
-                                    fctx.checker.diagnostics.push(
-                                        Diagnostic::error("match guard must be boolean")
-                                            .with_span(arm.span),
-                                    );
-                                }
-                                Box::new(h)
-                            })
-                        })
-                        .transpose()?;
-                    let (body_hir, body_ty) = fctx.infer_expr(&arm.body, None)?;
-                    // Seal: per-arm in-scope discharge (BEFORE pop, so
-                    // the arm's facts are still visible to resolve_binding).
-                    let variant = fctx
-                        .checker
-                        .resolve_gadt_variant_info(scrut_ty, &arm.pattern, arm.span)
-                        .map(|(_, vd, _)| vd);
-                    let this_arm_discharged = gadt_reachable
-                        && scrut_is_gadt
-                        && fctx.try_gadt_discharge(
-                            expected,
-                            body_ty,
-                            arm.span,
-                            variant.as_ref(),
-                        )?;
-                    if this_arm_discharged {
-                        gadt_discharged = true;
-                    }
-                    // Resolve the body type — follows bindings to the
-                    // concrete type where available (normal resolution,
-                    // no longer a GADT-specific capture hack).
-                    // M-USE: impose the match's expected type on the arm result WHILE
-                    // this arm's equations are live, so an equation the result
-                    // consumes is recorded as a fresh ambivalent label the exit
-                    // check can see (the paper's g).  A mismatch is reported by
-                    // the per-arm check below, which stays the single
-                    // diagnostic site; on error keep the plain resolved type.
-                    // M-USE (strict ambivalent semantics): impose the match's expected type
-                    // on the arm result WHILE this arm's equations are live, so
-                    // an equation the result consumes becomes a widened label
-                    // the arm-exit check can see (the paper's g).  The match's
-                    // own expectation is applied later by the enclosing
-                    // `return`/binding check, so fall back to the function's
-                    // declared return type.
-                    let arm_expected = expected.or(fctx.checker.current_return_type);
-                    let arm_body_ty = match (gadt_reachable && scrut_is_gadt, arm_expected) {
-                        (true, Some(exp)) => match fctx
-                            .checker
-                            .ctx
-                            .unify_ambivalent(body_ty, exp)
-                        {
-                            Ok(ty) => {
-                                // M-ANN (§3.5): an explicit annotation on
-                                // the arm result may DECREASE the widened set
-                                // to the annotated view — the paper's g1/g2.
-                                // Note the source form: a literal's own
-                                // `:` binds to the literal (`y + (1 : A)`), so
-                                // the whole-result annotation must be written
-                                // with an extra pair of parentheses
-                                // (`((y + 1) : A)`) — exactly how the paper's
-                                // g1 is intended.
-                                if matches!(&arm.body, Expr::TypeAnnotated { .. }) {
-                                    fctx.checker.ctx.narrow_ambivalent(ty, exp);
-                                }
-                                ty
+            ) = self.with_gadt_arm(scrut_ty, &arm.pattern, *span, |fctx, gadt_reachable| {
+                // Always type-check the guard and body, regardless of
+                // reachability, to ensure consistent diagnostics across
+                // match, if-let, and while-let.
+                let guard_hir = arm
+                    .guard
+                    .as_ref()
+                    .map(|g| {
+                        fctx.infer_expr(g, None).map(|(h, ty)| {
+                            if !fctx.checker.ctx.is_bool(ty) {
+                                fctx.checker.diagnostics.push(
+                                    Diagnostic::error("match guard must be boolean")
+                                        .with_span(arm.span),
+                                );
                             }
-                            Err(_) => fctx.checker.ctx.resolve_binding(body_ty),
-                        },
-                        _ => fctx.checker.ctx.resolve_binding(body_ty),
-                    };
-                    Ok((
-                        (guard_hir, body_hir, arm_body_ty, this_arm_discharged),
-                        arm_body_ty,
-                    ))
-                },
-            )?;
+                            Box::new(h)
+                        })
+                    })
+                    .transpose()?;
+                let (body_hir, body_ty) = fctx.infer_expr(&arm.body, None)?;
+                // Seal: per-arm in-scope discharge (BEFORE pop, so
+                // the arm's facts are still visible to resolve_binding).
+                let variant = fctx
+                    .checker
+                    .resolve_gadt_variant_info(scrut_ty, &arm.pattern, arm.span)
+                    .map(|(_, vd, _)| vd);
+                let this_arm_discharged = gadt_reachable
+                    && scrut_is_gadt
+                    && fctx.try_gadt_discharge(expected, body_ty, arm.span, variant.as_ref())?;
+                if this_arm_discharged {
+                    gadt_discharged = true;
+                }
+                // Resolve the body type — follows bindings to the
+                // concrete type where available (normal resolution,
+                // no longer a GADT-specific capture hack).
+                // M-USE: impose the match's expected type on the arm result WHILE
+                // this arm's equations are live, so an equation the result
+                // consumes is recorded as a fresh ambivalent label the exit
+                // check can see (the paper's g).  A mismatch is reported by
+                // the per-arm check below, which stays the single
+                // diagnostic site; on error keep the plain resolved type.
+                // M-USE (strict ambivalent semantics): impose the match's expected type
+                // on the arm result WHILE this arm's equations are live, so
+                // an equation the result consumes becomes a widened label
+                // the arm-exit check can see (the paper's g).  The match's
+                // own expectation is applied later by the enclosing
+                // `return`/binding check, so fall back to the function's
+                // declared return type.
+                let arm_expected = expected.or(fctx.checker.current_return_type);
+                let arm_body_ty = match (gadt_reachable && scrut_is_gadt, arm_expected) {
+                    (true, Some(exp)) => match fctx.checker.ctx.unify_ambivalent(body_ty, exp) {
+                        Ok(ty) => {
+                            // M-ANN (§3.5): an explicit annotation on
+                            // the arm result may DECREASE the widened set
+                            // to the annotated view — the paper's g1/g2.
+                            // Note the source form: a literal's own
+                            // `:` binds to the literal (`y + (1 : A)`), so
+                            // the whole-result annotation must be written
+                            // with an extra pair of parentheses
+                            // (`((y + 1) : A)`) — exactly how the paper's
+                            // g1 is intended.
+                            if matches!(&arm.body, Expr::TypeAnnotated { .. }) {
+                                fctx.checker.ctx.narrow_ambivalent(ty, exp);
+                            }
+                            ty
+                        }
+                        Err(_) => fctx.checker.ctx.resolve_binding(body_ty),
+                    },
+                    _ => fctx.checker.ctx.resolve_binding(body_ty),
+                };
+                Ok((
+                    (guard_hir, body_hir, arm_body_ty, this_arm_discharged),
+                    arm_body_ty,
+                ))
+            })?;
             // Cross-arm unification intentionally runs with TcLevel
             // escape checking DISABLED (`region_tree: None` below):
             // `arm_body_ty` is NOT always fully resolved (e.g. bool
@@ -2795,11 +2781,8 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
         // Enter scope so the pattern binding is scoped to the then-branch
         // (lifecycle encapsulated in `with_gadt_arm`).
         let (pattern_hir, then_hir, then_ty, _gadt_reachable) = {
-            let (p, (t, ty), _variant_reachable, gadt_reachable) = self.with_gadt_arm(
-                scrut_ty,
-                pattern,
-                *span,
-                |fctx, gadt_reachable| {
+            let (p, (t, ty), _variant_reachable, gadt_reachable) =
+                self.with_gadt_arm(scrut_ty, pattern, *span, |fctx, gadt_reachable| {
                     let t = fctx.check_block(then_branch)?;
                     // Seal: in-scope discharge BEFORE pop (facts visible).
                     let variant = fctx
@@ -2823,8 +2806,7 @@ impl<'input: 'a, 'a: 'tcx, 'tcx, 'src> FnCtxt<'a, 'tcx, 'src, 'input> {
                     // no longer roll back after each arm).
                     let ty = fctx.checker.ctx.resolve_binding(fctx.block_type(&t));
                     Ok(((t, ty), ty))
-                },
-            )?;
+                })?;
             (p, t, ty, gadt_reachable)
         }; // _scope dropped inside with_gadt_arm: pattern + then-branch bindings removed
         let else_hir = else_branch

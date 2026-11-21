@@ -76,21 +76,33 @@ impl<'a> Label<'a> {
     }
 
     /// The underline character for this annotation kind.
-    pub fn underline_char(&self) -> char {
+    ///
+    /// `None` means the kind has no underline at all (see
+    /// [`AnnotationKind::underline_char`]) — a renderer must then take the
+    /// no-underline path, instead of emitting a run of spaces that silently
+    /// corrupts the frame.
+    pub fn underline_char(&self) -> Option<char> {
         self.kind.underline_char()
     }
 }
 
 impl AnnotationKind {
-    /// The underline character for this annotation kind. Exposed on the kind
-    /// itself so callers that synthesize an annotation (e.g. the renderer's
-    /// primary span) do not need to build a throwaway [`Label`].
-    pub fn underline_char(self) -> char {
+    /// The underline character for this annotation kind, or `None` when the kind
+    /// is rendered without one.
+    ///
+    /// Exposed on the kind itself so callers that synthesize an annotation
+    /// (e.g. the renderer's primary span) do not need to build a throwaway
+    /// [`Label`].  Returning `Option` rather than `' '` for
+    /// [`AnnotationKind::Help`] makes "special-case this" a compile-time
+    /// obligation for every renderer: the old `' '` placeholder let a uniform
+    /// iteration emit invisible spaces.
+    pub fn underline_char(self) -> Option<char> {
         match self {
-            AnnotationKind::Primary => '^',
-            AnnotationKind::Secondary => '~',
-            AnnotationKind::Note => '-',
-            AnnotationKind::Help => ' ', // no underline, rendered as `| help: message`
+            AnnotationKind::Primary => Some('^'),
+            AnnotationKind::Secondary => Some('~'),
+            AnnotationKind::Note => Some('-'),
+            // No underline: rendered as `| help: message`.
+            AnnotationKind::Help => None,
         }
     }
 }
@@ -238,14 +250,14 @@ mod tests {
     /// loud failure.
     #[test]
     fn underline_chars_are_pinned() {
-        assert_eq!(AnnotationKind::Primary.underline_char(), '^');
-        assert_eq!(AnnotationKind::Secondary.underline_char(), '~');
-        assert_eq!(AnnotationKind::Note.underline_char(), '-');
-        // A placeholder: renderers must special-case `Help` instead of consuming
-        // the glyph (no underline, `| help: msg` prefix).
-        assert_eq!(AnnotationKind::Help.underline_char(), ' ');
+        assert_eq!(AnnotationKind::Primary.underline_char(), Some('^'));
+        assert_eq!(AnnotationKind::Secondary.underline_char(), Some('~'));
+        assert_eq!(AnnotationKind::Note.underline_char(), Some('-'));
+        // `None`, not `' '`: a placeholder glyph let a uniform iteration emit a
+        // run of invisible spaces.  The type now forces the no-underline path.
+        assert_eq!(AnnotationKind::Help.underline_char(), None);
         let label = Label::secondary(span(0, 1), "s");
-        assert_eq!(label.underline_char(), '~');
+        assert_eq!(label.underline_char(), Some('~'));
     }
 
     #[test]
@@ -264,23 +276,35 @@ mod tests {
             Label::note(span(0, 1), borrowed.clone()).kind,
             AnnotationKind::Note
         );
-        assert_eq!(
-            Label::help(span(0, 1), borrowed).kind,
-            AnnotationKind::Help
-        );
+        assert_eq!(Label::help(span(0, 1), borrowed).kind, AnnotationKind::Help);
+    }
+
+    /// Debug-only: a 0-based line start is a producer bug and must be loud.
+    /// `#[should_panic]` rather than `catch_unwind` so it still means something
+    /// under `panic = "abort"`, and cannot pass by accepting either outcome.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "line")]
+    fn snippet_line_start_zero_trips_the_assert() {
+        let _ = Snippet::new("f.pn", "fn main() {}\n").with_line_start(0);
     }
 
     #[test]
     fn snippet_line_start_is_clamped_and_one_based() {
         let src = "fn main() {}\n";
-        // Debug builds trip the assert; release clamps to 1.
-        let clamped = std::panic::catch_unwind(|| Snippet::new("f.pn", src).with_line_start(0));
-        match clamped {
-            Ok(s) => assert_eq!(s.line_start, 1),
-            // Debug builds: the invariant is caught loudly instead.
-            Err(_) => {}
-        }
-        assert_eq!(Snippet::new("f.pn", src).line_start, 1, "default is 1-based");
+        // Release-only: the clamp is deliberately silent there (see the
+        // `debug_assert` in `with_line_start`), so pin it.
+        #[cfg(not(debug_assertions))]
+        assert_eq!(
+            Snippet::new("f.pn", src).with_line_start(0).line_start,
+            1,
+            "release clamps a 0-based line start to 1"
+        );
+        assert_eq!(
+            Snippet::new("f.pn", src).line_start,
+            1,
+            "default is 1-based"
+        );
         assert_eq!(Snippet::new("f.pn", src).with_line_start(5).line_start, 5);
         assert_eq!(
             Snippet::new("f.pn", src)

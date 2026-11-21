@@ -3647,7 +3647,7 @@ impl<S: Scheduler> DepGraph<S> {
         // real session — fail loudly, fail closed.
         let prev = self
             .next_index
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 if cur >= u32::MAX { None } else { Some(cur + 1) }
             })
             .unwrap_or_else(|cur| {
