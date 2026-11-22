@@ -376,10 +376,7 @@ fn name_not_found_help<'src>(suggestions: &[Cow<'src, str>]) -> Option<Cow<'src,
     let (first, rest) = suggestions.split_first()?;
     // The conjunction is language-specific: the old `join("` or `")` baked
     // English "or" into every locale's output.
-    let mut joined: Cow<'src, str> = first.clone();
-    for next in rest {
-        joined = crate::diagnostics::i18n::fluent::suggestion_or(joined, next.clone()).lift();
-    }
+    let joined = crate::diagnostics::i18n::join_with_or(first.clone(), rest.iter().cloned());
     Some(crate::diagnostics::i18n::fluent::did_you_mean(joined).lift())
 }
 
@@ -795,15 +792,27 @@ impl<'src> DiagnosticKind<'src> {
                     ],
                 };
                 let mut labels = CovariantVec::new();
-                labels.push(Label::new(
-                    span,
-                    fluent::label_expected_found(expected.clone(), found).lift(),
-                ));
-                if let Some(ps) = param_span {
-                    labels.push(Label::secondary(
-                        ps,
-                        fluent::label_declared_here(expected).lift(),
-                    ));
+                // Three consumers of `expected` (message, first label, optional
+                // second label); only the *last* may move.  Without a param span
+                // the first label is the last, so it takes the value instead of a
+                // clone — the common shape for a call-site argument.
+                match param_span {
+                    Some(ps) => {
+                        labels.push(Label::new(
+                            span,
+                            fluent::label_expected_found(expected.clone(), found).lift(),
+                        ));
+                        labels.push(Label::secondary(
+                            ps,
+                            fluent::label_declared_here(expected).lift(),
+                        ));
+                    }
+                    None => {
+                        labels.push(Label::new(
+                            span,
+                            fluent::label_expected_found(expected, found).lift(),
+                        ));
+                    }
                 }
                 (message, labels, None, vec![])
             }
@@ -1173,10 +1182,13 @@ mod humanizer_differential_tests {
             "capped frames + one truncation marker: {out}"
         );
         assert!(out.contains('…'), "truncation must be marked: {out}");
-        // Primary label + capped frames (the cap checks before pushing, so the
-        // bound is MAX + 1 frames plus at most the primary).
+        // Primary label + capped *secondary* frames: the cap check runs before
+        // each push with `len` starting at 1 (the primary), so pushes stop at
+        // `MAX + 1` total.  The old `+ 2` and its "MAX + 1 frames plus the
+        // primary" comment were both off by one, which left the one guard on
+        // renderer underline counts unable to notice a label leaking past the cap.
         assert!(
-            kind.labels().len() <= MAX_TRACEBACK_FRAMES + 2,
+            kind.labels().len() <= MAX_TRACEBACK_FRAMES + 1,
             "labels must be capped too: {}",
             kind.labels().len()
         );

@@ -175,6 +175,9 @@ impl DiagnosticSink for StringSink {
         // claimed to be infallible".
         match self.buf.write_fmt(args) {
             Ok(()) => Ok(()),
+            // Ideally `io::const_error!` (message without the `Box`), but it is
+            // still unstable on this toolchain (E0658), and `broken_pipe()`'s
+            // payload-free form would drop the message a formatter bug needs.
             Err(_) => Err(io::Error::new(io::ErrorKind::Other, "formatter error")),
         }
     }

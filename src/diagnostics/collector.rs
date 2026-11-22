@@ -139,6 +139,7 @@ impl<'src> DiagCtxt<'src> {
         self.can_emit_warnings = enabled;
     }
 
+    #[must_use]
     pub fn can_emit_warnings(&self) -> bool {
         self.can_emit_warnings
     }
@@ -162,30 +163,37 @@ impl<'src> DiagCtxt<'src> {
     /// Push a diagnostic into `unreported` and return an `EmissionGuarantee`
     /// proving the diagnostic was recorded (inspired by rustc's `ErrorGuaranteed`).
     pub fn push(&mut self, diag: Diagnostic<'src>) -> EmissionGuarantee {
-        match diag.level() {
-            super::DiagnosticLevel::Fatal | super::DiagnosticLevel::Error => {
-                // Every tally, `From<Vec>`, `recount_derived_state` and
-                // `summary` agree only if `is_error()` also covers `Fatal`.
-                // That invariant lives in another module, so pin it here where
-                // the tallies are actually incremented.
-                debug_assert!(
-                    diag.is_error(),
-                    "a Fatal/Error diagnostic must report is_error() for the tallies"
-                );
-                self.errors += 1;
-                self.unreported_errors += 1;
-            }
-            super::DiagnosticLevel::Warning => {
-                if !self.can_emit_warnings {
-                    // Count before dropping: the suppressed diagnostic never
-                    // enters `diags`, so this is the only record of it.
-                    self.suppressed_warnings += 1;
-                    return EmissionGuarantee::suppressed();
-                }
-                self.warnings += 1;
-                self.unreported_warnings += 1;
-            }
-            _ => {}
+        // Gate first, and only on `Warning`: a suppressed diagnostic must never
+        // reach the counters.  The gate stays ahead of the counting so a
+        // suppressed warning cannot be counted twice.
+        if diag.is_warning() && !self.can_emit_warnings {
+            // Count before dropping: the suppressed diagnostic never enters
+            // `diags`, so this is the only record of it.
+            self.suppressed_warnings += 1;
+            return EmissionGuarantee::suppressed();
+        }
+        // Counting goes through the *same predicates* as `scan_derived` (the
+        // debug oracle), `recount_derived_state`, the truncation scans and
+        // `for_each_*`.  The old shape matched `level()` instead, so a
+        // level↔predicate divergence biased this one site against the oracle:
+        // `summary()` went O(1)-wrong and `check()` could return `Ok` for a
+        // context holding an Error, all silently in release.  Now any such
+        // divergence biases every site identically and the debug cross-check
+        // catches it.  (`is_error()` must keep covering `Fatal`; that bridge is
+        // pinned by the assert below and by the tallies' documented contract.)
+        if diag.is_error() {
+            debug_assert!(
+                matches!(
+                    diag.level(),
+                    super::DiagnosticLevel::Fatal | super::DiagnosticLevel::Error
+                ),
+                "is_error() must not cover a non-error level"
+            );
+            self.errors += 1;
+            self.unreported_errors += 1;
+        } else if diag.is_warning() {
+            self.warnings += 1;
+            self.unreported_warnings += 1;
         }
         // Conservative marker for `audit_source_attachment`: set when a
         // diagnostic arrives without a source, cleared by `attach_source` (which
@@ -267,18 +275,51 @@ impl<'src> DiagCtxt<'src> {
         // inexact iterator keeps the old reserve-nothing behaviour.
         match (lower, upper) {
             (l, Some(u)) if l == u => {
-                let items: Vec<Diagnostic<'src>> = iter.collect();
-                let kept = items.iter().filter(|d| !d.is_warning()).count();
-                self.diags.reserve(kept);
-                for diag in items {
+                // Reserve the optimistic `u`, let the `push` gate drop warnings,
+                // then give the slack back.  The old two-pass shape collected
+                // into a temporary `Vec` (u·|Diagnostic| written), counted over it
+                // (u·|D| read), then moved the survivors (2·kept·|D|): strictly
+                // more traffic at every `kept ≤ u`, and an extra allocation for
+                // an all-warning batch, which is the exact batch a
+                // warnings-disabled build produces.
+                self.diags.reserve(u);
+                for diag in iter {
                     self.push(diag);
                 }
+                self.diags.shrink_to_fit();
             }
             _ => {
                 for diag in iter {
                     self.push(diag);
                 }
             }
+        }
+    }
+
+    /// Extend from an owned batch, pre-filtering warnings in place.
+    ///
+    /// The `Vec` case of [`Self::extend`], made explicit: `retain` compacts the
+    /// input without a temporary buffer, so the exact surviving count is free and
+    /// the reserve is exact.  An all-warning batch (what a warnings-disabled
+    /// build receives) costs one scan and zero allocations.
+    pub fn extend_from_vec(&mut self, mut diags: Vec<Diagnostic<'src>>) {
+        if self.can_emit_warnings {
+            let kept = diags.len();
+            if kept > 0 {
+                self.diags.reserve(kept);
+            }
+            for diag in diags {
+                self.push(diag);
+            }
+            return;
+        }
+        diags.retain(|d| !d.is_warning());
+        let kept = diags.len();
+        if kept > 0 {
+            self.diags.reserve(kept);
+        }
+        for diag in diags {
+            self.push(diag);
         }
     }
 
@@ -461,10 +502,27 @@ impl<'src> DiagCtxt<'src> {
             }
             self.diags.truncate(keep);
         }
+        self.refresh_unsourced_flag();
     }
 
     /// Reset diagnostic data but **preserve** `can_emit_warnings`, which is
     /// configuration rather than data.
+    /// Clear the conservative unsourced marker when the vector is empty.
+    ///
+    /// "Empty ⇒ no diagnostic can be missing a source" is the same argument
+    /// `clear` documents, but only `clear` applied it: draining or truncating to
+    /// empty left the flag set, so the next `emit` paid an O(suffix) audit and
+    /// `attach_source` lost its O(1) fast path.  Called at the end of every
+    /// mutator; the `is_empty` test encodes exactly the difference between "the
+    /// region that could be unsourced is gone" (clear) and "a region that could
+    /// be unsourced remains" (do not clear).
+    #[inline]
+    fn refresh_unsourced_flag(&mut self) {
+        if self.diags.is_empty() {
+            self.may_have_unsourced = false;
+        }
+    }
+
     pub fn clear(&mut self) {
         self.diags.clear();
         self.reported_len = 0;
@@ -540,11 +598,10 @@ impl<'src> DiagCtxt<'src> {
         // saw `diags[reported_len..]` (and a debug-only scan above proves it did
         // not change their severity), so the prefix is unchanged and this keeps
         // `errors == reported + unreported`.
-        self.reported_errors += self.unreported_errors;
-        self.reported_warnings += self.unreported_warnings;
-        self.reported_len = self.diags.len();
-        self.unreported_errors = 0;
-        self.unreported_warnings = 0;
+        // One copy of the partition fold: `mark_all_reported` documents the
+        // "both tallies must be cleared" lesson, and an inline duplicate here is
+        // exactly how that lesson gets lost on the next fix.
+        self.mark_all_reported();
         Ok(())
     }
 
@@ -708,7 +765,8 @@ impl<'src> DiagCtxt<'src> {
             diag.invalidate_stable_id();
         }
         if let Some(source) = source
-            && diag.source.is_none()
+            // Accessor, not the field: every other site reads `source()`.
+            && diag.source().is_none()
         {
             diag.set_source(source);
         }
@@ -730,11 +788,13 @@ impl<'src> DiagCtxt<'src> {
     }
 
     /// True when there are unreported diagnostics.
+    #[must_use]
     pub fn has_unreported(&self) -> bool {
         self.diags.len() > self.reported_len
     }
 
     /// True when there are unreported errors.
+    #[must_use]
     pub fn has_unreported_errors(&self) -> bool {
         self.unreported_errors > 0
     }
@@ -825,6 +885,7 @@ impl<'src> DiagCtxt<'src> {
             self.warnings = 0;
             self.unreported_errors = 0;
             self.unreported_warnings = 0;
+            self.refresh_unsourced_flag();
             return std::mem::take(&mut self.diags).into_vec();
         }
         // One allocation, no `into_vec` + `split_off` pair: `SmallVec::drain`
@@ -856,6 +917,7 @@ impl<'src> DiagCtxt<'src> {
         }
         self.unreported_errors = 0;
         self.unreported_warnings = 0;
+        self.refresh_unsourced_flag();
         drained
     }
 
@@ -893,6 +955,7 @@ impl<'src> DiagCtxt<'src> {
         self.reported_len = 0;
         self.reported_errors = 0;
         self.reported_warnings = 0;
+        self.refresh_unsourced_flag();
         drained
     }
 
@@ -912,6 +975,7 @@ impl<'src> DiagCtxt<'src> {
         self.reported_warnings = 0;
         self.errors = self.unreported_errors;
         self.warnings = self.unreported_warnings;
+        self.refresh_unsourced_flag();
     }
 
     /// Drop the unreported suffix without allocating.

@@ -111,6 +111,22 @@ pub trait LiftCow<'a> {
     fn lift(self) -> Cow<'a, str>;
 }
 
+/// Join `first` and the rest with the locale's disjunction ("or").
+///
+/// The single source for list conjunctions: `"a` or `b"` baked English "or" into
+/// every locale's output, and that bug was fixed twice independently before this
+/// helper existed.  Callers own the item text (including any quoting).
+pub(crate) fn join_with_or<'a>(
+    first: Cow<'a, str>,
+    rest: impl IntoIterator<Item = Cow<'a, str>>,
+) -> Cow<'a, str> {
+    let mut joined = first;
+    for next in rest {
+        joined = crate::diagnostics::i18n::fluent::suggestion_or(joined, next).lift();
+    }
+    joined
+}
+
 impl<'a, 'src: 'a> LiftCow<'a> for Cow<'src, str> {
     fn lift(self) -> Cow<'a, str> {
         match self {

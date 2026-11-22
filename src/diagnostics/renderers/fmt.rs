@@ -88,7 +88,7 @@ static HEX_PAIRS: [u8; 512] = build_hex_pairs();
 /// ids comparable as byte strings without parsing.  One `push_str` of a
 /// 16-byte stack buffer instead of sixteen `push`es.
 #[inline]
-pub fn push_hex64(out: &mut String, mut n: u64) {
+pub fn push_hex64<W: std::fmt::Write + ?Sized>(out: &mut W, mut n: u64) {
     let mut buf = [0u8; 16];
     let mut i = 16;
     while i > 0 {
@@ -101,7 +101,7 @@ pub fn push_hex64(out: &mut String, mut n: u64) {
     // SAFETY: `buf` holds only ASCII hex digit bytes from `HEX_PAIRS`
     // (const-built from `HEX_LOWER` = `b"0123456789abcdef"`), all in
     // `0x30..=0x39 | 0x61..=0x66`.
-    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+    let _ = out.write_str(unsafe { std::str::from_utf8_unchecked(&buf) });
 }
 
 /// Append `n` space characters without per-iteration overhead.

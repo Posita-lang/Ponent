@@ -414,12 +414,45 @@ impl<'a> RenderCtx<'a> {
         // The fingerprint is therefore verified in **every** profile, not only
         // under `debug_assertions`: ~24 sampled bytes plus the length against an
         // avoided O(source_len) rescan.  A mismatch is treated as a miss (the
-        // LRU/shared/rebuild path is always correct), and `0` is the documented
-        // "unknown" sentinel for entries built without source text.
+        // LRU/shared/rebuild path is always correct).
+        //
+        // The old condition also accepted `e.fingerprint == 0`, the "unknown"
+        // sentinel `preload_line_index` documents for tables built without source
+        // text.  That bypass voided this tier's central invariant: a recycled
+        // allocation at the same `(ptr, len)` behind a sentinel entry returned
+        // silently wrong line numbers in release.  Every *prebuilt* entry is built
+        // from the source text (`source_fingerprint(source)` at the construction
+        // sites), so a sentinel here is a producer bug: loud in debug, a miss
+        // (never wrong output) in release.
         if let Some(prebuilt) = self.prebuilt
             && let Some(e) = prebuilt.iter().find(|e| e.ptr == ptr && e.len == len)
-            && (e.fingerprint == 0 || e.fingerprint == source_fingerprint(source))
+            && e.fingerprint != 0
+            && e.fingerprint == source_fingerprint(source)
         {
+            // Backfill the per-ctx LRU: without this every render re-pays the
+            // tier-0 `find` plus the release-mode fingerprint, while an LRU hit is
+            // an O(4) scan with no fingerprint at all.  The entry is already
+            // content-verified here, so the LRU's tripwire invariant holds.
+            {
+                let mut cache = self.source_index.borrow_mut();
+                if let Some(pos) = cache.iter().position(|c| c.ptr == ptr && c.len == len) {
+                    cache.remove(pos);
+                } else if cache.len() >= CACHE_SLOTS {
+                    cache.pop();
+                }
+                cache.insert(
+                    0,
+                    CachedSourceIndex {
+                        ptr,
+                        len,
+                        starts: Arc::clone(&e.starts),
+                        ascii: e.ascii,
+                        char_prefixes: Arc::clone(&e.char_prefixes),
+                        generation: e.generation,
+                        fingerprint: e.fingerprint,
+                    },
+                );
+            }
             return LineIndex::from_shared(
                 source,
                 Arc::clone(&e.starts),

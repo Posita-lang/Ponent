@@ -491,6 +491,19 @@ impl<'src> FixSet<'src> {
         // return the borrowed source when none applies.  The old shape walked
         // `edits` three times (any-check, size sum, write); the write pass is
         // already the authoritative "did anything apply" test.
+        // Pre-sum how much the replacements outgrow the text they replace, so the
+        // single allocation is the right size: `source.len()` alone is
+        // undersized for rewrite-heavy batches and reallocs mid-pass.
+        let excess: usize = edits
+            .iter()
+            .map(|e| {
+                e.replacement.len().saturating_sub(
+                    e.span
+                        .end_as_usize()
+                        .saturating_sub(e.span.start_as_usize()),
+                )
+            })
+            .sum();
         let mut out: Option<String> = None;
         let mut last = 0usize;
         for edit in edits {
@@ -520,7 +533,12 @@ impl<'src> FixSet<'src> {
             if start < last {
                 continue;
             }
-            let buf = out.get_or_insert_with(|| String::with_capacity(source.len()));
+            let buf = out.get_or_insert_with(|| {
+                // The buffer holds `source.len() - Σ|replaced| + Σ|replacement|`;
+                // a rewrite-heavy batch outgrows `source.len()` and reallocs
+                // mid-pass, copying everything already written.
+                String::with_capacity(source.len().saturating_add(excess))
+            });
             buf.push_str(&source[last..start]);
             buf.push_str(&edit.replacement);
             last = end;

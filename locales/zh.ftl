@@ -22,6 +22,7 @@ type-mismatch-reason = { type-mismatch } — { $reason }
 type-mismatch-ctx = { type-mismatch }（{ $ctx }）
 type-mismatch-ctx-reason = { type-mismatch }（{ $ctx }）— { $reason }
 suggestion-or = { $first } 或 { $next }
+see-also = 另见：
 argument-type-mismatch = 调用 `{ $callee }` 时实参类型不匹配：参数 `{ $param }` 期望 `{ $expected }`，得到 `{ $found }`
 contract-non-bool = `{ $clause }` 子句必须为布尔值，得到 `{ $found }`
 impl-missing-method = `{ $trait }` 的 impl 缺少方法 `{ $method }`
@@ -36,7 +37,7 @@ shadowing-definition = `{ $name }` 的阴影定义
 missing-method = trait `{ $trait }` 的实现缺少方法 `{ $method }`
 impl-trait-methods = 所有 trait 方法都必须实现
 unknown-error-code = 未知错误码：`{ $code }`
-did-you-mean = 您是不是想找 `{ $candidates }`？
+did-you-mean = 您是不是想找 { $candidates }？
 run-explain-hint = 请使用正确的错误码运行 `ponent explain <CODE>`
 available-error-codes = 可用的错误码：
 

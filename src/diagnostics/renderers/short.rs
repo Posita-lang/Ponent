@@ -34,11 +34,13 @@ pub struct ShortRenderer {
 
 impl ShortRenderer {
     /// Plain text (no ANSI colour).  The `--error-format=short` default.
+    #[must_use]
     pub fn new() -> Self {
         ShortRenderer { use_color: false }
     }
 
     /// Coloured `level[code]` tag (interactive terminals only).
+    #[must_use]
     pub fn colored() -> Self {
         ShortRenderer { use_color: true }
     }
@@ -58,6 +60,7 @@ impl Default for ShortRenderer {
 /// path, and its offset contract (a break offset into the *original* bytes) is a
 /// panic-on-misuse footgun if anyone revives that architecture, hence the
 /// assertion below.
+#[cfg(test)]
 #[inline]
 fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
     debug_assert!(
@@ -74,8 +77,11 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
 
     // Empty segments are exactly the interior/edges of a break run, so
     // skipping them *is* the run-collapsing rule — no second buffer needed.
-    // Seed the loop with the offset the fast path already found instead of
-    // re-scanning the prefix.
+    // `first` is used only by the assert above: the split below deliberately
+    // walks from byte 0.  (An earlier comment claimed this seeded the loop with
+    // the fast path's offset; it never did, and recreating the trim rule at a
+    // shifted segment boundary is exactly the divergence this oracle exists to
+    // catch.)
     // Segment edges abut a break, so a space there is part of the run: trim the
     // trailing spaces of every segment that a break follows and the leading
     // spaces of every segment that a break precedes, drop what is left empty,
@@ -221,7 +227,10 @@ impl Renderer for ShortRenderer {
         // digit widths feed the capacity computation, and every accessor
         // (`spans()`, `source()`, `message()`) is called once.
         let span = diag.spans().first();
-        let linecol: Option<(usize, usize)> = match (span, diag.source()) {
+        // Hoisted: the renderer's contract is one accessor call each, and the
+        // comment claimed that while calling `source()` three times.
+        let src = diag.source();
+        let linecol: Option<(usize, usize)> = match (span, src) {
             (Some(span), Some(source)) => {
                 let (line, col) = cx
                     .line_index(source)
@@ -256,7 +265,7 @@ impl Renderer for ShortRenderer {
                 len += 48; // "start..end: " upper bound
             }
             (None, None) => {
-                if diag.source().is_some() && !file.is_empty() {
+                if src.is_some() && !file.is_empty() {
                     len += file.len() + 2; // "file: "
                 }
             }
@@ -305,7 +314,7 @@ impl Renderer for ShortRenderer {
             // source-less diagnostic).  Pinned by
             // `no_source_no_span_omits_the_file_name`.
             (None, None) => {
-                if diag.source().is_some() && !file.is_empty() {
+                if src.is_some() && !file.is_empty() {
                     out.push_str(file);
                     out.push_str(": ");
                 }
@@ -582,7 +591,6 @@ mod tests {
         assert_eq!(ShortRenderer::new().render_separator(), "");
     }
 
-    #[test]
     /// The shape whose omission used to look accidental (the old pin only used
     /// the default `<input>` name): a real file name is still omitted when there
     /// is neither a span nor a source, because a name alone cannot place the
@@ -597,6 +605,10 @@ mod tests {
         assert_eq!(out, "error[E030]: boom\n");
     }
 
+    /// A span-less, source-less diagnostic renders the bare shape — no location
+    /// prefix at all (distinct from the file-omission pin above, which keeps a
+    /// source attached).
+    #[test]
     fn no_span_has_no_location_prefix() {
         let diag = Diagnostic::error("boom").with_code_str(ErrCode::E030);
         let opts = DiagOpts::default();

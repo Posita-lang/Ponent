@@ -23,6 +23,7 @@ impl HumanRenderer {
     /// one after parsing `--max-width`/context options silently renders with the
     /// defaults instead.
     #[inline]
+    #[must_use]
     pub fn colored() -> Self {
         Self::with_opts(true, None)
     }
@@ -31,6 +32,7 @@ impl HumanRenderer {
     /// layout options.  Same caveat as [`Self::colored`]: use [`Self::with_opts`]
     /// when a [`DiagOpts`] is available.
     #[inline]
+    #[must_use]
     pub fn plain() -> Self {
         Self::with_opts(false, None)
     }
@@ -39,6 +41,7 @@ impl HumanRenderer {
     /// `opts` (falling back to the [`DiagOpts`] defaults when `None`), so the
     /// CLI can drive the rendered width without the renderer owning a copy.
     #[inline]
+    #[must_use]
     pub fn with_opts(use_color: bool, opts: Option<&DiagOpts>) -> Self {
         Self {
             glyph: GlyphRenderer::with_opts(use_color, opts),
@@ -67,9 +70,17 @@ impl Renderer for HumanRenderer {
         // without line numbers.  Keep the policies divergent on purpose: this
         // disjunction IS the pin, so narrowing it to match JSON is a rendering
         // regression, not a cleanup.
+        //
+        // `related_errors` is here for the same reason, and it was the missing
+        // disjunct: glyph turns every related error that has a span into a
+        // synthetic label drawn against the excerpt, so a diagnostic carrying
+        // only related errors would otherwise render unplaceable.  Children and
+        // suggestions are message-and-diff only — no coordinates, so they stay
+        // out.
         let needs_index = diag.spans().first().is_some()
             || !diag.labels().is_empty()
-            || diag.call_chain().is_some_and(|c| !c.is_empty());
+            || diag.call_chain().is_some_and(|c| !c.is_empty())
+            || diag.related_errors.iter().any(|r| r.span.is_some());
         let idx = if needs_index {
             diag.source().map(|s| cx.line_index(s))
         } else {

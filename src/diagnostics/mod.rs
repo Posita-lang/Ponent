@@ -87,11 +87,11 @@ use covariant_vec::CovariantVec;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::fmt;
-use swrite::{SWrite, swrite, swriteln};
 use std::io;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use swrite::{SWrite, swrite, swriteln};
 
 // ── Diagnostic options (inspired by GHC's DiagOpts) ────────────────
 
@@ -282,7 +282,12 @@ impl Default for DiagOpts {
 /// three empty hash sets and an empty vec, so a diagnostic pays no lookup
 /// work at all.
 #[derive(Debug, Clone)]
-pub(crate) struct DiagFilter {
+/// A reusable filter: build once, then check many diagnostics.
+///
+/// [`Diagnostic::matches_filter`] rebuilds the filter per call (O(filter_size)
+/// allocations); hoist it with [`DiagFilter::from_opts`] and use
+/// [`Diagnostic::matches_filter_with`] when checking a batch.
+pub struct DiagFilter {
     /// Code filters as **interned table slots** for every pattern that names a
     /// registry code, plus the verbatim uppercased spelling for patterns that do
     /// not.  Matching a diagnostic whose code is registered is then one `u16`
@@ -325,7 +330,8 @@ impl Default for DiagFilter {
 
 impl DiagFilter {
     /// Build the fast-match view from a [`DiagOpts`].
-    pub(crate) fn from_opts(opts: &DiagOpts) -> Self {
+    /// Build a filter from the options once, for reuse across many diagnostics.
+    pub fn from_opts(opts: &DiagOpts) -> Self {
         // Codes are resolved case-insensitively everywhere else in the
         // codebase (`ErrCode::new`, `try_new`, `suggest_code`), and
         // `matches` compares against `ErrCode::code()` — which is the
@@ -337,7 +343,8 @@ impl DiagFilter {
         // still filter.
         let classify = |pats: &[CompactString]| {
             let mut slots = rustc_hash::FxHashSet::default();
-            let mut verbatim: rustc_hash::FxHashSet<CompactString> = rustc_hash::FxHashSet::default();
+            let mut verbatim: rustc_hash::FxHashSet<CompactString> =
+                rustc_hash::FxHashSet::default();
             for pat in pats {
                 match crate::diagnostics::error_code::lookup_uppercased(pat) {
                     Some(e) => {
@@ -413,7 +420,8 @@ impl DiagFilter {
     /// Whether `diag` passes the filter — mirrors the original
     /// [`Diagnostic::matches_filter`] exactly, with hash lookups for the
     /// exact-match fields.
-    pub(crate) fn matches(&self, diag: &Diagnostic<'_>) -> bool {
+    /// Whether `diag` passes this filter.
+    pub fn matches(&self, diag: &Diagnostic<'_>) -> bool {
         debug_assert!(
             self.is_empty
                 == (self.allow_slots.is_empty()
@@ -693,9 +701,16 @@ impl MultiSpan {
     /// [`first`](Self::first) read, so a fully reverse-sorted push stream
     /// costs `O(n log n)` total instead of `O(n²)` memmoves.
     pub fn push(&mut self, span: Span) {
-        // Drop the sorted view cache on every push by replacing the lock (the
-        // old `OnceLock::take` requires Rust 1.90; MSRV is 1.88).  Re-population
-        // only happens on the next dirty read.
+        // `push` is documented as idempotent (safe for a repeated `humanize`),
+        // and a duplicate tail changes nothing — including the sorted view, so
+        // it must not be dropped.  The old shape reset the cache before the
+        // match and made the idempotent path re-sort on the next read.
+        if self.primary.last() == Some(&span) {
+            return;
+        }
+        // Drop the sorted view cache on every real push by replacing the lock
+        // (the old `OnceLock::take` requires Rust 1.90; MSRV is 1.88).
+        // Re-population only happens on the next dirty read.
         self.sorted_cache = std::sync::OnceLock::new();
         match self.primary.last() {
             Some(last) if *last == span => {}
@@ -1180,6 +1195,13 @@ impl<'src> Diagnostic<'src> {
         self.source = Some(source);
     }
     pub fn set_file_name(&mut self, file_name: impl AsRef<str>) {
+        // Deliberately `AsRef<str>`, not `Into<Cow<'src, str>>`: the `Cow` form
+        // would let a borrowed rename stay borrow-free, but it forces every
+        // caller's *signature chain* to name `'src` (three E0621 sites in
+        // `main.rs`), so the cure costs more than the copy it saves — a rename
+        // happens once per diagnostic, while the lifetime plumbing would be
+        // permanent.  `with_file_name` remains the borrow-preserving
+        // constructor for callers that do know the lifetime.
         self.file_name = Cow::Owned(file_name.as_ref().to_owned());
         // C9: `stable_id` hashes the file name, so a rename must invalidate a
         // previously computed id (otherwise a stale id keyed to the old name
@@ -1363,7 +1385,9 @@ impl<'src> Diagnostic<'src> {
     /// Loop-safe variant of [`matches_filter`]: the caller builds the filter
     /// once and reuses it across many diagnostics, so the per-diagnostic cost
     /// is O(1) hash lookups rather than O(filter_size) allocations.
-    pub(crate) fn matches_filter_with(&self, filter: &DiagFilter) -> bool {
+    /// Whether this diagnostic passes a pre-built [`DiagFilter`] (the
+    /// loop-safe counterpart of [`Diagnostic::matches_filter`]).
+    pub fn matches_filter_with(&self, filter: &DiagFilter) -> bool {
         filter.matches(self)
     }
 }
@@ -2212,11 +2236,6 @@ pub fn explain_error_code(code_str: &str, use_color: bool) -> String {
     )
 }
 
-/// Like [`explain_error_code`] but with an explicit colour depth, wrap width
-/// and tab width, so the caller can share a probed [`term::ColorDepth`] and a
-/// configured `--width`/`--tab-width` across multiple calls.  (Before P5 this
-/// hardcoded [`DEFAULT_MAX_WIDTH`], so `--width` narrowed diagnostics but not
-/// `--explain` output.)
 /// Whether an `--explain` body line is a code/example line.
 ///
 /// The `CODE_TABLE` text format is "two spaces or one tab of indentation means
@@ -2230,6 +2249,11 @@ fn explain_line_is_code(line: &str) -> bool {
     (line.starts_with("  ") || line.starts_with('\t')) && !line.trim().is_empty()
 }
 
+/// Like [`explain_error_code`] but with an explicit colour depth, wrap width
+/// and tab width, so the caller can share a probed [`term::ColorDepth`] and a
+/// configured `--width`/`--tab-width` across multiple calls.  (Before P5 this
+/// hardcoded [`DEFAULT_MAX_WIDTH`], so `--width` narrowed diagnostics but not
+/// `--explain` output.)
 pub fn explain_error_code_with_depth(
     code_str: &str,
     use_color: bool,
@@ -2337,10 +2361,17 @@ pub fn explain_error_code_with_depth(
     };
     if !related.is_empty() {
         swriteln!(out);
+        // Localized: every neighbouring string on this surface is Fluent-resolved,
+        // and a mixed-language explain body is exactly what the comptime
+        // traceback fix removed.
+        let see_also = crate::diagnostics::i18n::fluent::see_also();
         if use_color {
-            out.push_str("\x1b[1mSee also:\x1b[0m\n");
+            out.push_str("\x1b[1m");
+            out.push_str(&see_also);
+            out.push_str("\x1b[0m\n");
         } else {
-            out.push_str("See also:\n");
+            out.push_str(&see_also);
+            out.push('\n');
         }
         for rel in related {
             out.push_str("  ");
@@ -2658,8 +2689,13 @@ fn suggest_code(input: &str, use_color: bool) -> CompactString {
         }
     } else {
         let help_label = DiagnosticLevel::Help.label();
-        let did_you_mean =
-            crate::diagnostics::i18n::fluent::did_you_mean(candidates.join("` or `"));
+        let did_you_mean = crate::diagnostics::i18n::fluent::did_you_mean({
+            // Each candidate is quoted individually and the *conjunction* is
+            // localized; `join("` or `")` baked English "or" in.
+            let mut it = candidates.iter();
+            let first = Cow::Owned(format!("`{}`", it.next().expect("non-empty")));
+            crate::diagnostics::i18n::join_with_or(first, it.map(|c| Cow::Owned(format!("`{c}`"))))
+        });
         let hint = crate::diagnostics::i18n::fluent::run_explain_hint_detail();
         if use_color {
             format_compact!("\x1b[1;34m{help_label}\x1b[0m: {did_you_mean}\n       {hint}")
@@ -2836,7 +2872,13 @@ fn suggest_top3_direct(needle: &str) -> ArrayVec<(usize, usize, &'static str), 3
         cand: &[u8; 4],
         dist: usize,
     ) {
-        let code = simdutf8::basic::from_utf8(cand).expect("E/W + ASCII digits is UTF-8");
+        // SAFETY: `cand` is assembled only from a `E`/`W` prefix and ASCII
+        // digits, so it is always valid UTF-8.  The previous `simdutf8`
+        // validation ran once per enumerated candidate (up to 41 per query) on
+        // the path whose whole point is being op-minimal; the debug assert keeps
+        // the argument checked.
+        debug_assert!(cand.iter().all(u8::is_ascii));
+        let code = unsafe { std::str::from_utf8_unchecked(cand) };
         if let Some(e) = crate::diagnostics::error_code::lookup(code) {
             // Dedup by code: the 5-char deletion branch can enumerate the
             // same 4-char code at two `skip` positions when the needle's
@@ -4966,7 +5008,6 @@ mod tests {
     /// Filter codes resolve case-insensitively, like every other code API:
     /// `--allow e030` must suppress the canonical `E030` diagnostic instead
     /// of silently matching nothing.
-    #[test]
     /// An empty `--only-files` pattern is dropped, not admitted: `memmem`'s
     /// empty needle matches at position 0 of *every* file name, so admitting it
     /// would leak every diagnostic through the filter while `is_empty` reported
@@ -5051,6 +5092,10 @@ mod tests {
         assert!(filter.matches(&Diagnostic::error("typed").with_code_str(ErrCode::E030)));
     }
 
+    /// Codes in a filter resolve case-insensitively, like every other code API:
+    /// `--allow e030` suppresses a `Known` `E030` *and* an `ErrCode::unknown`
+    /// spelling, because the filter compares canonical forms.
+    #[test]
     fn filter_codes_resolve_case_insensitively() {
         let mut opts = DiagOpts::default();
         opts.allow_codes = vec![CompactString::const_new("e030")];
@@ -5340,6 +5385,7 @@ mod tests {
     /// conversion plus the per-label grapheme re-walk in
     /// `byte_range_to_display`.
     #[test]
+    #[ignore = "perf harness: cargo test perf_ -- --ignored --nocapture"]
     fn perf_long_single_line() {
         let renderer = GlyphRenderer::new(false);
         let source = "x".repeat(500_000);
@@ -5370,6 +5416,7 @@ mod tests {
     /// per-span section recomputation, the per-row label scan, and the
     /// message-string multiline matching.
     #[test]
+    #[ignore = "perf harness: cargo test perf_ -- --ignored --nocapture"]
     fn perf_many_labels_spans() {
         let renderer = GlyphRenderer::new(false);
         let mut source = String::new();
@@ -5417,6 +5464,7 @@ mod tests {
     /// the per-batch [`RenderCtx`] cache the scan happens once.  A/B in one
     /// run, no asserts (benchmark-first harness).
     #[test]
+    #[ignore = "perf harness: cargo test perf_ -- --ignored --nocapture"]
     fn perf_many_diags_one_source() {
         let source = "let x = 1;\n".repeat(20_000); // ~220 KB
         let diags: Vec<Diagnostic<'_>> = (0..200)
@@ -5493,6 +5541,7 @@ mod tests {
     /// Micro-isolation of item 1: K indexed conversions near the end of
     /// a 220KB file. Index build is O(n) once; each lookup is O(log n).
     #[test]
+    #[ignore = "perf harness: cargo test perf_ -- --ignored --nocapture"]
     fn perf_byte_to_linecol() {
         let source = "let x = 1;\n".repeat(20_000);
         let offs: Vec<usize> = (0..200).map(|i| source.len() - 1 - i * 100).collect();
@@ -5518,6 +5567,7 @@ mod tests {
     /// printable-ASCII prose exercises `ascii_break_opportunities`'s `memchr`
     /// space scan.  Run: `cargo test perf_wrap_optimal -- --nocapture`.
     #[test]
+    #[ignore = "perf harness: cargo test perf_ -- --ignored --nocapture"]
     fn perf_wrap_optimal() {
         // (1) Short ASCII: the len guard makes this ~O(1) per call.
         let short_msgs: Vec<String> = (0..200)
@@ -5593,10 +5643,13 @@ mod tests {
         let s_c = Span::new(f1, 50, 60);
 
         let mut ms = MultiSpan::new(s_c);
-        ms.push(s_b); // descending → binary insert
+        // `push` appends and marks the vector dirty; the deferred sort+dedup on
+        // the next read is what produces the observable order.  (The old
+        // comments here described a binary-insert implementation.)
+        ms.push(s_b); // out of order → appended, sort deferred
         ms.push(s_a);
-        ms.push(s_b); // middle duplicate
-        ms.push(s_mid); // middle insertion
+        ms.push(s_b); // duplicate → merged by the deferred dedup
+        ms.push(s_mid);
         ms.push(s_c); // duplicate of the tail-most element (pos 0 after sort)
 
         assert_eq!(ms.primary().as_slice(), &[s_a, s_mid, s_b, s_c]);

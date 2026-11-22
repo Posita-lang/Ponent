@@ -248,9 +248,25 @@ pub fn is_explain_server_running() -> bool {
 /// the build once and a fat-pointer copy per hit (no `Arc` refcount, no clone).
 /// The cold-path caller (the explain server, one URL per served page) bypasses
 /// that cache.
+/// Write the localhost explain URL into `out` (the single format site).
+fn explain_server_url_into(port: u16, code: &str, out: &mut String) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
+        "http://127.0.0.1:{port}/{}",
+        encode_url_path_segment(code)
+    );
+}
+
 pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> String {
     if let Some(port) = port {
-        explain_server_url(port, code).into_string()
+        // Straight into the result: the old path built a `CompactString` and
+        // called `into_string()`, which the `SlotCache` doc above claims was
+        // removed — the hop was still there for localhost URLs, and it copies
+        // whenever the URL is short enough to be inline-resident.
+        let mut out = String::with_capacity(24);
+        explain_server_url_into(port, code, &mut out);
+        out
     } else {
         // We will register this domain and set up a proper documentation
         // website in the future.  For now, the local explain server is the
@@ -274,7 +290,11 @@ pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> String {
 /// percent-encoded as one path segment so untrusted input cannot escape the
 /// segment or smuggle control characters into the URL.
 pub(crate) fn explain_server_url(port: u16, code: &str) -> CompactString {
-    format_compact!("http://127.0.0.1:{port}/{}", encode_url_path_segment(code))
+    // The CLI keeps its `CompactString` contract; the format itself lives in one
+    // place so the two callers cannot drift.
+    let mut out = String::with_capacity(24);
+    explain_server_url_into(port, code, &mut out);
+    CompactString::from(out)
 }
 
 /// Percent-encode a single URL path segment per RFC 3986.  Unreserved
@@ -333,7 +353,7 @@ impl ErrorCategory {
     /// [`as_str`](Self::as_str).  JSON consumers that used to see
     /// `"Parse Error"` must read `"parse"`; the display renderers keep
     /// using `as_str`.
-    pub fn key(&self) -> &'static str {
+    pub const fn key(&self) -> &'static str {
         match self {
             ErrorCategory::Parse => "parse",
             ErrorCategory::Resolution => "resolution",
@@ -373,15 +393,20 @@ impl ErrorCategory {
     /// Single source for both `--only-category` validation and the "valid: …"
     /// text in `from_str`'s error, so a new category cannot be accepted by the
     /// parser while a hand-written message calls it invalid.
+    /// Derived from [`key`](Self::key), in `index()` order — the previous
+    /// hand-maintained parallel array pinned only the arity, so renaming one
+    /// `key()` arm without touching this table silently made `from_str` accept a
+    /// key the CLI rejected (and the "valid: …" text advertise the wrong one).
+    /// Now a new variant forces a change here, and a mismatch cannot compile.
     pub(crate) const CANONICAL_KEYS: [&'static str; Self::COUNT] = [
-        "parse",
-        "resolution",
-        "type",
-        "contract",
-        "trait",
-        "inference",
-        "internal",
-        "generic",
+        ErrorCategory::Parse.key(),
+        ErrorCategory::Resolution.key(),
+        ErrorCategory::Type.key(),
+        ErrorCategory::Contract.key(),
+        ErrorCategory::Trait.key(),
+        ErrorCategory::Inference.key(),
+        ErrorCategory::Internal.key(),
+        ErrorCategory::Generic.key(),
     ];
 
     /// Human-readable display string (e.g. `"Parse Error"`).  **Not** the
@@ -462,6 +487,15 @@ impl std::str::FromStr for ErrorCategory {
         ))
     }
 }
+
+// `ErrCode` is sent across threads by the diagnostics pipeline (`Arc<OtherCode>`,
+// `&'static ErrCodeInner`, `OnceLock<Box<str>>` are all `Send + Sync`).  Pin it
+// here so a future payload field that is not `Sync` fails at this definition
+// instead of at a distant use site.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ErrCode>();
+};
 
 /// A compiler error or warning code (e.g. "E030", "W113").
 ///
@@ -820,6 +854,7 @@ impl ErrCode {
     /// For [`Unknown`](Self::unknown) codes this is the stored spelling
     /// verbatim (untrusted echo semantics); use [`canonical`](Self::canonical)
     /// for identity.
+    #[must_use]
     pub fn code(&self) -> &str {
         match &self.0 {
             ErrCodeRepr::Known(e) => e.display,
@@ -873,11 +908,13 @@ impl ErrCode {
     }
 
     /// Short title, e.g. "type mismatch" or "duplicate definition".
+    #[must_use]
     pub fn title(&self) -> &'static str {
         self.entry_or_unknown().title
     }
 
     /// The error category, e.g. `ErrorCategory::Type`.
+    #[must_use]
     pub fn category(&self) -> ErrorCategory {
         self.entry_or_unknown().category
     }
@@ -925,6 +962,7 @@ impl ErrCode {
     /// The port-unset quadrants are not caches: registry codes read a build-time
     /// constant and everything else builds uncached, which is why a later
     /// `set_explain_port` can never observe a stale doc-URL host.
+    #[must_use]
     pub fn url(&self) -> std::borrow::Cow<'static, str> {
         let slot = self.slot();
         self.url_for_slot(slot)
@@ -946,12 +984,29 @@ impl ErrCode {
         let Some(port) = port else {
             // No explain server: a registry code's documentation URL is a
             // build-time constant, and a spelling that resolves to one borrows
-            // that same constant.  Only a genuinely unregistered spelling has to
-            // build a URL — and this is the "port unset" quadrant that used to
-            // hold a cache per slot; it is gone rather than memoized.
+            // that same constant.
+            //
+            // A genuinely unregistered *shape-valid* spelling (`E999`) used to
+            // rebuild its doc URL — percent-encode scan plus a `String` — on
+            // every call, on the per-diagnostic hyperlink path.  The old note
+            // justified deleting the slot cache here with "there is nothing to
+            // invalidate when the port is set later"; that is true of the
+            // localhost URL, but the *doc* URL is a pure function of the
+            // canonical code and contains no port, so there is nothing to
+            // invalidate at all.  `code_slot` is injective over its domain
+            // (pinned by `code_slot_is_a_bijection_onto_the_direct_address_range`),
+            // so the slot is a sound key.
             return match self.entry() {
                 Some(e) => std::borrow::Cow::Borrowed(inner_for_entry(e).doc_url),
-                None => std::borrow::Cow::Owned(explain_url_with_port(self.canonical(), None)),
+                None => match self.slot() {
+                    None => std::borrow::Cow::Owned(explain_url_with_port(self.canonical(), None)),
+                    Some(slot) => {
+                        static DOC_URL_CACHE: SlotCache = new_slot_cache();
+                        std::borrow::Cow::Borrowed(cached_slot_string(&DOC_URL_CACHE, slot, || {
+                            explain_url_with_port(self.canonical(), None)
+                        }))
+                    }
+                },
             };
         };
         let Some(slot) = slot else {
@@ -992,6 +1047,7 @@ impl ErrCode {
         self.0.is_canonical_spelling()
     }
 
+    #[must_use]
     pub fn url_ansi(&self) -> std::borrow::Cow<'static, str> {
         let Some(port) = explain_port() else {
             // Same as `url`, with one extra condition: the wrapper embeds the
@@ -1001,7 +1057,20 @@ impl ErrCode {
                 Some(e) if self.0.is_canonical_spelling() => {
                     std::borrow::Cow::Borrowed(inner_for_entry(e).doc_url_ansi)
                 }
-                _ => std::borrow::Cow::Owned(self.url_ansi_build(None, None)),
+                _ => match self.slot() {
+                    // Shape-valid but unregistered (`E999`): the wrapper embeds
+                    // only the canonical spelling and the port-free doc URL, so
+                    // the slot is a sound key with nothing to invalidate.
+                    Some(slot) if self.ansi_cacheable() => {
+                        static DOC_URL_ANSI_CACHE: SlotCache = new_slot_cache();
+                        std::borrow::Cow::Borrowed(cached_slot_string(
+                            &DOC_URL_ANSI_CACHE,
+                            slot,
+                            || self.url_ansi_build(Some(slot), None),
+                        ))
+                    }
+                    _ => std::borrow::Cow::Owned(self.url_ansi_build(None, None)),
+                },
             };
         };
         let Some(slot) = self.slot() else {
@@ -1945,37 +2014,17 @@ mod tests {
         let mut i = 0;
         while i < bytes.len() {
             // Raw string: r"...", r#"..."#; byte raw string: br#"..."#.
-            let raw_start = raw_string_opener(bytes, i);
-            if let Some(r) = raw_start {
-                let mut h = r + 1;
-                while h < bytes.len() && bytes[h] == b'#' {
-                    h += 1;
-                }
-                if h < bytes.len() && bytes[h] == b'"' {
-                    let hashes = h - (r + 1);
-                    let mut j = h + 1;
-                    loop {
-                        if j >= bytes.len() {
-                            j = bytes.len();
-                            break;
-                        }
-                        if bytes[j] == b'"' {
-                            let mut k = j + 1;
-                            let mut cnt = 0;
-                            while cnt < hashes && k < bytes.len() && bytes[k] == b'#' {
-                                k += 1;
-                                cnt += 1;
-                            }
-                            if cnt == hashes {
-                                j = k;
-                                break;
-                            }
-                        }
-                        j += 1;
-                    }
-                    i = j;
-                    continue;
-                }
+            //
+            // Via the shared helper: `strip_non_code` was the one scanner still
+            // carrying its own copy, after `skip_block_comment`'s doc recorded
+            // that this exact pattern ("they agreed by maintenance only, and the
+            // failure mode is silent") is how the scanners drift.  `None` means
+            // "not quote-terminated", which falls through to the other forms.
+            if let Some(r) = raw_string_opener(bytes, i)
+                && let Some(end) = skip_raw_string(bytes, r)
+            {
+                i = end;
+                continue;
             }
 
             // String literal: "..." or byte string b"...".  The opener must not

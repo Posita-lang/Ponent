@@ -29,6 +29,7 @@ pub struct Label<'a> {
 }
 
 impl<'a> Label<'a> {
+    #[must_use]
     pub fn new(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
@@ -37,6 +38,7 @@ impl<'a> Label<'a> {
         }
     }
 
+    #[must_use]
     pub fn secondary(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
@@ -45,6 +47,7 @@ impl<'a> Label<'a> {
         }
     }
 
+    #[must_use]
     pub fn note(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
@@ -62,6 +65,7 @@ impl<'a> Label<'a> {
     /// string for the whole diagnostic, while this is a positioned annotation
     /// that belongs in `Diagnostic::labels`.  A help *text* string placed here
     /// renders as a plausible-but-wrong source annotation.
+    #[must_use]
     pub fn help(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
             span,
@@ -70,6 +74,7 @@ impl<'a> Label<'a> {
         }
     }
 
+    #[must_use]
     pub fn with_kind(mut self, kind: AnnotationKind) -> Self {
         self.kind = kind;
         self
@@ -170,6 +175,7 @@ pub struct Snippet<'a> {
 }
 
 impl<'a> Snippet<'a> {
+    #[must_use]
     pub fn new(origin: impl Into<Cow<'a, str>>, source: &'a str) -> Self {
         Snippet {
             origin: origin.into(),
@@ -180,6 +186,7 @@ impl<'a> Snippet<'a> {
         }
     }
 
+    #[must_use]
     pub fn with_line_start(mut self, line_start: usize) -> Self {
         debug_assert!(
             line_start >= 1,
@@ -189,16 +196,19 @@ impl<'a> Snippet<'a> {
         self
     }
 
+    #[must_use]
     pub fn with_annotation(mut self, label: Label<'a>) -> Self {
         self.annotations.push(label);
         self
     }
 
+    #[must_use]
     pub fn with_annotations(mut self, labels: impl IntoIterator<Item = Label<'a>>) -> Self {
         self.annotations.extend(labels);
         self
     }
 
+    #[must_use]
     pub fn with_fold(mut self, fold: bool) -> Self {
         self.fold = fold;
         self

@@ -26,6 +26,11 @@ enum PendingAction {
 struct PendingConn {
     stream: TcpStream,
     accepted_at: Instant,
+    /// When the first byte arrived, if it has.  The 2 s partial-request window
+    /// was anchored at `accepted_at`, so a client that connected, stalled under
+    /// load, then dribbled a header had only the remainder of its budget while
+    /// actively transmitting — and its slot churned.
+    first_byte_at: Option<Instant>,
     buf: SmallVec<[u8; 512]>,
     scan: HeaderScan,
     /// Header terminator offset already found by `scan`; passed to
@@ -38,12 +43,12 @@ impl PendingConn {
     /// Silent preconnects expire after the first-byte budget; a partial
     /// request gets a longer but still bounded window.
     fn expiry(&self) -> Instant {
-        self.accepted_at
-            + if self.buf.is_empty() {
-                FIRST_BYTE_READ_TIMEOUT
-            } else {
-                Duration::from_secs(2)
-            }
+        match self.first_byte_at {
+            // Silent preconnect: unchanged first-byte budget.
+            None => self.accepted_at + FIRST_BYTE_READ_TIMEOUT,
+            // Actively transmitting: the full transfer window from first byte.
+            Some(t0) => t0 + Duration::from_secs(2),
+        }
     }
 }
 
@@ -110,11 +115,12 @@ struct RestoreNonblocking<'a> {
 
 impl<'a> RestoreNonblocking<'a> {
     fn new(listener: &'a TcpListener, nonblocking: bool) -> std::io::Result<Self> {
-        // Query first: if the query fails the listener is untouched.
-        #[cfg(unix)]
-        let was_nonblocking = Some(socket2::SockRef::from(listener).nonblocking()?);
-        #[cfg(not(unix))]
-        let was_nonblocking = None;
+        // Query first: if the query fails the listener is untouched.  `socket2`
+        // is the dependency this file already carries for exactly this gap;
+        // `.ok()` keeps today's documented `None` degradation on a platform that
+        // cannot answer, so the cfg (and the mode leak it encoded on Windows) is
+        // gone rather than duplicated.
+        let was_nonblocking = socket2::SockRef::from(listener).nonblocking().ok();
         listener.set_nonblocking(nonblocking)?;
         Ok(Self {
             listener,
@@ -410,6 +416,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                             pending.push(PendingConn {
                                 stream,
                                 accepted_at: Instant::now(),
+                                first_byte_at: None,
                                 buf: SmallVec::new(),
                                 scan: HeaderScan::new(),
                                 head_end: None,
@@ -421,7 +428,10 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                             // fails (EMFILE/ENFILE/...).  Sleeping here bounds
                             // the otherwise immediate re-poll to a hot spin.
                             accept_errors += 1;
-                            let ms = (50u64 << accept_errors.min(4)).min(1000);
+                            // Cap the shift at 5 so the `.min(1000)` is reachable:
+                            // with `min(4)` the maximum was 800 ms and the cap was
+                            // dead code (the thread path's ceiling is 1 s).
+                            let ms = (50u64 << accept_errors.min(5)).min(1000);
                             std::thread::sleep(Duration::from_millis(ms));
                             break;
                         }
@@ -453,6 +463,8 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                             break;
                         }
                         Ok(n) => {
+                            // First byte: start the transfer window (see `expiry`).
+                            let _ = pending[i].first_byte_at.get_or_insert_with(Instant::now);
                             pending[i].buf.extend_from_slice(&tmp[..n]);
                             let progress = pending[i].scan.scan(&pending[i].buf);
                             match progress {
@@ -1224,9 +1236,38 @@ fn drain_or_pre(
     pre: Option<DrainOutcome>,
     budget: Duration,
 ) -> DrainOutcome {
-    pre.unwrap_or_else(|| drain_request(stream, prefix, budget))
+    pre.unwrap_or_else(|| drain_after_request_line(stream, prefix, budget))
 }
 
+/// Drain a request whose bytes *after* the request line are in `prefix`.
+///
+/// `drain_request_tracked`'s own doc records the bug that motivated the
+/// `prefix_has_request_line` parameter: keeping it pinned to `true` made
+/// `scan_framing` skip the first *header* line as a request line, and every
+/// production caller of this shape passes post-line bytes (the routed one-shot
+/// path and `read_request_line`'s drains).  Encoding the meaning in the wrapper
+/// is what stops the next caller from inheriting the flag by habit.
+fn drain_after_request_line(
+    stream: &mut TcpStream,
+    prefix: &[u8],
+    budget: Duration,
+) -> DrainOutcome {
+    let mut tail_len = 0;
+    let mut wants_close = false;
+    let mut is_head = false;
+    drain_request_tracked(
+        stream,
+        prefix,
+        budget,
+        &mut tail_len,
+        &mut wants_close,
+        &mut is_head,
+        false,
+        None,
+    )
+}
+
+/// Drain a request whose bytes arrive fresh on `stream` (empty-prefix paths).
 fn drain_request(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> DrainOutcome {
     let mut tail_len = 0;
     let mut wants_close = false;
@@ -1524,8 +1565,9 @@ fn csp_style_src() -> &'static str {
             base64::engine::general_purpose::STANDARD.encode(digest)
         };
         let mut out = String::new();
-        // The closed set of `page_head(_, extra_css)` variants below.
-        for extra in [EXPLAIN_CSS, INDEX_CSS, ""] {
+        // The closed set of `page_head(_, extra_css)` variants — named once so
+        // `page_head` can assert against the same list (see `KNOWN_EXTRA_CSS`).
+        for extra in KNOWN_EXTRA_CSS {
             if !out.is_empty() {
                 out.push(' ');
             }
@@ -1935,7 +1977,9 @@ fn serve_page_after_prefix(
         // A non-GET/HEAD must not receive a full body (protocol violation); answer
         // 405 with `Allow: GET, HEAD` and keep waiting for the real page request.
         if req.method != "GET" && req.method != "HEAD" {
-            stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+            // The 1 s read/write timeouts are armed once at the top of this
+            // function; re-arming them per response was two `setsockopt`s (and
+            // two `?` paths that closed the connection for a no-op change).
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             let resp = method_not_allowed_response();
             return finish_response(stream, drain, &resp, false);
@@ -1955,7 +1999,6 @@ fn serve_page_after_prefix(
                 if let Some(code) = canonical.as_deref()
                     && let Some(page) = explain_page_cached(code)
                 {
-                    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                     let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
                     if head_only {
                         return finish_head(
@@ -1990,7 +2033,6 @@ fn serve_page_after_prefix(
                 // Drain the whole request before writing: closing with unread
                 // inbound bytes makes the kernel send RST, which can discard
                 // the 404 response (the discipline).
-                stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                 let decoded = percent_decode(raw);
                 let key = decoded.strip_prefix('/').unwrap_or(decoded.as_str());
                 let key = if key.is_empty() { "/" } else { key };
@@ -2027,7 +2069,6 @@ fn serve_page_after_prefix(
         }
         // HEAD gets the identical GET head (including Content-Length) and no body.
         if head_only {
-            stream.set_read_timeout(Some(Duration::from_secs(1)))?;
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             let head = render_head("200 OK", "", body.len());
             return finish_head(
@@ -2345,7 +2386,19 @@ fn page_style(css: &str, extra_css: &str) -> String {
 /// Shared HTML head: the process-wide dark/light stylesheet, viewport meta,
 /// base layout, and the theme toggle.  `extra_css` is trusted literal CSS
 /// (never user input); `title` is escaped.
+/// The closed set of page styles this server can serve.
+///
+/// A new variant must be added here *and* is asserted in `page_head`: passing an
+/// unrhashed style compiles, ships, and renders the page unstyled (the browser
+/// rejects the `<style>` block on a hash mismatch) with no server-side signal.
+const KNOWN_EXTRA_CSS: [&str; 3] = [EXPLAIN_CSS, INDEX_CSS, ""];
+
 fn page_head(title: &str, extra_css: &str) -> String {
+    debug_assert!(
+        KNOWN_EXTRA_CSS.contains(&extra_css),
+        "extra_css is not in csp_style_src's hashed set — the browser would \
+         reject the <style> block; add it to KNOWN_EXTRA_CSS"
+    );
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -2568,208 +2621,222 @@ fn serve_explain_persistent_impl(
     // Linux uses a single non-blocking epoll reactor: one event loop owns
     // every connection, so a slow client costs no thread and cannot delay
     // accepts.  Other platforms keep the scoped thread-per-connection path.
+    // Exactly one of the two blocks below survives `cfg` expansion, and the
+    // survivor IS this function's tail expression.  The old shape returned on
+    // Linux and left the entire thread path statically unreachable there — the
+    // `unreachable_code` lint fired over ~150 lines on the primary target, which
+    // is what made the parity argument ("the thread path stays type-checked")
+    // cost a warning instead of buying anything.
     #[cfg(target_os = "linux")]
     {
-        return serve_explain_persistent_epoll(listener, idle);
+        serve_explain_persistent_epoll(listener, idle)
     }
-    let active = std::sync::Arc::new(AtomicUsize::new(0));
-    // A permanently failing listener (closed fd → `EBADF`, a device error)
-    // must not leave the process spinning at 50 ms per iteration forever with
-    // no diagnostic.  A *transient* error (EMFILE, ENFILE) is followed by
-    // success, which resets the counter, so only a genuinely stuck listener
-    // reaches the cap.
-    let mut consecutive_accept_errors = 0usize;
-    // H5: exponential backoff for transient fd/memory exhaustion, capped at
-    // 1 s and excluded from the give-up counter.
-    let mut accept_backoff_ms = 50u64;
-    // a dead listener must not be reported as a successful server exit.
-    let mut terminal_error: Option<std::io::Error> = None;
-    if idle.is_some() {
-        listener.set_nonblocking(true)?;
-    }
-    let first_deadline = Instant::now() + Duration::from_secs(10);
-    let mut served_any = false;
-    let mut last_activity = Instant::now();
-    let served_count = std::sync::Arc::new(AtomicUsize::new(0));
-    let mut seen_served = 0usize;
-    std::thread::scope(|scope| {
-        loop {
-            let now = Instant::now();
-            let written = served_count.load(Ordering::Relaxed);
-            if written != seen_served {
-                seen_served = written;
-                served_any = true;
-                last_activity = now;
-            }
-            if let Some(idle) = idle {
-                if !served_any && now >= first_deadline && active.load(Ordering::Relaxed) == 0 {
-                    terminal_error = Some(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "explain server: no client connected before the first-request deadline",
-                    ));
-                    break;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let active = std::sync::Arc::new(AtomicUsize::new(0));
+        // A permanently failing listener (closed fd → `EBADF`, a device error)
+        // must not leave the process spinning at 50 ms per iteration forever with
+        // no diagnostic.  A *transient* error (EMFILE, ENFILE) is followed by
+        // success, which resets the counter, so only a genuinely stuck listener
+        // reaches the cap.
+        let mut consecutive_accept_errors = 0usize;
+        // H5: exponential backoff for transient fd/memory exhaustion, capped at
+        // 1 s and excluded from the give-up counter.
+        let mut accept_backoff_ms = 50u64;
+        // a dead listener must not be reported as a successful server exit.
+        let mut terminal_error: Option<std::io::Error> = None;
+        if idle.is_some() {
+            listener.set_nonblocking(true)?;
+        }
+        let first_deadline = Instant::now() + Duration::from_secs(10);
+        let mut served_any = false;
+        let mut last_activity = Instant::now();
+        let served_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut seen_served = 0usize;
+        std::thread::scope(|scope| {
+            loop {
+                let now = Instant::now();
+                let written = served_count.load(Ordering::Relaxed);
+                if written != seen_served {
+                    seen_served = written;
+                    served_any = true;
+                    last_activity = now;
                 }
-                if served_any
-                    && active.load(Ordering::Relaxed) == 0
-                    && now.saturating_duration_since(last_activity) >= idle
-                {
-                    break;
+                if let Some(idle) = idle {
+                    if !served_any && now >= first_deadline && active.load(Ordering::Relaxed) == 0 {
+                        terminal_error = Some(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "explain server: no client connected before the first-request deadline",
+                        ));
+                        break;
+                    }
+                    if served_any
+                        && active.load(Ordering::Relaxed) == 0
+                        && now.saturating_duration_since(last_activity) >= idle
+                    {
+                        break;
+                    }
                 }
-            }
-            let incoming = listener.accept();
-            match incoming {
-                Ok((mut stream, _)) => {
-                    consecutive_accept_errors = 0;
-                    accept_backoff_ms = 50;
-                    // Per-connection errors must not kill the server.
-                    if active.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
-                        // At the cap: shed with a short budget instead of serving inline.  The
-                        // full handler would hold the accept loop for up to ~4 s
-                        // (2 s read + 1 s drain + 1 s write), which a handful of
-                        // trickle clients could force indefinitely.  A bounded
-                        // drain + close is the same treatment preconnects get;
-                        // browsers retry.  The accept loop stall drops to ~0.1 s.
-                        // if the short read timeout cannot be installed, a blocking drain
-                        // would stall the accept loop, so close immediately.
-                        if stream
-                            .set_read_timeout(Some(Duration::from_millis(100)))
-                            .is_err()
-                        {
-                            let _ = stream.shutdown(Shutdown::Both);
+                let incoming = listener.accept();
+                match incoming {
+                    Ok((mut stream, _)) => {
+                        consecutive_accept_errors = 0;
+                        accept_backoff_ms = 50;
+                        // Per-connection errors must not kill the server.
+                        if active.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
+                            // At the cap: shed with a short budget instead of serving inline.  The
+                            // full handler would hold the accept loop for up to ~4 s
+                            // (2 s read + 1 s drain + 1 s write), which a handful of
+                            // trickle clients could force indefinitely.  A bounded
+                            // drain + close is the same treatment preconnects get;
+                            // browsers retry.  The accept loop stall drops to ~0.1 s.
+                            // if the short read timeout cannot be installed, a blocking drain
+                            // would stall the accept loop, so close immediately.
+                            if stream
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .is_err()
+                            {
+                                let _ = stream.shutdown(Shutdown::Both);
+                                continue;
+                            }
+                            let (outcome, is_head) = drain_request_with_head(
+                                &mut stream,
+                                &[],
+                                Duration::from_millis(100),
+                            );
+                            if outcome == DrainOutcome::NoRequest {
+                                // H3: a silent preconnect never made a request;
+                                // writing a 503 to it is unsolicited and can
+                                // desynchronise the browser.  Close instead.
+                                let _ = stream.shutdown(Shutdown::Both);
+                                continue;
+                            }
+                            if outcome == DrainOutcome::TooLarge {
+                                let _ = write_header_too_large(&mut stream);
+                                linger_after_half_close(&mut stream);
+                                continue;
+                            }
+                            // tell the client we are overloaded so a browser
+                            // can retry, instead of an empty close.
+                            let page = shed_page();
+                            let body: &str = if is_head { "" } else { &page.body };
+                            let _ = write_prepared_parts(&mut stream, page.head_parts(), body);
+                            let _ = drain_residual(&mut stream);
+                            if outcome == DrainOutcome::Complete {
+                                let _ = stream.shutdown(Shutdown::Both);
+                            } else {
+                                // Unread inbound bytes + hard close = RST, which
+                                // can destroy the 503 we just wrote.  The shared
+                                // linger loops to EOF/budget (H5/).
+                                linger_after_half_close(&mut stream);
+                            }
                             continue;
                         }
-                        let (outcome, is_head) =
-                            drain_request_with_head(&mut stream, &[], Duration::from_millis(100));
-                        if outcome == DrainOutcome::NoRequest {
-                            // H3: a silent preconnect never made a request;
-                            // writing a 503 to it is unsolicited and can
-                            // desynchronise the browser.  Close instead.
-                            let _ = stream.shutdown(Shutdown::Both);
-                            continue;
+                        active.fetch_add(1, Ordering::Relaxed);
+                        let guard = ActiveConnectionGuard(std::sync::Arc::clone(&active));
+                        // A default thread stack is 8 MiB of *virtual* address
+                        // space per connection; this handler only needs a few KiB
+                        // (the largest frames are the 4 KiB drain buffer and a
+                        // 4096-byte inline SmallVec).  64 KiB keeps the resident
+                        // footprint honest and still leaves room for debug-build
+                        // frames.  If spawn itself fails, dropping the closure
+                        // drops the guard, so the counter never leaks.
+                        let served_thread = std::sync::Arc::clone(&served_count);
+                        let spawned = std::thread::Builder::new()
+                            .name("ponent-explain".into())
+                            .stack_size(64 * 1024)
+                            .spawn_scoped(scope, move || {
+                                let _guard = guard;
+                                // H6: `thread::scope` re-raises a scoped thread's
+                                // panic at the boundary, which would abort the
+                                // whole persistent server.  Contain one malformed
+                                // request instead; the guard still drops on
+                                // unwind.
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let _ =
+                                        handle_persistent_connection(&mut stream, &served_thread);
+                                }))
+                                .is_err()
+                                {
+                                    eprintln!(
+                                        "ponent explain server: connection handler panicked; \
+                                     connection closed"
+                                    );
+                                }
+                            });
+                        if let Err(e) = spawned {
+                            // The guard has already been dropped (closure
+                            // destructuring on the failed spawn); just avoid
+                            // spinning on resource exhaustion.
+                            let _ = e;
+                            std::thread::sleep(Duration::from_millis(10));
                         }
-                        if outcome == DrainOutcome::TooLarge {
-                            let _ = write_header_too_large(&mut stream);
-                            linger_after_half_close(&mut stream);
-                            continue;
-                        }
-                        // tell the client we are overloaded so a browser
-                        // can retry, instead of an empty close.
-                        let page = shed_page();
-                        let body: &str = if is_head { "" } else { &page.body };
-                        let _ = write_prepared_parts(&mut stream, page.head_parts(), body);
-                        let _ = drain_residual(&mut stream);
-                        if outcome == DrainOutcome::Complete {
-                            let _ = stream.shutdown(Shutdown::Both);
-                        } else {
-                            // Unread inbound bytes + hard close = RST, which
-                            // can destroy the 503 we just wrote.  The shared
-                            // linger loops to EOF/budget (H5/).
-                            linger_after_half_close(&mut stream);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    // EINTR / transient errors — retry.  Any other persistent
+                    // accept failure (`EMFILE`, a closed listener, …) backs off
+                    // instead of spinning: the old `continue` turned a resource
+                    // exhaustion condition into a hot loop that burned a core.
+                    // A short sleep keeps the server alive to retry without
+                    // spinning, so a transient `EMFILE` recovers as descriptors
+                    // free up rather than permanently killing the server.
+                    Err(e) => {
+                        // EMFILE/ENFILE/ENOBUFS/ENOMEM are transient
+                        // resource exhaustion; ECONNABORTED/EPROTO are normal
+                        // under a backlog RST storm.  None may permanently kill
+                        // the server.  EBADF/InvalidInput still trips the cap.
+                        #[cfg(unix)]
+                        let transient = matches!(
+                            e.raw_os_error(),
+                            Some(
+                                libc::EMFILE
+                                    | libc::ENFILE
+                                    | libc::ENOBUFS
+                                    | libc::ENOMEM
+                                    | libc::ECONNABORTED
+                                    | libc::EPROTO
+                            )
+                        );
+                        #[cfg(not(unix))]
+                        let transient = matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                        );
+                        match e.kind() {
+                            std::io::ErrorKind::Interrupted => {}
+                            _ if transient => {
+                                accept_backoff_ms = (accept_backoff_ms * 2).min(1000);
+                                std::thread::sleep(Duration::from_millis(accept_backoff_ms));
+                            }
+                            _ => {
+                                consecutive_accept_errors += 1;
+                                if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                                    // The listener is not recovering (fd closed /
+                                    // permanently invalid).  Surface it once and
+                                    // stop rather than burning a core forever.
+                                    eprintln!(
+                                        "ponent explain server: giving up after \
+                                     {consecutive_accept_errors} consecutive accept errors: {e}"
+                                    );
+                                    terminal_error = Some(e);
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
                         }
                         continue;
                     }
-                    active.fetch_add(1, Ordering::Relaxed);
-                    let guard = ActiveConnectionGuard(std::sync::Arc::clone(&active));
-                    // A default thread stack is 8 MiB of *virtual* address
-                    // space per connection; this handler only needs a few KiB
-                    // (the largest frames are the 4 KiB drain buffer and a
-                    // 4096-byte inline SmallVec).  64 KiB keeps the resident
-                    // footprint honest and still leaves room for debug-build
-                    // frames.  If spawn itself fails, dropping the closure
-                    // drops the guard, so the counter never leaks.
-                    let served_thread = std::sync::Arc::clone(&served_count);
-                    let spawned = std::thread::Builder::new()
-                        .name("ponent-explain".into())
-                        .stack_size(64 * 1024)
-                        .spawn_scoped(scope, move || {
-                            let _guard = guard;
-                            // H6: `thread::scope` re-raises a scoped thread's
-                            // panic at the boundary, which would abort the
-                            // whole persistent server.  Contain one malformed
-                            // request instead; the guard still drops on
-                            // unwind.
-                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                let _ = handle_persistent_connection(&mut stream, &served_thread);
-                            }))
-                            .is_err()
-                            {
-                                eprintln!(
-                                    "ponent explain server: connection handler panicked; \
-                                     connection closed"
-                                );
-                            }
-                        });
-                    if let Err(e) = spawned {
-                        // The guard has already been dropped (closure
-                        // destructuring on the failed spawn); just avoid
-                        // spinning on resource exhaustion.
-                        let _ = e;
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                // EINTR / transient errors — retry.  Any other persistent
-                // accept failure (`EMFILE`, a closed listener, …) backs off
-                // instead of spinning: the old `continue` turned a resource
-                // exhaustion condition into a hot loop that burned a core.
-                // A short sleep keeps the server alive to retry without
-                // spinning, so a transient `EMFILE` recovers as descriptors
-                // free up rather than permanently killing the server.
-                Err(e) => {
-                    // EMFILE/ENFILE/ENOBUFS/ENOMEM are transient
-                    // resource exhaustion; ECONNABORTED/EPROTO are normal
-                    // under a backlog RST storm.  None may permanently kill
-                    // the server.  EBADF/InvalidInput still trips the cap.
-                    #[cfg(unix)]
-                    let transient = matches!(
-                        e.raw_os_error(),
-                        Some(
-                            libc::EMFILE
-                                | libc::ENFILE
-                                | libc::ENOBUFS
-                                | libc::ENOMEM
-                                | libc::ECONNABORTED
-                                | libc::EPROTO
-                        )
-                    );
-                    #[cfg(not(unix))]
-                    let transient = matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
-                    );
-                    match e.kind() {
-                        std::io::ErrorKind::Interrupted => {}
-                        _ if transient => {
-                            accept_backoff_ms = (accept_backoff_ms * 2).min(1000);
-                            std::thread::sleep(Duration::from_millis(accept_backoff_ms));
-                        }
-                        _ => {
-                            consecutive_accept_errors += 1;
-                            if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
-                                // The listener is not recovering (fd closed /
-                                // permanently invalid).  Surface it once and
-                                // stop rather than burning a core forever.
-                                eprintln!(
-                                    "ponent explain server: giving up after \
-                                     {consecutive_accept_errors} consecutive accept errors: {e}"
-                                );
-                                terminal_error = Some(e);
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                    }
-                    continue;
                 }
             }
+        });
+        match terminal_error {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-    });
-    match terminal_error {
-        Some(e) => Err(e),
-        None => Ok(()),
     }
 }
 
@@ -2795,7 +2862,11 @@ fn serve_explain_persistent_epoll(
     const MAX_EVENTS: usize = 64;
     const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(2);
     const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-    /// Shared post-response drain budget (matches the thread path's bound).
+    /// Shared post-response drain budget for a response whose body is already
+    /// drained.  Same *order* as the thread path's post-response budgets, but not
+    /// the same numbers: the thread path uses a 20 ms residual drain
+    /// (`drain_residual`) and a 150 ms one-shot linger (`ONE_SHOT_LINGER`).
+    /// These encode the RST-vs-FIN tradeoff, so the divergences are deliberate.
     const LINGER_BUDGET: Duration = Duration::from_millis(100);
     /// Explicit connection phase (replaces the former `u8` plus three ad-hoc
     /// constants).  The reactor's transitions are exactly
@@ -2906,6 +2977,11 @@ fn serve_explain_persistent_epoll(
     epoll_ctl_checked(epfd, libc::EPOLL_CTL_ADD, listener_fd, &mut interest)?;
 
     let mut conns: FxHashMap<i32, Conn> = FxHashMap::default();
+    // Number of resident connections that are not `overload` slots.  The accept
+    // path used to rescan the whole map (`conns.values().filter(...).count()`)
+    // for every accepted connection — an O(n) pass on the event-loop thread
+    // inside the accept burst for a value that is trivial to maintain.
+    let mut normal_conns: usize = 0;
     let mut events: Vec<libc::epoll_event> = (0..MAX_EVENTS)
         .map(|_| libc::epoll_event { events: 0, u64: 0 })
         .collect();
@@ -3000,7 +3076,7 @@ fn serve_explain_persistent_epoll(
                             // the heap arm, so the lazy-invalidation check
                             // (`at == conn.deadline`) stays exact.
                             let first_byte_deadline = Instant::now() + FIRST_BYTE_READ_TIMEOUT;
-                            let normal = conns.values().filter(|c| !c.overload).count();
+                            let normal = normal_conns;
                             if normal >= MAX_CONCURRENT_CONNECTIONS {
                                 if conns.len() >= MAX_CONCURRENT_CONNECTIONS * 2 {
                                     // Bound overload slots too: a preconnect
@@ -3047,6 +3123,7 @@ fn serve_explain_persistent_epoll(
                                         body_remaining: 0,
                                     },
                                 );
+                                normal_conns += 1;
                             }
                             // A closed (shed) accept leaves no map entry; the
                             // arm is then pruned as stale on the next peek.
@@ -3071,6 +3148,9 @@ fn serve_explain_persistent_epoll(
                             .is_err()
                             {
                                 if let Some(conn) = conns.remove(&conn_fd) {
+                                    if !conn.overload {
+                                        normal_conns = normal_conns.saturating_sub(1);
+                                    }
                                     let _ = conn.stream.shutdown(Shutdown::Both);
                                 }
                             }
@@ -3534,6 +3614,9 @@ fn serve_explain_persistent_epoll(
         close.dedup();
         for fd in close {
             if let Some(conn) = conns.remove(&fd) {
+                if !conn.overload {
+                    normal_conns = normal_conns.saturating_sub(1);
+                }
                 let _ = epoll_ctl_checked(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
                 let _ = conn.stream.shutdown(Shutdown::Both);
             }
@@ -3699,14 +3782,14 @@ fn read_request_line(
     if let Some(nl) = memchr::memchr(b'\n', prefix) {
         if nl >= MAX_REQUEST_LINE {
             *too_large = true;
-            let _ = drain_request(stream, &prefix[nl + 1..], Duration::from_millis(100));
+            let _ = drain_after_request_line(stream, &prefix[nl + 1..], Duration::from_millis(100));
             return None;
         }
         let raw = &prefix[..nl];
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         let Ok(line) = simdutf8::basic::from_utf8(raw) else {
             *malformed = true;
-            let _ = drain_request(stream, &prefix[nl + 1..], Duration::from_millis(100));
+            let _ = drain_after_request_line(stream, &prefix[nl + 1..], Duration::from_millis(100));
             return None;
         };
         let mut leftover: SmallVec<[u8; 512]> = SmallVec::new();
@@ -3764,7 +3847,11 @@ fn read_request_line(
                     // arrived past the newline and the kernel may hold more;
                     // drain both before returning so closing does not reset
                     // the connection under the client.
-                    let _ = drain_request(stream, &chunk[nl + 1..], Duration::from_millis(100));
+                    let _ = drain_after_request_line(
+                        stream,
+                        &chunk[nl + 1..],
+                        Duration::from_millis(100),
+                    );
                     return None;
                 }
                 line.extend_from_slice(&chunk[..nl]);
@@ -3777,7 +3864,7 @@ fn read_request_line(
                 // the rest of the request unread (which would RST on close).
                 let Ok(line) = simdutf8::basic::from_utf8(&line[..]) else {
                     *malformed = true;
-                    let _ = drain_request(stream, &leftover, Duration::from_millis(100));
+                    let _ = drain_after_request_line(stream, &leftover, Duration::from_millis(100));
                     return None;
                 };
                 return Some((line.into(), leftover));
@@ -4493,6 +4580,48 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    /// Every style variant the page builders can pass must be in the CSP hash
+    /// set: a variant that is not compiles and ships, and the browser then
+    /// rejects the `<style>` block with no server-side signal (the page renders
+    /// unstyled).  `page_head`'s debug assert is the other half of this pin.
+    #[test]
+    fn csp_hashes_cover_every_page_style_variant() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let css = crate::diagnostics::emitter::stylesheet::dark_css();
+        let src = csp_style_src();
+        for extra in KNOWN_EXTRA_CSS {
+            let digest = Sha256::digest(page_style(css, extra).as_bytes());
+            let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+            assert!(
+                src.contains(&b64),
+                "style variant {extra:?} is not covered by the CSP hash set"
+            );
+        }
+    }
+
+    /// Golden values for the civil-date arithmetic: the only test before this
+    /// pinned prefix/suffix shape, so every month could have been off by one and
+    /// the suite would still pass.
+    #[test]
+    fn http_date_goldens_pin_the_civil_arithmetic() {
+        assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(
+            format_http_date(1_700_000_000),
+            "Tue, 14 Nov 2023 22:13:20 GMT"
+        );
+        // Leap day in a leap year (2024-02-29 12:00:00 UTC).
+        assert_eq!(
+            format_http_date(1_709_208_000),
+            "Thu, 29 Feb 2024 12:00:00 GMT"
+        );
+        // Weekday roll-over across a month end (2023-12-31 → Sunday).
+        assert_eq!(
+            format_http_date(1_704_067_199),
+            "Sun, 31 Dec 2023 23:59:59 GMT"
+        );
+    }
 
     /// routing must not act on a truncated first read.  A 600-byte
     /// request line (long `?` query) has no `\n` in the 512-byte probe, so

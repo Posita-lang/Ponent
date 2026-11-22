@@ -25,6 +25,7 @@ type-mismatch-reason = { type-mismatch } — { $reason }
 type-mismatch-ctx = { type-mismatch } ({ $ctx })
 type-mismatch-ctx-reason = { type-mismatch } ({ $ctx }) — { $reason }
 suggestion-or = { $first } or { $next }
+see-also = See also:
 argument-type-mismatch = argument type mismatch in call to `{ $callee }`: parameter `{ $param }` expected `{ $expected }`, found `{ $found }`
 contract-non-bool = `{ $clause }` clause must be boolean, found `{ $found }`
 impl-missing-method = impl of `{ $trait }` is missing method `{ $method }`
@@ -39,7 +40,7 @@ shadowing-definition = shadowing definition of `{ $name }`
 missing-method = impl missing method `{ $method }` required by trait `{ $trait }`
 impl-trait-methods = every trait method must be implemented — add a `def` for it in this impl block
 unknown-error-code = unknown error code: `{ $code }`
-did-you-mean = did you mean `{ $candidates }`?
+did-you-mean = did you mean { $candidates }?
 run-explain-hint = run `ponent explain <CODE>` with a valid error code
 available-error-codes = Available error codes:
 

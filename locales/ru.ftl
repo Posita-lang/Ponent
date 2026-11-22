@@ -22,6 +22,7 @@ type-mismatch-reason = { type-mismatch } — { $reason }
 type-mismatch-ctx = { type-mismatch } ({ $ctx })
 type-mismatch-ctx-reason = { type-mismatch } ({ $ctx }) — { $reason }
 suggestion-or = { $first } или { $next }
+see-also = См. также:
 argument-type-mismatch = несоответствие типов аргумента в вызове `{ $callee }`: параметр `{ $param }` ожидал `{ $expected }`, найден `{ $found }`
 contract-non-bool = условие `{ $clause }` должно быть логическим значением, найдено `{ $found }`
 impl-missing-method = в impl `{ $trait }` отсутствует метод `{ $method }`
@@ -36,7 +37,7 @@ shadowing-definition = затенение определения `{ $name }`
 missing-method = в реализации трейта `{ $trait }` отсутствует метод `{ $method }`
 impl-trait-methods = все методы трейта должны быть реализованы
 unknown-error-code = неизвестный код ошибки: `{ $code }`
-did-you-mean = возможно, вы имели в виду `{ $candidates }`?
+did-you-mean = возможно, вы имели в виду { $candidates }?
 run-explain-hint = запустите `ponent explain <CODE>` с правильным кодом
 available-error-codes = Доступные коды ошибок:
 

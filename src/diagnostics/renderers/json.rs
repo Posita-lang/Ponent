@@ -36,14 +36,17 @@ pub struct JsonRenderer {
 }
 
 impl JsonRenderer {
+    #[must_use]
     pub fn new(pretty: bool) -> Self {
         JsonRenderer { pretty }
     }
 
+    #[must_use]
     pub fn new_pretty() -> Self {
         JsonRenderer::new(true)
     }
 
+    #[must_use]
     pub fn new_compact() -> Self {
         JsonRenderer::new(false)
     }
@@ -151,6 +154,29 @@ impl JsonRenderer {
     /// to an owned `"  ".repeat(level)`.
     fn indent(level: usize) -> Cow<'static, str> {
         const INDENTS: &[&str] = &["", "  ", "    ", "      ", "        ", "          "];
+        // Same machine-check `fmt.rs` applies to `SPACES`: indent widths are not
+        // pinned by a test (pinning a guessed layout is how such a test rots), so
+        // a corrupted table must fail the build instead of shipping
+        // valid-but-misaligned pretty output.
+        const _: () = {
+            let mut i = 0;
+            let mut ok = true;
+            while i < INDENTS.len() {
+                let b = INDENTS[i].as_bytes();
+                if b.len() != i * 2 {
+                    ok = false;
+                }
+                let mut j = 0;
+                while j < b.len() {
+                    if b[j] != b' ' {
+                        ok = false;
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
+            assert!(ok, "INDENTS[i] must be exactly 2*i spaces (two per level)");
+        };
         match INDENTS.get(level) {
             Some(s) => Cow::Borrowed(s),
             None => Cow::Owned("  ".repeat(level)),
@@ -348,7 +374,7 @@ impl JsonRenderer {
             for lbl in diag.labels() {
                 arr.element();
                 // Flat `{"k": v, …}` element: bytes pushed directly, no
-                // per-element `JsonContainer` frame (see `flat_open`).
+                // per-element `JsonContainer` frame (see `flat_key0`).
                 let o = &mut *arr.out;
                 o.push('{');
                 flat_key0(o, "start");
@@ -399,6 +425,17 @@ impl JsonRenderer {
                 arr.element();
                 let o = &mut *arr.out;
                 o.push('{');
+                // `RelatedError::label` is retained precisely for backends like
+                // this one (the human renderer shows only message/code), so emit
+                // it with the same field names as `labels[]`; a consumer then
+                // reuses one parser.  Absent optionals stay omitted.
+                if let Some(lbl) = rel.label.as_ref() {
+                    flat_key(o, "label");
+                    o.push('{');
+                    flat_key0(o, "message");
+                    Self::push_json_str(o, lbl);
+                    o.push('}');
+                }
                 // Whether the two sibling arrays are concerned, a related
                 // error can point into a *different* file; name it (matching
                 // `labels`/`callChain`) instead of emitting a bare span the
@@ -824,6 +861,7 @@ impl<'a> JsonContainer<'a> {
     /// `{"k": v, "k": v}` — always compact: array elements render as one
     /// line each regardless of the pretty setting (matching the previous
     /// per-item output exactly).
+    #[must_use]
     fn compact_object(out: &'a mut String) -> Self {
         out.push('{');
         Self {
@@ -869,7 +907,17 @@ impl<'a> JsonContainer<'a> {
 
     /// Value: pre-rendered JSON (`null`, a small inline object, …).
     fn raw(&mut self, s: &str) {
-        self.out.push_str(s);
+        // A zero-byte payload would leave `"key": }` on the wire because the
+        // position marker assumes every value write appends bytes (`string`
+        // writes ≥ 2, `u64` ≥ 1, `u64_hex` ≥ 18).  Degrade to `null` — the same
+        // repair the `Drop` tripwire applies — and keep it loud in debug.
+        if s.is_empty() {
+            debug_assert!(false, "raw(\"\") would emit `\"key\": }}`; emitting null");
+            self.out.push_str("null");
+        } else {
+            self.out.push_str(s);
+        }
+        self.pending_value_at = None;
     }
 
     /// Value: a bare `u64` (JSON number) — no quoting, no `core::fmt`.

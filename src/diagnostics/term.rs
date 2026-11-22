@@ -108,20 +108,51 @@ impl TermCaps {
 /// rather than the environment probes, so the snapshot is not observable
 /// there.  [`TermCaps::detect`] remains available for a caller that genuinely
 /// wants a fresh probe (e.g. after deliberately changing the environment).
-static GLOBAL_CAPS: std::sync::OnceLock<TermCaps> = std::sync::OnceLock::new();
-
-fn global_caps() -> &'static TermCaps {
-    GLOBAL_CAPS.get_or_init(TermCaps::detect)
+/// Colour-only probe: `isatty` plus the colour env reads, nothing else.
+fn detect_color_caps_fresh() -> ColorCaps {
+    let stderr_is_tty = io::stderr().is_terminal();
+    let term_env = std::env::var_os("TERM");
+    let term = term_env.as_deref().and_then(OsStr::to_str);
+    color_caps_from_env(stderr_is_tty, term)
 }
+
+/// Unicode-only probe: the locale reads plus `TERM`, no `isatty`, no TIOCGWINSZ.
+fn detect_unicode_fresh() -> bool {
+    let term_env = std::env::var_os("TERM");
+    let term = term_env.as_deref().and_then(OsStr::to_str);
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
+    unicode_decision_os(locale.as_deref(), is_dumb_term(term))
+}
+
+/// Width-only probe: `COLUMNS` first, TIOCGWINSZ only if it misses.
+fn detect_width_fresh() -> usize {
+    let columns = std::env::var_os("COLUMNS");
+    width_decision_lazy(columns.as_deref().and_then(OsStr::to_str), || {
+        terminal_size::terminal_size_of(io::stderr()).map(|(Width(w), _)| w as usize)
+    })
+}
+
+// Per-capability snapshots instead of one `TermCaps`: a CLI that only asks for
+// colour (never width, never hyperlinks) used to pay `TIOCGWINSZ` + three locale
+// reads + a full colour decision for an answer it discarded.  The consistency
+// contract is per-capability — `color` and `depth` must agree, which is why they
+// share one cache — while `unicode`, `width` and `hyperlinks` are independent
+// readings nothing depends on agreeing.
+//
+// `LazyLock`'s deref is one atomic load with no branch (the initialiser is
+// guaranteed to have run for any observed reference), where `OnceLock::get` is a
+// load + test + branch per detector call on the per-diagnostic path.
+static COLOR_CAPS: std::sync::LazyLock<ColorCaps> =
+    std::sync::LazyLock::new(detect_color_caps_fresh);
+static UNICODE_CAP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(detect_unicode_fresh);
+static WIDTH_CAP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(detect_width_fresh);
 
 /// Snapshot the colour-related environment once, so `color` and `depth` can
 /// never describe different environments.
 pub fn detect_color_caps() -> ColorCaps {
-    let caps = global_caps();
-    ColorCaps {
-        color: caps.color,
-        depth: caps.depth,
-    }
+    *COLOR_CAPS
 }
 
 /// ASCII-only, allocation-free case-insensitive substring test.
@@ -159,39 +190,59 @@ fn signed_digits(s: &str) -> Option<(bool, &str)> {
     (!body.is_empty() && body.bytes().all(|b| b.is_ascii_digit())).then_some((neg, body))
 }
 
-fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
-    let s = v.to_str()?.trim();
-    match s {
-        // Deliberate deviation from `supports-color`, which pins `true`/`""` to
-        // level 1: pinning 16 colours *downgrades* a truecolor terminal, so we
-        // only force colour on (the `force_color_is_off == false` half, handled
-        // by `color_decision`) and let COLORTERM/TERM pick the depth.
-        // Pinned by `force_color_true_and_empty_detect_depth`.
-        "" | "true" => None,
-        "false" => None,
-        _ => signed_digits(s).and_then(|(neg, digits)| {
-            // A negative value never pins a level (it means "off"; `force_color_is_off`
-            // owns that rule).
-            if neg {
-                return None;
+/// One parse of `FORCE_COLOR` into both facts the two decisions need.
+///
+/// `force_color_is_off` and `force_color_level` are called on the same `OsStr`
+/// when the variable is set, each doing its own `to_str` + `trim`.  Beyond the
+/// saved pass, a single parser is what makes it structurally impossible for the
+/// two to disagree on whether a value is numeric.
+fn classify_force_color(v: &OsStr) -> (bool, Option<ColorDepth>) {
+    let Some(s) = v.to_str().map(str::trim) else {
+        return (false, None);
+    };
+    match signed_digits(s) {
+        Some((neg, digits)) => {
+            // `supports-color` clamps `level < 0` to 0, i.e. OFF, and `-0`/`+0`
+            // are zero, hence off.  Digit classification is exact at *every*
+            // magnitude, so a 40-digit negative cannot fall off an integer
+            // boundary and silently read as "force on".
+            if neg || digits.bytes().all(|b| b == b'0') {
+                return (true, None);
             }
-            let significant = digits.trim_start_matches('0');
-            match significant.len() {
-                0 => None,
-                1 => match significant.as_bytes()[0] {
-                    b'1' => Some(ColorDepth::Sixteen),
-                    b'2' => Some(ColorDepth::TwoFiftySix),
-                    // `0` is handled above, so this is 3..=9.
-                    _ => Some(ColorDepth::TrueColor),
-                },
-                // Any magnitude past a single significant digit is ≥ 10, i.e.
-                // "true colour" — including 40-digit CI-generated strings and
-                // a `+`-prefixed value, both of which the old `u128` fallback
-                // treated inconsistently.
-                _ => Some(ColorDepth::TrueColor),
-            }
-        }),
+            (false, force_color_depth_from_digits(digits))
+        }
+        // Non-numeric values (`"abc"`, `"FALSE"`) mean force-on — not an
+        // explicit off request.  Case-sensitive `false` only, mirroring Node.
+        None => (s == "false", None),
     }
+}
+
+/// `FORCE_COLOR`'s Node/chalk level for a strictly-positive decimal string.
+fn force_color_depth_from_digits(digits: &str) -> Option<ColorDepth> {
+    let significant = digits.trim_start_matches('0');
+    match significant.len() {
+        0 => None,
+        1 => match significant.as_bytes()[0] {
+            b'1' => Some(ColorDepth::Sixteen),
+            b'2' => Some(ColorDepth::TwoFiftySix),
+            // `0` is handled above, so this is 3..=9.
+            _ => Some(ColorDepth::TrueColor),
+        },
+        // Any magnitude past a single significant digit is ≥ 10, i.e. "true
+        // colour" — including 40-digit CI-generated strings and a `+`-prefixed
+        // value, both of which the old `u128` fallback treated inconsistently.
+        _ => Some(ColorDepth::TrueColor),
+    }
+}
+
+fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
+    // Deliberate deviation from `supports-color`, which pins `true`/`""` to
+    // level 1: pinning 16 colours *downgrades* a truecolor terminal, so we only
+    // force colour on (the `force_color_is_off == false` half) and let
+    // COLORTERM/TERM pick the depth.  Pinned by
+    // `force_color_true_and_empty_detect_depth`.
+    let (off, level) = classify_force_color(v);
+    if off { None } else { level }
 }
 
 /// The three rules, in the order the body applies them (this list IS the
@@ -206,20 +257,7 @@ fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
 /// `force_color_noncanonical_values_force_on` and
 /// `force_color_off_survives_negative_overflow` pin the two edges.
 fn force_color_is_off(v: &OsStr) -> bool {
-    let Some(s) = v.to_str().map(str::trim) else {
-        return false;
-    };
-    match signed_digits(s) {
-        // `supports-color` clamps `level < 0` to 0, i.e. OFF: a CI script setting
-        // `FORCE_COLOR=-1` means "silence colour".  Digit classification is exact
-        // at *every* magnitude, so a 40-digit negative no longer falls off an
-        // integer boundary and silently reads as "force on" (`i128` was the
-        // previous, one-boundary-short fix).  `-0` and `+0` are zero, hence off.
-        Some((neg, digits)) => neg || digits.bytes().all(|b| b == b'0'),
-        // Non-numeric values (`"abc"`, `"FALSE"`) mean force-on — not an
-        // explicit off request.  Case-sensitive `false` only, mirroring Node.
-        None => s == "false",
-    }
+    classify_force_color(v).0
 }
 
 /// Detect the terminal's colour depth from `FORCE_COLOR`, `COLORTERM` and
@@ -447,6 +485,15 @@ pub(crate) fn color_decision_env(env: &ColorEnv<'_>) -> bool {
     // force-on.  The two conventions collide inside this one function, so
     // neither arm may be "fixed" into the other; pinned by
     // `force_color_empty_diverges_from_clicolor_force_empty`.
+    //
+    // Three different empty/padded conventions meet in this function; the table
+    // is the contract (each row is pinned by a test):
+    //
+    // | variable         | unset | empty      | padded (`" "`) | `"0"`   | `"false"` |
+    // |------------------|-------|------------|----------------|---------|-----------|
+    // | `NO_COLOR`       | no-op | no-op      | **present → off** | n/a  | n/a       |
+    // | `CLICOLOR_FORCE` | no-op | unset      | unset          | no force| force on  |
+    // | `FORCE_COLOR`    | no-op | force on   | force on       | off     | off       |
     if let Some(v) = env.clicolor_force.and_then(env_trimmed)
         && v != "0"
     {
@@ -487,7 +534,7 @@ pub fn detect_unicode() -> bool {
     // Process-stable snapshot (see `GLOBAL_CAPS`): the locale/`TERM` reads and
     // the `isatty`/TIOCGWINSZ probes happen once per process instead of once
     // per optional-detection call.
-    global_caps().unicode
+    *UNICODE_CAP
 }
 
 fn unicode_decision_os(locale: Option<&OsStr>, term_dumb: bool) -> bool {
@@ -521,7 +568,7 @@ pub fn detect_width() -> usize {
     // instead of one per call.  The `COLUMNS`/`terminal_size_of` derivation
     // lives in `TermCaps::detect`, which still reads `COLUMNS` via `var_os` +
     // `to_str` like the rest of the module.
-    global_caps().width
+    *WIDTH_CAP
 }
 
 /// The `COLUMNS` half of the width decision.
@@ -582,33 +629,43 @@ fn width_decision_lazy(columns: Option<&str>, probe: impl FnOnce() -> Option<usi
 /// the [`supports-hyperlinks`] crate via its `on(Stream)` entry point.  The
 /// answer is memoized because the environment cannot change during a run and
 /// this probe sits on the per-diagnostic path.
-static HYPERLINK_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static HYPERLINK_CACHE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    let no_hyperlink = std::env::var_os("NO_HYPERLINK").is_some_and(|v| !v.is_empty());
+    // `TERM=dumb` means "cannot render control sequences", and an OSC 8
+    // hyperlink *is* one: the upstream probe does not veto `dumb`
+    // universally, so without this a dumb terminal received the escapes as
+    // literal garbage.  The other two capabilities already consult it.
+    let term_dumb = is_dumb_term(std::env::var_os("TERM").as_deref().and_then(OsStr::to_str));
+    // One env read inside a once-per-process closure.
+    hyperlink_decision(
+        no_hyperlink,
+        term_dumb,
+        supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr),
+    )
+});
 
 pub fn supports_hyperlinks() -> bool {
-    *HYPERLINK_CACHE.get_or_init(|| {
-        let no_hyperlink = std::env::var_os("NO_HYPERLINK").is_some_and(|v| !v.is_empty());
-        if no_hyperlink {
-            false
-        } else {
-            hyperlink_decision(
-                false,
-                supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr),
-            )
-        }
-    })
+    *HYPERLINK_CACHE
 }
 
-pub(crate) fn hyperlink_decision(no_hyperlink: bool, probe_on_stderr: bool) -> bool {
-    !no_hyperlink && probe_on_stderr
+pub(crate) fn hyperlink_decision(
+    no_hyperlink: bool,
+    term_dumb: bool,
+    probe_on_stderr: bool,
+) -> bool {
+    !no_hyperlink && !term_dumb && probe_on_stderr
 }
 
 /// The `URL_SAFE` predicate as a 256-bit mask: four `u64` words, one cache line,
 /// versus 256 `bool`s spread over four.  `scan_url_path` touches it once per
 /// path byte, so the locality is free to improve.
-const URL_SAFE_BITS: [u64; 4] = {
-    let mut bits = [0u64; 4];
+/// Only indices 0 and 1 are ever read: `is_url_safe` short-circuits on
+/// `b < 0x80`, and the `matches!` below covers ASCII ranges only (the upper half
+/// would const-evaluate to zero).  Two words = 16 bytes instead of 32.
+const URL_SAFE_BITS: [u64; 2] = {
+    let mut bits = [0u64; 2];
     let mut i = 0usize;
-    while i < 256 {
+    while i < 128 {
         // RFC 3986 unreserved characters plus the path delimiters this crate
         // emits.  This `matches!` is the single source of truth for the set.
         if matches!(
@@ -776,6 +833,14 @@ fn encode_scanned_path(out: &mut Vec<u8>, s: &[u8], first_unsafe: usize, unsafe_
 /// three branches of `format_file_url` did — was the second O(n) pass the
 /// encoder's own doc says must not exist.
 #[inline]
+/// Remove a URL-safe prefix of length `k` from a `(first_unsafe, unsafe_count)`
+/// pair.
+///
+/// The `k` call sites pass the length of a hard-coded prefix (`"/mnt/" + one
+/// ASCII letter`, `"file:///"`, …).  That the prefix is entirely URL-safe is what
+/// earns the subtraction, and today it holds only because the prefix is a
+/// literal: a future configurable mount point or a non-ASCII drive letter would
+/// silently break it, and the debug assert would fire only in debug builds.
 fn sub_stats(full: (usize, usize), k: usize) -> (usize, usize) {
     debug_assert!(
         full.0 >= k,
@@ -819,12 +884,22 @@ pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
     let (first_unsafe, unsafe_count) = scan_url_path(s);
     if first_unsafe == s.len() {
         // As above: the safe set is ASCII, so this is valid UTF-8.
-        return Cow::Borrowed(simdutf8::basic::from_utf8(s).expect("URL-safe bytes are ASCII"));
+        //
+        // SAFETY: every byte of `s` passed `is_url_safe`, whose mask is
+        // const-evaluated from a `matches!` over ASCII ranges only
+        // (`URL_SAFE_BITS`), so `s` is pure ASCII and therefore valid UTF-8.  The
+        // old `simdutf8` call was one full SIMD validation on the *common*
+        // (all-safe) path — the only O(n) work in this branch.
+        debug_assert!(s.iter().all(u8::is_ascii));
+        return Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(s) });
     }
     let mut out: Vec<u8> =
         Vec::with_capacity(s.len().saturating_add(unsafe_count.saturating_mul(2)));
     encode_scanned_path(&mut out, s, first_unsafe, unsafe_count);
-    Cow::Owned(String::from_utf8(out).expect("percent-encoding emits ASCII by construction"))
+    // SAFETY: every byte is either from the ASCII-safe set or `%XX` (three ASCII
+    // bytes), so the buffer is valid UTF-8 by construction.
+    debug_assert!(out.iter().all(u8::is_ascii));
+    Cow::Owned(unsafe { String::from_utf8_unchecked(out) })
 }
 
 /// Convert a file path to a `file://` URL, handling WSL path translation.
@@ -1055,7 +1130,10 @@ fn file_url_cached(path: &[u8]) -> std::sync::Arc<str> {
 /// end instead of a UTF-8 length check per emitted byte.
 #[inline]
 fn finish(out: Vec<u8>) -> String {
-    String::from_utf8(out).expect("file:// URL construction emits ASCII by construction")
+    // SAFETY: same invariant as the encoder above — see `URL_SAFE_BITS`.  The
+    // comment already said this cannot fail; now it is not paid for.
+    debug_assert!(out.iter().all(u8::is_ascii));
+    unsafe { String::from_utf8_unchecked(out) }
 }
 
 fn format_file_url(path: &[u8], distro: Option<&str>) -> String {
@@ -1611,6 +1689,29 @@ mod tests {
     }
 
     #[test]
+    /// `FORCE_COLOR="   "` trims to empty, which is the chalk force-on rule —
+    /// the same answer as `FORCE_COLOR=""`.  Unpinned until now, so a templated
+    /// CI matrix materialising a padded value could have been "fixed" into
+    /// silence without any test objecting.
+    #[test]
+    fn force_color_whitespace_only_forces_on() {
+        for v in ["", " ", "   ", "\t"] {
+            assert!(!force_color_is_off(OsStr::new(v)), "{v:?}");
+            assert_eq!(force_color_level(OsStr::new(v)), None, "{v:?}");
+            assert!(
+                color(false, None, None, Some(v), Some("dumb"), false),
+                "{v:?} should force color on"
+            );
+        }
+        // Padded numeric values keep their level too.
+        assert_eq!(
+            force_color_level(OsStr::new(" 2 ")),
+            Some(ColorDepth::TwoFiftySix)
+        );
+        assert!(force_color_is_off(OsStr::new(" false ")));
+    }
+
+    #[test]
     fn force_color_noncanonical_values_force_on() {
         for v in ["abc", "FALSE", "18446744073709551616"] {
             assert!(!force_color_is_off(OsStr::new(v)), "{v}");
@@ -1705,7 +1806,16 @@ mod tests {
                 "{term}"
             );
         }
-        for term in ["indirect", "xterm-direct-foo", "xterm-directx"] {
+        // `xterm-direct-2024`: trailing digits strip to `xterm-direct-`, which
+        // does not end in `direct`, so it falls through to Sixteen.  Conservative
+        // and correct; pinned so a future "strip digits more aggressively" edit
+        // cannot silently promote it.
+        for term in [
+            "indirect",
+            "xterm-direct-foo",
+            "xterm-directx",
+            "xterm-direct-2024",
+        ] {
             assert_eq!(
                 color_depth_decision_env(&ColorEnv {
                     term: Some(term),
@@ -1913,9 +2023,10 @@ mod tests {
 
     #[test]
     fn hyperlink_overrides() {
-        assert!(!hyperlink_decision(true, true));
-        assert!(!hyperlink_decision(false, false));
-        assert!(hyperlink_decision(false, true));
+        assert!(!hyperlink_decision(true, false, true));
+        assert!(!hyperlink_decision(false, true, true));
+        assert!(!hyperlink_decision(false, false, false));
+        assert!(hyperlink_decision(false, false, true));
     }
 
     #[test]
