@@ -211,9 +211,17 @@ impl<'src> FixSet<'src> {
     /// before calling; the zero-length dedup relies on equal
     /// `(file, start, start)` being adjacent.
     ///
-    /// Intervals are half-open `[start, end)`.  Zero-length edits are points:
-    /// duplicate insertions at one point collapse to the highest-weight one,
-    /// but an insertion at a replacement's boundary is disjoint and survives.
+    /// Intervals are half-open `[start, end)` **except zero-length edits, which
+    /// are closed points**: a point conflicts with any interval *containing* its
+    /// offset (so an interior insertion competes with the enclosing replacement
+    /// and, being the shorter interval, wins the tie — pinned by
+    /// `insertion_inside_replacement_wins_as_shorter_interval`), while a point at
+    /// an interval's boundary composes with it.  Duplicate insertions at one
+    /// point collapse to the highest weight.
+    ///
+    /// The distinction is load-bearing: under strict half-open semantics `[3,3)`
+    /// would be the empty set, disjoint from everything, which is *not* what the
+    /// resolution (or the pinned test) implements.
     fn resolve_overlaps(candidates: Vec<FixEdit<'src>>) -> Vec<FixEdit<'src>> {
         // Candidates arrive sorted by `(file, start, end)`, so duplicate
         // zero-length runs are adjacent.  A peekable consuming iterator moves
@@ -260,11 +268,7 @@ impl<'src> FixSet<'src> {
             if !group.is_empty() {
                 let start = result.len();
                 Self::resolve_file(std::mem::take(&mut group), &mut result, &mut scratch);
-                debug_assert!(
-                    result[start..]
-                        .is_sorted_by_key(|e| { (e.span.start_as_usize(), e.span.end_as_usize()) }),
-                    "resolve_file must emit non-overlapping edits in source order"
-                );
+                Self::debug_assert_disjoint(&result[start..]);
             }
             last_file = Some(edit.span.file);
             group.push(edit);
@@ -272,13 +276,25 @@ impl<'src> FixSet<'src> {
         if !group.is_empty() {
             let start = result.len();
             Self::resolve_file(group, &mut result, &mut scratch);
-            debug_assert!(
-                result[start..]
-                    .is_sorted_by_key(|e| { (e.span.start_as_usize(), e.span.end_as_usize()) }),
-                "resolve_file must emit non-overlapping edits in source order"
-            );
+            Self::debug_assert_disjoint(&result[start..]);
         }
         result
+    }
+
+    /// Pin the type's headline invariant — "non-overlapping edits for one source
+    /// buffer" — rather than only the ordering.  `is_sorted_by_key` accepted a
+    /// dropped dedup or a broken tie rule as long as the order still held, which
+    /// is exactly what the `start >= last_end` machinery can regress into
+    /// silently.
+    fn debug_assert_disjoint(edits: &[FixEdit<'_>]) {
+        for pair in edits.windows(2) {
+            debug_assert!(
+                pair[0].span.end_as_usize() <= pair[1].span.start_as_usize(),
+                "resolve_file must emit pairwise-disjoint edits in source order, got {:?} then {:?}",
+                pair[0].span,
+                pair[1].span
+            );
+        }
     }
 
     fn resolve_file(
@@ -395,12 +411,18 @@ impl<'src> FixSet<'src> {
     /// An empty set borrows `source` unchanged, so a file with no applicable
     /// edits pays no copy to discover there is nothing to do.
     ///
-    /// Prefer [`Self::apply_for_file`] whenever the batch may span multiple
-    /// files: `apply` interprets *every* retained edit as an offset into this
-    /// one buffer, so a foreign-file edit would corrupt a byte range it was
-    /// never meant to touch (the `start < last` guard below catches only the
-    /// accidental overlaps, not the wrong-file ones that happen to land in
-    /// order).
+    /// **Multi-file sets.** A batch can carry edits for several files.  In debug
+    /// builds `apply` panics on such a set (`apply_rejects_multi_file_set`); in
+    /// release builds it routes through [`Self::apply_single_file`], which keeps
+    /// only the edits of the *first* edit's file, so a foreign file's byte
+    /// offsets can never reach this buffer.  Neither behaviour is a silent
+    /// mis-splice — the old doc warned about one that this code cannot produce.
+    ///
+    /// Prefer [`Self::apply_for_file_counted`] / [`Self::apply_for_file`] when the
+    /// batch may span files: they make the file choice explicit instead of
+    /// leaving it to the sorted order.  The `start < last` guard inside
+    /// `apply_slice_count` remains a genuine *same-file* overlap backstop for a
+    /// corrupted set; the cross-file defence is the anchor filter above it.
     #[must_use = "apply returns the rewritten source; write it out or the fix is lost"]
     pub fn apply<'s>(&self, source: &'s str) -> Cow<'s, str> {
         self.apply_single_file(source).0
@@ -606,6 +628,86 @@ mod tests {
         let set = FixSet::collect(&[wide, left, right], FixHints::All);
         let got: Vec<&str> = set.iter().map(|e| e.replacement.as_ref()).collect();
         assert_eq!(got, ["L", "R"], "the pair reaches the total first");
+    }
+
+    /// The module's whole value proposition is a **maximum**-weight independent
+    /// set, and the all-equal-weight greedy fast path is the fork most likely to
+    /// lose it silently (a tie-rule tweak, a `p[i]` regression under the
+    /// closed-point model).  Nothing pinned it before: the existing tests check
+    /// tie-breaking and per-geometry parity, not optimality.
+    ///
+    /// Brute force over every subset, with the conflict relation the resolution
+    /// actually implements: half-open intervals, zero-length edits as closed
+    /// points that conflict only with an interval's *interior* (a boundary one
+    /// composes), and two insertions at one point mutually exclusive.
+    #[test]
+    fn collect_is_a_maximum_weight_independent_set() {
+        let mut seed: u64 = 0x5eed_f1ab_cdef_0011;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for _ in 0..300 {
+            let n = 2 + (next() % 5) as usize; // 2..=6
+            let mut spans: Vec<(u32, u32)> = Vec::with_capacity(n);
+            let mut diags: Vec<Diagnostic<'static>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let start = (next() % 10) as u32;
+                let len = (next() % 4) as u32; // 0 => a zero-length insertion
+                let app = match next() % 3 {
+                    0 => Applicability::MachineApplicable,
+                    1 => Applicability::MaybeIncorrect,
+                    _ => Applicability::HasPlaceholders,
+                };
+                spans.push((start, start + len));
+                diags.push(diag_with_fix(
+                    Span::new(FileId::DUMMY, start, start + len),
+                    "R",
+                    app,
+                ));
+            }
+            let weights: Vec<u64> = diags
+                .iter()
+                .map(|d| {
+                    let app = d.suggestions()[0].applicability;
+                    applicability_weight(app)
+                })
+                .collect();
+
+            let conflicts = |a: (u32, u32), b: (u32, u32)| -> bool {
+                let (sa, ea) = a;
+                let (sb, eb) = b;
+                match (sa == ea, sb == eb) {
+                    // Two insertions: only the same point collides (they dedup).
+                    (true, true) => sa == sb,
+                    // A point only conflicts with an interval's interior.
+                    (true, false) => sb < sa && sa < eb,
+                    (false, true) => sa < sb && sb < ea,
+                    (false, false) => sa < eb && sb < ea,
+                }
+            };
+
+            let set = FixSet::collect(&diags, FixHints::All);
+            let got: u64 = set
+                .iter()
+                .map(|e| applicability_weight(e.applicability))
+                .sum();
+            let mut want = 0u64;
+            for mask in 0u32..(1 << n) {
+                let chosen: Vec<usize> = (0..n).filter(|i| mask >> i & 1 == 1).collect();
+                let disjoint = chosen.iter().enumerate().all(|(k, &i)| {
+                    chosen[k + 1..]
+                        .iter()
+                        .all(|&j| !conflicts(spans[i], spans[j]))
+                });
+                if disjoint {
+                    want = want.max(chosen.iter().map(|&i| weights[i]).sum());
+                }
+            }
+            assert_eq!(got, want, "not maximum-weight for spans {spans:?}");
+        }
     }
 
     fn diag_with_fix(

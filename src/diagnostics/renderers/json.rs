@@ -217,10 +217,17 @@ impl JsonRenderer {
         // derived from the same span below — the coordinates and the file name
         // can therefore never name different files.
         let anchor_file = diag.spans.first().map(|s| s.file);
-        // Every index consumer (primary span, additional spans, related errors,
-        // call chain) first requires an anchor file; labels/suggestions/children
-        // never read line/col.  The old four extra disjuncts only forced an O(n)
-        // line-index build for diagnostics that could not consume it.
+        // Every coordinate consumer — the primary span, additional spans, related
+        // errors, the call chain, *and* labels/suggestions/children — resolves its
+        // `line`/`column` through `anchor_linecol`, which returns `None` unless
+        // the span's file is the anchor file.  So `anchor_file.is_some()` is the
+        // complete gate: no index is needed (or usable) without an anchor.  The
+        // old four extra disjuncts only forced an O(n) line-index build for
+        // diagnostics that could not consume it.
+        //
+        // Deliberate policy this implies: a diagnostic with labels but no primary
+        // span gets **no coordinates anywhere**, even with a source attached,
+        // because coordinates are anchored to the first primary span's file.
         let needs_index = anchor_file.is_some();
         let idx = if needs_index {
             diag.source().map(|s| cx.line_index(s))
@@ -761,6 +768,14 @@ struct JsonContainer<'a> {
     /// invalid JSON (the "bracket always closed" invariant, mirroring the
     /// separator-before-field invariant that is structural).
     closed: bool,
+    /// Buffer length right after the last [`Self::key`] was written: the position
+    /// a value must appear at.  `Drop` compares against `out.len()`, so a key left
+    /// without a value auto-closes as `"x": null` instead of the invalid `"x": }`.
+    ///
+    /// A position marker rather than a `pending: bool` so no value method has to
+    /// cooperate: any value write appends bytes, so equality alone answers it and a
+    /// missed method cannot desynchronise the flag.
+    pending_value_at: Option<usize>,
 }
 
 impl<'a> JsonContainer<'a> {
@@ -785,6 +800,7 @@ impl<'a> JsonContainer<'a> {
             first: true,
             close: '}',
             closed: false,
+            pending_value_at: None,
         }
     }
 
@@ -801,6 +817,7 @@ impl<'a> JsonContainer<'a> {
             first: true,
             close: ']',
             closed: false,
+            pending_value_at: None,
         }
     }
 
@@ -818,6 +835,7 @@ impl<'a> JsonContainer<'a> {
             first: true,
             close: '}',
             closed: false,
+            pending_value_at: None,
         }
     }
 
@@ -841,6 +859,7 @@ impl<'a> JsonContainer<'a> {
         self.out.push('"');
         self.out.push_str(key);
         self.out.push_str("\": ");
+        self.pending_value_at = Some(self.out.len());
     }
 
     /// Value: a JSON string literal.
@@ -887,10 +906,28 @@ impl Drop for JsonContainer<'_> {
         // `close`) used to emit an unclosed bracket — invalid JSON on the wire.
         // Auto-close instead: the degradation becomes *valid* (empty) JSON, and
         // the debug assert still makes the bug loud in development.
-        debug_assert!(
-            false,
-            "JsonContainer dropped without close() — auto-closing to keep the stream valid"
-        );
+        // Not while unwinding: a render panic (the very thing
+        // `render_internal_error` contains) unwinds through the live containers,
+        // and an assert *panicking during unwinding* aborts the process,
+        // destroying that containment.  A forgotten `close()` in normal control
+        // flow still trips.
+        if !std::thread::panicking() {
+            debug_assert!(
+                false,
+                "JsonContainer dropped without close() — auto-closing to keep the stream valid"
+            );
+        }
+        // A key whose value never arrived would auto-close as `"x": }`, which does
+        // not parse; `null` keeps the degradation valid.  A missing *element*
+        // cannot be repaired this way (the flat helpers bypass the bookkeeping),
+        // so a container dropped right after `element()` can still leave a trailing
+        // comma — the doc says so rather than overclaiming.
+        if self
+            .pending_value_at
+            .is_some_and(|mark| self.out.len() == mark)
+        {
+            self.out.push_str("null");
+        }
         if self.pretty && !self.first {
             self.out.push('\n');
             self.out.push_str(self.close_ind);
@@ -1132,6 +1169,20 @@ fn push_json_escaped_str<W: std::fmt::Write>(out: &mut W, s: &str) {
 /// but unexpected output (`0x7F` becomes `\u007f`, and U+2028/2029 are left
 /// raw); the debug assert pins the contract rather than silently accepting
 /// it.
+/// The 32 C0 controls as JSON escapes, indexed by code point.
+///
+/// A closed table replaces building a six-byte `\uXXXX` array and *validating*
+/// it (`simdutf8::basic::from_utf8(..).unwrap()`) on every control escape — which
+/// also made `simdutf8` a runtime dependency the module's header contract does
+/// not mention.  The named escapes (`\"`, `\\`, `\n`, `\r`, `\t`) are matched
+/// before this table is consulted, so their slots are unreachable.
+const C0_ESCAPED: [&str; 32] = [
+    "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006", "\\u0007",
+    "\\u0008", "\\u0009", "\\u000a", "\\u000b", "\\u000c", "\\u000d", "\\u000e", "\\u000f",
+    "\\u0010", "\\u0011", "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+    "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d", "\\u001e", "\\u001f",
+];
+
 fn push_json_escaped<W: std::fmt::Write>(out: &mut W, c: char) {
     debug_assert!(
         matches!(c, '"' | '\\' | '\n' | '\r' | '\t' | '\u{0}'..='\u{1f}'),
@@ -1143,10 +1194,13 @@ fn push_json_escaped<W: std::fmt::Write>(out: &mut W, c: char) {
         '\n' => out.write_str("\\n"),
         '\r' => out.write_str("\\r"),
         '\t' => out.write_str("\\t"),
+        // `\u{0}`–`\u{1f}` other than the named escapes above: one table load.
+        c if (c as u32) < 0x20 => out.write_str(C0_ESCAPED[c as usize]),
         c if c.is_control() => {
-            // `0x7F`–`0x9F` are Unicode controls but not JSON-required
-            // escapes (JSON only requires `< 0x20`). The scanner never
-            // selects them, but this arm still emits a valid `\uXXXX`.
+            // `0x7F`–`0x9F` are Unicode controls but not JSON-required escapes
+            // (JSON only requires `< 0x20`).  The scanner never selects them, but
+            // this arm still emits a valid `\uXXXX`; the six bytes are ASCII by
+            // construction, so the decode cannot fail.
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let n = c as u32;
             let buf = [
@@ -1157,7 +1211,7 @@ fn push_json_escaped<W: std::fmt::Write>(out: &mut W, c: char) {
                 HEX[((n >> 4) & 0xf) as usize],
                 HEX[(n & 0xf) as usize],
             ];
-            out.write_str(std::str::from_utf8(&buf).unwrap())
+            out.write_str(std::str::from_utf8(&buf).expect("hex escape is ASCII"))
         }
         c => out.write_char(c),
     };
@@ -1199,6 +1253,28 @@ mod tests {
         assert!(
             !section.contains("\"span\""),
             "absent span must be omitted, not null: {section}"
+        );
+    }
+
+    /// Pretty mode is one field per line; compact mode is exactly one line — the
+    /// property a consumer of the machine format relies on.  (Neither mode's
+    /// indent widths are asserted as a literal here: pinning a guessed layout is
+    /// how such a test rots.)
+    #[test]
+    fn pretty_is_multiline_and_compact_is_single_line() {
+        let span = Span::new(FileId::DUMMY, 12, 13);
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_span(span)
+            .with_label(span, "not found");
+        let pretty = json_of(&diag, true);
+        assert!(pretty.starts_with('{'), "{pretty}");
+        assert!(pretty.ends_with("\n}"), "{pretty}");
+        assert!(pretty.lines().count() > 2, "{pretty}");
+        let compact = json_of(&diag, false);
+        assert!(
+            !compact.trim_end_matches('\n').contains('\n'),
+            "compact must be one line: {compact}"
         );
     }
 
@@ -1496,7 +1572,7 @@ mod tests {
         // valid UTF-8.  Multi-byte continuations can't be a single-byte `&str`.
         for byte in 0u8..0x80 {
             let buf = [byte];
-            let s = std::str::from_utf8(&buf).unwrap();
+            let s = simdutf8::basic::from_utf8(&buf).unwrap();
             check(s, &format!("single byte {byte:#04x}"));
         }
         // Escape candidate at each position 0..=16, padded clean on both sides

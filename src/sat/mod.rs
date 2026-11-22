@@ -707,16 +707,14 @@ pub trait SatSolver {
     /// DIMACS CNF export of the current formula (variables are 1-based, as
     /// in this family). Useful for cross-checking with external solvers.
     fn to_dimacs(&self) -> String {
-        use std::fmt::Write as _;
+        use swrite::{SWrite, swrite, swriteln};
         let clauses = self.clauses_snapshot();
         // Rough preallocation: header + an average of ~8 bytes per literal.
         let mut out = String::with_capacity(24 + clauses.len() * 8);
-        let _ = writeln!(out, "p cnf {} {}", self.num_vars(), clauses.len());
+        swriteln!(out, "p cnf {} {}", self.num_vars(), clauses.len());
         for c in &clauses {
             for l in c {
-                // `write!` formats straight into `out` — no per-literal
-                // intermediate `String` allocation.
-                let _ = write!(out, "{l} ");
+                swrite!(out, "{l} ");
             }
             out.push_str("0\n");
         }

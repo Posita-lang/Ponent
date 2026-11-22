@@ -1009,7 +1009,7 @@ fn parse_request_head(buf: &[u8], head_end: Option<usize>) -> Option<RequestHead
     let nl = memchr::memchr(b'\n', buf)?;
     let raw = &buf[..nl];
     let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-    let line = std::str::from_utf8(raw).ok()?;
+    let line = simdutf8::basic::from_utf8(raw).ok()?;
     let head_end = head_end.or_else(|| header_end(buf))?;
     if head_end > MAX_HEADER {
         return None;
@@ -1017,7 +1017,7 @@ fn parse_request_head(buf: &[u8], head_end: Option<usize>) -> Option<RequestHead
     Some(RequestHead {
         line: line.into(),
         head_end,
-        framing: scan_framing(&buf[..head_end]),
+        framing: scan_framing(&buf[..head_end], true),
     })
 }
 
@@ -1029,7 +1029,7 @@ fn parse_request_head(buf: &[u8], head_end: Option<usize>) -> Option<RequestHead
 /// forces close + drain instead of keep-alive.  This is a deliberate
 /// smuggling-adjacent leniency: it never leaves a reusable connection with
 /// unread body bytes.
-fn scan_framing(headers: &[u8]) -> HeaderFraming {
+fn scan_framing(headers: &[u8], first_line_is_request: bool) -> HeaderFraming {
     let mut framing = HeaderFraming {
         content_length: None,
         has_transfer_encoding: false,
@@ -1238,6 +1238,8 @@ fn drain_request(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> Dra
         &mut tail_len,
         &mut wants_close,
         &mut is_head,
+        true,
+        None,
     )
 }
 
@@ -1257,6 +1259,8 @@ fn drain_request_with_head(
         &mut tail_len,
         &mut wants_close,
         &mut is_head,
+        true,
+        None,
     );
     (outcome, is_head)
 }
@@ -1278,6 +1282,14 @@ fn drain_request_tracked(
     tail_len: &mut usize,
     wants_close: &mut bool,
     is_head: &mut bool,
+    // Whether `prefix` begins with the request line.  Inferring it was a real
+    // bug: the keep-alive path passes everything *after* the request line's
+    // `\n`, so both the `is_head` probe below and the `http11` derivation at
+    // the end silently read a *header* line, pinning `wants_close` to true and
+    // disabling keep-alive on every backend but the epoll reactor.
+    prefix_has_request_line: bool,
+    // The version, when the caller has already parsed the request line.
+    http11_hint: Option<bool>,
 ) -> DrainOutcome {
     let deadline = Instant::now() + budget;
     // 4 KiB covers the common request header block on the stack; larger
@@ -1350,11 +1362,13 @@ fn drain_request_tracked(
             DrainOutcome::NoRequest
         };
     };
-    *is_head = collected.starts_with(b"HEAD ");
+    if prefix_has_request_line {
+        *is_head = collected.starts_with(b"HEAD ");
+    }
 
     // Bytes past the terminator arrived in the same read as the headers and
     // count toward the body, then toward a pipelined request.
-    let framing = scan_framing(&collected[..head_end]);
+    let framing = scan_framing(&collected[..head_end], prefix_has_request_line);
     let already_read = collected.len() - head_end;
     // Any body at all (declared, chunked, or unframable) means this path cannot
     // reuse the connection for a following request.
@@ -1362,10 +1376,14 @@ fn drain_request_tracked(
     // `HeaderFraming::decide`.  The version is the request line's last token; an
     // HTTP/1.0 request gets no implicit keep-alive, which is what the reactor
     // already enforced and this path used to miss.
-    let http11 = collected
-        .split(|&b| b == b'\n')
-        .next()
-        .is_some_and(|line| line.trim_ascii_end().ends_with(b"HTTP/1.1"));
+    // Only meaningful when the request line is in `collected`; otherwise the
+    // caller (which parsed it) supplies the answer.
+    let http11 = http11_hint.unwrap_or_else(|| {
+        collected
+            .split(|&b| b == b'\n')
+            .next()
+            .is_some_and(|line| line.trim_ascii_end().ends_with(b"HTTP/1.1"))
+    });
     let decision = framing.decide(already_read, http11);
     *wants_close = !decision.keep_alive_allowed;
     if decision.body_remaining.is_none() {
@@ -1750,7 +1768,7 @@ fn extension_method_probe_is_accepted() {
 fn request_target(bytes: &[u8]) -> Option<&str> {
     let line = bytes.split(|&b| b == b'\n').next()?;
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let text = std::str::from_utf8(line).ok()?;
+    let text = simdutf8::basic::from_utf8(line).ok()?;
     text.split_ascii_whitespace().nth(1)
 }
 
@@ -3234,7 +3252,7 @@ fn serve_explain_persistent_epoll(
                 };
                 if conn.overload {
                     let is_head = conn.buf.starts_with(b"HEAD ");
-                    let framing = scan_framing(&conn.buf[..head_end]);
+                    let framing = scan_framing(&conn.buf[..head_end], true);
                     let already_read = conn.buf.len().saturating_sub(head_end);
                     conn.body_remaining = match framing.body(already_read) {
                         RequestBody::Unframed => usize::MAX,
@@ -3291,7 +3309,7 @@ fn serve_explain_persistent_epoll(
                         }
                         continue;
                     }
-                    let Ok(request_line) = std::str::from_utf8(&head[..line_end]) else {
+                    let Ok(request_line) = simdutf8::basic::from_utf8(&head[..line_end]) else {
                         conn.queue_bad_request(fd, &mut deadline_heap);
                         let mut event = libc::epoll_event {
                             events: libc::EPOLLOUT as u32,
@@ -3308,7 +3326,10 @@ fn serve_explain_persistent_epoll(
                         // One framing policy for all backends: the thread
                         // path's `scan_framing` decides body/TE/Connection
                         // semantics here too.
-                        scan_framing(&head[line_end..head_end]),
+                        // Slice starts *after* the request line: the first line
+                        // here is a header, so a colon-less first line must be
+                        // flagged malformed instead of skipped as a request line.
+                        scan_framing(&head[line_end..head_end], false),
                         http11,
                     )
                 };
@@ -3570,6 +3591,7 @@ fn handle_persistent_connection(
         let mut tail_len = 0usize;
         let mut wants_close = false;
         let mut is_head = false;
+        let http11 = line.trim_ascii_end().ends_with("HTTP/1.1");
         let outcome = drain_request_tracked(
             stream,
             &leftover,
@@ -3577,6 +3599,8 @@ fn handle_persistent_connection(
             &mut tail_len,
             &mut wants_close,
             &mut is_head,
+            false,
+            Some(http11),
         );
         if outcome == DrainOutcome::NoRequest {
             return Ok(());
@@ -3680,7 +3704,7 @@ fn read_request_line(
         }
         let raw = &prefix[..nl];
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-        let Ok(line) = std::str::from_utf8(raw) else {
+        let Ok(line) = simdutf8::basic::from_utf8(raw) else {
             *malformed = true;
             let _ = drain_request(stream, &prefix[nl + 1..], Duration::from_millis(100));
             return None;
@@ -3751,7 +3775,7 @@ fn read_request_line(
                 leftover.extend_from_slice(&chunk[nl + 1..]);
                 // Invalid UTF-8 is a malformed request, not a reason to leave
                 // the rest of the request unread (which would RST on close).
-                let Ok(line) = std::str::from_utf8(&line[..]) else {
+                let Ok(line) = simdutf8::basic::from_utf8(&line[..]) else {
                     *malformed = true;
                     let _ = drain_request(stream, &leftover, Duration::from_millis(100));
                     return None;
@@ -4856,7 +4880,34 @@ mod tests {
         );
     }
 
+    /// Shared network helper: one request, one-shot server join.
+    /// Returns the response body and any read error so callers can assert on both.
+    fn one_shot_serve(code: &str) -> (Vec<u8>, Option<std::io::Error>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let code_owned = code.to_string();
+        let server = std::thread::spawn(move || {
+            // Serve with the owned string; `serve_explain` borrows it for the
+            // duration of the call, which is fine here.
+            serve_explain(&listener, &code_owned)
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(
+                format!("GET /{code} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+        let mut response = Vec::new();
+        let read_err = client.read_to_end(&mut response).err();
+        server.join().unwrap().unwrap();
+        (response, read_err)
+    }
+
     #[test]
+    #[cfg(unix)]
     fn one_shot_restores_caller_nonblocking_mode() {
         for initial_nonblocking in [true, false] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4880,6 +4931,23 @@ mod tests {
                 "one-shot server must restore the caller's mode"
             );
         }
+    }
+
+    #[test]
+    fn one_shot_server_smoke_test() {
+        // Winsock has no way to query the nonblocking bit, so the
+        // nonblocking-restore assertion is unix-only (see above).
+        // On all platforms we verify the server responds correctly.
+        let (response, read_err) = one_shot_serve("E030");
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK"),
+            "server should respond (read_err={read_err:?}): {:?}",
+            &response[..response.len().min(40)],
+        );
+        assert!(
+            read_err.is_none(),
+            "read should complete without error: {read_err:?}"
+        );
     }
 
     #[test]
@@ -5118,19 +5186,23 @@ mod tests {
     #[test]
     fn scan_framing_flags_transfer_encoding_and_ambiguous_lengths() {
         assert!(
-            scan_framing(b"Transfer-Encoding: chunked\r\n\r\n").has_transfer_encoding,
+            scan_framing(b"Transfer-Encoding: chunked\r\n\r\n", false).has_transfer_encoding,
             "chunked request must not be reusable as keep-alive"
         );
         assert!(
-            scan_framing(b"Content-Length: 5\r\nContent-Length: 6\r\n\r\n").ambiguous,
+            scan_framing(b"Content-Length: 5\r\nContent-Length: 6\r\n\r\n", false).ambiguous,
             "conflicting Content-Length must be rejected"
         );
         assert!(
-            scan_framing(b"Content-Length: +5\r\n\r\n").ambiguous,
+            scan_framing(b"Content-Length: +5\r\n\r\n", false).ambiguous,
             "signed Content-Length must be rejected"
         );
         assert!(
-            scan_framing(b"Content-Length: 999999999999999999999999999999\r\n\r\n").oversized,
+            scan_framing(
+                b"Content-Length: 999999999999999999999999999999\r\n\r\n",
+                false
+            )
+            .oversized,
             "a Content-Length beyond the body cap must be marked oversized"
         );
     }
@@ -5142,7 +5214,7 @@ mod tests {
     #[test]
     fn scan_framing_marks_colonless_header_lines_as_malformed() {
         let head = b"GET /E030 HTTP/1.1\r\nHost: localhost\r\nContent-Length 100\r\n\r\n";
-        let framing = scan_framing(head);
+        let framing = scan_framing(head, true);
         assert!(
             framing.malformed,
             "colon-less header line must be malformed"
@@ -5163,7 +5235,7 @@ mod tests {
             &b"GET /E030 HTTP/1.1\nHost: localhost\n\n"[..],
             &b"GET /E030 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"[..],
         ] {
-            assert!(!scan_framing(head).malformed, "head: {:?}", head);
+            assert!(!scan_framing(head, true).malformed, "head: {:?}", head);
         }
     }
 

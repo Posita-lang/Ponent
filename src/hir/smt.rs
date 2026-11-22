@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use swrite::{SWrite, swrite, swriteln};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -486,17 +487,17 @@ impl SmtSolver {
         smt.push_str(UNICITY_PRELUDE.as_str());
 
         // ── 6. Inference variable ──────────────────────────────
-        let _ = writeln!(smt, "(declare-const iv_{} Type)", var_id);
+        swriteln!(smt, "(declare-const iv_{} Type)", var_id);
 
         // ── 7. Bindings ──────────────────────────────────────────
         for (vid, bound_ty) in bindings {
             let term = Self::type_to_smt_term(ctx, *bound_ty);
-            let _ = writeln!(smt, "(assert (= iv_{} {}))", vid, term);
+            swriteln!(smt, "(assert (= iv_{} {}))", vid, term);
         }
 
         // ── 8. Eq constraints ────────────────────────────────────
         for (a, b) in eq_constraints {
-            let _ = writeln!(smt, "(assert (= iv_{} iv_{}))", a, b);
+            swriteln!(smt, "(assert (= iv_{} iv_{}))", a, b);
         }
 
         // ── 9. Push/assert/pop for each candidate shape ──────────
@@ -510,7 +511,7 @@ impl SmtSolver {
         ];
 
         for (name, _ps) in &shape_names {
-            let _ = writeln!(
+            swriteln!(
                 smt,
                 "(push 1)\n(assert (= (shape-of iv_{}) {}))\n(check-sat)\n(pop 1)",
                 var_id, name
@@ -1004,9 +1005,9 @@ fn expr_to_smt_bv_at(
         crate::ast::Expr::Literal(crate::ast::Literal::Int(v), _) => {
             let w = ctx_w.unwrap_or(64);
             if *v < 0 {
-                out.push_str(&format!("(bvneg (_ bv{} {}))", v.unsigned_abs(), w));
+                swrite!(out, "(bvneg (_ bv{} {}))", v.unsigned_abs(), w);
             } else {
-                out.push_str(&format!("(_ bv{} {})", v, w));
+                swrite!(out, "(_ bv{} {})", v, w);
             }
             true
         }
@@ -1161,14 +1162,14 @@ impl SmtSolver {
         vars.sort_unstable();
         vars.dedup();
         for v in &vars {
-            smt.push_str(&format!("(declare-const {} Int)\n", v));
+            swrite!(smt, "(declare-const {} Int)\n", v);
         }
         for a in assertions {
             let mut e = String::new();
             if !expr_to_smt(a, &mut e) {
                 return false; // untranslatable → drop the candidate.
             }
-            smt.push_str(&format!("(assert {})\n", e));
+            swrite!(smt, "(assert {})\n", e);
         }
         smt.push_str("(check-sat)\n");
         // `call_z3` reports success by exit code and wraps the RAW stdout
@@ -1239,14 +1240,14 @@ impl SmtSolver {
         vars.sort_unstable();
         vars.dedup();
         for v in &vars {
-            smt.push_str(&format!("(declare-const {} Int)\n", v));
+            swrite!(smt, "(declare-const {} Int)\n", v);
         }
         for h in hints {
             let mut e = String::new();
             if !expr_to_smt(h, &mut e) {
                 return false; // untranslatable hint — fail closed.
             }
-            smt.push_str(&format!("(assert {})\n", e));
+            swrite!(smt, "(assert {})\n", e);
         }
         // The negation of the obligation: if satisfiable together with the
         // hints, a counter-model exists and the obligation is NOT entailed.
@@ -1254,7 +1255,7 @@ impl SmtSolver {
         if !expr_to_smt(obligation, &mut neg) {
             return false; // untranslatable obligation — fail closed.
         }
-        smt.push_str(&format!("(assert (not {}))\n", neg));
+        swrite!(smt, "(assert (not {}))\n", neg);
         smt.push_str("(check-sat)\n");
         match self.run_raw_query(&smt) {
             RawQueryOutcome::Unsat => true, // ∧hints ∧ ¬obligation unsat → entailed.
@@ -1316,7 +1317,7 @@ impl SmtSolver {
                 .get(&crate::symbol::Symbol::intern(v))
                 .copied()
                 .unwrap_or(64);
-            smt.push_str(&format!("(declare-const {} (_ BitVec {}))\n", v, w));
+            swrite!(smt, "(declare-const {} (_ BitVec {}))\n", v, w);
         }
         for h in hints {
             let mut e = String::new();
@@ -1324,7 +1325,7 @@ impl SmtSolver {
             if !expr_to_smt_bv(h, &mut e, widths, hint_signed) {
                 return false; // untranslatable hint — fail closed.
             }
-            smt.push_str(&format!("(assert {})\n", e));
+            swrite!(smt, "(assert {})\n", e);
         }
         // The negation of the obligation: satisfiable with the hints ⇒ a
         // counter-model exists under wrap-around semantics ⇒ NOT entailed.
@@ -1332,7 +1333,7 @@ impl SmtSolver {
         if !expr_to_smt_bv(obligation, &mut neg, widths, signed) {
             return false; // untranslatable obligation — fail closed.
         }
-        smt.push_str(&format!("(assert (not {}))\n", neg));
+        swrite!(smt, "(assert (not {}))\n", neg);
         smt.push_str("(check-sat)\n");
         match self.run_raw_query(&smt) {
             RawQueryOutcome::Unsat => true, // ∧hints ∧ ¬obligation unsat → entailed.
@@ -1351,14 +1352,16 @@ impl SmtSolver {
 
         // Build the SMT query with timeout and memory limit baked in.
         let mut smt_with_limits = String::new();
-        smt_with_limits.push_str(&format!(
+        swrite!(
+            smt_with_limits,
             "(set-option :timeout {})\n",
             *self.timeout_ms.borrow()
-        ));
-        smt_with_limits.push_str(&format!(
+        );
+        swrite!(
+            smt_with_limits,
             "(set-option :memory_max_size {})\n",
             Z3_MEMORY_LIMIT_MB
-        ));
+        );
         smt_with_limits.push_str(smt);
 
         // Check the process-wide cache first — avoids spawning Z3 for identical

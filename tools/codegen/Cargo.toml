@@ -15,6 +15,7 @@ site = ["dep:pulldown-cmark"]
 toml = { version = "0.8", features = ["preserve_order"] }
 fluent-syntax = "0.12"
 pulldown-cmark = { version = "0.13", optional = true }
+swrite = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

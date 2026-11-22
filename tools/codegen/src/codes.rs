@@ -2,7 +2,7 @@
 //! and generation of the `error_codes_gen.rs` table source.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
+use swrite::{SWrite, swrite, swriteln};
 use std::fs;
 use std::path::Path;
 
@@ -340,27 +340,23 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
     );
     rs.push_str("pub(crate) const CODE_TABLE: &[CodeEntry] = &[\n");
     for e in entries {
-        let _ = writeln!(rs, "    CodeEntry {{");
-        let _ = writeln!(rs, "        code: {:?},", e.code);
+        swriteln!(rs, "    CodeEntry {{");
+        swriteln!(rs, "        code: {:?},", e.code);
         let b = e.code.as_bytes();
         let prefix = if b[0] == b'E' { 0 } else { 1 };
         let n = (b[1] - b'0') as usize * 100 + (b[2] - b'0') as usize * 10 + (b[3] - b'0') as usize;
-        let _ = writeln!(rs, "        slot: {},", prefix * 1000 + n);
-        let _ = writeln!(rs, "        title: {:?},", e.title);
-        let _ = writeln!(
-            rs,
-            "        category: ErrorCategory::{},",
-            e.category_variant
-        );
-        let _ = write!(rs, "        related: &[");
+        swriteln!(rs, "        slot: {},", prefix * 1000 + n);
+        swriteln!(rs, "        title: {:?},", e.title);
+        swriteln!(rs, "        category: ErrorCategory::{},", e.category_variant);
+        swrite!(rs, "        related: &[");
         for (i, rel) in e.related.iter().enumerate() {
             if i > 0 {
                 rs.push_str(", ");
             }
-            let _ = write!(rs, "{rel:?}");
+            swrite!(rs, "{rel:?}");
         }
-        let _ = writeln!(rs, "],");
-        let _ = write!(rs, "        siblings: &[");
+        swriteln!(rs, "],");
+        swrite!(rs, "        siblings: &[");
         let mut first = true;
         for other in entries
             .iter()
@@ -370,15 +366,15 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
                 rs.push_str(", ");
             }
             first = false;
-            let _ = write!(rs, "{:?}", other.code);
+            swrite!(rs, "{:?}", other.code);
         }
-        let _ = writeln!(rs, "],");
-        let _ = writeln!(
+        swriteln!(rs, "],");
+        swriteln!(
             rs,
             "        explain: include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/error_codes/{}\")),",
             e.explain
         );
-        let _ = writeln!(rs, "    }},");
+        swriteln!(rs, "    }},");
     }
     rs.push_str("];\n");
 
@@ -392,18 +388,18 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
     // rather than tuned.
     rs.push_str("pub(crate) const CODE_INNER: &[ErrCodeInner] = &[\n");
     for (i, e) in entries.iter().enumerate() {
-        let _ = writeln!(rs, "    ErrCodeInner {{");
-        let _ = writeln!(rs, "        display: {:?},", e.code);
-        let _ = writeln!(rs, "        canonical: {:?},", e.code);
-        let _ = writeln!(rs, "        entry: Some(&CODE_TABLE[{i}]),");
-        let _ = writeln!(rs, "        known: true,");
-        let _ = writeln!(rs, "        hash: {:#x},", fnv1a(e.code.as_bytes()));
+        swriteln!(rs, "    ErrCodeInner {{");
+        swriteln!(rs, "        display: {:?},", e.code);
+        swriteln!(rs, "        canonical: {:?},", e.code);
+        swriteln!(rs, "        entry: Some(&CODE_TABLE[{i}]),");
+        swriteln!(rs, "        known: true,");
+        swriteln!(rs, "        hash: {:#x},", fnv1a(e.code.as_bytes()));
         let doc = format!("{DOC_URL_PREFIX}{}.html", e.code);
-        let _ = writeln!(rs, "        doc_url: {doc:?},");
+        swriteln!(rs, "        doc_url: {doc:?},");
         let ansi = format!("\u{1b}]8;;{doc}\u{1b}\\{}\u{1b}]8;;\u{1b}\\", e.code);
-        let _ = writeln!(rs, "        doc_url_ansi: {ansi:?},");
+        swriteln!(rs, "        doc_url_ansi: {ansi:?},");
 
-        let _ = writeln!(rs, "    }},");
+        swriteln!(rs, "    }},");
     }
     rs.push_str("];\n");
 
@@ -418,7 +414,7 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
     // the lookup.
     rs.push_str("\nimpl ErrCode {\n");
     for e in entries.iter() {
-        let _ = writeln!(rs, "    pub const {}: &'static str = {:?};", e.code, e.code);
+        swriteln!(rs, "    pub const {}: &'static str = {:?};", e.code, e.code);
     }
     rs.push_str("}\n");
 

@@ -143,13 +143,13 @@ macro_rules! theme_css {
     ($($name:literal => $field:ident => $dark:literal => $light:literal),+ $(,)?) => {
         /// Dark theme with the `.light` override — the HTML renderer's stylesheet.
         pub const DARK_HTML_CSS: &str = concat!(
-            ":root{", $($name, ":", $dark, ";",)+ "}",
-            "html.light{", $($name, ":", $light, ";",)+ "}",
+            ":root{color-scheme:dark light;", $($name, ":", $dark, ";",)+ "}",
+            "html.light{color-scheme:dark light;", $($name, ":", $light, ";",)+ "}",
         );
 
         /// Light theme, `:root` only.
         pub const LIGHT_HTML_CSS: &str = concat!(
-            ":root{", $($name, ":", $light, ";",)+ "}",
+            ":root{color-scheme:dark light;", $($name, ":", $light, ";",)+ "}",
         );
 
         /// Every CSS variable this palette defines, in declaration order.
@@ -167,9 +167,16 @@ macro_rules! theme_css {
             // directions, so neither home can drift.
             let dark = Stylesheet { $($field: $dark,)+ };
             let light = Stylesheet { $($field: $light,)+ };
+            // The comparison must be *between* the two homes, not between the
+            // literal and itself: `dark.$field` IS `$dark`, so the earlier form
+            // asserted `x == x` and the drift guard this macro exists for did not
+            // exist.  `Stylesheet::dark()` / `light()` are the hand-written
+            // constructors the renderers read, so pin those against the palette.
+            let handwritten_dark = Stylesheet::dark();
+            let handwritten_light = Stylesheet::light();
             $(
-                assert!(str_eq(dark.$field, $dark));
-                assert!(str_eq(light.$field, $light));
+                assert!(str_eq(dark.$field, handwritten_dark.$field));
+                assert!(str_eq(light.$field, handwritten_light.$field));
             )+
         };
     };
@@ -281,12 +288,16 @@ mod tests {
         );
         assert!(light.ends_with('}'), "{light:?}");
 
-        // Compactness is not bought with truncation: every declaration of the
-        // pretty form survives.  Count `;` as a proxy for declarations.
+        // Compactness is not bought with truncation: every palette declaration
+        // survives, in both theme blocks.  An exact count (rather than the old
+        // `% 2 == 0`, which any even number satisfied) makes a dropped variable
+        // a failure; the `color-scheme` declaration each `:root` carries is the
+        // only other `;`.
         assert_eq!(
-            dark.matches(';').count() % 2,
-            0,
-            "declaration count should pair across the two theme blocks"
+            dark.matches(';').count(),
+            2 * THEME_VARS.len() + 2,
+            "declaration count should match the palette exactly"
         );
+        assert_eq!(light.matches(';').count(), THEME_VARS.len() + 1);
     }
 }

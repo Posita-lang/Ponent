@@ -5,18 +5,18 @@
 
 use super::{MirBody, Operand, Place, Rvalue, Statement, SwitchTarget, Terminator};
 use crate::symbol::Symbol;
-use std::fmt::Write;
+use swrite::{SWrite, swriteln};
 
 impl MirBody {
     pub fn pretty(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(out, "fn {}(", self.func_name);
+        swriteln!(out, "fn {}(", self.func_name);
         for (i, local) in self.locals.iter().enumerate() {
             if i < self.arg_count {
-                let _ = writeln!(out, "    arg _{}: {:?}", i, local.ty);
+                swriteln!(out, "    arg _{}: {:?}", i, local.ty);
             }
         }
-        let _ = writeln!(out, ") -> {{");
+        swriteln!(out, ") -> {{");
         for (i, local) in self.locals.iter().enumerate() {
             if i >= self.arg_count {
                 let kind = if local.is_temp {
@@ -31,18 +31,18 @@ impl MirBody {
                     Some(n) => format!(" {}", n),
                     None => String::new(),
                 };
-                let _ = writeln!(out, "    {} _{}{}: {:?}", kind, i, name, local.ty);
+                swriteln!(out, "    {} _{}{}: {:?}", kind, i, name, local.ty);
             }
         }
-        let _ = writeln!(out, "}}");
+        swriteln!(out, "}}");
 
         for (bi, block) in self.blocks.iter().enumerate() {
-            let _ = writeln!(out, "bb{}: {{", bi);
+            swriteln!(out, "bb{}: {{", bi);
             for stmt in &block.stmts {
-                let _ = writeln!(out, "    {}", stmt.pretty());
+                swriteln!(out, "    {}", stmt.pretty());
             }
-            let _ = writeln!(out, "    {}", block.terminator.pretty());
-            let _ = writeln!(out, "}}");
+            swriteln!(out, "    {}", block.terminator.pretty());
+            swriteln!(out, "}}");
         }
         out
     }

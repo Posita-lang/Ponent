@@ -53,6 +53,8 @@ allow = [
     "MPL-2.0",
     # webpki-roots (reqwest/rustls TLS chain): license of root CA cert data.
     "CDLA-Permissive-2.0",
+    # foldhash (transitive via iddqd): zlib license, very permissive.
+    "Zlib",
 ]
 confidence-threshold = 0.8
 exceptions = [

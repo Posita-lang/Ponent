@@ -51,6 +51,7 @@ use crate::hir::types::{FrozenPlace, LoanKind, SignatureFacts, TypeData, TypeId}
 use crate::symbol::Symbol;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
+use swrite::{SWrite, swrite};
 
 /// A point encoded as a plain integer (the polonius_int.dl point ids):
 /// `block << 36 | stmt << 16 | expr` — a 64-bit encoding with generous
@@ -2749,13 +2750,13 @@ mod tests {
     fn gen_large_body(loans: usize, points: usize) -> Vec<HirStmt<'static>> {
         let mut src = String::from("def main() -> Int<32> {\n");
         for i in 0..loans {
-            src.push_str(&format!("set mut v{i} = {i};\n"));
-            src.push_str(&format!("set r{i} = &mut v{i};\n"));
+            swrite!(src, "set mut v{i} = {i};\n");
+            swrite!(src, "set r{i} = &mut v{i};\n");
         }
         // The `points` statements: mutations over the borrowed vars (each
         // is a loan event + a point — the solver's work scales with them).
         for i in 0..points {
-            src.push_str(&format!("v{} = {};\n", i % loans, i));
+            swrite!(src, "v{} = {};\n", i % loans, i);
         }
         src.push_str("return 0;\n}");
         let src: &'static str = Box::leak(src.into_boxed_str());
@@ -4079,7 +4080,7 @@ pub const POLONIUS_INPUTS: &[&str] = &[
 pub fn write_facts_csv(facts: &PoloniusFacts, dir: &Path) -> std::io::Result<()> {
     let mut s = String::new();
     for (a, b) in &facts.cfg_edge {
-        s.push_str(&format!("{a},{b}\n"));
+        swrite!(s, "{a},{b}\n");
     }
     std::fs::write(dir.join("cfg_edge.csv"), &s)?;
     s.clear();
@@ -4090,44 +4091,44 @@ pub fn write_facts_csv(facts: &PoloniusFacts, dir: &Path) -> std::io::Result<()>
         // `to_official` helper does the same for the polonius-engine
         // oracle; previously the CSV was written in the internal order,
         // corrupting the FlowLog differential input).
-        s.push_str(&format!("{o},{l},{p}\n"));
+        swrite!(s, "{o},{l},{p}\n");
     }
     std::fs::write(dir.join("loan_issued_at.csv"), &s)?;
     s.clear();
     for (l, p) in &facts.loan_invalidated_at {
         // The official schema is `loan_invalidated_at(point, loan)` —
         // transposed from the internal (loan, point) order.
-        s.push_str(&format!("{p},{l}\n"));
+        swrite!(s, "{p},{l}\n");
     }
     std::fs::write(dir.join("loan_invalidated_at.csv"), &s)?;
     s.clear();
     for (v, p) in &facts.var_used_at {
-        s.push_str(&format!("{v},{p}\n"));
+        swrite!(s, "{v},{p}\n");
     }
     std::fs::write(dir.join("var_used_at.csv"), &s)?;
     s.clear();
     for (v, o) in &facts.use_of_var_derefs_origin {
-        s.push_str(&format!("{v},{o}\n"));
+        swrite!(s, "{v},{o}\n");
     }
     std::fs::write(dir.join("use_of_var_derefs_origin.csv"), &s)?;
     s.clear();
     for (a, b, p) in &facts.subset_base {
-        s.push_str(&format!("{a},{b},{p}\n"));
+        swrite!(s, "{a},{b},{p}\n");
     }
     std::fs::write(dir.join("subset_base.csv"), &s)?;
     s.clear();
     for o in &facts.universal_region {
-        s.push_str(&format!("{o}\n"));
+        swrite!(s, "{o}\n");
     }
     std::fs::write(dir.join("universal_region.csv"), &s)?;
     s.clear();
     for (a, b) in &facts.known_placeholder_subset {
-        s.push_str(&format!("{a},{b}\n"));
+        swrite!(s, "{a},{b}\n");
     }
     std::fs::write(dir.join("known_placeholder_subset.csv"), &s)?;
     s.clear();
     for (l, p) in &facts.loan_killed_at {
-        s.push_str(&format!("{l},{p}\n"));
+        swrite!(s, "{l},{p}\n");
     }
     std::fs::write(dir.join("loan_killed_at.csv"), &s)?;
     // The remaining inputs are empty in this model.

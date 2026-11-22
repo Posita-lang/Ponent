@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::Path;
 
+use swrite::{SWrite, swrite};
+
 use crate::codes::{CATEGORIES, RegistryEntry, load_registry};
 
 /// Pages written by [`render_site`] (one per code plus the index).
@@ -140,14 +142,15 @@ fn index_html(entries: &[RegistryEntry]) -> String {
         if group.is_empty() {
             continue;
         }
-        out.push_str(&format!("<h2>{variant}</h2>\n<ul>\n"));
+        swrite!(out, "<h2>{variant}</h2>\n<ul>\n");
         for e in group {
-            out.push_str(&format!(
+            swrite!(
+                out,
                 "<li><a href=\"{}.html\"><code>{}</code></a> — {}</li>\n",
                 e.code,
                 e.code,
                 escape(&e.title),
-            ));
+            );
         }
         out.push_str("</ul>\n");
     }

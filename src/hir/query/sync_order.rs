@@ -241,11 +241,11 @@ fn held_with<R>(f: impl FnOnce(&mut [u32; FAMS]) -> R) -> R {
 /// replay.
 #[cfg(any(debug_assertions, feature = "shuttle"))]
 fn held_vector(h: &[u32; FAMS]) -> String {
-    use std::fmt::Write as _;
+    use swrite::{SWrite, swrite};
     let mut s = String::new();
     for (i, &n) in h.iter().enumerate() {
         if n > 0 {
-            let _ = write!(s, " {:?}={n}", Fam::ALL[i]);
+            swrite!(s, " {:?}={n}", Fam::ALL[i]);
         }
     }
     if s.is_empty() {

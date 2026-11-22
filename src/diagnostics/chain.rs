@@ -972,7 +972,10 @@ impl<'src> CallChain<'src> {
             // Test-only mirror of the renderer's visit count, so a differential
             // test can assert `ChainFacts::entry_count == rendered entries`
             // (the reserve estimate and the renderer are independent walks).
-            #[cfg(test)]
+            // Same gate as the helper's module (`chain::tests`): under the
+            // concurrency checker the module is compiled out, so a bare
+            // `cfg(test)` here referenced a module that does not exist.
+            #[cfg(all(test, not(feature = "shuttle")))]
             tests::note_rendered_entry();
             // One ASCII classification serves both sanitizer selection and the
             // fast-path gate: printable/tab-only input is untouched by the

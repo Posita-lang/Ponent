@@ -124,6 +124,7 @@ use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use sexp::Sexp;
 use std::ops::Neg;
+use swrite::{SWrite, swrite};
 
 /// A single template row `l ≤ f(X) ≤ u` over the loop variables.
 ///
@@ -1754,11 +1755,7 @@ fn build_refine_query_skeleton(
     // Bound constants for the witness template A' (the existential part).
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        prefix.push_str(&format!(
-            "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
-            sort(ebw),
-            sort(ebw)
-        ));
+        swrite!(prefix, "(declare-const l_{r} {})\n(declare-const u_{r} {})\n", sort(ebw), sort(ebw));
     }
 
     // The inductiveness formula ∀X,X'.P(A',X,X') with A'(X) = ⋀_r l_r ≤
@@ -1769,10 +1766,10 @@ fn build_refine_query_skeleton(
     let mut smt = String::with_capacity(8192);
     smt.push_str("(assert (forall (");
     for i in 0..n {
-        smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+        swrite!(smt, "(x_{i} {}) ", sort(bws[i] as u32));
     }
     for i in 0..n {
-        smt.push_str(&format!("(xp_{i} {}) ", sort(bws[i] as u32)));
+        swrite!(smt, "(xp_{i} {}) ", sort(bws[i] as u32));
     }
     for name in &inter {
         let var_idx = name
@@ -1784,7 +1781,7 @@ fn build_refine_query_skeleton(
                     "intermediate name must encode var index as xs_{{step}}_{{var}}, got: {name}"
                 )
             });
-        smt.push_str(&format!("({} {}) ", name, sort(bws[var_idx] as u32)));
+        swrite!(smt, "({} {}) ", name, sort(bws[var_idx] as u32));
     }
     smt.push_str(")\n");
 
@@ -1903,16 +1900,7 @@ fn build_refine_query_skeleton(
     // justification as `var_range_conds` on the BiiLoopProblem path);
     // BV mode emits `true`. Inductiveness:
     // A'(X) ∧ G(X) ∧ T(X,X') → A'(X').
-    smt.push_str(&format!(
-        "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n",
-        pre,
-        loop_var_range_conds(n, bws, signed, bv),
-        a_x,
-        a_x,
-        guard,
-        trans,
-        a_xp
-    ));
+    swrite!(smt, "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n", pre, loop_var_range_conds(n, bws, signed, bv), a_x, a_x, guard, trans, a_xp);
     smt.push_str("))\n");
     smt.push_str("(check-sat)\n");
     if get_model {
@@ -2016,20 +2004,14 @@ fn emit_candidate_disjunction(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
-        smt.push_str(&format!(
-            "  ({} l_{r} {}) ({} u_{r} {})\n",
-            rge,
-            render_bound(&row.lb, ebw, &off, bv),
-            rle,
-            render_bound(&row.ub, ebw, &off, bv)
-        ));
+        swrite!(smt, "  ({} l_{r} {}) ({} u_{r} {})\n", rge, render_bound(&row.lb, ebw, &off, bv), rle, render_bound(&row.ub, ebw, &off, bv));
     }
     // Shared well-formedness: A' is never empty (l_r ≤ u_r) — hoisted out
     // of the former per-candidate repetition; also gives the solver a
     // unit-propagation hint against the empty witness.
     for (r, row) in cur.rows.iter().enumerate() {
         let (_, rle) = row_ge_le(row, bv);
-        smt.push_str(&format!("  ({} l_{r} u_{r})\n", rle));
+        swrite!(smt, "  ({} l_{r} u_{r})\n", rle);
     }
     // Per candidate: the single strictly-tightened row (O(1) each).
     smt.push_str("  (or\n");
@@ -2038,15 +2020,7 @@ fn emit_candidate_disjunction(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
-        smt.push_str(&format!(
-            "    (and ({} l_{} {}) ({} u_{} {}))\n",
-            rge,
-            c.row_idx,
-            render_bound(&c.new_lb, ebw, &off, bv),
-            rle,
-            c.row_idx,
-            render_bound(&c.new_ub, ebw, &off, bv)
-        ));
+        swrite!(smt, "    (and ({} l_{} {}) ({} u_{} {}))\n", rge, c.row_idx, render_bound(&c.new_lb, ebw, &off, bv), rle, c.row_idx, render_bound(&c.new_ub, ebw, &off, bv));
     }
     // Close: the (or ...), the enclosing (and ...), and the (assert ...).
     smt.push_str("  )))\n");
@@ -2681,11 +2655,7 @@ fn build_refine_query_problem_skeleton(
     }
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        prefix.push_str(&format!(
-            "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
-            sort(ebw),
-            sort(ebw)
-        ));
+        swrite!(prefix, "(declare-const l_{r} {})\n(declare-const u_{r} {})\n", sort(ebw), sort(ebw));
     }
 
     let mut smt = String::with_capacity(8192);
@@ -2708,33 +2678,27 @@ fn build_refine_query_problem_skeleton(
     let a_x_init = template_formula(rows, vars_len, false, bv, bws, &signed_all, &[]);
     smt.push_str("(assert (forall (");
     for i in 0..vars_len {
-        smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+        swrite!(smt, "(x_{i} {}) ", sort(bws[i] as u32));
     }
     for (j, p) in problem.params.iter().enumerate() {
-        smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+        swrite!(smt, "(n_{j} {}) ", sort(p.bw as u32));
     }
-    smt.push_str(&format!(
-        ") (=> (and {} {} {}) {})))\n",
-        init_cond,
-        param_range_conds(&problem.params, bv),
-        var_range_conds(&problem.vars, bv),
-        a_x_init
-    ));
+    swrite!(smt, ") (=> (and {} {} {}) {})))\n", init_cond, param_range_conds(&problem.params, bv), var_range_conds(&problem.vars, bv), a_x_init);
 
     // One ∀ implication per back edge (x/xp loop variables, n read-only params).
     for edge in &problem.back_edges {
         let imp = encode_edge_inductiveness(problem, cur, edge, bv, bws, false)?;
         smt.push_str("(assert (forall (");
         for i in 0..vars_len {
-            smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+            swrite!(smt, "(x_{i} {}) ", sort(bws[i] as u32));
         }
         for (j, p) in problem.params.iter().enumerate() {
-            smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+            swrite!(smt, "(n_{j} {}) ", sort(p.bw as u32));
         }
         for i in 0..vars_len {
-            smt.push_str(&format!("(xp_{i} {}) ", sort(bws[i] as u32)));
+            swrite!(smt, "(xp_{i} {}) ", sort(bws[i] as u32));
         }
-        smt.push_str(&format!(") {imp}))\n"));
+        swrite!(smt, ") {imp}))\n");
     }
 
     // Property Strengthening (Yao et al., "Demystifying...", §IV-A):
@@ -2746,18 +2710,12 @@ fn build_refine_query_problem_skeleton(
 
         smt.push_str("(assert (forall (");
         for i in 0..vars_len {
-            smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+            swrite!(smt, "(x_{i} {}) ", sort(bws[i] as u32));
         }
         for (j, p) in problem.params.iter().enumerate() {
-            smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+            swrite!(smt, "(n_{j} {}) ", sort(p.bw as u32));
         }
-        smt.push_str(&format!(
-            ") (=> (and {} {} (not {})) {})))\n",
-            a_x,
-            var_range_conds(&problem.vars, bv),
-            g_s,
-            post_s
-        ));
+        swrite!(smt, ") (=> (and {} {} (not {})) {})))\n", a_x, var_range_conds(&problem.vars, bv), g_s, post_s);
     }
 
     smt.push_str("(check-sat)\n");
@@ -2822,11 +2780,7 @@ fn build_bounded_leap_query_problem(
     }
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        smt.push_str(&format!(
-            "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
-            sort(ebw),
-            sort(ebw)
-        ));
+        swrite!(smt, "(declare-const l_{r} {})\n(declare-const u_{r} {})\n", sort(ebw), sort(ebw));
     }
     // B ⊑ A′ ⊏ A (Algorithm 5). `limits == None` relaxes the `B ⊑ A′`
     // half (the optimality query's "B is still ⊥" case).
@@ -2835,23 +2789,11 @@ fn build_bounded_leap_query_problem(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
-        smt.push_str(&format!(
-            " ({} l_{r} {}) ({} u_{r} {})",
-            rge,
-            lit(&row.lb, ebw, &off),
-            rle,
-            lit(&row.ub, ebw, &off)
-        ));
+        swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rge, lit(&row.lb, ebw, &off), rle, lit(&row.ub, ebw, &off));
         if let Some(limits) = limits {
-            smt.push_str(&format!(
-                " ({} l_{r} {}) ({} u_{r} {})",
-                rle,
-                lit(&limits.lb[r], ebw, &off),
-                rge,
-                lit(&limits.ub[r], ebw, &off)
-            ));
+            swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rle, lit(&limits.lb[r], ebw, &off), rge, lit(&limits.ub[r], ebw, &off));
         }
-        smt.push_str(&format!(" ({} l_{r} u_{r})", rle));
+        swrite!(smt, " ({} l_{r} u_{r})", rle);
     }
     smt.push_str("))\n");
     // `A′ ⊏ A` conjunct (Algorithm 5) of Zuo et al. (2026) — the strict-bound
@@ -2861,13 +2803,7 @@ fn build_bounded_leap_query_problem(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rgt, rlt) = row_gt_lt(row, bv);
-        smt.push_str(&format!(
-            " ({} l_{r} {}) ({} u_{r} {})",
-            rgt,
-            lit(&row.lb, ebw, &off),
-            rlt,
-            lit(&row.ub, ebw, &off)
-        ));
+        swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rgt, lit(&row.lb, ebw, &off), rlt, lit(&row.ub, ebw, &off));
     }
     smt.push_str("))\n");
 
@@ -2906,15 +2842,15 @@ fn build_bounded_leap_query_problem(
 
     smt.push_str("(assert (forall (");
     for i in 0..vars_len {
-        smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+        swrite!(smt, "(x_{i} {}) ", sort(bws[i] as u32));
     }
     for (j, p) in problem.params.iter().enumerate() {
-        smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+        swrite!(smt, "(n_{j} {}) ", sort(p.bw as u32));
     }
     for i in 0..vars_len {
-        smt.push_str(&format!("(xp_{i} {}) ", sort(bws[i] as u32)));
+        swrite!(smt, "(xp_{i} {}) ", sort(bws[i] as u32));
     }
-    smt.push_str(&format!(") {body}))\n"));
+    swrite!(smt, ") {body}))\n");
 
     // Property Strengthening (Yao et al., "Demystifying...", §IV-A):
     // ∀X. (A'(X) ∧ ¬G(X)) ⇒ Post(X)
@@ -2925,18 +2861,12 @@ fn build_bounded_leap_query_problem(
 
         smt.push_str("(assert (forall (");
         for i in 0..vars_len {
-            smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+            swrite!(smt, "(x_{i} {}) ", sort(bws[i] as u32));
         }
         for (j, p) in problem.params.iter().enumerate() {
-            smt.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+            swrite!(smt, "(n_{j} {}) ", sort(p.bw as u32));
         }
-        smt.push_str(&format!(
-            ") (=> (and {} {} (not {})) {})))\n",
-            a_x,
-            var_range_conds(&problem.vars, bv),
-            g_s,
-            post_s
-        ));
+        swrite!(smt, ") (=> (and {} {} (not {})) {})))\n", a_x, var_range_conds(&problem.vars, bv), g_s, post_s);
     }
 
     smt.push_str("(check-sat)\n");
@@ -4181,24 +4111,25 @@ pub(crate) fn verify_template_against_problem(
     let mut q = logic.clone();
     q.push_str("(assert (not (forall (");
     for i in 0..vars_len {
-        q.push_str(&format!("(x_{i} {}) ", sort(bws_all[i] as u32)));
+        swrite!(q, "(x_{i} {}) ", sort(bws_all[i] as u32));
     }
     for (j, p) in problem.params.iter().enumerate() {
-        q.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+        swrite!(q, "(n_{j} {}) ", sort(p.bw as u32));
     }
-    q.push_str(&format!(
+    // Trap semantics: the entry value respects the declared type, so
+    // the ranges join the antecedent (matches the DBM path's
+    // `apply_type_bounds` and the BV path's bounded sorts). Without
+    // them an unpinned loop variable is quantified over ALL of ℤ in
+    // the Init implication and check 1 spuriously reports a
+    // Counterexample.
+    swrite!(
+        q,
         ") (=> (and {} {} {}) {}))))\n",
         init_cond,
         param_range_conds(&problem.params, bv),
-        // Trap semantics: the entry value respects the declared type, so
-        // the ranges join the antecedent (matches the DBM path's
-        // `apply_type_bounds` and the BV path's bounded sorts). Without
-        // them an unpinned loop variable is quantified over ALL of ℤ in
-        // the Init implication and check 1 spuriously reports a
-        // Counterexample.
         var_range_conds(&problem.vars, bv),
         a_x
-    ));
+    );
     q.push_str("(check-sat)\n");
     match solver.run_raw_query(&q) {
         RawQueryOutcome::Unsat => {}
@@ -4220,15 +4151,15 @@ pub(crate) fn verify_template_against_problem(
         let mut q = logic.clone();
         q.push_str("(assert (not (forall (");
         for i in 0..vars_len {
-            q.push_str(&format!("(x_{i} {}) ", sort(bws_all[i] as u32)));
+            swrite!(q, "(x_{i} {}) ", sort(bws_all[i] as u32));
         }
         for (j, p) in problem.params.iter().enumerate() {
-            q.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+            swrite!(q, "(n_{j} {}) ", sort(p.bw as u32));
         }
         for i in 0..vars_len {
-            q.push_str(&format!("(xp_{i} {}) ", sort(bws_all[i] as u32)));
+            swrite!(q, "(xp_{i} {}) ", sort(bws_all[i] as u32));
         }
-        q.push_str(&format!(") {imp})))\n"));
+        swrite!(q, ") {imp})))\n");
         q.push_str("(check-sat)\n");
         match solver.run_raw_query(&q) {
             RawQueryOutcome::Unsat => {}
@@ -4274,12 +4205,12 @@ pub(crate) fn verify_template_against_problem(
         let mut q = logic.clone();
         q.push_str("(assert (not (forall (");
         for i in 0..vars_len {
-            q.push_str(&format!("(x_{i} {}) ", sort(bws_all[i] as u32)));
+            swrite!(q, "(x_{i} {}) ", sort(bws_all[i] as u32));
         }
         for (j, p) in problem.params.iter().enumerate() {
-            q.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+            swrite!(q, "(n_{j} {}) ", sort(p.bw as u32));
         }
-        q.push_str(&format!(") (=> {} {}))))\n", ante_cond, def_s));
+        swrite!(q, ") (=> {} {}))))\n", ante_cond, def_s);
         q.push_str("(check-sat)\n");
         match solver.run_raw_query(&q) {
             RawQueryOutcome::Unsat => {}
@@ -4310,12 +4241,12 @@ pub(crate) fn verify_template_against_problem(
         let mut q = logic.clone();
         q.push_str("(assert (not (forall (");
         for i in 0..vars_len {
-            q.push_str(&format!("(x_{i} {}) ", sort(bws_all[i] as u32)));
+            swrite!(q, "(x_{i} {}) ", sort(bws_all[i] as u32));
         }
         for (j, p) in problem.params.iter().enumerate() {
-            q.push_str(&format!("(n_{j} {}) ", sort(p.bw as u32)));
+            swrite!(q, "(n_{j} {}) ", sort(p.bw as u32));
         }
-        q.push_str(&format!(") (=> {} {}))))\n", ante_cond, post_s));
+        swrite!(q, ") (=> {} {}))))\n", ante_cond, post_s);
         q.push_str("(check-sat)\n");
 
         match solver.run_raw_query(&q) {
@@ -4386,11 +4317,7 @@ fn build_bounded_leap_query(
     }
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        smt.push_str(&format!(
-            "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
-            sort(ebw),
-            sort(ebw)
-        ));
+        swrite!(smt, "(declare-const l_{r} {})\n(declare-const u_{r} {})\n", sort(ebw), sort(ebw));
     }
 
     // B ⊑ A′ ⊏ A in bound terms (ENCODED domain, Diff rows offset):
@@ -4402,23 +4329,11 @@ fn build_bounded_leap_query(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
-        smt.push_str(&format!(
-            " ({} l_{r} {}) ({} u_{r} {})",
-            rge,
-            lit(&row.lb, ebw, &off),
-            rle,
-            lit(&row.ub, ebw, &off)
-        ));
+        swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rge, lit(&row.lb, ebw, &off), rle, lit(&row.ub, ebw, &off));
         if let Some(limits) = limits {
-            smt.push_str(&format!(
-                " ({} l_{r} {}) ({} u_{r} {})",
-                rle,
-                lit(&limits.lb[r], ebw, &off),
-                rge,
-                lit(&limits.ub[r], ebw, &off)
-            ));
+            swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rle, lit(&limits.lb[r], ebw, &off), rge, lit(&limits.ub[r], ebw, &off));
         }
-        smt.push_str(&format!(" ({} l_{r} u_{r})", rle));
+        swrite!(smt, " ({} l_{r} u_{r})", rle);
     }
     smt.push_str("))\n");
 
@@ -4430,13 +4345,7 @@ fn build_bounded_leap_query(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rgt, rlt) = row_gt_lt(row, bv);
-        smt.push_str(&format!(
-            " ({} l_{r} {}) ({} u_{r} {})",
-            rgt,
-            lit(&row.lb, ebw, &off),
-            rlt,
-            lit(&row.ub, ebw, &off)
-        ));
+        swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rgt, lit(&row.lb, ebw, &off), rlt, lit(&row.ub, ebw, &off));
     }
     smt.push_str("))\n");
 
@@ -4445,10 +4354,10 @@ fn build_bounded_leap_query(
 
     smt.push_str("(assert (forall (");
     for i in 0..n {
-        smt.push_str(&format!("(x_{i} {}) ", sort(bws[i] as u32)));
+        swrite!(smt, "(x_{i} {}) ", sort(bws[i] as u32));
     }
     for i in 0..n {
-        smt.push_str(&format!("(xp_{i} {}) ", sort(bws[i] as u32)));
+        swrite!(smt, "(xp_{i} {}) ", sort(bws[i] as u32));
     }
     for name in &inter {
         let var_idx = name
@@ -4460,7 +4369,7 @@ fn build_bounded_leap_query(
                     "intermediate name must encode var index as xs_{{step}}_{{var}}, got: {name}"
                 )
             });
-        smt.push_str(&format!("({} {}) ", name, sort(bws[var_idx] as u32)));
+        swrite!(smt, "({} {}) ", name, sort(bws[var_idx] as u32));
     }
     smt.push_str(")\n");
 
@@ -4563,16 +4472,7 @@ fn build_bounded_leap_query(
     };
 
     // Init: Pre(X) ∧ ranges(X) → A'(X) — see `build_refine_query_skeleton`.
-    smt.push_str(&format!(
-        "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n",
-        pre,
-        loop_var_range_conds(n, bws, signed, bv),
-        a_x,
-        a_x,
-        guard,
-        trans,
-        a_xp
-    ));
+    swrite!(smt, "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n", pre, loop_var_range_conds(n, bws, signed, bv), a_x, a_x, guard, trans, a_xp);
     smt.push_str("))\n");
     smt.push_str("(check-sat)\n");
     if get_model {

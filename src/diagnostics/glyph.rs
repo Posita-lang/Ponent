@@ -54,6 +54,7 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Write;
+use swrite::{SWrite, swrite};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use unicode_segmentation::UnicodeSegmentation;
@@ -1308,7 +1309,7 @@ impl GlyphRenderer {
         } else {
             self.s.warning
         };
-        let _ = write!(
+        swrite!(
             out,
             "{dim}{bl}{h}{reset} {accent}",
             dim = self.s.dim,
@@ -1320,33 +1321,33 @@ impl GlyphRenderer {
         match (error_count, warning_count) {
             (0, 0) => unreachable!("returned early above"),
             (0, w) => {
-                let _ = write!(
+                swrite!(
                     out,
                     "{}",
                     crate::diagnostics::i18n::fluent::summary_warnings(DisplayArg(w))
                 );
             }
             (e, 0) => {
-                let _ = write!(
+                swrite!(
                     out,
                     "{}",
                     crate::diagnostics::i18n::fluent::summary_errors(DisplayArg(e))
                 );
             }
             (e, w) => {
-                let _ = write!(
+                swrite!(
                     out,
                     "{}; ",
                     crate::diagnostics::i18n::fluent::summary_mixed_errors(DisplayArg(e))
                 );
-                let _ = write!(
+                swrite!(
                     out,
                     "{}",
                     crate::diagnostics::i18n::fluent::summary_warnings(DisplayArg(w))
                 );
             }
         }
-        let _ = write!(out, "{}", self.s.reset);
+        swrite!(out, "{}", self.s.reset);
         out
     }
 
@@ -1366,7 +1367,7 @@ impl GlyphRenderer {
         if s.is_empty() {
             return s;
         }
-        let _ = write!(
+        swrite!(
             s,
             " {}",
             crate::diagnostics::i18n::fluent::summary_files(DisplayArg(file_count))

@@ -111,36 +111,53 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
 /// sanitized string and made `push_flattened` start mid-character.  This
 /// derives both decisions from the same character stream.
 fn push_sanitized_flattened(out: &mut String, msg: &str) {
-    let mut wrote = false;
+    // Sanitize and flatten in one pass, byte-identical to `push_flattened`'s
+    // split/trim/join rule: segment edges abut a break, so a space there belongs
+    // to the run — the *trailing* spaces of a segment a break follows are
+    // retracted (`out.truncate`, the mark is the start of the current space run),
+    // the *leading* ones after a break are absorbed, and segments join with
+    // exactly one space.
+    //
+    // Suppressing the joiner alone is not enough: spaces pushed before the break
+    // are already in the buffer.  `"a  \tb"` used to emit `"a  b"` where the
+    // reference emits `"a b"`, and `" \ta"` emitted `" a"` vs. `"a"`.
+    let mut emitted = false; // a non-space char survives the truncation
     let mut pending_break = false;
-    // Whether the last emitted char was a literal space, so a break run adjacent
-    // to spaces still joins with exactly one.  Without it `"a\t b"` emitted
-    // `"a  b"` and `"a \tb"` emitted `"a  b"` — the run-collapsing rule the
-    // oracle (`push_flattened`) already implemented, drifting from the fast path.
-    let mut prev_space = false;
+    let mut space_run: Option<usize> = None; // where the trailing space run began
     for c in msg.chars() {
         if crate::diagnostics::is_bidi_override(c) {
             continue;
         }
         if matches!(c, '\n' | '\r' | '\t') {
             pending_break = true;
+            if let Some(mark) = space_run.take() {
+                out.truncate(mark);
+            }
             continue;
         }
         let c = if c.is_control() { '\u{FFFD}' } else { c };
         if pending_break {
-            // A space on either side of the break belongs to the run: absorb a
-            // trailing one, and suppress the joiner after a leading one.
+            // Leading spaces of the segment a break precedes are absorbed; the
+            // loop stays "pending" so a whole run collapses.
             if c == ' ' {
                 continue;
             }
-            if wrote && !prev_space {
+            if emitted {
                 out.push(' ');
             }
             pending_break = false;
         }
+        if c == ' ' {
+            if space_run.is_none() {
+                // Char-boundary by construction: recorded right after a
+                // non-space char or at the start of the buffer.
+                space_run = Some(out.len());
+            }
+        } else {
+            space_run = None;
+            emitted = true;
+        }
         out.push(c);
-        wrote = true;
-        prev_space = c == ' ';
     }
 }
 
@@ -280,6 +297,13 @@ impl Renderer for ShortRenderer {
                 fmt::push_uint(out, span.end_as_usize() as u64);
                 out.push_str(": ");
             }
+            // No span at all: the file name is printed only when a source is
+            // attached, i.e. when it *places* the message.  This is a decision,
+            // not an oversight: a bare `src/lib.pn:` with neither coordinates nor
+            // an excerpt is noise in the grep-style output this renderer exists
+            // for (and it would print the `<input>` default for every
+            // source-less diagnostic).  Pinned by
+            // `no_source_no_span_omits_the_file_name`.
             (None, None) => {
                 if diag.source().is_some() && !file.is_empty() {
                     out.push_str(file);
@@ -374,6 +398,19 @@ mod tests {
             "a\u{0085}b",
             "e\u{0301}\u{FFFD}中",
             "x\x7f\ny",
+            // Space runs on the *before* side of a break.  These were the
+            // divergence class: suppressing only the post-break joiner left the
+            // pre-break spaces in the buffer ("a  \tb" -> "a  b" vs. "a b").
+            "a  \tb",
+            "a \t",
+            " \ta",
+            "  \tb",
+            "a  \t  b",
+            "a\t ",
+            "a \t ",
+            "  \t  ",
+            "\t a",
+            "a\t\t  b",
         ] {
             let sanitized = crate::diagnostics::sanitize_for_terminal_flatten(raw);
             let break_at = memchr::memchr3(b'\n', b'\r', b'\t', sanitized.as_bytes());
@@ -412,7 +449,7 @@ mod tests {
                 };
                 bytes.push(c);
             }
-            let Ok(s) = std::str::from_utf8(&bytes) else {
+            let Ok(s) = simdutf8::basic::from_utf8(&bytes) else {
                 continue;
             };
             for keep_breaks in [true, false] {
@@ -421,19 +458,46 @@ mod tests {
                 } else {
                     crate::diagnostics::sanitize_for_terminal(s)
                 };
-                let mut out = String::new();
+                let mut want = String::new();
                 push_flattened(
-                    &mut out,
+                    &mut want,
                     &sanitized,
                     memchr::memchr3(b'\n', b'\r', b'\t', sanitized.as_bytes()),
                 );
                 assert!(
-                    out.len() <= sanitized.len(),
+                    want.len() <= sanitized.len(),
                     "push_flattened grew {s:?} (keep_breaks={keep_breaks}): \
                      {} > {}",
-                    out.len(),
+                    want.len(),
                     sanitized.len()
                 );
+                // Equality against the oracle, not just non-growth: the size
+                // check alone could not see the two implementations disagree.
+                //
+                // Only under `keep_breaks`: the fused path *is* the flattening
+                // sanitizer's one-pass form, while `sanitize_for_terminal` (the
+                // non-flatten one) maps a break to U+FFFD, so under
+                // `keep_breaks == false` the two are fed legitimately different
+                // inputs and only the size bound is meaningful.
+                // The bound is the *flatten-sanitized* width: a 1-byte control
+                // becomes a 3-byte U+FFFD, so comparing against the raw input
+                // length would flag legitimate expansion.
+                let flatten_sanitized = crate::diagnostics::sanitize_for_terminal_flatten(s);
+                let mut got = String::new();
+                push_sanitized_flattened(&mut got, s);
+                assert!(
+                    got.len() <= flatten_sanitized.len(),
+                    "fused flattener grew {s:?} (keep_breaks={keep_breaks}): \
+                     {} > {}",
+                    got.len(),
+                    flatten_sanitized.len()
+                );
+                if keep_breaks {
+                    assert_eq!(
+                        got, want,
+                        "fused flatten diverged from the reference for {s:?}"
+                    );
+                }
             }
         }
     }
@@ -519,6 +583,20 @@ mod tests {
     }
 
     #[test]
+    /// The shape whose omission used to look accidental (the old pin only used
+    /// the default `<input>` name): a real file name is still omitted when there
+    /// is neither a span nor a source, because a name alone cannot place the
+    /// message.
+    #[test]
+    fn no_source_no_span_omits_the_file_name() {
+        let diag = Diagnostic::error("boom")
+            .with_code_str(ErrCode::E030)
+            .with_file_name("src/lib.pn");
+        let opts = DiagOpts::default();
+        let out = ShortRenderer::new().render(&diag, &ctx(&opts));
+        assert_eq!(out, "error[E030]: boom\n");
+    }
+
     fn no_span_has_no_location_prefix() {
         let diag = Diagnostic::error("boom").with_code_str(ErrCode::E030);
         let opts = DiagOpts::default();

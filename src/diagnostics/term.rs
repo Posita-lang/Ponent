@@ -15,13 +15,11 @@
 //! [`TermCaps::detect`] is the escape hatch for callers that genuinely want a
 //! fresh probe.
 
-use crate::diagnostics::HEX_UPPER;
+use crate::diagnostics::{DEFAULT_MAX_WIDTH, HEX_UPPER};
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal};
 use terminal_size::{self, Width};
-
-use crate::diagnostics::DEFAULT_MAX_WIDTH;
 
 /// Terminal colour depth, used to downgrade 256-colour sequences on
 /// terminals that only support the 16-colour ANSI palette.
@@ -91,10 +89,9 @@ impl TermCaps {
             color: caps.color,
             depth: caps.depth,
             unicode: unicode_decision_os(locale.as_deref(), term_dumb),
-            width: width_decision(
-                columns.as_deref().and_then(OsStr::to_str),
-                terminal_size::terminal_size_of(io::stderr()).map(|(Width(w), _)| w as usize),
-            ),
+            width: width_decision_lazy(columns.as_deref().and_then(OsStr::to_str), || {
+                terminal_size::terminal_size_of(io::stderr()).map(|(Width(w), _)| w as usize)
+            }),
         }
     }
 }
@@ -178,9 +175,10 @@ fn force_color_level(v: &OsStr) -> Option<ColorDepth> {
             if neg {
                 return None;
             }
-            match digits.trim_start_matches('0').len() {
+            let significant = digits.trim_start_matches('0');
+            match significant.len() {
                 0 => None,
-                1 => match digits.trim_start_matches('0').as_bytes()[0] {
+                1 => match significant.as_bytes()[0] {
                     b'1' => Some(ColorDepth::Sixteen),
                     b'2' => Some(ColorDepth::TwoFiftySix),
                     // `0` is handled above, so this is 3..=9.
@@ -234,8 +232,10 @@ fn force_color_is_off(v: &OsStr) -> bool {
 ///   2. A terminal-family signal *before* `COLORTERM`: `WT_SESSION` (Windows
 ///      Terminal) → [`ColorDepth::TrueColor`], and an exact `TERM_PROGRAM` in
 ///      `{iTerm.app, WezTerm, vscode, WarpTerminal, Warp}` → [`ColorDepth::TrueColor`].
-///   3. JetBrains `TERMINAL_EMULATOR=JetBrains-JediTerm` or a JetBrains
-///      `TERM` → [`ColorDepth::TrueColor`].
+///   3. `TERMINAL_EMULATOR=JetBrains-JediTerm` → [`ColorDepth::TrueColor`].
+///      (No `TERM` clause: JetBrains terminals are identified by this one
+///      variable, and a `TERM` heuristic would also fire on the shells they
+///      spawn elsewhere.)
 ///   4. `COLORTERM` contains `truecolor` or `24bit` → [`ColorDepth::TrueColor`]
 ///   5. `TERM` ends with `truecolor`, `direct`, or is `xterm-kitty` →
 ///      [`ColorDepth::TrueColor`]
@@ -247,7 +247,7 @@ pub fn detect_color_depth() -> ColorDepth {
 
 /// The colour-related environment as one named value.
 ///
-/// Replaces nine positional parameters.  `colorterm` and `term` are both
+/// Replaces ten positional parameters.  `colorterm` and `term` are both
 /// `Option<&str>`, so a swapped pair type-checks and can even *pass* (a
 /// `COLORTERM` value shaped like a `TERM`); named fields make every call site
 /// auditable and turn the literal into its own documentation.  `Default` is the
@@ -273,6 +273,10 @@ pub(crate) struct ColorEnv<'a> {
 
 /// The depth-only subset of [`ColorEnv`], for callers that do not care about
 /// colour-on/off (and for the pure decision core's tests).
+/// Positional shim for tests only: production code builds a [`ColorEnv`], whose
+/// named fields make the `colorterm`/`term` swap impossible.  Gated so the
+/// three-`Option` signature cannot leak back into the crate surface.
+#[cfg(test)]
 pub(crate) fn color_depth_decision(
     colorterm: Option<&str>,
     term: Option<&str>,
@@ -329,8 +333,23 @@ pub(crate) fn color_depth_decision_env(env: &ColorEnv<'_>) -> ColorDepth {
         if t.eq_ignore_ascii_case(b"xterm-kitty") {
             return ColorDepth::TrueColor;
         }
-        if ends_with_ignore_ascii_case(t, b"truecolor") || ends_with_ignore_ascii_case(t, b"direct")
-        {
+        // `direct` may carry a trailing digit run (`xterm-direct2`,
+        // `xterm-direct3` are stock ncurses entries, and forks add more), so
+        // digits are stripped before the suffix test.  The feature must also
+        // start a token: bare `direct`, or `...-direct`.  A plain suffix test
+        // would match `TERM=indirect`, which is why the separator is checked.
+        if ends_with_ignore_ascii_case(t, b"truecolor") {
+            return ColorDepth::TrueColor;
+        }
+        let mut end = t.len();
+        while end > 0 && t[end - 1].is_ascii_digit() {
+            end -= 1;
+        }
+        let direct = &t[..end];
+        let is_direct_token = direct.len() >= 6
+            && ends_with_ignore_ascii_case(direct, b"direct")
+            && (direct.len() == 6 || direct[direct.len() - 7] == b'-');
+        if is_direct_token {
             return ColorDepth::TrueColor;
         }
         if ends_with_ignore_ascii_case(t, b"256color") {
@@ -345,7 +364,9 @@ pub(crate) fn color_depth_decision_env(env: &ColorEnv<'_>) -> ColorDepth {
 /// Precedence (matching `anstream`/`should-color`):
 ///   1. `NO_COLOR` set to a non-empty value → off (per no-color.org, the
 ///      empty string means "unset").
-///   2. `CLICOLOR_FORCE` set to a non-empty value other than `"0"` → on.
+///   2. `CLICOLOR_FORCE` set to a non-**blank** value other than `"0"` → on
+///      (padding is trimmed first, so `" 0 "` does not force — see
+///      [`env_trimmed`]).
 ///   3. `FORCE_COLOR` → see [`force_color_is_off`]: `false` and any numeric
 ///      `≤ 0` are off, non-numeric garbage is on, everything else is on.
 ///   4. `CLICOLOR=0` → off.
@@ -503,7 +524,12 @@ pub fn detect_width() -> usize {
     global_caps().width
 }
 
-pub(crate) fn width_decision(columns: Option<&str>, term_size: Option<usize>) -> usize {
+/// The `COLUMNS` half of the width decision.
+///
+/// Separable so [`TermCaps::detect`] can skip the `TIOCGWINSZ` probe entirely
+/// when `COLUMNS` resolves — the argument to `width_decision` used to be
+/// evaluated eagerly, costing one syscall per process for a value it discarded.
+fn width_from_columns(columns: Option<&str>) -> Option<usize> {
     columns
         .map(str::trim)
         .and_then(|s| {
@@ -513,15 +539,37 @@ pub(crate) fn width_decision(columns: Option<&str>, term_size: Option<usize>) ->
                 // back to the terminal size / default.  (`FORCE_COLOR` had the
                 // same class of bug; `force_color_level` is the model here.)
                 let body = s.strip_prefix('+').unwrap_or(s);
-                (!body.is_empty()
-                    && body.bytes().all(|b| b.is_ascii_digit())
-                    && body.bytes().any(|b| b != b'0'))
-                .then_some(u16::MAX as usize)
+                // One pass: `all(digit)` then `any(non-zero)` walked the same
+                // bytes twice.  Leading zeros are significant-free, so the
+                // second predicate is what distinguishes "huge number" from "0".
+                let mut all_digits = !body.is_empty();
+                let mut any_nonzero = false;
+                for b in body.bytes() {
+                    if !b.is_ascii_digit() {
+                        all_digits = false;
+                        break;
+                    }
+                    any_nonzero |= b != b'0';
+                }
+                (all_digits && any_nonzero).then_some(u16::MAX as usize)
             })
         })
         .filter(|&w| w > 0)
         .map(|w| w.min(u16::MAX as usize))
+}
+
+pub(crate) fn width_decision(columns: Option<&str>, term_size: Option<usize>) -> usize {
+    width_from_columns(columns)
         .or(term_size.filter(|&w| w > 0))
+        .unwrap_or(DEFAULT_MAX_WIDTH)
+}
+
+/// `width_decision` with a lazy terminal-size probe, for the one production
+/// caller: the probe is a syscall and must not run when `COLUMNS` wins.
+fn width_decision_lazy(columns: Option<&str>, probe: impl FnOnce() -> Option<usize>) -> usize {
+    width_from_columns(columns)
+        .or_else(probe)
+        .filter(|&w| w > 0)
         .unwrap_or(DEFAULT_MAX_WIDTH)
 }
 
@@ -661,10 +709,18 @@ fn wsl_distro_name() -> Option<&'static str> {
                 .filter(|s| !s.is_empty())?;
             #[cfg(target_os = "linux")]
             {
-                // SSH/CI can forward WSL_DISTRO_NAME to a native Linux host.
-                // Only translate when the kernel also identifies as WSL; if
-                // /proc cannot be read, keep the env-only fallback.
-                if let Ok(version) = std::fs::read_to_string("/proc/version") {
+                // SSH/CI can forward WSL_DISTRO_NAME to a native Linux host,
+                // and a hardened container can mask `/proc`.  Only translate when
+                // the kernel identifies as WSL, and **fail closed** when
+                // `/proc/version` is unreadable: trusting the env var alone
+                // produced `file://wsl.localhost/<distro>/...` links that point
+                // nowhere on the host that read them.  The failure mode this
+                // loses — a real distro with an unreadable `/proc/version` — does
+                // not occur in practice (WSL2 always reports a Microsoft string).
+                let Ok(version) = std::fs::read_to_string("/proc/version") else {
+                    return None;
+                };
+                {
                     // Allocation-free and ASCII-case-insensitive, like the rest
                     // of this module: lowercasing copied the whole kernel version
                     // string just to run two substring tests.
@@ -691,6 +747,10 @@ fn encode_scanned_path(out: &mut Vec<u8>, s: &[u8], first_unsafe: usize, unsafe_
     out.extend_from_slice(&s[..first_unsafe]);
     let mut i = first_unsafe;
     while i < s.len() {
+        // Only the *first* iteration is guaranteed to see an unsafe byte: every
+        // later iteration resumes just past an escaped byte, which is usually the
+        // start of a safe run.  The branch is therefore not redundant — an earlier
+        // "it never fires" reading of this loop broke the byte-exact encoders.
         if is_url_safe(s[i]) {
             let start = i;
             while i < s.len() && is_url_safe(s[i]) {
@@ -759,7 +819,7 @@ pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
     let (first_unsafe, unsafe_count) = scan_url_path(s);
     if first_unsafe == s.len() {
         // As above: the safe set is ASCII, so this is valid UTF-8.
-        return Cow::Borrowed(std::str::from_utf8(s).expect("URL-safe bytes are ASCII"));
+        return Cow::Borrowed(simdutf8::basic::from_utf8(s).expect("URL-safe bytes are ASCII"));
     }
     let mut out: Vec<u8> =
         Vec::with_capacity(s.len().saturating_add(unsafe_count.saturating_mul(2)));
@@ -872,43 +932,80 @@ pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
 /// pathological run.  Eviction demotes the hot generation into `cold` rather
 /// than clearing, so a working set slightly larger than the cap keeps hitting
 /// (clear-all thrashed to zero hits); a cold hit promotes back.
+/// Two-generation cache: the hot generation takes inserts, the cold one
+/// holds the previous generation and is consulted second.
+///
+/// `clear()` on reaching the cap gave a cyclically-accessed working set of
+/// `CACHE_CAP + 1` distinct paths **zero** hits: each iteration cleared the
+/// map just before inserting the next entry.  Demoting the hot map instead
+/// keeps the previous generation reachable, and a cold hit promotes back to
+/// hot (segmented FIFO — no per-entry recency bookkeeping, no LRU metadata).
+///
+/// **Bound, stated exactly:** `hot` is capped by `CACHE_CAP` entries and
+/// `max_bytes` (keys + URLs), while `cold` holds at most one previous
+/// generation.  The per-thread worst case is therefore about `2 ×
+/// max_bytes + one generation of keys`, not `max_bytes`: the previous comment
+/// advertised the hot bound only, which is the number a reader budgets against.
+struct UrlCache {
+    hot: rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>,
+    cold: rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>,
+    hot_bytes: usize,
+    /// Entry cap and byte budget.  Instance fields rather than consts so the
+    /// eviction paths (demote, cold hit, promote) are *reachable* from tests:
+    /// with the production cap of 1024 no test could ever fill the hot map.
+    cap: usize,
+    max_bytes: usize,
+}
+impl UrlCache {
+    fn new() -> Self {
+        Self::with_limits(CACHE_CAP, CACHE_MAX_BYTES)
+    }
+    fn with_limits(cap: usize, max_bytes: usize) -> Self {
+        Self {
+            hot: rustc_hash::FxHashMap::default(),
+            cold: rustc_hash::FxHashMap::default(),
+            hot_bytes: 0,
+            cap,
+            max_bytes,
+        }
+    }
+    fn account(&mut self, key: &[u8], url: &str) {
+        self.hot_bytes = self
+            .hot_bytes
+            .saturating_add(key.len())
+            .saturating_add(url.len());
+    }
+}
+// Entry cap *and* byte budget: the cap bounds a pathological run, the budget
+// bounds memory per worker thread (keys + percent-encoded URLs), which the
+// old entry-only cap did not.
+const CACHE_CAP: usize = 1024;
+const CACHE_MAX_BYTES: usize = 1 << 20;
+
+/// Run `f` with a thread-local cache sized by `cap`/`max_bytes`, then restore
+/// the production limits.  `URLS` is thread-local and libtest gives each test
+/// its own thread, so an override cannot leak into another test.
+#[cfg(test)]
+fn with_cache_limits<R>(cap: usize, max_bytes: usize, f: impl FnOnce() -> R) -> R {
+    URLS.with(|c| *c.borrow_mut() = UrlCache::with_limits(cap, max_bytes));
+    let out = f();
+    URLS.with(|c| *c.borrow_mut() = UrlCache::new());
+    out
+}
+
+/// `(hot entries, cold entries, hot bytes)` — the eviction state a test needs
+/// to prove that demote and promote actually ran.
+#[cfg(test)]
+fn cache_state() -> (usize, usize, usize) {
+    URLS.with(|c| {
+        let c = c.borrow();
+        (c.hot.len(), c.cold.len(), c.hot_bytes)
+    })
+}
+thread_local! {
+    static URLS: std::cell::RefCell<UrlCache> = std::cell::RefCell::new(UrlCache::new());
+}
 fn file_url_cached(path: &[u8]) -> std::sync::Arc<str> {
-    /// Two-generation cache: the hot generation takes inserts, the cold one
-    /// holds the previous generation and is consulted second.
-    ///
-    /// `clear()` on reaching the cap gave a cyclically-accessed working set of
-    /// `CACHE_CAP + 1` distinct paths **zero** hits: each iteration cleared the
-    /// map just before inserting the next entry.  Demoting the hot map instead
-    /// keeps the previous generation reachable, and a cold hit promotes back to
-    /// hot (segmented FIFO — no per-entry recency bookkeeping, no LRU metadata).
-    struct UrlCache {
-        hot: rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>,
-        cold: rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>,
-        hot_bytes: usize,
-    }
-    impl UrlCache {
-        fn new() -> Self {
-            Self {
-                hot: rustc_hash::FxHashMap::default(),
-                cold: rustc_hash::FxHashMap::default(),
-                hot_bytes: 0,
-            }
-        }
-        fn account(&mut self, key: &[u8], url: &str) {
-            self.hot_bytes = self
-                .hot_bytes
-                .saturating_add(key.len())
-                .saturating_add(url.len());
-        }
-    }
-    // Entry cap *and* byte budget: the cap bounds a pathological run, the budget
-    // bounds memory per worker thread (keys + percent-encoded URLs), which the
-    // old entry-only cap did not.
-    const CACHE_CAP: usize = 1024;
-    const CACHE_MAX_BYTES: usize = 1 << 20;
-    thread_local! {
-        static URLS: std::cell::RefCell<UrlCache> = std::cell::RefCell::new(UrlCache::new());
-    }
     URLS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(hit) = cache.hot.get(path) {
@@ -916,8 +1013,16 @@ fn file_url_cached(path: &[u8]) -> std::sync::Arc<str> {
         }
         if let Some(hit) = cache.cold.get(path) {
             let url = std::sync::Arc::clone(hit);
-            // Promote: the working set has revisited this path.
-            if cache.hot.len() < CACHE_CAP {
+            // Promote: the working set has revisited this path.  The byte budget
+            // is enforced here as well as on insert — promoting a whole cold
+            // generation back used to re-accumulate bytes with no ceiling, so the
+            // documented per-thread bound only held for a cache that never
+            // demoted (an all-hit steady state never demotes).  Skipping the
+            // promote is still correct: the entry stays reachable in `cold`.
+            let entry_bytes = path.len() + url.len();
+            if cache.hot.len() < cache.cap
+                && cache.hot_bytes.saturating_add(entry_bytes) <= cache.max_bytes
+            {
                 cache.account(path, &url);
                 cache.hot.insert(
                     path.to_vec().into_boxed_slice(),
@@ -928,7 +1033,7 @@ fn file_url_cached(path: &[u8]) -> std::sync::Arc<str> {
         }
         let url: std::sync::Arc<str> =
             std::sync::Arc::from(format_file_url(path, wsl_distro_name()));
-        if cache.hot.len() >= CACHE_CAP || cache.hot_bytes >= CACHE_MAX_BYTES {
+        if cache.hot.len() >= cache.cap || cache.hot_bytes >= cache.max_bytes {
             // Demote rather than clear: the previous generation stays reachable.
             let hot = std::mem::take(&mut cache.hot);
             cache.cold = hot;
@@ -1151,6 +1256,10 @@ mod tests {
     /// cannot reach: which variable feeds which field, the trim/filter rules and
     /// the locale precedence.  A swapped field (`LANG` ↔ `LC_CTYPE`) or a typo
     /// would pass every other test in this module.
+    ///
+    /// Spawns a child process, so it is meaningless under Miri (no process
+    /// spawn) and in sandboxes that forbid it — skip rather than fail.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn env_wiring_drives_term_caps() {
         use std::collections::BTreeMap;
@@ -1219,6 +1328,38 @@ mod tests {
         // `CLICOLOR_FORCE` also forces, but its empty value means unset.
         assert_eq!(probe(&[("CLICOLOR_FORCE", "1")])["color"], "true");
         assert_eq!(probe(&[("CLICOLOR_FORCE", "")])["color"], "false");
+        // Empty values mean "unset" for the no-color.org switches, and a
+        // non-empty one suppresses even an explicit force.  These are what a
+        // templated CI matrix materializes, and the
+        // `var_os().is_some_and(|v| !v.is_empty())` chain had no end-to-end probe
+        // (the unit helper takes a `bool`, so it could not express them).
+        assert_eq!(
+            probe(&[("NO_COLOR", ""), ("FORCE_COLOR", "1")])["color"],
+            "true",
+            "NO_COLOR='' must not disable colour"
+        );
+        assert_eq!(
+            probe(&[("NO_COLOR", "1"), ("FORCE_COLOR", "1")])["color"],
+            "false",
+            "a non-empty NO_COLOR suppresses even an explicit force"
+        );
+        assert_eq!(
+            probe(&[("WT_SESSION", ""), ("TERM", "xterm")])["depth"],
+            "16",
+            "an empty WT_SESSION must not upgrade the depth"
+        );
+        // Without a tty only the "not forced on" direction is observable, which is
+        // exactly the clause an empty value must not trip.
+        assert_eq!(probe(&[("NO_HYPERLINK", "")])["hyperlinks"], "false");
+        // `NO_COLOR` keeps the raw "present and non-empty" rule (no trimming):
+        // a padded value is still present, so it suppresses even an explicit
+        // force.  The trimmed numeric switches are the deliberate exception.
+        assert_eq!(
+            probe(&[("NO_COLOR", " "), ("FORCE_COLOR", "1")])["color"],
+            "false",
+            "a padded NO_COLOR is still present and must suppress"
+        );
+
         // A colour-capable terminal still needs a tty (or a force) to *emit*.
         let ct = probe(&[("COLORTERM", "truecolor")]);
         assert_eq!(ct["color"], "false");
@@ -1535,6 +1676,64 @@ mod tests {
         assert_eq!(width_decision(Some("+0"), Some(120)), 120);
         assert_eq!(width_decision(Some("-80"), Some(120)), 120);
         assert_eq!(width_decision(Some("0"), Some(120)), 120);
+        // Leading zeros parse successfully to a *tiny* value, so the overflow
+        // clamp gives no protection: this is spec-honest (`1` is a positive
+        // integer) but every downstream `width - used` must saturate.  Pinned so
+        // a future "reject implausible widths" change is a visible decision.
+        assert_eq!(
+            width_decision(Some(&format!("{}1", "0".repeat(24))), None),
+            1
+        );
+    }
+
+    /// `direct` may carry a digit suffix (`xterm-direct2`, `xterm-direct3` are
+    /// stock ncurses entries).  Still a suffix test: `indirect` must not match.
+    #[test]
+    fn term_direct_with_digit_suffix_is_truecolor() {
+        for term in [
+            "xterm-direct",
+            "xterm-direct2",
+            "xterm-direct3",
+            "XTERM-DIRECT16",
+        ] {
+            assert_eq!(
+                color_depth_decision_env(&ColorEnv {
+                    term: Some(term),
+                    ..ColorEnv::default()
+                }),
+                ColorDepth::TrueColor,
+                "{term}"
+            );
+        }
+        for term in ["indirect", "xterm-direct-foo", "xterm-directx"] {
+            assert_eq!(
+                color_depth_decision_env(&ColorEnv {
+                    term: Some(term),
+                    ..ColorEnv::default()
+                }),
+                ColorDepth::Sixteen,
+                "{term}"
+            );
+        }
+    }
+
+    /// A non-UTF-8 `FORCE_COLOR` cannot be decoded, so it is not an explicit
+    /// "off" (`false` is the only off spelling) — colour stays forced on, but no
+    /// depth is pinned.  The rule lived in a match arm nothing exercised.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_force_color_forces_on_without_pinning_depth() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = OsStr::from_bytes(&[0xFF, 0xFE]);
+        assert!(
+            !force_color_is_off(raw),
+            "undecodable is not an off request"
+        );
+        assert_eq!(force_color_level(raw), None, "and it pins no depth");
+        assert!(color_decision_env(&ColorEnv {
+            force_color: Some(raw),
+            ..ColorEnv::default()
+        }));
     }
 
     #[test]
@@ -1742,26 +1941,109 @@ mod tests {
         assert!(!url.contains("%EF%BF%BD"));
     }
 
+    /// The eviction paths with limits a test can actually reach.
+    ///
+    /// With the production cap (1024) no test could fill `hot`, so neither
+    /// demote, cold-hit nor promote ever executed: this test used to pass while
+    /// proving only plain memoisation.  An injected cap of 8 over 12 paths forces
+    /// a demote after the first eight, and the second full cycle must be all
+    /// hits returning the *same* allocation — that is promote-or-cold-hit, never
+    /// a rebuild.
+    #[test]
+    fn url_cache_demotes_and_promotes_under_an_injected_cap() {
+        let paths: Vec<String> = (0..12)
+            .map(|i| format!("/tmp/ponent-evict-{i}.pon"))
+            .collect();
+        with_cache_limits(8, 1 << 20, || {
+            let first: Vec<_> = paths
+                .iter()
+                .map(|p| file_url_cached(p.as_bytes()))
+                .collect();
+            // 12 paths past a cap of 8: the ninth insert demotes the first eight
+            // into `cold`, and the last four stay hot.
+            let (hot, cold, _) = cache_state();
+            assert_eq!(hot, 4, "the four post-demote inserts stay hot");
+            assert_eq!(cold, 8, "the demoted generation is kept, not cleared");
+            for (path, want) in paths.iter().zip(&first) {
+                let got = file_url_cached(path.as_bytes());
+                assert!(
+                    std::sync::Arc::ptr_eq(&got, want),
+                    "{path} was rebuilt instead of served from the cache"
+                );
+            }
+        });
+    }
+
+    /// A cold hit must not promote when the byte budget is already spent.
+    #[test]
+    fn url_cache_promote_respects_the_byte_budget() {
+        // One entry well over the budget (a long generated path), with the small
+        // entries summing below it so a single demote is all that happens.
+        let long = format!("/tmp/{}", "x".repeat(1000));
+        let small = ["/tmp/a.pon", "/tmp/b.pon", "/tmp/c.pon"];
+        // Cap 4 so the three small entries do not trigger a *second* demote,
+        // which would drop the demoted `long` generation before the cold hit.
+        with_cache_limits(4, 400, || {
+            let long_url = file_url_cached(long.as_bytes());
+            for p in small {
+                file_url_cached(p.as_bytes());
+            }
+            // `long` has been demoted by the two-entry cap; hitting it again would
+            // promote it if the promotion ignored `max_bytes`.
+            let (hot_before, cold_before, bytes_before) = cache_state();
+            let again = file_url_cached(long.as_bytes());
+            assert!(
+                std::sync::Arc::ptr_eq(&long_url, &again),
+                "cold hit must hit"
+            );
+            let (hot_after, cold_after, bytes_after) = cache_state();
+            // The entry alone exceeds the whole budget, so promoting it back would
+            // break the documented per-thread ceiling (`max_bytes + one entry`):
+            // the hit is served from `cold` and nothing moves.
+            assert_eq!(
+                (hot_after, bytes_after),
+                (hot_before, bytes_before),
+                "a cold hit must not promote past the byte budget"
+            );
+            assert_eq!(cold_after, cold_before, "the entry stays reachable in cold");
+        });
+    }
+
+    /// A working set slightly above the hot cap must never rebuild.
+    ///
+    /// Two defects used to hide this: the fn had no `#[test]`, and it ran under
+    /// the production cap (1024) over 40 paths, so no demote ever happened and
+    /// it proved plain memoisation only — the exact failure its own comment
+    /// describes.  Injected at 32 so the second cycle exercises promote and
+    /// cold-hit.
     #[test]
     fn url_cache_promotes_and_survives_a_cycling_working_set() {
-        // A path count slightly above the hot cap used to thrash to zero hits
-        // (clear-all evicted the map just before each insert).  After one full
-        // cycle every path is either hot or cold, so a second cycle is all hits
-        // and every returned `Arc` is the same allocation.
-        let paths: Vec<String> = (0..40)
-            .map(|i| format!("/tmp/ponent-cache-{i}.pon"))
-            .collect();
-        let mut first: Vec<std::sync::Arc<str>> = Vec::new();
-        for p in &paths {
-            first.push(path_to_file_url(std::path::Path::new(p)));
-        }
-        for (p, prev) in paths.iter().zip(&first) {
-            let again = path_to_file_url(std::path::Path::new(p));
+        with_cache_limits(32, 1 << 20, || {
+            // A path count slightly above the hot cap used to thrash to zero
+            // hits (clear-all evicted the map just before each insert).  After
+            // one full cycle every path is either hot or cold, so a second cycle
+            // is all hits and every returned `Arc` is the same allocation.
+            let paths: Vec<String> = (0..40)
+                .map(|i| format!("/tmp/ponent-cache-{i}.pon"))
+                .collect();
+            let mut first: Vec<std::sync::Arc<str>> = Vec::new();
+            for p in &paths {
+                first.push(path_to_file_url(std::path::Path::new(p)));
+            }
+            let (hot, cold, _) = cache_state();
             assert!(
-                std::sync::Arc::ptr_eq(prev, &again),
-                "{p} should be memoised, not rebuilt"
+                hot + cold > 0 && hot <= 32,
+                "the cycle must populate the cache without exceeding the cap: \
+                 hot={hot} cold={cold}"
             );
-        }
+            for (p, prev) in paths.iter().zip(&first) {
+                let again = path_to_file_url(std::path::Path::new(p));
+                assert!(
+                    std::sync::Arc::ptr_eq(prev, &again),
+                    "{p} should be hot- or cold-hit, not rebuilt"
+                );
+            }
+        });
     }
 
     /// Independent restatement of the safe set, used as an oracle below.

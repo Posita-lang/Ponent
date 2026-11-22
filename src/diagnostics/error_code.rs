@@ -6,6 +6,45 @@ use std::sync::OnceLock;
 /// The port number of the local explain server, if running.
 static EXPLAIN_PORT: OnceLock<u16> = OnceLock::new();
 
+/// Test-only override of [`EXPLAIN_PORT`].
+///
+/// `Some(Some(p))` forces the port, `Some(None)` forces "no port set".  The
+/// process global is set-once, so without this a test cannot order "render, then
+/// set, then re-render" — the user-visible contract of [`set_explain_port`].
+/// Thread-local, and libtest gives every test its own thread, so an override
+/// cannot leak into another test.
+#[cfg(test)]
+thread_local! {
+    static TEST_EXPLAIN_PORT: std::cell::RefCell<Option<Option<u16>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The effective explain port: the test override when present, else the
+/// process-global set-once value.
+fn explain_port() -> Option<u16> {
+    #[cfg(test)]
+    if let Some(port) = TEST_EXPLAIN_PORT.with(|c| *c.borrow()) {
+        return port;
+    }
+    EXPLAIN_PORT.get().copied()
+}
+
+/// Run `f` with `port` as the effective explain port, restoring the previous
+/// override even on panic.
+#[cfg(test)]
+fn with_explain_port<R>(port: Option<u16>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Option<u16>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_EXPLAIN_PORT.with(|c| *c.borrow_mut() = self.0);
+        }
+    }
+    let previous = TEST_EXPLAIN_PORT.with(|c| *c.borrow());
+    TEST_EXPLAIN_PORT.with(|c| *c.borrow_mut() = Some(port));
+    let _restore = Restore(previous);
+    f()
+}
+
 /// Direct-address index over [`CODE_TABLE`], built at compile time.
 ///
 /// The registry is validated at build time against `^[EW]\d{3}$`, so every
@@ -83,8 +122,11 @@ const fn build_code_index() -> [u16; CODE_INDEX_SLOTS] {
 ///
 /// The `OnceLock` slots are inline in the static; a slot's `Box<str>` payload is
 /// heap-allocated on first use and never freed.  Only the pages a process
-/// actually renders are ever committed (~48 KB of BSS per table, ~190 KB across
-/// the four — BSS, not resident).
+/// actually renders are ever committed (~48 KB of BSS per table, ~98 KB across
+/// the two — BSS, not resident).  Only the port-*set* quadrants are cached: the
+/// port-unset ones were deleted (registry codes are build-time constants there,
+/// everything else is an uncached build), so there is nothing to invalidate when
+/// the port is set later.
 ///
 /// Storing `Box<str>` and *borrowing* it out (rather than `Arc<str>` and
 /// cloning) is what makes the hit path free: the earlier design paid an atomic
@@ -163,8 +205,14 @@ fn cached_slot_string(
 /// entry that was already built.  So a diagnostic rendered before the port was
 /// set keeps its documentation URL, and re-rendering it afterwards yields
 /// `127.0.0.1:<port>` — the same logical diagnostic showing two different link
-/// targets.  Setting the port first is therefore a contract, not a
-/// performance hint.  (Pinned by `render_before_and_after_set_explain_port`.)
+/// targets.  Setting the port first is therefore a contract, not a performance
+/// hint: a caller that renders first and sets the port later has already put the
+/// documentation host in front of the user.
+///
+/// `EXPLAIN_PORT` is a set-once process global, so the ordering can only be
+/// pinned in a test through the `#[cfg(test)]` thread-local override
+/// (`with_explain_port`), which is what
+/// `url_flips_between_doc_and_localhost_across_the_override` does.
 pub fn set_explain_port(port: u16) -> Result<(), u16> {
     EXPLAIN_PORT.set(port).map_err(|_| {
         // `set` fails exactly when a value already exists, so `get` is `Some`
@@ -417,12 +465,16 @@ impl std::str::FromStr for ErrorCategory {
 
 /// A compiler error or warning code (e.g. "E030", "W113").
 ///
-/// Every code — registry or not — is a single `&'static` pointer to an
-/// interned [`ErrCodeInner`], so `ErrCode` is one word: `Clone` is a copy,
-/// construction of a registry code is one `CODE_INDEX` read (no allocation, no
-/// atomic), and `title()` / `category()` / `explain()` need no further lookup.
-/// A code that is not in the table (CLI input, `Diagnostic::with_code_str`) is
-/// interned on first use.  Equality and hashing compare the **canonical**
+/// A registry code is a `&'static` pointer to its [`ErrCodeInner`], so
+/// `ErrCode` is **two** words — the additional variant discriminant is
+/// unavoidable (pinned by `err_code_stays_two_words`) — and it is `Clone`, not
+/// `Copy`: cloning a `Known` code is free, while cloning an `Other` code pays one
+/// atomic RMW on its `Arc<OtherCode>`.  Construction of a registry code is one
+/// `CODE_INDEX` read (no allocation, no atomic), and `title()` / `category()` /
+/// `explain()` need no further lookup.  A code that is not in the table (CLI
+/// input, `Diagnostic::with_code_str`) allocates one `Arc<OtherCode>` on first
+/// use — it is reference-counted and freed with the last handle, *not* interned
+/// or leaked (see `ErrCodeRepr::Other`).  Equality and hashing compare the **canonical**
 /// spelling (what
 /// `PartialEq`/`Hash` use, via [`Self::canonical`]), so case spellings of one
 /// registry code are one key: `unknown("e030") == new("E030")` even though
@@ -583,18 +635,15 @@ const fn code_hash(s: &str) -> u64 {
     h
 }
 
-/// Intern an unresolved code for the process lifetime.
+/// FNV-1a over the canonical spelling.
 ///
-/// `ErrCode` is `Copy` because both variants are now `&'static` pointers: cloning
-/// a batch of diagnostics costs no atomic RMW (the `Arc` this replaced paid one
-/// per clone), and `PartialEq` is a pointer compare for *every* code, not just
-/// the registry ones.
-///
-/// The interner is keyed by the verbatim spelling alone, which is sound because
-/// `resolve(spelling)` is deterministic — one spelling can only ever map to one
-/// canonical entry.  Interned payloads are leaked deliberately: a distinct
-/// unknown spelling is bounded by what the process actually prints, and this is
-/// the same trade the module already documents for registry codes.
+/// The hash must be **identical across representations**: a registry code and a
+/// spelling of it that resolved through `Other` compare equal (see
+/// `PartialEq`/`Hash`), so they must hash equal too.  It is precomputed because
+/// `Hash` for an `ErrCode` is one `write_u64`; the trade-off is that the value
+/// is unkeyed, so a `HashMap<ErrCode, _>` does not get SipHash's per-map keying
+/// (inputs are compiler source and diagnostic strings, not attacker-chosen
+/// keys).
 /// Wrap `url` in an OSC 8 hyperlink around `visible`.
 fn ansi_wrap(url: &str, visible: &str) -> String {
     // "\x1b]8;;" + url + "\x1b\\" + visible + "\x1b]8;;\x1b\\"
@@ -872,16 +921,17 @@ impl ErrCode {
     /// shape-valid unregistered code (e.g. `E999`) still occupies its slot and is
     /// cached, so repeated emissions do not rebuild the URL.
     ///
-    /// Four such arrays exist in total (one per `(url, url_ansi) × (port set,
-    /// port unset)` quadrant), so a later `set_explain_port` can never observe a
-    /// stale doc-URL host.
+    /// Two such arrays exist — `(url, url_ansi)` for the port-*set* quadrant.
+    /// The port-unset quadrants are not caches: registry codes read a build-time
+    /// constant and everything else builds uncached, which is why a later
+    /// `set_explain_port` can never observe a stale doc-URL host.
     pub fn url(&self) -> std::borrow::Cow<'static, str> {
         let slot = self.slot();
         self.url_for_slot(slot)
     }
 
     fn url_for_slot(&self, slot: Option<u16>) -> std::borrow::Cow<'static, str> {
-        self.url_for_slot_with_port(slot, EXPLAIN_PORT.get().copied())
+        self.url_for_slot_with_port(slot, explain_port())
     }
 
     fn url_for_slot_with_port(
@@ -943,7 +993,7 @@ impl ErrCode {
     }
 
     pub fn url_ansi(&self) -> std::borrow::Cow<'static, str> {
-        let Some(port) = EXPLAIN_PORT.get().copied() else {
+        let Some(port) = explain_port() else {
             // Same as `url`, with one extra condition: the wrapper embeds the
             // *visible* spelling, so only a canonical spelling may borrow the
             // build-time constant.
@@ -1182,6 +1232,32 @@ pub fn category_siblings_of(code: &str, max: usize) -> &'static [&'static str] {
 
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
+    /// The user-visible contract of [`set_explain_port`]: a render made before
+    /// the port is known keeps the documentation host, a render after it yields
+    /// the localhost link, and the country does not stick.  Driven through the
+    /// test-only override because the real global is set-once.
+    #[test]
+    fn url_flips_between_doc_and_localhost_across_the_override() {
+        let code = ErrCode::try_new("E030").expect("E030 is registered");
+        let doc = with_explain_port(None, || code.url().into_owned());
+        assert!(doc.starts_with("https://"), "doc URL expected, got {doc}");
+        let local = with_explain_port(Some(41234), || code.url().into_owned());
+        // Only the host is asserted: the slot caches are keyed per slot within
+        // the port-*set* quadrant, and this test binary's process-global port may
+        // already be 0 from `set_explain_port_reports_second_set`, so which port
+        // an already-built entry embeds is not this contract (the doc says an
+        // entry built under one port is not invalidated by a later set).
+        assert!(
+            local.contains("127.0.0.1:"),
+            "localhost URL expected, got {local}"
+        );
+        let back = with_explain_port(None, || code.url().into_owned());
+        assert_eq!(back, doc, "the override must not be sticky");
+        // The ANSI wrapper follows the same flip.
+        let ansi_local = with_explain_port(Some(41234), || code.url_ansi().into_owned());
+        assert!(ansi_local.contains("127.0.0.1:"), "{ansi_local}");
+    }
+
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};

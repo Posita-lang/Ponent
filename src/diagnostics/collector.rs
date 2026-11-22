@@ -304,6 +304,14 @@ impl<'src> DiagCtxt<'src> {
     /// production sites (two in the checker, two in the resolver), each once
     /// per file.
     pub fn attach_source(&mut self, source: &'src str) {
+        if !self.may_have_unsourced {
+            // `false` means every stored diagnostic is known-sourced: set by a
+            // full-coverage audit, a full-vector patch, or a sourced-only
+            // batch, and only ever re-armed by a sourceless `push`.  So the
+            // common steady state (producer attaches after each push batch)
+            // skips the scan entirely.
+            return;
+        }
         for diag in &mut self.diags {
             if diag.source().is_none() {
                 diag.set_source(source);
@@ -466,6 +474,10 @@ impl<'src> DiagCtxt<'src> {
         self.unreported_warnings = 0;
         self.reported_errors = 0;
         self.reported_warnings = 0;
+        // Derived state: the vector is empty, so "some diagnostic may lack a
+        // source" is provably false.  Leaving it set made the first post-clear
+        // emit pay a wasted audit and blocked `attach_source`'s O(1) path.
+        self.may_have_unsourced = false;
         // `suppressed_warnings` is deliberately NOT reset: it is a
         // session-lifetime observation, not derived state.
     }
@@ -647,7 +659,7 @@ impl<'src> DiagCtxt<'src> {
             // Reuse the same derivation `recount_derived_state` and
             // `From<Vec>` use: a bespoke loop here could drift from them, which
             // is exactly what `scan_derived`'s doc cites as its reason to exist.
-            let (e, w, _, _) = scan_derived(&self.diags, self.reported_len);
+            let (e, w, _, _, _) = scan_derived(&self.diags, self.reported_len);
             debug_assert_eq!(
                 (self.errors, self.warnings),
                 (e, w),
@@ -785,7 +797,7 @@ impl<'src> DiagCtxt<'src> {
         // tallies silently wrong.
         #[cfg(debug_assertions)]
         {
-            let (errors, warnings, ue, uw) = scan_derived(&self.diags, self.reported_len);
+            let (errors, warnings, ue, uw, _) = scan_derived(&self.diags, self.reported_len);
             debug_assert_eq!(
                 (
                     self.errors,
@@ -938,7 +950,12 @@ impl<'src> DiagCtxt<'src> {
     /// assertable in tests without parsing output.
     fn report_internal_bug(&mut self, msg: &str) {
         self.internal_bugs += 1;
-        eprintln!("ponent: internal bug: {msg}");
+        // `eprintln!` panics when stderr is closed or broken (daemonized
+        // processes, `2>&-`, closed CI pipes), which would take down the very
+        // emission path this function exists to keep alive.  The counter stays
+        // the assertable record; the write is best-effort.
+        use std::io::Write as _;
+        let _ = writeln!(io::stderr(), "ponent: internal bug: {msg}");
     }
 
     /// Terminal source audit, run by [`Self::emit`] before the handoff.
@@ -958,8 +975,15 @@ impl<'src> DiagCtxt<'src> {
         let start = self.reported_len;
         let suffix = &self.diags[start..];
         let Some(first) = suffix.iter().position(|d| d.source().is_none()) else {
-            // The flag was stale (a drain/discard may have removed the offender).
-            self.may_have_unsourced = false;
+            // Clear only when the scan covered the whole vector.  `reported_len
+            // > 0` means `mark_all_reported` moved diagnostics into the prefix
+            // *without* auditing them, so a clean suffix says nothing about
+            // them: clearing here would manufacture exactly the stale `false`
+            // that the flag's one-way soundness doc forbids (a later
+            // `attach_source` fast path would then skip patching the prefix).
+            if self.reported_len == 0 {
+                self.may_have_unsourced = false;
+            }
             return;
         };
         // Bug state only, so the second pass is acceptable — and reporting just
@@ -1077,12 +1101,17 @@ impl<'src> DiagCtxt<'src> {
 /// construction and the post-emit recount cannot drift apart: `reported_len`
 /// splits "total" from "unreported" counts, and `From<Vec>` passes `0` because
 /// a freshly built context has nothing reported yet.
-fn scan_derived(diags: &[Diagnostic<'_>], reported_len: usize) -> (usize, usize, usize, usize) {
+fn scan_derived(
+    diags: &[Diagnostic<'_>],
+    reported_len: usize,
+) -> (usize, usize, usize, usize, bool) {
     let mut errors = 0usize;
     let mut warnings = 0usize;
     let mut unreported_errors = 0usize;
     let mut unreported_warnings = 0usize;
+    let mut has_unsourced = false;
     for (i, d) in diags.iter().enumerate() {
+        has_unsourced |= d.source().is_none();
         if d.is_error() {
             errors += 1;
             if i >= reported_len {
@@ -1095,7 +1124,13 @@ fn scan_derived(diags: &[Diagnostic<'_>], reported_len: usize) -> (usize, usize,
             }
         }
     }
-    (errors, warnings, unreported_errors, unreported_warnings)
+    (
+        errors,
+        warnings,
+        unreported_errors,
+        unreported_warnings,
+        has_unsourced,
+    )
 }
 
 impl Default for DiagCtxt<'_> {
@@ -1110,7 +1145,8 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
         // unreported (`reported_len == 0`), so the totals and the unreported
         // tallies coincide.  Deriving them twice is how the initial
         // construction and the post-emit recount drift apart.
-        let (errors, warnings, unreported_errors, unreported_warnings) = scan_derived(&diags, 0);
+        let (errors, warnings, unreported_errors, unreported_warnings, has_unsourced) =
+            scan_derived(&diags, 0);
         DiagCtxt {
             diags: SmallVec::from_vec(diags),
             reported_len: 0,
@@ -1123,8 +1159,10 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
             reported_warnings: 0,
             suppressed_warnings: 0,
             internal_bugs: 0,
-            // Any of these may lack a source; one scan at emission decides.
-            may_have_unsourced: true,
+            // The constructor's own scan already answered this; assuming
+            // `true` made every sourced batch pay one wasted audit at first
+            // emit and gave up the O(1) `attach_source` path.
+            may_have_unsourced: has_unsourced,
         }
     }
 }
@@ -1474,7 +1512,7 @@ mod tests {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 self.0
                     .borrow_mut()
-                    .push_str(std::str::from_utf8(buf).expect("diagnostic output is UTF-8"));
+                    .push_str(simdutf8::basic::from_utf8(buf).expect("diagnostic output is UTF-8"));
                 Ok(buf.len())
             }
 
@@ -1537,7 +1575,7 @@ mod tests {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 self.0
                     .borrow_mut()
-                    .push_str(std::str::from_utf8(buf).expect("diagnostic output is UTF-8"));
+                    .push_str(simdutf8::basic::from_utf8(buf).expect("diagnostic output is UTF-8"));
                 Ok(buf.len())
             }
 

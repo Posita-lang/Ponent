@@ -49,6 +49,47 @@ fn fill_internal_error<R: Renderer>(renderer: &R, buf: &mut String) {
     }
 }
 
+/// Restores the one-batch permit on unwind, or retires the pool if the permit
+/// was already handed to it.
+///
+/// `submit` consumes the permit by value, so any unwind after that point leaves
+/// the pool's in-flight state unknown *and* the permit unobtainable.  Restoring
+/// only on the success path meant one recoverable panic made every later
+/// parallel batch panic; retiring instead degrades to the serial path, which is
+/// always correct.
+struct BatchPermit<'a> {
+    slot: &'a std::sync::Mutex<Option<crate::pool::BatchToken>>,
+    retired: &'a std::sync::atomic::AtomicBool,
+    token: Option<crate::pool::BatchToken>,
+}
+
+impl<'a> BatchPermit<'a> {
+    fn take(
+        slot: &'a std::sync::Mutex<Option<crate::pool::BatchToken>>,
+        retired: &'a std::sync::atomic::AtomicBool,
+    ) -> Self {
+        let token = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        Self {
+            slot,
+            retired,
+            token,
+        }
+    }
+}
+
+impl Drop for BatchPermit<'_> {
+    fn drop(&mut self) {
+        match self.token.take() {
+            Some(token) => *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(token),
+            // Handed to `submit` and never returned: never start another
+            // parallel batch on this pool.
+            None => self
+                .retired
+                .store(true, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
 pub mod stylesheet;
 
 /// Distinct-file set used by the batch summary, shaped for the access
@@ -79,6 +120,12 @@ struct FilesSeen {
     /// Index of the previous key in `seen` — no second ownership of a
     /// `FileKey::Name` (and no `CompactString` clone) on repeat-heavy batches.
     last: Option<usize>,
+    /// The `(FileId, display name)` pair recorded most recently.  Repeat-heavy
+    /// batches re-mention one file; the memo turns the common case into a pair
+    /// of comparisons instead of a linear scan over every distinct pair (that
+    /// scan is `O(diagnostics x files)` across a batch).  Invalidated wherever
+    /// `id_names` is mutated from another path (`claim_anonymous`).
+    last_pair: Option<(crate::ast::FileId, CompactString)>,
     seen: FilesSeenInner,
 }
 
@@ -113,6 +160,7 @@ impl FilesSeen {
     fn new() -> Self {
         FilesSeen {
             last: None,
+            last_pair: None,
             seen: FilesSeenInner::Small {
                 seen: SmallVec::new(),
                 id_names: SmallVec::new(),
@@ -273,6 +321,12 @@ impl FilesSeen {
     }
 
     fn add_id_name(&mut self, id: crate::ast::FileId, name: &str) {
+        if let Some((last_id, last_name)) = &self.last_pair
+            && *last_id == id
+            && last_name == name
+        {
+            return;
+        }
         match &mut self.seen {
             FilesSeenInner::Small { id_names, .. } => {
                 if !id_names
@@ -307,22 +361,12 @@ impl FilesSeen {
                 }
             }
         }
+        self.last_pair = Some((id, CompactString::from(name)));
     }
 
     fn add_anonymous_name(&mut self, name: &str) {
         if let FilesSeenInner::Large { names, .. } = &mut self.seen {
             names.anon.insert(CompactString::from(name));
-        }
-    }
-
-    fn id_name_known(&self, id: crate::ast::FileId, name: &str) -> bool {
-        match &self.seen {
-            FilesSeenInner::Small { id_names, .. } => id_names
-                .iter()
-                .any(|(known_id, known_name)| *known_id == id && known_name == name),
-            FilesSeenInner::Large { names, .. } => {
-                names.id_names.contains(&(id, CompactString::from(name)))
-            }
         }
     }
 
@@ -444,15 +488,15 @@ struct BatchShared<'a, 'src, R: Renderer> {
     /// Claim order (weights descending for throughput, index order for
     /// streaming).
     order: &'a [usize],
-    cells: Vec<std::sync::Mutex<&'a mut Diagnostic<'src>>>,
-    slots: Vec<std::sync::Mutex<Option<(String, usize)>>>,
+    cells: Vec<Padded<std::sync::Mutex<&'a mut Diagnostic<'src>>>>,
+    slots: Vec<Padded<std::sync::Mutex<Option<(String, usize)>>>>,
     slot_cv: std::sync::Condvar,
     renderer: &'a R,
     opts: &'a DiagOpts,
     prebuilt: &'a [Prebuilt],
     /// One buffer pool per resident worker.  A buffer is returned to the pool
     /// of the worker that produced it, so the hot path has no shared mutex.
-    string_pools: &'a [std::sync::Mutex<Vec<String>>],
+    string_pools: &'a [std::sync::Mutex<StringPool>],
     streaming: bool,
 }
 
@@ -472,27 +516,84 @@ const POOL_OVERSIZE_CAP: usize = 1024 * 1024;
 /// retention at roughly eight typical buffers per pool.
 const POOL_BYTE_BUDGET: usize = 512 * 1024;
 
+/// Floor for a single pool's budget after dividing `POOL_BYTE_BUDGET` by the
+/// worker count.  Below ~32 typical 2 KiB render buffers the pool stops amortising
+/// allocations at all, so the division must not drive it to zero on many-core
+/// hosts.
+const POOL_BYTE_BUDGET_MIN: usize = 64 * 1024;
+
 /// Return `buf` to `pool` under the retained-bytes budget.
 ///
 /// One implementation for both the batch and the streaming path: they carried
 /// hand-copied versions of this policy, which is exactly the duplicate that
 /// drifts.
-fn return_buffer_to_pool(pool: &mut Vec<String>, buf: String) {
-    if buf.capacity() > POOL_SMALL_CAP {
+/// One resident worker's buffer pool.
+///
+/// Admission used to recompute `sum(capacities)` and scan for an oversize slot
+/// on *every* return — a linear pass per rendered diagnostic on the stitch path.
+/// Both quantities only change on push/pop, so they are maintained here.
+struct StringPool {
+    bufs: Vec<String>,
+    /// Sum of `bufs` capacities, oversize slot included (the budget check has
+    /// always covered the whole pool).
+    retained: usize,
+    /// Whether an oversize (`capacity > POOL_SMALL_CAP`) buffer is resident.
+    oversize: bool,
+    /// Bytes this pool may retain.  Scaled down by the worker count at
+    /// construction: the old *per-pool* budget multiplied by the core count, so a
+    /// 64-core host kept ~96 MB of idle buffers alive.  Each pool is also used
+    /// proportionally less often when there are more of them.
+    budget: usize,
+}
+
+impl StringPool {
+    fn new(budget: usize) -> Self {
+        StringPool {
+            bufs: Vec::new(),
+            retained: 0,
+            oversize: false,
+            budget,
+        }
+    }
+
+    fn take(&mut self) -> String {
+        match self.bufs.pop() {
+            Some(buf) => {
+                self.retained -= buf.capacity();
+                if buf.capacity() > POOL_SMALL_CAP {
+                    self.oversize = false;
+                }
+                buf
+            }
+            None => String::new(),
+        }
+    }
+}
+
+fn return_buffer_to_pool(pool: &mut StringPool, buf: String) {
+    let cap = buf.capacity();
+    if cap > POOL_SMALL_CAP {
         // One oversize slot per pool, never above the absolute cap.
-        if buf.capacity() > POOL_OVERSIZE_CAP || pool.iter().any(|b| b.capacity() > POOL_SMALL_CAP)
-        {
+        if cap > POOL_OVERSIZE_CAP || pool.oversize {
             return;
         }
-        pool.push(buf);
+        pool.oversize = true;
+    } else if pool.retained.saturating_add(cap) > pool.budget {
         return;
     }
-    let retained: usize = pool.iter().map(|b| b.capacity()).sum();
-    if retained.saturating_add(buf.capacity()) > POOL_BYTE_BUDGET {
-        return;
-    }
-    pool.push(buf);
+    pool.retained += cap;
+    pool.bufs.push(buf);
 }
+
+/// Cache-line-padded cell.
+///
+/// Workers claim in *weight* order, so adjacent indices are routinely written by
+/// different cores — the textbook false-sharing shape for a `Vec<Mutex<_>>` whose
+/// entries are ~40 bytes.  Memory grows to one line per slot (a 4k-diagnostic
+/// batch goes from ~0.2 MB to ~2 MB of mutexes), which is trivial next to the
+/// rendered output the batch holds at the same time.
+#[repr(align(64))]
+struct Padded<T>(T);
 
 /// Resident-pool worker for one batch.  Claims are atomic and each cell is
 /// locked exactly for its own render, so weight-model lies only affect claim
@@ -529,12 +630,14 @@ fn worker_render_dynamic<R: Renderer>(
         let mut buf = shared.string_pools[worker_idx]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .pop()
-            .unwrap_or_default();
+            .take();
         buf.clear();
         let buf = match &cx {
             Some(cx) => {
-                let mut guard = shared.cells[orig].lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = shared.cells[orig]
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let diag: &mut Diagnostic<'_> = &mut **guard;
                 let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     diag.humanize();
@@ -551,7 +654,10 @@ fn worker_render_dynamic<R: Renderer>(
                 buf
             }
         };
-        *shared.slots[orig].lock().unwrap_or_else(|e| e.into_inner()) = Some((buf, worker_idx));
+        *shared.slots[orig]
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((buf, worker_idx));
         if shared.streaming {
             // Streaming has exactly one waiter (the main consumer); notifying
             // the whole queue for a single thread is wasted wakeups.
@@ -587,11 +693,17 @@ pub struct Emitter<R, M> {
     /// second submit before `wait` is a compile error rather than a release-mode
     /// UB path (see `pool::BatchToken`).
     pool_token: std::sync::Mutex<Option<crate::pool::BatchToken>>,
+    /// Set when a panic unwound through a batch *after* the permit was handed to
+    /// the pool: its in-flight state is then unknown, so parallel rendering is
+    /// retired for the rest of this emitter's life and every later batch renders
+    /// serially.  A recoverable panic must not become a panic on every subsequent
+    /// batch, which is what `expect`ing a swallowed permit produced.
+    pool_retired: std::sync::atomic::AtomicBool,
     /// Reused across batch emits: weights and claim order.
     batch: BatchScratch,
     /// One reusable `String` pool per resident worker.  Workers only ever push
     /// into and pop from their own pool, so the old single hot mutex is gone.
-    string_pools: Vec<std::sync::Mutex<Vec<String>>>,
+    string_pools: Vec<std::sync::Mutex<StringPool>>,
     /// Cross-batch line tables keyed by `(FileId, full-content hash)`, newest
     /// at the front with FIFO eviction past 8 entries (a recent-files window,
     /// not a timestamp LRU — the per-batch `line_cache` is that).
@@ -620,10 +732,16 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             parallelism,
             pool: std::sync::OnceLock::new(),
             pool_token: std::sync::Mutex::new(None),
+            pool_retired: std::sync::atomic::AtomicBool::new(false),
             batch: BatchScratch::default(),
-            string_pools: (0..parallelism)
-                .map(|_| std::sync::Mutex::new(Vec::new()))
-                .collect(),
+            string_pools: {
+                // Keep the *aggregate* resident budget roughly constant instead of
+                // growing it by a factor of `parallelism`.
+                let per_pool = (POOL_BYTE_BUDGET / parallelism.max(1)).max(POOL_BYTE_BUDGET_MIN);
+                (0..parallelism)
+                    .map(|_| std::sync::Mutex::new(StringPool::new(per_pool)))
+                    .collect()
+            },
             file_index_cache: std::cell::RefCell::new(crate::smallvec::SmallVec::new()),
         }
     }
@@ -645,15 +763,22 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let ptr = src.as_ptr() as usize;
         let len = src.len();
         let fingerprint = source_fingerprint(src);
-        let content_hash = source_content_hash(src);
-        let cached = file_id.and_then(|id| {
-            self.file_index_cache
+        // The hash is only meaningful when there is a `FileId` to key on *and* the
+        // cache holds something to compare against; computing it unconditionally
+        // put a full pass over the source on the single-emit (LSP) path for
+        // diagnostics that could never hit.
+        let content_hash = match file_id {
+            Some(_) if !self.file_index_cache.borrow().is_empty() => Some(source_content_hash(src)),
+            _ => None,
+        };
+        let cached = match (file_id, content_hash) {
+            (Some(id), Some(h)) => self
+                .file_index_cache
                 .borrow()
                 .iter()
-                .find_map(|(f, h, n, p)| {
-                    (*f == id && *h == content_hash && *n == len).then(|| p.clone())
-                })
-        });
+                .find_map(|(f, ch, n, p)| (*f == id && *ch == h && *n == len).then(|| p.clone())),
+            _ => None,
+        };
         let entry = match cached {
             Some(p) => PreloadedSource {
                 ptr,
@@ -681,7 +806,8 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                     if cache.len() >= 8 {
                         cache.pop();
                     }
-                    cache.insert(0, (id, content_hash, len, entry.clone()));
+                    let h = content_hash.unwrap_or_else(|| source_content_hash(src));
+                    cache.insert(0, (id, h, len, entry.clone()));
                 }
                 entry
             }
@@ -734,10 +860,16 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // Reuse the line table this emitter already built for the file, when it
         // has one: an LSP loop emits diagnostics for the same file repeatedly,
         // and the table is content-addressed, so a rebuild is pure waste.
-        let prebuilt = diag
-            .source()
-            .map(|src| self.prebuilt_for_single(src, diag.spans().first().map(|s| s.file)))
-            .unwrap_or_default();
+        // A failed `humanize` already forces the internal-error placeholder, so a
+        // line table built for it would be pure waste (the old order did exactly
+        // that).
+        let prebuilt = if humanized {
+            diag.source()
+                .map(|src| self.prebuilt_for_single(src, diag.spans().first().map(|s| s.file)))
+                .unwrap_or_default()
+        } else {
+            SmallVec::new()
+        };
         let cx = if prebuilt.is_empty() {
             RenderCtx::hoisted(&self.opts, None, &self.shared)
         } else {
@@ -1000,29 +1132,31 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // would spawn 64 threads for one diagnostic each — ~3 ms of
         // `spawn`/`join` for work that barely amortises.
         let num_threads = num_threads.min((num_renderable / MIN_CHUNK).max(1));
+        let pool_usable = !self.pool_retired.load(std::sync::atomic::Ordering::Relaxed);
         let render_result = if streaming
+            && pool_usable
             && num_renderable >= PARALLEL_THRESHOLD
             && total_weight >= WEIGHT_THRESHOLD
             && num_threads > 1
         {
             self.render_streaming(filtered.as_mut_slice(), &mut batch, sink, num_threads)
-        } else if num_renderable >= PARALLEL_THRESHOLD
+        } else if pool_usable
+            && num_renderable >= PARALLEL_THRESHOLD
             && total_weight >= WEIGHT_THRESHOLD
             && num_threads > 1
         {
             self.render_dynamic(filtered.as_mut_slice(), &mut batch, sink, num_threads)
         } else {
-            // Opportunistic content-keyed reuse.  Hashing every source is only
-            // worth it once the cache already holds content keys (a parallel
-            // batch or an earlier serial batch); on a cold process it would add
-            // a full pass on top of the `LineIndex::new` the path pays anyway.
-            // With keys present, an LSP re-publish (same file, new allocation)
-            // reuses the table instead of rescanning the whole file.
-            let prebuilt = if self.file_index_cache.borrow().is_empty() {
-                Vec::new()
-            } else {
-                self.prebuild_sources(&filtered[..], &batch.weights).0
-            };
+            // Opportunistic content-keyed reuse, on the serial path too.
+            //
+            // This used to be gated on the cache already being non-empty, which
+            // made the mechanism dead for workloads that never reach the parallel
+            // threshold and never call `emit` (an LSP re-publish loop over a small
+            // batch): it stayed cold forever and rescanned every source per batch.
+            // The gate's premise was also wrong — the cold branch below uses the
+            // fused `LineIndex::new_hashed`, so prebuilding is scan-neutral and
+            // strictly better once a batch touches one file several times.
+            let prebuilt = self.prebuild_sources(&filtered[..], &batch.weights).0;
             let cx = RenderCtx::hoisted_with_prebuilt(&self.opts, None, &self.shared, &prebuilt);
             self.render_sequential(filtered.as_mut_slice(), sink, &cx)
         };
@@ -1083,8 +1217,11 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 self.renderer.render_into(diag, &cx, &mut buf);
             }));
             if rendered.is_err() {
-                buf.clear();
-                self.renderer.render_internal_error(&mut buf);
+                // Same panic containment as `emit` and the worker path: the
+                // fallback's fallback must be global, and this was the one route
+                // where a panic inside `render_internal_error` escaped into the
+                // caller (aborting an LSP batch, or killing a pooled thread).
+                fill_internal_error(&self.renderer, &mut buf);
             }
             if buf.is_empty() {
                 continue;
@@ -1121,6 +1258,14 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             if let Some(src) = diag.source() {
                 let key = (src.as_ptr() as usize, src.len());
                 *source_weight.entry(key).or_default() += weights[i];
+                // 1.6: a source with no span at all is never line-queried, and
+                // with no `FileId` the table could not enter the cache either —
+                // the fused build was pure O(source) waste.  The renderer builds
+                // lazily if some path does ask (see `RenderCtx::line_index`), so
+                // skipping here cannot change a byte of output.
+                if diag.spans().first().is_none() {
+                    continue;
+                }
                 if seen.insert(key) {
                     let file_id = diag.spans.primary_ref().first().map(|s| s.file);
                     let fingerprint = crate::diagnostics::render::source_fingerprint(src);
@@ -1225,15 +1370,17 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         scratch
             .order
             .sort_unstable_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
-        let cells: Vec<std::sync::Mutex<&mut Diagnostic<'_>>> = filtered
+        let cells: Vec<Padded<std::sync::Mutex<&mut Diagnostic<'_>>>> = filtered
             .iter_mut()
-            .map(|diag| std::sync::Mutex::new(&mut **diag))
+            .map(|diag| Padded(std::sync::Mutex::new(&mut **diag)))
             .collect();
         let shared = BatchShared {
             next: std::sync::atomic::AtomicUsize::new(0),
             order: &scratch.order,
             cells,
-            slots: (0..n).map(|_| std::sync::Mutex::new(None)).collect(),
+            slots: (0..n)
+                .map(|_| Padded(std::sync::Mutex::new(None)))
+                .collect(),
             slot_cv: std::sync::Condvar::new(),
             renderer: &self.renderer,
             opts: &self.opts,
@@ -1246,10 +1393,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             *self.pool_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
             pool
         });
-        let token = self
-            .pool_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let mut permit = BatchPermit::take(&self.pool_token, &self.pool_retired);
+        let token = permit
+            .token
             .take()
             .expect("batch token is absent only while a batch is in flight");
         let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
@@ -1265,16 +1411,25 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             }));
         }
         let token = pool.submit(token, jobs).wait();
-        *self.pool_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+        permit.token = Some(token);
         let string_pools = shared.string_pools;
         let BatchShared { slots, .. } = shared;
         let mut first = true;
         for slot in slots {
             let (mut buf, owner) = slot
+                .0
                 .into_inner()
                 .unwrap_or_else(|e| e.into_inner())
                 .expect("every claimed render slot must be filled before stitch");
+            // Return the buffer even when the render was empty: dropping it here
+            // evicted half the pool on an every-other-empty workload, forcing a
+            // fresh allocation on the next pop — the churn the pool exists to
+            // remove.  A cleared buffer is worth exactly as much as before.
             if buf.is_empty() {
+                let mut pool = string_pools[owner]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                return_buffer_to_pool(&mut pool, buf);
                 continue;
             }
             if first {
@@ -1322,15 +1477,17 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let n = filtered.len();
         scratch.order.clear();
         scratch.order.extend(0..n);
-        let cells: Vec<std::sync::Mutex<&mut Diagnostic<'_>>> = filtered
+        let cells: Vec<Padded<std::sync::Mutex<&mut Diagnostic<'_>>>> = filtered
             .iter_mut()
-            .map(|diag| std::sync::Mutex::new(&mut **diag))
+            .map(|diag| Padded(std::sync::Mutex::new(&mut **diag)))
             .collect();
         let shared = BatchShared {
             next: std::sync::atomic::AtomicUsize::new(0),
             order: &scratch.order,
             cells,
-            slots: (0..n).map(|_| std::sync::Mutex::new(None)).collect(),
+            slots: (0..n)
+                .map(|_| Padded(std::sync::Mutex::new(None)))
+                .collect(),
             slot_cv: std::sync::Condvar::new(),
             renderer: &self.renderer,
             opts: &self.opts,
@@ -1343,10 +1500,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             *self.pool_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
             pool
         });
-        let token = self
-            .pool_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let mut permit = BatchPermit::take(&self.pool_token, &self.pool_retired);
+        let token = permit
+            .token
             .take()
             .expect("batch token is absent only while a batch is in flight");
         let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
@@ -1367,6 +1523,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         for cursor in 0..n {
             let (mut buf, owner) = {
                 let mut slot = shared.slots[cursor]
+                    .0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 while slot.is_none() {
@@ -1374,7 +1531,14 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 }
                 slot.take().expect("slot filled")
             };
+            // Same as the batch stitch: a fast consumer drains slots faster than
+            // workers fill them, so most buffers arriving here are empty — losing
+            // them to the allocator defeats the pool.
             if buf.is_empty() {
+                let mut pool = shared.string_pools[owner]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                return_buffer_to_pool(&mut pool, buf);
                 continue;
             }
             if first {
@@ -1401,7 +1565,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             }
         }
         let token = wait.wait();
-        *self.pool_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+        permit.token = Some(token);
         result
     }
 }
@@ -1670,6 +1834,58 @@ mod tests {
             N / 128,
             "every failed diagnostic must get exactly one placeholder: {out}"
         );
+    }
+
+    /// 1.3: a permit that goes into `submit` and never comes back must retire
+    /// the pool rather than leave an `expect` that panics on every later batch.
+    #[test]
+    fn lost_batch_permit_retires_the_pool() {
+        let slot = std::sync::Mutex::new(None);
+        let retired = std::sync::atomic::AtomicBool::new(false);
+        {
+            let permit = BatchPermit::take(&slot, &retired);
+            assert!(permit.token.is_none());
+            // Drop with no permit: the unwound-through-`submit` shape.
+        }
+        assert!(
+            retired.load(std::sync::atomic::Ordering::Relaxed),
+            "a swallowed permit must retire the pool instead of panicking later"
+        );
+    }
+
+    /// 1.4: a workload whose renders are mostly empty must not drain the buffer
+    /// pool — the empty stitch used to drop the buffer to the allocator.
+    #[test]
+    fn empty_renders_keep_the_buffer_pool_resident() {
+        let opts = DiagOpts::default();
+        let mut emitter = Emitter::new(EveryOtherEmpty, string(), opts);
+        // Below the parallel threshold the pools are never touched.
+        if emitter.parallelism <= 1 {
+            return;
+        }
+        let mut diags = alternating_diags(512);
+        let mut sink = StringSink::new();
+        emitter.emit_all_to(&mut diags, &mut sink).unwrap();
+        let resident: usize = emitter
+            .string_pools
+            .iter()
+            .map(|pool| pool.lock().unwrap_or_else(|e| e.into_inner()).bufs.len())
+            .sum();
+        assert!(
+            resident > 0,
+            "an every-other-empty batch must leave buffers pooled, not drop them"
+        );
+    }
+
+    /// 5.5: the single-emit path (the LSP hot path) contains a render panic to a
+    /// placeholder instead of unwinding into the caller.
+    #[test]
+    fn single_emit_contains_render_panics() {
+        let mut emitter = Emitter::new(PanicOnBoom, string(), DiagOpts::default());
+        let mut diag = Diagnostic::warning("boom");
+        emitter
+            .emit(&mut diag)
+            .expect("a panic must not escape emit");
     }
 
     #[test]

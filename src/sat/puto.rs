@@ -2385,13 +2385,13 @@ impl Solver {
 
     /// DIMACS CNF export of the current formula (1-based variables, as here).
     pub fn to_dimacs(&self) -> String {
-        use std::fmt::Write as _;
+        use swrite::{SWrite, swrite, swriteln};
         let clauses = self.clauses_snapshot();
         let mut out = String::with_capacity(24 + clauses.len() * 8);
-        let _ = writeln!(out, "p cnf {} {}", self.num_vars(), clauses.len());
+        swriteln!(out, "p cnf {} {}", self.num_vars(), clauses.len());
         for c in &clauses {
             for l in c {
-                let _ = write!(out, "{l} ");
+                swrite!(out, "{l} ");
             }
             out.push_str("0\n");
         }

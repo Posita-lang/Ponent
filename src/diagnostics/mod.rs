@@ -87,6 +87,7 @@ use covariant_vec::CovariantVec;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::fmt;
+use swrite::{SWrite, swrite, swriteln};
 use std::io;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -190,7 +191,14 @@ pub struct DiagOpts {
     /// next `tab_width`-column stop.  Defaults to 4 (matches the historical
     /// hard-coded `TAB_WIDTH`); projects using 2/8-space indents can override.
     pub tab_width: usize,
-    pub only_codes: Vec<String>,
+    /// Show only these diagnostic codes (exact, case-insensitive match against
+    /// the **canonical** spelling; entries are canonicalized once when the
+    /// filter is built).
+    ///
+    /// **A diagnostic with no code is excluded** — matching is keyed on the code,
+    /// exactly as for `only_categories`.  `allow_codes` wins when a code appears
+    /// in both lists, and the three `only_*` filters compose with AND.
+    pub only_codes: Vec<CompactString>,
     /// Keep only diagnostics whose error code belongs to one of these
     /// categories.
     ///
@@ -200,13 +208,19 @@ pub struct DiagOpts {
     /// diagnostics that carry a code participate normally.  Callers that need
     /// code-less findings to survive must not filter by category.
     pub only_categories: Vec<ErrorCategory>,
-    pub only_files: Vec<String>,
+    /// Show only diagnostics whose display file name contains one of these
+    /// patterns — **substring** match (via `memmem`), not glob or exact match.
+    /// Unlike `only_codes`/`only_categories`, a code-less diagnostic *does*
+    /// participate: the file name is independent of the code.
+    ///
+    /// Empty patterns are ignored (see `DiagFilter::from_opts`).
+    pub only_files: Vec<CompactString>,
     /// Codes to *suppress*, rustc `-A`-style: a diagnostic whose code is in
     /// this list is filtered out (not rendered, not counted).  The name
     /// follows rustc's `-A`/`--allow` lint levels — an "allowed" diagnostic
     /// is permitted to fail silently.  For the opposite (show *only* these
     /// codes) use [`DiagOpts::only_codes`].
-    pub allow_codes: Vec<String>,
+    pub allow_codes: Vec<CompactString>,
     pub quiet: bool,
     pub no_wrap: bool,
 }
@@ -275,14 +289,15 @@ pub(crate) struct DiagFilter {
     /// hash instead of hashing a string and possibly allocating an uppercased
     /// copy of it.
     allow_slots: rustc_hash::FxHashSet<u16>,
-    allow_verbatim: rustc_hash::FxHashSet<String>,
+    allow_verbatim: rustc_hash::FxHashSet<CompactString>,
     only_slots: rustc_hash::FxHashSet<u16>,
-    only_verbatim: rustc_hash::FxHashSet<String>,
+    only_verbatim: rustc_hash::FxHashSet<CompactString>,
     only_categories: rustc_hash::FxHashSet<ErrorCategory>,
-    only_files: Vec<String>,
-    /// Prebuilt SIMD substring searchers for `only_files`: `str::contains` runs a
-    /// two-way setup per call on the per-diagnostic path, `memmem::FinderOwned`
-    /// pays that once at construction.
+    /// Prebuilt SIMD substring searchers for `only_files`, and the *only* copy of
+    /// that filter: `str::contains` runs a two-way setup per call on the
+    /// per-diagnostic path, while `memmem::FinderOwned` pays it once at
+    /// construction.  A parallel `Vec<String>` was kept in lockstep here and then
+    /// never read, i.e. a second source of truth whose only future was to drift.
     only_files_finders: Vec<memchr::memmem::Finder<'static>>,
     /// Precomputed "no filter is set": the common unfiltered batch turns
     /// `matches` into one predictable branch instead of four `is_empty()`
@@ -302,7 +317,6 @@ impl Default for DiagFilter {
             only_slots: rustc_hash::FxHashSet::default(),
             only_verbatim: rustc_hash::FxHashSet::default(),
             only_categories: rustc_hash::FxHashSet::default(),
-            only_files: Vec::new(),
             only_files_finders: Vec::new(),
             is_empty: true,
         }
@@ -321,16 +335,16 @@ impl DiagFilter {
         // A pattern that names a registry code becomes its table slot; one that
         // does not keeps the uppercased spelling, so genuinely unknown codes
         // still filter.
-        let classify = |pats: &[String]| {
+        let classify = |pats: &[CompactString]| {
             let mut slots = rustc_hash::FxHashSet::default();
-            let mut verbatim: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+            let mut verbatim: rustc_hash::FxHashSet<CompactString> = rustc_hash::FxHashSet::default();
             for pat in pats {
                 match crate::diagnostics::error_code::lookup_uppercased(pat) {
                     Some(e) => {
                         slots.insert(e.slot);
                     }
                     None => {
-                        verbatim.insert(pat.to_ascii_uppercase());
+                        verbatim.insert(CompactString::from(pat.to_ascii_uppercase()));
                     }
                 }
             }
@@ -340,9 +354,15 @@ impl DiagFilter {
         let (only_slots, only_verbatim) = classify(&opts.only_codes);
         let only_categories: rustc_hash::FxHashSet<ErrorCategory> =
             opts.only_categories.iter().copied().collect();
-        let only_files = opts.only_files.clone();
-        let only_files_finders: Vec<memchr::memmem::Finder<'static>> = only_files
+        // Empty patterns are dropped instead of admitted: a `memmem::Finder` for
+        // the empty needle matches at position 0 of *every* file name, so
+        // `--only-files ""` would silently become a no-op while `is_empty`
+        // reported the filter active — ANDing a match-everything term against the
+        // other filters instead of being rejected at the boundary.
+        let only_files_finders: Vec<memchr::memmem::Finder<'static>> = opts
+            .only_files
             .iter()
+            .filter(|pat| !pat.is_empty())
             .map(|pat| memchr::memmem::Finder::new(pat.as_bytes()).into_owned())
             .collect();
         let is_empty = allow_slots.is_empty()
@@ -350,14 +370,13 @@ impl DiagFilter {
             && only_slots.is_empty()
             && only_verbatim.is_empty()
             && only_categories.is_empty()
-            && only_files.is_empty();
+            && only_files_finders.is_empty();
         DiagFilter {
             allow_slots,
             allow_verbatim,
             only_slots,
             only_verbatim,
             only_categories,
-            only_files,
             only_files_finders,
             is_empty,
         }
@@ -365,7 +384,7 @@ impl DiagFilter {
 
     fn code_matches(
         slots: &rustc_hash::FxHashSet<u16>,
-        verbatim: &rustc_hash::FxHashSet<String>,
+        verbatim: &rustc_hash::FxHashSet<CompactString>,
         code: &crate::diagnostics::error_code::ErrCode,
     ) -> bool {
         // Registry codes: one `u16` lookup, no string hashing.
@@ -387,7 +406,8 @@ impl DiagFilter {
         if canonical.bytes().all(|b| !b.is_ascii_lowercase()) {
             return false;
         }
-        set.contains(&canonical.to_ascii_uppercase())
+        let upper = canonical.to_ascii_uppercase();
+        set.contains(upper.as_str())
     }
 
     /// Whether `diag` passes the filter — mirrors the original
@@ -401,7 +421,7 @@ impl DiagFilter {
                     && self.only_slots.is_empty()
                     && self.only_verbatim.is_empty()
                     && self.only_categories.is_empty()
-                    && self.only_files.is_empty()),
+                    && self.only_files_finders.is_empty()),
             "DiagFilter::is_empty disagrees with the sets it summarises"
         );
         if self.is_empty {
@@ -740,7 +760,9 @@ impl MultiSpan {
             out.sort_unstable();
             out.dedup();
             debug_assert!(
-                out.windows(2).all(|w| w[0] <= w[1]),
+                // Strict: the documented invariant is sorted **and deduped**, so
+                // a dropped `dedup()` must trip here rather than pass on `<=`.
+                out.windows(2).all(|w| w[0] < w[1]),
                 "MultiSpan::primary must be sorted by (file, start)"
             );
             // Cache the sorted view so repeated reads between pushes skip
@@ -1764,12 +1786,15 @@ impl<'src> Diagnostic<'src> {
     /// constructor defaults.  The [`Emitter`] calls this at its render
     /// boundary; direct readers of those fields must call it themselves.
     ///
-    /// Spans are an exception: once a builder sets them (`with_span`,
-    /// `with_additional_span`, `augment`, `adorn_with_span`), `humanize`
-    /// preserves them instead of deriving primary spans from the kind's
-    /// labels — so attaching the kind first and the span second is the
-    /// supported builder ordering.  `help`/`suggestions` are always
-    /// re-derived from the kind.
+    /// **Spans, help and suggestions share one precedent** — the `spans_user_set`
+    /// / `help_user_set` / `suggestions_user_set` flags: once a builder supplies
+    /// one, `humanize` preserves it and the kind fills only the fields still
+    /// unset.  So attaching the kind first and the span/help second is the
+    /// supported builder ordering, and a `with_help` survives a later `with_kind`
+    /// too (the flags are sticky).  This is not an "exception" for spans: it is
+    /// the rule for every user-owned field, and the kinds derive only what no
+    /// caller claimed.  Overwriting user help here silently lost data once
+    /// already (the C3 regression the inline comment records).
     ///
     /// `message` is **kind-owned** as well: text passed to a message-taking
     /// constructor (`Diagnostic::error("…")`) is a placeholder that this call
@@ -1789,7 +1814,13 @@ impl<'src> Diagnostic<'src> {
                 return;
             }
         }
-        self.invalidate_stable_id();
+        // Only the kind path can change anything `stable_id` hashes (the
+        // derived message): invalidating on the no-kind path recomputed an
+        // identical value and made `invalidate_stable_id`'s mutator list claim
+        // more than the code does.
+        if self.kind.is_some() {
+            self.invalidate_stable_id();
+        }
         let kind_box = std::mem::take(&mut self.kind);
         let Some(kind_arc) = kind_box else {
             // No kind: message/labels were set manually.  Latch so later
@@ -2243,16 +2274,16 @@ pub fn explain_error_code_with_depth(
 
     // ── Header ──
     if use_color {
-        let _ = writeln!(
+        swriteln!(
             out,
             "\x1b[1m{code}:\x1b[0m \x1b[36m{title}\x1b[0m",
             code = code.code(),
             title = code.title(),
         );
     } else {
-        let _ = writeln!(out, "{}: {}", code.code(), code.title());
+        swriteln!(out, "{}: {}", code.code(), code.title());
     }
-    let _ = writeln!(out);
+    swriteln!(out);
 
     // ── Body: parse explanation text, highlight code blocks, wrap text ──
     let mut in_code_block = false;
@@ -2270,24 +2301,24 @@ pub fn explain_error_code_with_depth(
         if explain_line_is_code(line) {
             // Code/example line — apply syntax highlighting + background
             if !in_code_block {
-                let _ = writeln!(out);
+                swriteln!(out);
                 in_code_block = true;
             }
             let highlighted = crate::diagnostics::glyph::highlight_code(line, use_color);
             if use_color {
-                let _ = writeln!(out, "  {code_bg}{highlighted}{RESET}");
+                swriteln!(out, "  {code_bg}{highlighted}{RESET}");
             } else {
-                let _ = writeln!(out, "  {highlighted}");
+                swriteln!(out, "  {highlighted}");
             }
         } else if trimmed.is_empty() {
             if in_code_block {
                 in_code_block = false;
             }
-            let _ = writeln!(out);
+            swriteln!(out);
         } else {
             if in_code_block {
                 in_code_block = false;
-                let _ = writeln!(out);
+                swriteln!(out);
             }
             // Regular text — wrap at the shared diagnostic width so the
             // explain text and rendered diagnostics agree on one width.
@@ -2305,7 +2336,7 @@ pub fn explain_error_code_with_depth(
         explicit
     };
     if !related.is_empty() {
-        let _ = writeln!(out);
+        swriteln!(out);
         if use_color {
             out.push_str("\x1b[1mSee also:\x1b[0m\n");
         } else {
@@ -2564,6 +2595,19 @@ fn digits_match_with_one_deletion(a: &[u8], b: &[u8]) -> bool {
     a[i + 1..] == b[i..]
 }
 
+/// Whether `nb` has the registry code shape (`[EW]` + 3–4 digits).
+///
+/// The three callers (`suggest_code`, `suggest_top3_scan`, `suggest_top3_direct`)
+/// route between the direct-address enumeration and the table scan on this
+/// decision; three hand-copied predicates were one registry change away from
+/// disagreeing, and the differential test compares *outputs*, so a drift that
+/// happened to agree on the tested inputs would survive.
+fn is_shaped_needle(nb: &[u8]) -> bool {
+    matches!(nb.len(), 4 | 5)
+        && matches!(nb.first(), Some(b'E' | b'W'))
+        && nb[1..].iter().all(u8::is_ascii_digit)
+}
+
 /// Generate a "did you mean?" suggestion for an unknown error code.
 ///
 /// Uses OSA (Damerau-Levenshtein) edit distance against every entry in `CODE_TABLE`
@@ -2583,17 +2627,10 @@ fn suggest_code(input: &str, use_color: bool) -> CompactString {
     // Longer inputs tolerate a slightly wider search radius; short ones
     // stay tight so we don't suggest unrelated codes.
     let max_dist = std::cmp::max(1, needle_len / 3);
-
     // Top-3 by (dist asc, prefix desc, code asc) via fixed-size insertion
     // sort — avoids the `Vec` + `O(n log n)` sort for a 3-element result.
     let nb = needle.as_bytes();
-    // A needle shaped like the registry (`[EW]\d{3,4}`) takes the
-    // direct-address neighbourhood enumeration; everything else keeps the
-    // general table scan (which also carries the bucketed branch as the
-    // differential-test reference for `suggest_top3_direct`).
-    let bucketed = matches!(needle_len, 4 | 5)
-        && matches!(nb[0], b'E' | b'W')
-        && nb[1..].iter().all(u8::is_ascii_digit);
+    let bucketed = is_shaped_needle(nb);
     let top = if bucketed {
         suggest_top3_direct(&needle)
     } else {
@@ -2675,9 +2712,7 @@ fn suggest_top3_scan(
     // through the full rolling DP.  Non-shape needles (shorter, longer,
     // non-EW prefix, non-digit body) fall through to the unrestricted scan
     // below.
-    let bucketed = matches!(needle_len, 4 | 5)
-        && matches!(nb[0], b'E' | b'W')
-        && nb[1..].iter().all(u8::is_ascii_digit);
+    let bucketed = is_shaped_needle(nb);
     if bucketed {
         let same_prefix = nb[0];
         let rest = &needle[1..];
@@ -2785,9 +2820,7 @@ fn suggest_top3_direct(needle: &str) -> ArrayVec<(usize, usize, &'static str), 3
     // exactly such inputs).  Production callers route shaped needles here
     // and unshaped ones straight to the scan, so this branch is cold.
     let nb = needle.as_bytes();
-    let shaped = matches!(nb.len(), 4 | 5)
-        && matches!(nb[0], b'E' | b'W')
-        && nb[1..].iter().all(u8::is_ascii_digit);
+    let shaped = is_shaped_needle(nb);
     if !shaped {
         // Character count, matching `suggest_code`'s own radius derivation.
         // Using the *byte* length here made an unshaped multi-byte needle
@@ -2803,7 +2836,7 @@ fn suggest_top3_direct(needle: &str) -> ArrayVec<(usize, usize, &'static str), 3
         cand: &[u8; 4],
         dist: usize,
     ) {
-        let code = std::str::from_utf8(cand).expect("E/W + ASCII digits is UTF-8");
+        let code = simdutf8::basic::from_utf8(cand).expect("E/W + ASCII digits is UTF-8");
         if let Some(e) = crate::diagnostics::error_code::lookup(code) {
             // Dedup by code: the 5-char deletion branch can enumerate the
             // same 4-char code at two `skip` positions when the needle's
@@ -2883,18 +2916,18 @@ pub fn list_error_codes(use_color: bool) -> String {
         ("", "", "", "")
     };
     let mut out = String::new();
-    let _ = writeln!(
+    swriteln!(
         out,
         "{bold}{}{reset}\n",
         crate::diagnostics::i18n::fluent::available_error_codes()
     );
     for (cat, entries) in crate::diagnostics::error_code::code_entries_by_category() {
-        let _ = writeln!(out, " {cyan}── {} ──{reset}", cat.label(),);
+        swriteln!(out, " {cyan}── {} ──{reset}", cat.label(),);
         for entry in entries {
-            let _ = writeln!(out, "  {bold}{}{reset}  {}", entry.code, entry.title,);
+            swriteln!(out, "  {bold}{}{reset}  {}", entry.code, entry.title,);
         }
     }
-    let _ = writeln!(
+    swriteln!(
         out,
         "\n{dim}{}{reset}",
         crate::diagnostics::i18n::fluent::run_explain_detail()
@@ -3421,9 +3454,10 @@ fn scan_terminal_control_flags_flatten(s: &[u8]) -> (bool, bool, bool, Option<us
     (has_high, dirty, has_c1, first_break)
 }
 
-/// Unicode bidirectional formatting characters: the U+202A–U+202E
-/// overrides and the U+2066–U+2069 isolates.  Invisible, but they reorder
-/// the surrounding display text — a path like `evil.cod\u{202E}exe` can
+/// Unicode bidirectional formatting characters: the U+200E–U+200F direction
+/// marks (not overrides, but equally invisible and reordering-adjacent), the
+/// U+202A–U+202E overrides, and the U+2066–U+2069 isolates.  Invisible, but they
+/// reorder the surrounding display text — a path like `evil.cod\u{202E}exe` can
 /// render with a spoofed extension.
 pub(crate) fn is_bidi_override(c: char) -> bool {
     ('\u{200E}'..='\u{200F}').contains(&c)
@@ -3737,10 +3771,10 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool, u64) {
 /// Soft cap on `LineIndex::char_prefixes` growth: the map gains one entry per
 /// queried non-ASCII line and never evicts, so a long-lived process rendering
 /// a very large CJK-heavy source would creep toward ~10 MB per cached index.
-/// Past the cap the map clears wholesale — a query then rebuilds one line's
-/// sparse table, the same cost as the first query for that line, so the
-/// regression is bounded and only reaches files that genuinely have thousands
-/// of distinct non-ASCII lines.
+/// Past the cap the `CHAR_PREFIXES_EVICT` least-recently-used entries are
+/// evicted in one amortized pass (`select_nth`, no sort); the rest of the cache
+/// — including a hot line's table — survives, so no query pays a rebuild for an
+/// entry it has been using.
 const CHAR_PREFIXES_CAP: usize = 4 * 1024;
 /// Evict a batch rather than one entry: the LRU scan is O(cap), so paying it
 /// once per `CHAR_PREFIXES_EVICT` insertions amortizes to ~O(1) per insert
@@ -4230,7 +4264,11 @@ impl<'a> LineIndex<'a> {
     }
 }
 
-#[cfg(all(test, not(feature = "shuttle")))]
+// The module itself is not gated: the SWAR scanner, `LineIndex`, `MultiSpan` and
+// `DiagFilter` suites are pure and single-threaded, so they must also run under
+// the concurrency checker.  Only the emitter-driven tests inside it carry their
+// own `#[cfg(not(feature = "shuttle"))]`, which is what the compiler verifies.
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::Span;
@@ -4304,7 +4342,7 @@ mod tests {
         );
 
         let opts = DiagOpts {
-            allow_codes: vec!["e030".to_string()],
+            allow_codes: vec![CompactString::const_new("e030")],
             ..DiagOpts::default()
         };
         assert!(!known.matches_filter(&opts));
@@ -4846,7 +4884,7 @@ mod tests {
     #[test]
     fn allow_codes_suppresses_matching_diagnostics() {
         let mut opts = DiagOpts::default();
-        opts.allow_codes = vec!["E030".to_string()];
+        opts.allow_codes = vec![CompactString::const_new("E030")];
         let suppressed = Diagnostic::error("x").with_code_str("E030");
         let kept = Diagnostic::error("y").with_code_str("E031");
         let no_code = Diagnostic::error("z");
@@ -4904,8 +4942,8 @@ mod tests {
         for allow in cases {
             for only in cases {
                 let mut opts = DiagOpts::default();
-                opts.allow_codes = allow.iter().map(|s| s.to_string()).collect();
-                opts.only_codes = only.iter().map(|s| s.to_string()).collect();
+                opts.allow_codes = allow.iter().map(|s| CompactString::from(*s)).collect();
+                opts.only_codes = only.iter().map(|s| CompactString::from(*s)).collect();
                 let filter = DiagFilter::from_opts(&opts);
                 let (allow_c, only_c) = (canon(allow), canon(only));
                 for d in &diags {
@@ -4929,9 +4967,93 @@ mod tests {
     /// `--allow e030` must suppress the canonical `E030` diagnostic instead
     /// of silently matching nothing.
     #[test]
+    /// An empty `--only-files` pattern is dropped, not admitted: `memmem`'s
+    /// empty needle matches at position 0 of *every* file name, so admitting it
+    /// would leak every diagnostic through the filter while `is_empty` reported
+    /// the filter active (ANDing a match-everything term against the others).
+    #[test]
+    fn empty_only_files_pattern_is_dropped() {
+        let mut opts = DiagOpts::default();
+        opts.only_files = vec![CompactString::const_new("")];
+        let filter = DiagFilter::from_opts(&opts);
+        assert!(filter.is_empty, "an empty pattern must not arm the filter");
+        assert!(filter.matches(&Diagnostic::error("x").with_file_name("src/lib.pn")));
+
+        opts.only_files = vec![CompactString::const_new("lib")];
+        let filter = DiagFilter::from_opts(&opts);
+        assert!(!filter.is_empty);
+        assert!(filter.matches(&Diagnostic::error("x").with_file_name("src/lib.pn")));
+        assert!(!filter.matches(&Diagnostic::error("x").with_file_name("src/main.pn")));
+    }
+
+    /// C3's help/suggestion half had no pin — only spans did — so the guards that
+    /// preserve user-supplied help could have been "simplified" away silently.
+    #[test]
+    fn humanize_preserves_user_set_help_and_suggestions() {
+        let span = Span::new(FileId::DUMMY, 0, 3);
+        let mut diag = Diagnostic::error("placeholder")
+            .with_kind(DiagnosticKind::TypeMismatch {
+                expected: Cow::Borrowed("Int<32>"),
+                found: Cow::Borrowed("Str"),
+                span,
+                found_span: None,
+                reason: None,
+                context: None,
+            })
+            .with_help("user help")
+            .with_span_suggestion(
+                span,
+                "user replacement",
+                "user suggestion",
+                Applicability::MachineApplicable,
+            );
+        diag.humanize();
+        assert_eq!(
+            diag.help(),
+            Some("user help"),
+            "user help must survive humanize"
+        );
+        assert_eq!(diag.suggestions().len(), 1, "user suggestion must survive");
+        assert_eq!(
+            diag.suggestions()[0].replacement.as_deref(),
+            Some("user replacement")
+        );
+    }
+
+    /// `stable_id` must hash the **sorted-first** span.  `MultiSpan` sorts
+    /// lazily, so a diagnostic built with reverse-ordered primary spans must hash
+    /// identically to the same diagnostic built in ascending order — otherwise the
+    /// dedup key depends on builder order.
+    #[test]
+    fn stable_id_hashes_the_sorted_first_span() {
+        let lo = Span::new(FileId::DUMMY, 0, 3);
+        let hi = Span::new(FileId::DUMMY, 20, 25);
+        let ascending = Diagnostic::error("boom")
+            .with_span(lo)
+            .with_additional_span(hi);
+        let descending = Diagnostic::error("boom")
+            .with_span(hi)
+            .with_additional_span(lo);
+        assert_eq!(ascending.stable_id(), descending.stable_id());
+    }
+
+    /// The `only_categories` doc's headline claim — a code-less diagnostic is
+    /// excluded, because a category is a property of the code — had no test.
+    #[test]
+    fn only_categories_excludes_code_less_diagnostics() {
+        let mut opts = DiagOpts::default();
+        opts.only_categories = vec![ErrorCategory::Type];
+        let filter = DiagFilter::from_opts(&opts);
+        assert!(
+            !filter.matches(&Diagnostic::error("no code")),
+            "a code-less diagnostic must not pass a category filter"
+        );
+        assert!(filter.matches(&Diagnostic::error("typed").with_code_str(ErrCode::E030)));
+    }
+
     fn filter_codes_resolve_case_insensitively() {
         let mut opts = DiagOpts::default();
-        opts.allow_codes = vec!["e030".to_string()];
+        opts.allow_codes = vec![CompactString::const_new("e030")];
         let suppressed = Diagnostic::error("x").with_code_str("E030");
         assert!(
             !suppressed.matches_filter(&opts),
@@ -4939,7 +5061,7 @@ mod tests {
         );
 
         let mut only = DiagOpts::default();
-        only.only_codes = vec!["e031".to_string()];
+        only.only_codes = vec![CompactString::const_new("e031")];
         assert!(
             Diagnostic::error("x")
                 .with_code_str("E031")

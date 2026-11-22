@@ -1708,6 +1708,7 @@ dependencies = [
  "sexp",
  "sha2",
  "shuttle",
+ "simdutf8",
  "small-map",
  "smallbox",
  "smallvec",
@@ -1715,6 +1716,7 @@ dependencies = [
  "stacker",
  "static_assertions",
  "supports-hyperlinks",
+ "swrite",
  "terminal_size",
  "thread_local",
  "unicode-linebreak",
@@ -1730,6 +1732,7 @@ version = "0.0.0"
 dependencies = [
  "fluent-syntax",
  "pulldown-cmark",
+ "swrite",
  "tempfile",
  "toml",
 ]
@@ -2327,6 +2330,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
 name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2434,6 +2443,12 @@ name = "supports-hyperlinks"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e396b6523b11ccb83120b115a0b7366de372751aa6edf19844dfb13a6af97e91"
+
+[[package]]
+name = "swrite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f3fece30b2dc06d65ecbca97b602db15bf75f932711d60cc604534f1f8b7a03"
 
 [[package]]
 name = "syn"

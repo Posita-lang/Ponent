@@ -244,7 +244,11 @@ fn main() {
 
     let mut diag_opts = DiagOpts::detect();
     diag_opts.use_color = color_choice.resolve();
-    diag_opts.only_codes = cli.only_code.clone();
+    diag_opts.only_codes = cli
+        .only_code
+        .iter()
+        .map(compact_str::CompactString::from)
+        .collect();
     diag_opts.only_categories = match cli
         .only_category
         .iter()
@@ -254,8 +258,16 @@ fn main() {
         Ok(c) => c,
         Err(msg) => usage_error(msg),
     };
-    diag_opts.only_files = cli.only_file.clone();
-    diag_opts.allow_codes = cli.allow.clone();
+    diag_opts.only_files = cli
+        .only_file
+        .iter()
+        .map(compact_str::CompactString::from)
+        .collect();
+    diag_opts.allow_codes = cli
+        .allow
+        .iter()
+        .map(compact_str::CompactString::from)
+        .collect();
     diag_opts.quiet = cli.quiet;
     diag_opts.no_wrap = cli.no_wrap;
 
