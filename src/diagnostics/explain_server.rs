@@ -158,23 +158,30 @@ fn enable_tcp_defer_accept(listener: &TcpListener) -> TcpDeferAcceptGuard {
             &mut len,
         )
     } == 0;
+    // Only mutate the option when its previous value is known: the guard's whole
+    // point is to restore the caller's socket, and a failed query used to still
+    // set the option, leaving a permanent change with no restore token.
+    if !queried {
+        return TcpDeferAcceptGuard::no_restore(fd);
+    }
     let one: libc::c_int = 1;
     // SAFETY: `listener` owns a live TCP socket fd; `one` is a valid
     // `c_int` and its size is exactly the optval length.  The call only
     // changes a socket option; a failure is a portability/backstop issue, and
     // the userspace first-byte budgets remain authoritative.
-    unsafe {
+    let set_ok = unsafe {
         libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_DEFER_ACCEPT,
             std::ptr::from_ref(&one).cast(),
             std::mem::size_of_val(&one) as libc::socklen_t,
-        );
-    }
+        )
+    } == 0;
     TcpDeferAcceptGuard {
         fd,
-        previous: queried.then_some(previous),
+        // A failed `setsockopt` changed nothing, so there is nothing to restore.
+        previous: set_ok.then_some(previous),
     }
 }
 
@@ -191,6 +198,16 @@ fn enable_tcp_defer_accept(listener: &TcpListener) -> TcpDeferAcceptGuard {
 struct TcpDeferAcceptGuard {
     fd: std::os::fd::RawFd,
     previous: Option<libc::c_int>,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl TcpDeferAcceptGuard {
+    /// A guard that restores nothing: the option was never changed (the query
+    /// failed, or the `setsockopt` did).  Keeping the same type means the caller
+    /// has one return path and no `Option<Guard>`.
+    fn no_restore(fd: std::os::fd::RawFd) -> Self {
+        TcpDeferAcceptGuard { fd, previous: None }
+    }
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
@@ -368,7 +385,13 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             // Poll for the whole remaining budget (M2): the fd set is
             // level-triggered and nothing in the loop is time-driven except
             // the deadline, so a fixed 100 ms tick only burns wakeups.
-            let ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+            // Ceiling, not truncation: a positive sub-millisecond remainder
+            // truncated to 0 turned the poll into a busy spin for the rest of
+            // the interval.  `div_ceil` keeps the wait as short as the deadline
+            // allows without ever polling with a zero timeout.
+            let ms = usize::try_from(remaining.as_nanos().div_ceil(1_000_000))
+                .unwrap_or(i32::MAX as usize)
+                .clamp(1, i32::MAX as usize) as i32;
             // SAFETY: `fds` is a live, correctly sized array of `pollfd`; the
             // count is exactly its length.
             let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
@@ -1052,15 +1075,17 @@ fn scan_framing(headers: &[u8], first_line_is_request: bool) -> HeaderFraming {
     };
     for (index, line) in headers.split(|&b| b == b'\n').enumerate() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        // The block starts with the request line on the real path
-        // (`buf[..head_end]` spans request line + headers) and ends with a blank
-        // terminator.  Recognise the request line by *shape* — spaces, no colon
-        // — rather than by position, so a caller that passes a header block only
-        // (as the unit tests do) still has its first header line scanned.
         if line.is_empty() {
             continue;
         }
-        if index == 0 && line.contains(&b' ') && !line.contains(&b':') {
+        // Trust the caller.  This used to guess by shape ("has a space, has no
+        // colon"), which silently skipped a *malformed first header* such as
+        // `Content-Length 5`: no `Content-Length` was parsed, the body was framed
+        // as empty, and an HTTP/1.1 connection could be reused with the client's
+        // body still inbound — a request-smuggling shape.  `first_line_is_request`
+        // is true exactly when the caller's slice still starts with the request
+        // line (`buf[..head_end]`), false for a headers-only block.
+        if index == 0 && first_line_is_request {
             continue;
         }
         let Some(colon) = line.iter().position(|&b| b == b':') else {
@@ -1080,6 +1105,13 @@ fn scan_framing(headers: &[u8], first_line_is_request: bool) -> HeaderFraming {
         if name_raw.last().is_some_and(|&b| b == b' ' || b == b'\t') {
             // RFC 7230 §3.2.4: whitespace before the colon is forbidden.
             framing.ambiguous = true;
+            continue;
+        }
+        if name_raw.iter().any(|&b| b == b' ' || b == b'\t') {
+            // `Content-Length x: 5` — interior whitespace means this is not a
+            // field name at all.  Ignoring it would frame the body as empty, so
+            // mark the framing untrustworthy (drain and close).
+            framing.malformed = true;
             continue;
         }
         let name = name_raw.trim_ascii();
@@ -1264,6 +1296,31 @@ fn drain_after_request_line(
         &mut is_head,
         false,
         None,
+        0,
+    )
+}
+
+/// Drain a request whose prefix still **begins with the request line** (the
+/// test-only whole-head path).
+///
+/// The flag matters: [`drain_after_request_line`]'s `false` is right for every
+/// production caller, but this one passes the unparsed buffer, and treating its
+/// request line as a colonless header marked the framing untrusted — which
+/// drained unframed (read to EOF/1 s) where the request already had no body.
+fn drain_whole_head(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> DrainOutcome {
+    let mut tail_len = 0;
+    let mut wants_close = false;
+    let mut is_head = false;
+    drain_request_tracked(
+        stream,
+        prefix,
+        budget,
+        &mut tail_len,
+        &mut wants_close,
+        &mut is_head,
+        true,
+        None,
+        0,
     )
 }
 
@@ -1281,6 +1338,7 @@ fn drain_request(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> Dra
         &mut is_head,
         true,
         None,
+        0,
     )
 }
 
@@ -1302,6 +1360,7 @@ fn drain_request_with_head(
         &mut is_head,
         true,
         None,
+        0,
     );
     (outcome, is_head)
 }
@@ -1331,8 +1390,16 @@ fn drain_request_tracked(
     prefix_has_request_line: bool,
     // The version, when the caller has already parsed the request line.
     http11_hint: Option<bool>,
+    // Length of the request line the caller already consumed (0 when `prefix`
+    // still contains it).  `MAX_HEADER` is defined over the **whole** request
+    // head — that is what `HeaderScan::scan` enforces and the scanner test pins —
+    // so the thread path, which starts reading after the request line, must add
+    // it back or its limit is up to `MAX_REQUEST_LINE` bytes more permissive.
+    request_line_len: usize,
 ) -> DrainOutcome {
     let deadline = Instant::now() + budget;
+    // Budget for the bytes this function may still read.
+    let header_budget = MAX_HEADER.saturating_sub(request_line_len);
     // 4 KiB covers the common request header block on the stack; larger
     // blocks (cookies, long URLs) spill to the heap once and are bounded by
     // `MAX_HEADER` below.
@@ -1353,13 +1420,13 @@ fn drain_request_tracked(
         if Instant::now() >= deadline {
             break;
         }
-        if collected.len() >= MAX_HEADER {
+        if collected.len() >= header_budget {
             hit_cap = true;
             break;
         }
         // Finding 8: never read past the header cap; a terminator arriving
         // beyond it must not be accepted as a valid header block.
-        let want = (MAX_HEADER - collected.len()).min(buf.len());
+        let want = (header_budget - collected.len()).min(buf.len());
         if want == 0 {
             hit_cap = true;
             break;
@@ -1394,7 +1461,7 @@ fn drain_request_tracked(
         }
     }
 
-    let Some(head_end) = head_end.filter(|&end| end <= MAX_HEADER) else {
+    let Some(head_end) = head_end.filter(|&end| end <= header_budget) else {
         // Absent and incomplete are silent; hitting the size cap is a
         // protocol-visible 431, matching the reactor's `TooLargeHeader`.
         return if hit_cap {
@@ -1404,7 +1471,7 @@ fn drain_request_tracked(
         };
     };
     if prefix_has_request_line {
-        *is_head = collected.starts_with(b"HEAD ");
+        *is_head = request_line_is_head(&collected);
     }
 
     // Bytes past the terminator arrived in the same read as the headers and
@@ -1948,23 +2015,38 @@ fn serve_page_after_prefix(
             }
         }
     } else {
-        // Test-only `serve_page`: keep the method-agnostic drain path.
-        (CompactString::new(""), SmallVec::from_slice(first), None)
+        // Test-only `serve_page`: the whole buffer is still here, request line
+        // included, so drain it with the matching flag.
+        let drain = drain_whole_head(stream, first, Duration::from_secs(1));
+        (
+            CompactString::new(""),
+            SmallVec::from_slice(first),
+            Some(drain),
+        )
     };
     let prefix: &[u8] = &leftover;
 
     if expected_path.is_some() {
+        // HEAD is decided from the raw line *before* validation: every 400 branch
+        // below (unparseable line, bad version, bad target) must suppress the body
+        // too, and `HEAD /E030 HTTP/2` used to receive one.  `space or tab` after
+        // the method, matching `parse_request_line`'s separator policy.
+        let head_only = line
+            .as_bytes()
+            .strip_prefix(b"HEAD")
+            .is_some_and(|rest| rest.first().is_some_and(|&b| b == b' ' || b == b'\t'));
         // Finding 6: validate the full three-token grammar and version before
         // any routing decision, exactly like the persistent dispatcher.
         let Some(req) = parse_request_line(line.as_ref()) else {
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             let resp = bad_request_response();
+            let resp = if head_only { resp.as_head() } else { resp };
             return finish_response(stream, drain, &resp, false);
         };
-        let head_only = req.method == "HEAD";
         if !matches!(req.version, "HTTP/1.0" | "HTTP/1.1") {
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             let resp = bad_request_response();
+            let resp = if head_only { resp.as_head() } else { resp };
             return finish_response(stream, drain, &resp, false);
         }
         // [4]2: origin-form is required; `GET E030 HTTP/1.1` must not be
@@ -1972,6 +2054,7 @@ fn serve_page_after_prefix(
         if !req.target.starts_with('/') {
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
             let resp = bad_request_response();
+            let resp = if head_only { resp.as_head() } else { resp };
             return finish_response(stream, drain, &resp, false);
         }
         // A non-GET/HEAD must not receive a full body (protocol violation); answer
@@ -2883,8 +2966,17 @@ fn serve_explain_persistent_epoll(
         Draining,
     }
 
+    /// The lazy deadline heap.  Entries carry `(deadline, fd, generation)`:
+    /// `fd` alone is not an identity — a closed connection's descriptor can be
+    /// reused by a new one whose `Instant` deadline happens to be equal (rare
+    /// with a monotonic clock, but the ABA is free to rule out).  A popped entry
+    /// is live only when the fd *and* the generation still match.
+    type DeadlineHeap = BinaryHeap<Reverse<(Instant, i32, u64)>>;
+
     struct Conn {
         stream: TcpStream,
+        /// Monotonic per-connection id; see `DeadlineHeap`.
+        generation: u64,
         buf: Vec<u8>,
         /// Response kept alive for the write duration; slices are written
         /// directly with `write_vectored` (head, Connection header, body).
@@ -2913,7 +3005,7 @@ fn serve_explain_persistent_epoll(
     }
 
     impl Conn {
-        fn queue_bad_request(&mut self, fd: i32, heap: &mut BinaryHeap<Reverse<(Instant, i32)>>) {
+        fn queue_bad_request(&mut self, fd: i32, heap: &mut DeadlineHeap) {
             self.response = Some(bad_request_response());
             self.conn_hdr = b"Connection: close\r\n\r\n";
             self.keep_alive = false;
@@ -2926,7 +3018,7 @@ fn serve_explain_persistent_epoll(
             arm_deadline(&mut *self, fd, Instant::now() + WRITE_TIMEOUT, heap);
         }
 
-        fn queue_too_large(&mut self, fd: i32, heap: &mut BinaryHeap<Reverse<(Instant, i32)>>) {
+        fn queue_too_large(&mut self, fd: i32, heap: &mut DeadlineHeap) {
             self.response = Some(HttpResponse::from_cache(
                 "431 Request Header Fields Too Large",
                 "",
@@ -2950,18 +3042,15 @@ fn serve_explain_persistent_epoll(
     /// gone or its current deadline differs (the heap may hold stale arms);
     /// a deadline that SHORTENS is pushed immediately, so a wakeup is never
     /// late.
-    fn arm_deadline(
-        conn: &mut Conn,
-        fd: i32,
-        at: Instant,
-        heap: &mut BinaryHeap<Reverse<(Instant, i32)>>,
-    ) {
+    fn arm_deadline(conn: &mut Conn, fd: i32, at: Instant, heap: &mut DeadlineHeap) {
         conn.deadline = at;
-        heap.push(Reverse((at, fd)));
+        heap.push(Reverse((at, fd, conn.generation)));
     }
 
     // Lazy-invalidation deadline heap (see `arm_deadline`).
-    let mut deadline_heap: BinaryHeap<Reverse<(Instant, i32)>> = BinaryHeap::new();
+    let mut deadline_heap: DeadlineHeap = BinaryHeap::new();
+    // Source of `Conn::generation`.  One increment per accepted connection.
+    let mut next_generation: u64 = 0;
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -3009,9 +3098,9 @@ fn serve_explain_persistent_epoll(
         // Drop stale arms (connection closed, or re-armed since) and take the
         // earliest live deadline from the heap instead of scanning every
         // connection on every wakeup.
-        while let Some(&Reverse((at, fd))) = deadline_heap.peek() {
+        while let Some(&Reverse((at, fd, epoch))) = deadline_heap.peek() {
             match conns.get(&fd) {
-                Some(conn) if at == conn.deadline => break,
+                Some(conn) if at == conn.deadline && epoch == conn.generation => break,
                 _ => {
                     deadline_heap.pop();
                 }
@@ -3030,10 +3119,10 @@ fn serve_explain_persistent_epoll(
         if deadline_heap.len() > HEAP_COMPACT_MIN + conns.len() * HEAP_COMPACT_FACTOR {
             deadline_heap = conns
                 .iter()
-                .map(|(&fd, conn)| Reverse((conn.deadline, fd)))
+                .map(|(&fd, conn)| Reverse((conn.deadline, fd, conn.generation)))
                 .collect();
         }
-        if let Some(&Reverse((at, _))) = deadline_heap.peek() {
+        if let Some(&Reverse((at, _, _))) = deadline_heap.peek() {
             wait = wait.min(at.saturating_duration_since(now));
         }
         if let Some(idle) = idle {
@@ -3044,7 +3133,11 @@ fn serve_explain_persistent_epoll(
             };
             wait = wait.min(until.saturating_duration_since(now));
         }
-        let timeout_ms = wait.as_millis().min(5_000) as i32;
+        // Ceiling: a positive sub-millisecond remainder truncated to 0 makes
+        // `epoll_wait` poll instead of block, burning wakeups until the deadline.
+        let timeout_ms = usize::try_from(wait.as_nanos().div_ceil(1_000_000))
+            .unwrap_or(5_000)
+            .clamp(1, 5_000) as i32;
         let ready =
             unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms) };
         if ready < 0 {
@@ -3087,6 +3180,7 @@ fn serve_explain_persistent_epoll(
                                         conn_fd,
                                         Conn {
                                             stream,
+                                            generation: next_generation,
                                             buf: Vec::new(),
                                             response: None,
                                             date: None,
@@ -3108,6 +3202,7 @@ fn serve_explain_persistent_epoll(
                                     conn_fd,
                                     Conn {
                                         stream,
+                                        generation: next_generation,
                                         buf: Vec::new(),
                                         response: None,
                                         date: None,
@@ -3127,7 +3222,17 @@ fn serve_explain_persistent_epoll(
                             }
                             // A closed (shed) accept leaves no map entry; the
                             // arm is then pruned as stale on the next peek.
-                            deadline_heap.push(Reverse((first_byte_deadline, conn_fd)));
+                            next_generation = next_generation.wrapping_add(1);
+                            // Only map-resident connections need an arm; a shed
+                            // accept has nothing to expire (the entry would be
+                            // pruned as stale on the next peek).
+                            if let Some(c) = conns.get(&conn_fd) {
+                                deadline_heap.push(Reverse((
+                                    first_byte_deadline,
+                                    conn_fd,
+                                    c.generation,
+                                )));
+                            }
                             let mut conn_event = libc::epoll_event {
                                 events: if conns
                                     .get(&conn_fd)
@@ -3325,13 +3430,13 @@ fn serve_explain_persistent_epoll(
                             .get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
                         conn.deadline = header_deadline;
                         if first_byte {
-                            deadline_heap.push(Reverse((header_deadline, fd)));
+                            deadline_heap.push(Reverse((header_deadline, fd, conn.generation)));
                         }
                     }
                     continue;
                 };
                 if conn.overload {
-                    let is_head = conn.buf.starts_with(b"HEAD ");
+                    let is_head = request_line_is_head(&conn.buf);
                     let framing = scan_framing(&conn.buf[..head_end], true);
                     let already_read = conn.buf.len().saturating_sub(head_end);
                     conn.body_remaining = match framing.body(already_read) {
@@ -3601,12 +3706,15 @@ fn serve_explain_persistent_epoll(
         // entry (`Conn::arm_deadline`, plus the first-byte header deadline), so
         // a live deadline is always represented by at least one entry.
         let now = Instant::now();
-        while let Some(&Reverse((deadline, fd))) = deadline_heap.peek() {
+        while let Some(&Reverse((deadline, fd, epoch))) = deadline_heap.peek() {
             if deadline > now {
                 break;
             }
             deadline_heap.pop();
-            if conns.get(&fd).is_some_and(|conn| conn.deadline == deadline) {
+            if conns
+                .get(&fd)
+                .is_some_and(|conn| conn.deadline == deadline && conn.generation == epoch)
+            {
                 close.push(fd);
             }
         }
@@ -3684,6 +3792,9 @@ fn handle_persistent_connection(
             &mut is_head,
             false,
             Some(http11),
+            // `MAX_HEADER` covers the whole head; this path already consumed the
+            // request line, so its length has to count too.
+            line.len(),
         );
         if outcome == DrainOutcome::NoRequest {
             return Ok(());
@@ -3727,12 +3838,58 @@ struct ParsedRequestLine<'a> {
 /// grammar: the loopback one-shot and persistent backends share this parser
 /// and must accept the same bytes. Tightening one backend alone would create
 /// a cross-platform routing difference for `GET\t/E030`.
+/// Whether a raw request line names the `HEAD` method.
+///
+/// The separator may be SP **or HTAB**, matching [`parse_request_line`].  The
+/// two `starts_with(b"HEAD ")` checks this replaces accepted only a space, so a
+/// tab-separated HEAD was classified as a normal request and received a
+/// body-bearing response (including a body-bearing 503 on the overload path).
+fn request_line_is_head(line: &[u8]) -> bool {
+    matches!(
+        line.strip_prefix(b"HEAD").and_then(|rest| rest.first()),
+        Some(b' ' | b'\t')
+    )
+}
+
+/// Whether `s` is an RFC 7230 `token` (a method must be one).
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 fn parse_request_line(line: &str) -> Option<ParsedRequestLine<'_>> {
-    let mut parts = line.split_ascii_whitespace();
+    // SP/HTAB only.  `split_ascii_whitespace` also treats VT (0x0B) and FF
+    // (0x0C) as separators, which the one-shot prefilter rejects — accepting a
+    // request line there but not here is how the two backends drift apart.
+    let mut parts = line.split([' ', '\t']).filter(|part| !part.is_empty());
     let method = parts.next()?;
     let target = parts.next()?;
     let version = parts.next()?;
     if parts.next().is_some() {
+        return None;
+    }
+    if !is_http_token(method) {
+        // An invalid method is a malformed request line (400), not a valid but
+        // unsupported one (405).
         return None;
     }
     Some(ParsedRequestLine {

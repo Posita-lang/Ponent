@@ -66,19 +66,21 @@ impl Renderer for JsonRenderer {
     fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
         // Batch output is a JSON array; indent the object one level under `[`
         // (fields one level deeper still), which is what every pretty-printer
-        // and `jq` produce.
-        self.write_diagnostic(diag, cx, 2, out);
+        // and `jq` produce.  `BATCH_LEVEL` is shared with `render_internal_error`
+        // so a change here cannot misalign the panic placeholder.
+        self.write_diagnostic::<BATCH_LEVEL>(diag, cx, out);
     }
 
     fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String {
-        // One allocation: the same estimator the batch path uses.  The old form
-        // sized from `message().len() + 128` and then let `write_diagnostic`
-        // `reserve` a larger amount — a guaranteed realloc on any non-trivial
-        // diagnostic.
-        let mut out = String::with_capacity(Self::estimate_cap(diag));
+        // `write_diagnostic` owns the sizing (`reserve(estimate_cap)`), so this
+        // start empty: a `with_capacity(estimate_cap(..))` here evaluated the
+        // same O(fields) estimator a second time and then made the inner
+        // `reserve` a no-op.  `String::new()` + one `reserve` is still exactly
+        // one allocation.
+        let mut out = String::new();
         // Single-object output is not inside an array, so keep the brace at
         // column 0 (fields still one level in).
-        self.write_diagnostic(diag, cx, 1, &mut out);
+        self.write_diagnostic::<1>(diag, cx, &mut out);
         out
     }
 
@@ -96,20 +98,49 @@ impl Renderer for JsonRenderer {
         // `render_into` writes at `indent_lvl = 2`: the `{` sits at
         // `indent(1)` under `[` and its fields at `indent(2)`.  The old form
         // opened at column 0 with 2-space fields, visually breaking the array.
-        // The real indent helpers are reachable here (they are inherent on
-        // `JsonRenderer`), so no hardcoding is needed — bind them locally
-        // because `JsonContainer` borrows the strings for its whole lifetime.
-        let open_ind = Self::indent(1);
-        let field_ind = Self::indent(2);
-        let mut obj = JsonContainer::object(out, &open_ind, &field_ind, self.pretty);
-        obj.key("message");
-        obj.string("internal: diagnostic rendering panicked");
+        //
+        // **Buffer contract:** `out` must be empty.  The emitter's
+        // `fill_internal_error` clears it before calling, precisely because a
+        // panicking `render_into` leaves a syntactically-closed but semantically
+        // garbage object behind (`JsonContainer::drop` auto-closes) and
+        // appending to it would make the array unparseable — reintroducing the
+        // failure this method exists to prevent.  The debug assertion makes a
+        // future caller that forgets the clear fail loudly instead of producing
+        // a corrupt stream.
+        debug_assert!(
+            out.is_empty(),
+            "render_internal_error expects an empty buffer; got {} bytes",
+            out.len()
+        );
+        // `BATCH_LEVEL` is the level `render_into` writes a batch element at, so
+        // the placeholder lines up with its neighbours instead of relying on the
+        // two sites agreeing by maintenance.
+        let mut obj = JsonContainer::object(
+            out,
+            INDENTS[BATCH_LEVEL - 1],
+            INDENTS[BATCH_LEVEL],
+            self.pretty,
+        );
+        // Same field set and order as a normal element: a consumer that reads
+        // `id` unconditionally must not meet an element without one, and the
+        // placeholder is exactly the element it most wants to identify.
+        obj.key("id");
+        obj.u64_hex(INTERNAL_ERROR_ID);
         obj.key("level");
         obj.string("error");
+        obj.key("message");
+        obj.string("internal: diagnostic rendering panicked");
         obj.close();
     }
 
     fn render_summary(&self, _errors: usize, _warnings: usize) -> String {
+        String::new()
+    }
+
+    /// Explicit rather than relying on the default's delegation: a trailer after
+    /// the closing `]` makes the whole document unparseable, so the guarantee
+    /// should not depend on the trait default staying a delegation.
+    fn render_summary_full(&self, _errors: usize, _warnings: usize, _files: usize) -> String {
         String::new()
     }
 
@@ -135,52 +166,36 @@ impl JsonRenderer {
     /// U+2028/U+2029 are valid JSON string characters and are intentionally
     /// emitted raw; this renderer's output is not safe to embed verbatim in an
     /// HTML `<script>` context (escape them at that boundary if needed).
-    fn push_json_str(out: &mut impl Write, s: &str) {
-        // Escaping is decided and applied by [`push_json_escaped_str`]: a
-        // single SWAR scan per 8-byte chunk finds each escape site, and the
-        // runs between them are bulk-copied with `write_str`.  The clean case
-        // (no control byte, `"`, or `\`) is one scan that finds nothing plus
-        // one `write_str(s)`.
-        let _ = out.write_str("\"");
+    /// `&mut String`, not `impl fmt::Write`: the whole document is assembled in
+    /// one `String` (`JsonContainer.out`), and the generic bound advertised a
+    /// fallible writer whose every error the old code discarded with `let _ =`.
+    /// Narrowing removes the `Result` plumbing, the capacity check per call, and
+    /// the one way this module could have produced silently truncated JSON.
+    fn push_json_str(out: &mut String, s: &str) {
+        // Escaping is decided and applied by [`push_json_escaped_str`]: a single
+        // SWAR scan per 8-byte chunk finds each escape site, and the runs between
+        // them are bulk-copied.  The clean case (no control byte, `"`, or `\\`) is
+        // one scan that finds nothing plus one `push_str(s)`.
+        // One reserve covers the quotes and the (common) unescaped body, so the
+        // pushes below do not each re-check capacity.  An escaped body can still
+        // grow past it; that is one amortized extension, not the norm.
+        out.reserve(s.len() + 2);
+        out.push('"');
         push_json_escaped_str(out, s);
-        let _ = out.write_str("\"");
+        out.push('"');
     }
 
-    /// Indentation for `level` nesting steps.
+    /// Indentation for `level` nesting steps, saturated at the table's depth.
     ///
-    /// Diagnostic JSON nests at most a couple of levels deep, so the common
-    /// levels borrow a `'static` slice instead of allocating; only deeper
-    /// nesting (which this renderer does not currently produce) falls back
-    /// to an owned `"  ".repeat(level)`.
-    fn indent(level: usize) -> Cow<'static, str> {
-        const INDENTS: &[&str] = &["", "  ", "    ", "      ", "        ", "          "];
-        // Same machine-check `fmt.rs` applies to `SPACES`: indent widths are not
-        // pinned by a test (pinning a guessed layout is how such a test rots), so
-        // a corrupted table must fail the build instead of shipping
-        // valid-but-misaligned pretty output.
-        const _: () = {
-            let mut i = 0;
-            let mut ok = true;
-            while i < INDENTS.len() {
-                let b = INDENTS[i].as_bytes();
-                if b.len() != i * 2 {
-                    ok = false;
-                }
-                let mut j = 0;
-                while j < b.len() {
-                    if b[j] != b' ' {
-                        ok = false;
-                    }
-                    j += 1;
-                }
-                i += 1;
-            }
-            assert!(ok, "INDENTS[i] must be exactly 2*i spaces (two per level)");
-        };
-        match INDENTS.get(level) {
-            Some(s) => Cow::Borrowed(s),
-            None => Cow::Owned("  ".repeat(level)),
-        }
+    /// `&'static str`, not `Cow<'static, str>`: the `Owned` arm only existed for
+    /// levels past the table, which no caller reaches (production uses 0/1/2,
+    /// the tests 0–2), and it made every field pay a discriminant check before
+    /// its `push_str`.  Saturation keeps the type total without allocating.
+    fn indent(level: usize) -> &'static str {
+        INDENTS
+            .get(level)
+            .copied()
+            .unwrap_or(INDENTS[INDENTS.len() - 1])
     }
 
     /// Length-bounded capacity estimate for one diagnostic's JSON object.
@@ -195,19 +210,36 @@ impl JsonRenderer {
     /// reallocate: `children` entries carry a message, styled parts, a span and
     /// a full label array each.
     fn estimate_cap(diag: &Diagnostic<'_>) -> usize {
-        192 + diag.message().len()
-            + diag.file_name().len() * 2
-            + 64
-            + diag.labels().len() * 128
-            + diag.suggestions().len() * 96
-            + diag.related_errors.len() * 96
-            + diag.help().map_or(0, |h| h.len() + 16)
-            + diag.children().len() * 160
-            + diag.spans.primary_ref().len().saturating_sub(1) * 96
-            + diag
-                .call_chain
+        // Every term saturates: the result feeds `reserve`, so the correct
+        // semantic for an absurd diagnostic is "huge", not a debug-build overflow
+        // panic (`+`/`*` wrap in release and are a real fuzzing hazard in debug).
+        // The message is escaped, so its JSON form can exceed its text: a quote or
+        // backslash doubles, a C0 control expands sixfold (`\\u00XX`).  Sizing
+        // from the raw length guaranteed a realloc for exactly those "dirty"
+        // messages, which is the case this single-allocation design exists for.
+        // 2x covers the overwhelmingly common quoted/backslashed case; a
+        // control-heavy message may still grow once, which is cheaper than a
+        // full extra scan here (see `push_json_escaped_str`).
+        let mut cap = 192usize.saturating_add(diag.message().len().saturating_mul(2));
+        cap = cap.saturating_add(diag.file_name().len().saturating_mul(2));
+        cap = cap.saturating_add(64);
+        cap = cap.saturating_add(diag.labels().len().saturating_mul(128));
+        cap = cap.saturating_add(diag.suggestions().len().saturating_mul(96));
+        cap = cap.saturating_add(diag.related_errors.len().saturating_mul(96));
+        cap = cap.saturating_add(diag.help().map_or(0, |h| h.len().saturating_add(16)));
+        cap = cap.saturating_add(diag.children().len().saturating_mul(160));
+        cap = cap.saturating_add(
+            diag.spans
+                .primary_ref()
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(96),
+        );
+        cap.saturating_add(
+            diag.call_chain
                 .as_ref()
-                .map_or(0, |c| c.entries().len() * 80)
+                .map_or(0, |c| c.entries().len().saturating_mul(80)),
+        )
     }
 
     /// Stream one diagnostic object into `out`.
@@ -216,18 +248,25 @@ impl JsonRenderer {
     /// declaration order. The separator is written *before* each field, so a
     /// trailing comma is structurally impossible — no intermediate field
     /// list is needed to guarantee it.
-    fn write_diagnostic(
+    /// Render one diagnostic object at nesting level `LVL`.
+    ///
+    /// `LVL` is a const generic rather than a parameter because every caller
+    /// uses a literal (2 for the batch array, 1 for a single object, 0 for the
+    /// test fixture): as a const, `INDENTS[LVL]` is folded to the literal, so the
+    /// per-field `push_str` sees a constant slice instead of a bounds-checked
+    /// load.  It is a private inherent method, so this introduces no lifetime or
+    /// trait parameter — nothing outside this module can observe the change.
+    fn write_diagnostic<const LVL: usize>(
         &self,
         diag: &Diagnostic<'_>,
         cx: &RenderCtx<'_>,
-        indent_lvl: usize,
         out: &mut String,
     ) {
-        let ind = Self::indent(indent_lvl);
-        let ind1 = Self::indent(indent_lvl + 1);
+        let ind = INDENTS[LVL];
+        let ind1 = Self::indent(LVL + 1);
         // `{` sits at the *outer* indentation, so `}` aligns with it; the
         // fields sit one level deeper.
-        let ind0 = Self::indent(indent_lvl.saturating_sub(1));
+        let ind0 = INDENTS[LVL.saturating_sub(1)];
         out.reserve(Self::estimate_cap(diag));
         let mut obj = JsonContainer::object(out, &ind0, &ind, self.pretty);
 
@@ -347,13 +386,13 @@ impl JsonRenderer {
                     }
                     None => {
                         flat_key0(o, "fileId");
-                        super::fmt::push_uint(o, sp.file.as_u32() as u64);
+                        super::fmt::push_u32(o, sp.file.as_u32());
                     }
                 }
                 flat_key(o, "start");
-                super::fmt::push_uint(o, sp.start as u64);
+                super::fmt::push_u32(o, sp.start);
                 flat_key(o, "end");
-                super::fmt::push_uint(o, sp.end as u64);
+                super::fmt::push_u32(o, sp.end);
                 if let Some((line, col)) =
                     anchor_linecol(idx.as_ref(), diag.source(), anchor_file, *sp)
                 {
@@ -378,9 +417,9 @@ impl JsonRenderer {
                 let o = &mut *arr.out;
                 o.push('{');
                 flat_key0(o, "start");
-                super::fmt::push_uint(o, lbl.span.start as u64);
+                super::fmt::push_u32(o, lbl.span.start);
                 flat_key(o, "end");
-                super::fmt::push_uint(o, lbl.span.end as u64);
+                super::fmt::push_u32(o, lbl.span.end);
                 // Resolved coordinates, same policy as every other section
                 // (`anchor_linecol`): a consumer must not have to reimplement
                 // offset → line mapping per section, and it must not have to
@@ -405,7 +444,7 @@ impl JsonRenderer {
                     }
                     None => {
                         flat_key(o, "fileId");
-                        super::fmt::push_uint(o, lbl.span.file.as_u32() as u64);
+                        super::fmt::push_u32(o, lbl.span.file.as_u32());
                     }
                 }
                 flat_key(o, "message");
@@ -425,16 +464,31 @@ impl JsonRenderer {
                 arr.element();
                 let o = &mut *arr.out;
                 o.push('{');
+                // `first` must be tracked *around* the label block.  The label is
+                // the first field whenever present, and emitting it with
+                // `flat_key` wrote a leading `, ` while leaving `first` stale, so
+                // the following field omitted its comma:
+                // `{, "label": …"file": …}` — invalid JSON for every related
+                // error carrying a label.
+                let mut first = true;
                 // `RelatedError::label` is retained precisely for backends like
-                // this one (the human renderer shows only message/code), so emit
-                // it with the same field names as `labels[]`; a consumer then
-                // reuses one parser.  Absent optionals stay omitted.
+                // this one (the human renderer shows only message/code).
+                //
+                // Shape: `{"message": …}`, **not** a `labels[]` element — the
+                // field carries no span, so there are no `start`/`end`/`line`/
+                // `column`/`kind` to reuse, and the old comment's "a consumer
+                // reuses one parser" was simply wrong.  The object (rather than a
+                // bare string) keeps room for a future `code`/`kind` without a
+                // wire break; `suggestions[].message` stays a bare string for the
+                // same reason it always was (there is nothing to nest under it).
+                // Absent optionals stay omitted.
                 if let Some(lbl) = rel.label.as_ref() {
-                    flat_key(o, "label");
+                    flat_key0(o, "label");
                     o.push('{');
                     flat_key0(o, "message");
                     Self::push_json_str(o, lbl);
                     o.push('}');
+                    first = false;
                 }
                 // Whether the two sibling arrays are concerned, a related
                 // error can point into a *different* file; name it (matching
@@ -447,16 +501,23 @@ impl JsonRenderer {
                 // consumer needs exactly one "missing" test per section.  An
                 // empty code counts as absent, matching `short.rs`, which drops
                 // it rather than rendering `error[]`.
-                let mut first = true;
                 if let Some(sp) = rel.span.as_ref() {
                     match diag.file_name_for(sp.file) {
                         Some(name) => {
-                            flat_key0(o, "file");
+                            if first {
+                                flat_key0(o, "file");
+                            } else {
+                                flat_key(o, "file");
+                            }
                             Self::push_json_str(o, name);
                         }
                         None => {
-                            flat_key0(o, "fileId");
-                            super::fmt::push_uint(o, sp.file.as_u32() as u64);
+                            if first {
+                                flat_key0(o, "fileId");
+                            } else {
+                                flat_key(o, "fileId");
+                            }
+                            super::fmt::push_u32(o, sp.file.as_u32());
                         }
                     }
                     first = false;
@@ -481,9 +542,9 @@ impl JsonRenderer {
                         flat_key(o, "span");
                         o.push('{');
                         flat_key0(o, "start");
-                        super::fmt::push_uint(o, sp.start as u64);
+                        super::fmt::push_u32(o, sp.start);
                         flat_key(o, "end");
-                        super::fmt::push_uint(o, sp.end as u64);
+                        super::fmt::push_u32(o, sp.end);
                         // Free when the anchor's source is attached *and*
                         // the span belongs to that same file (the common
                         // same-file case); a foreign span's offsets would
@@ -548,9 +609,9 @@ impl JsonRenderer {
                     flat_key(o, "span");
                     o.push('{');
                     flat_key0(o, "start");
-                    super::fmt::push_uint(o, sp.start as u64);
+                    super::fmt::push_u32(o, sp.start);
                     flat_key(o, "end");
-                    super::fmt::push_uint(o, sp.end as u64);
+                    super::fmt::push_u32(o, sp.end);
                     if let Some((line, col)) =
                         anchor_linecol(idx.as_ref(), diag.source(), anchor_file, sp)
                     {
@@ -566,7 +627,7 @@ impl JsonRenderer {
                         }
                         None => {
                             flat_key(o, "fileId");
-                            super::fmt::push_uint(o, sp.file.as_u32() as u64);
+                            super::fmt::push_u32(o, sp.file.as_u32());
                         }
                     }
                     o.push('}');
@@ -580,9 +641,9 @@ impl JsonRenderer {
                         }
                         o.push('{');
                         flat_key0(o, "start");
-                        super::fmt::push_uint(o, lbl.span.start as u64);
+                        super::fmt::push_u32(o, lbl.span.start);
                         flat_key(o, "end");
-                        super::fmt::push_uint(o, lbl.span.end as u64);
+                        super::fmt::push_u32(o, lbl.span.end);
                         if let Some((line, col)) =
                             anchor_linecol(idx.as_ref(), diag.source(), anchor_file, lbl.span)
                         {
@@ -598,7 +659,7 @@ impl JsonRenderer {
                             }
                             None => {
                                 flat_key(o, "fileId");
-                                super::fmt::push_uint(o, lbl.span.file.as_u32() as u64);
+                                super::fmt::push_u32(o, lbl.span.file.as_u32());
                             }
                         }
                         flat_key(o, "message");
@@ -642,9 +703,9 @@ impl JsonRenderer {
                     flat_key(o, "span");
                     o.push('{');
                     flat_key0(o, "start");
-                    super::fmt::push_uint(o, sp.start as u64);
+                    super::fmt::push_u32(o, sp.start);
                     flat_key(o, "end");
-                    super::fmt::push_uint(o, sp.end as u64);
+                    super::fmt::push_u32(o, sp.end);
                     if let Some((line, col)) =
                         anchor_linecol(idx.as_ref(), diag.source(), anchor_file, sp)
                     {
@@ -660,7 +721,7 @@ impl JsonRenderer {
                         }
                         None => {
                             flat_key(o, "fileId");
-                            super::fmt::push_uint(o, sp.file.as_u32() as u64);
+                            super::fmt::push_u32(o, sp.file.as_u32());
                         }
                     }
                     o.push('}');
@@ -700,11 +761,16 @@ impl JsonRenderer {
                 // that file's identity; otherwise its location is silently
                 // dropped and a JSON consumer cannot place it.
                 if let Some(span) = entry.span {
-                    // Resolve the entry's owning file name *once* and use it
-                    // for both the `file`/`fileId` field and `location`, so a
-                    // single object can never name two different files (the
-                    // `file` field used to consult `file_name_for` while
-                    // `location` used the hoisted anchor `file_name`).
+                    // Resolve the entry's owning file name *once* and use it for
+                    // both the `file`/`fileId` field and `location`.  In the
+                    // common case that keeps a single object from naming two
+                    // different files; the one exception is "the entry is in the
+                    // anchor file but the anchor has no resolvable display name",
+                    // where `file` degrades to `fileId` while `location` uses the
+                    // hoisted fallback name — the coordinates are still right,
+                    // and `call_chain_location_falls_back_when_anchor_is_unresolvable`
+                    // pins that branch rather than letting the claim stand as an
+                    // absolute.
                     let entry_file = diag.file_name_for(span.file);
                     match entry_file {
                         Some(name) => {
@@ -750,13 +816,24 @@ impl JsonRenderer {
 /// byte shapes are pinned identical to `compact_object` (`"` + key +
 /// `": "`, `", "` separators) — the JSON snapshots hold this.
 fn flat_key(out: &mut String, key: &str) {
-    out.push_str(", ");
-    flat_key0(out, key);
+    // One reserve for `key` plus the punctuation, so the pushes below do not
+    // each re-check capacity; this runs once per field of every related error,
+    // label and suggestion.
+    out.reserve(key.len() + 4);
+    // One `push_str` for `, "` instead of two: these run ~8x per label /
+    // related error / suggestion, so the saved capacity check is not noise.
+    out.push_str(", \"");
+    out.push_str(key);
+    out.push_str("\": ");
 }
 
 /// First field of a flat object: no separator (the `{` was just pushed).
 fn flat_key0(out: &mut String, key: &str) {
-    out.push('"');
+    // One reserve for `key` plus the punctuation, so the pushes below do not
+    // each re-check capacity; this runs once per field of every related error,
+    // label and suggestion.
+    out.reserve(key.len() + 4);
+    out.push_str("\"");
     out.push_str(key);
     out.push_str("\": ");
 }
@@ -879,7 +956,34 @@ impl<'a> JsonContainer<'a> {
 
     /// Begin the next element: separator first, then (in pretty mode) the
     /// newline and indentation.
+    /// Emit `null` for a key written without a value.
+    ///
+    /// Called from both `close()` and `Drop`: repairing only in `Drop` meant
+    /// `close()` (which sets `closed = true` and so silences the tripwire) was the
+    /// one exit path where a dangling key shipped as `"x": }`.
+    fn repair_pending(&mut self) {
+        if self
+            .pending_value_at
+            .is_some_and(|mark| self.out.len() == mark)
+        {
+            self.out.push_str("null");
+            self.pending_value_at = None;
+        }
+    }
+
     fn element(&mut self) {
+        // Repair first: `key("x")` followed by another `key(..)`/`element()` would
+        // otherwise write the separator and make `out.len() > mark`, after which no
+        // repair path can fire and the stream is invalid.  One well-predicted
+        // branch on a path that already does several `push_str`s.
+        if let Some(mark) = self.pending_value_at.take() {
+            // Only a *dangling* key is repaired: the flat helpers write their
+            // value straight into `out` without clearing the marker, so any bytes
+            // after the mark mean the value did arrive.
+            if self.out.len() == mark {
+                self.out.push_str("null");
+            }
+        }
         if self.first {
             self.first = false;
         } else {
@@ -970,12 +1074,7 @@ impl Drop for JsonContainer<'_> {
         // cannot be repaired this way (the flat helpers bypass the bookkeeping),
         // so a container dropped right after `element()` can still leave a trailing
         // comma — the doc says so rather than overclaiming.
-        if self
-            .pending_value_at
-            .is_some_and(|mark| self.out.len() == mark)
-        {
-            self.out.push_str("null");
-        }
+        self.repair_pending();
         if self.pretty && !self.first {
             self.out.push('\n');
             self.out.push_str(self.close_ind);
@@ -1017,20 +1116,13 @@ fn anchor_linecol(
 /// First byte JSON must escape — a control byte (`< 0x20`), `"` or `\` — or
 /// `None` if none qualifies.
 ///
-/// Adaptive dispatch, because the two regimes want different machinery:
-///
-/// * **≤ [`SHORT_FUSED_MAX`]** (diagnostic messages, labels, help text): the
-///   fused SWAR scan.  One pass over ≤8 vector-sized chunks finds all three
-///   classes at once; `memchr2`'s wider vectors cannot amortize their setup at
-///   this length.
-/// * **longer**: `memchr2` for the two structural bytes (wider than SWAR),
-///   then the control scan bounded to the first structural hit, so a string
-///   with an early quote never pays a full control pass.
-///
-/// Both alternatives are exact: the fused scan's combined mask flags the lowest
-/// *true* candidate (a cross-byte borrow can only add a lane above a true one,
-/// and `trailing_zeros` takes the lowest), and UTF-8 continuation bytes are all
-/// `≥ 0x80`, so no multi-byte character is a candidate.
+/// **Test-only.**  Production dispatch lives inside [`push_json_escaped_str`]
+/// (fused scan ≤ [`SHORT_FUSED_MAX`], `memchr2` + bounded control scan above);
+/// this entry point exists so the differential test can pin the *positional*
+/// contract of the same predicate.  It used to be described here as the
+/// production dispatcher, which was a doc-only architecture that the code did
+/// not have.
+#[cfg(test)]
 #[inline]
 fn next_json_escape_byte(b: &[u8]) -> Option<usize> {
     if b.len() <= SHORT_FUSED_MAX {
@@ -1058,7 +1150,13 @@ const SHORT_FUSED_MAX: usize = 64;
 /// and `has_zero` masks are all zero, and the high-bit test clears them even
 /// when a borrow propagates out of a real lane).
 #[inline]
-fn next_escape_swar(b: &[u8]) -> Option<usize> {
+/// Lane mask for the three JSON escape classes in one 8-byte word.
+///
+/// `hasless` for the control range (`< 0x20`; the lowest flagged lane is always
+/// a true hit — a borrow can only flag a byte that is itself `>= 0x20` *after* a
+/// real `< 0x20` lane) plus Mycroft `has_zero` for `"` and `\\`.
+#[inline]
+fn escape_mask(x: u64) -> u64 {
     const HI: u64 = 0x8080_8080_8080_8080;
     const LO: u64 = 0x0101_0101_0101_0101;
     const SP: u64 = 0x2020_2020_2020_2020;
@@ -1068,28 +1166,148 @@ fn next_escape_swar(b: &[u8]) -> Option<usize> {
     fn has_zero(v: u64) -> u64 {
         v.wrapping_sub(LO) & !v & HI
     }
+    (x.wrapping_sub(SP) & !x & HI) | has_zero(x ^ QUOTE) | has_zero(x ^ BACKSLASH)
+}
+
+/// Lane mask for JSON control bytes (`< 0x20`) in one 8-byte word.
+#[inline]
+fn ctrl_mask(x: u64) -> u64 {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const SP: u64 = 0x2020_2020_2020_2020;
+    x.wrapping_sub(SP) & !x & HI
+}
+
+/// One pass over `b`, yielding the position of every escape byte in ascending
+/// order.
+///
+/// The previous shape re-entered the scanner at `hit + 1`, so an escape-dense
+/// string (a message full of `\\n`, or a binary snippet) re-scanned the same
+/// 8-byte chunk up to eight times: linear, but with an 8× constant on exactly the
+/// inputs that are already slow.  Draining the whole chunk mask before advancing
+/// makes each chunk cost one SWAR step.
+///
+/// Tail handling pads with `0xFF`, whose lanes cannot flag: `(0xFF - 0x20) & !0xFF`
+/// is 0 and `has_zero(0xFF ^ c)` is 0 for every `c` the masks use.
+struct EscapeIter<'a> {
+    b: &'a [u8],
+    /// Start of the next chunk to scan.
+    pos: usize,
+    /// Start of the chunk `mask` describes.
+    chunk: usize,
+    mask: u64,
+}
+
+impl<'a> EscapeIter<'a> {
     #[inline]
-    fn lane(mask: u64) -> usize {
-        (mask.trailing_zeros() / 8) as usize
-    }
-    let mut i = 0;
-    while i + 8 <= b.len() {
-        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        let hits = (x.wrapping_sub(SP) & !x & HI) | has_zero(x ^ QUOTE) | has_zero(x ^ BACKSLASH);
-        if hits != 0 {
-            return Some(i + lane(hits));
+    fn new(b: &'a [u8]) -> Self {
+        EscapeIter {
+            b,
+            pos: 0,
+            chunk: 0,
+            mask: 0,
         }
-        i += 8;
     }
-    let n = b.len() - i;
-    if n == 0 {
-        return None;
+}
+
+impl Iterator for EscapeIter<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            if self.mask != 0 {
+                let lane = (self.mask.trailing_zeros() / 8) as usize;
+                // Clear this lane; every lane keeps its flag in bit 7 of its byte.
+                self.mask &= !(0x80u64 << (lane * 8));
+                return Some(self.chunk + lane);
+            }
+            let remaining = self.b.len() - self.pos;
+            if remaining >= 8 {
+                let x = u64::from_le_bytes(
+                    self.b[self.pos..self.pos + 8]
+                        .try_into()
+                        .expect("8-byte chunk"),
+                );
+                self.mask = escape_mask(x);
+                self.chunk = self.pos;
+                self.pos += 8;
+                continue;
+            }
+            if remaining == 0 {
+                return None;
+            }
+            let mut buf = [0xFFu8; 8];
+            buf[..remaining].copy_from_slice(&self.b[self.pos..]);
+            self.mask = escape_mask(u64::from_le_bytes(buf));
+            self.chunk = self.pos;
+            self.pos += remaining;
+        }
     }
-    let mut buf = [0xFFu8; 8];
-    buf[..n].copy_from_slice(&b[i..]);
-    let x = u64::from_le_bytes(buf);
-    let hits = (x.wrapping_sub(SP) & !x & HI) | has_zero(x ^ QUOTE) | has_zero(x ^ BACKSLASH);
-    (hits != 0).then(|| i + lane(hits))
+}
+
+/// One pass over `b`, yielding the position of every JSON control byte
+/// (`< 0x20`) in ascending order.
+///
+/// Same restructuring as [`EscapeIter`], for the long path's control scan.
+struct CtrlIter<'a> {
+    b: &'a [u8],
+    pos: usize,
+    chunk: usize,
+    mask: u64,
+}
+
+impl<'a> CtrlIter<'a> {
+    #[inline]
+    fn new(b: &'a [u8]) -> Self {
+        CtrlIter {
+            b,
+            pos: 0,
+            chunk: 0,
+            mask: 0,
+        }
+    }
+}
+
+impl Iterator for CtrlIter<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            if self.mask != 0 {
+                let lane = (self.mask.trailing_zeros() / 8) as usize;
+                self.mask &= !(0x80u64 << (lane * 8));
+                return Some(self.chunk + lane);
+            }
+            let remaining = self.b.len() - self.pos;
+            if remaining >= 8 {
+                let x = u64::from_le_bytes(
+                    self.b[self.pos..self.pos + 8]
+                        .try_into()
+                        .expect("8-byte chunk"),
+                );
+                self.mask = ctrl_mask(x);
+                self.chunk = self.pos;
+                self.pos += 8;
+                continue;
+            }
+            if remaining == 0 {
+                return None;
+            }
+            let mut buf = [0xFFu8; 8];
+            buf[..remaining].copy_from_slice(&self.b[self.pos..]);
+            self.mask = ctrl_mask(u64::from_le_bytes(buf));
+            self.chunk = self.pos;
+            self.pos += remaining;
+        }
+    }
+}
+
+/// First escape byte in `b`, or `None`.  Thin wrapper over [`EscapeIter`] so the
+/// positional contract and the production drain share one implementation.
+#[inline]
+fn next_escape_swar(b: &[u8]) -> Option<usize> {
+    EscapeIter::new(b).next()
 }
 
 /// First byte `< 0x20` in `b` (JSON control range), or `None`.
@@ -1099,35 +1317,7 @@ fn next_escape_swar(b: &[u8]) -> Option<usize> {
 /// can only flag a byte that is itself `≥ 0x20` *after* a true `< 0x20` lane).
 #[inline]
 fn next_ctrl_byte(b: &[u8]) -> Option<usize> {
-    const HI: u64 = 0x8080_8080_8080_8080;
-    const SP: u64 = 0x2020_2020_2020_2020;
-    let mut i = 0;
-    while i + 8 <= b.len() {
-        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        let ctrl = x.wrapping_sub(SP) & !x & HI;
-        if ctrl != 0 {
-            return Some(i + (ctrl.trailing_zeros() / 8) as usize);
-        }
-        i += 8;
-    }
-    // Tail (0..=7 remaining bytes — the dominant case for diagnostic messages,
-    // labels and help text): pad into a stack buffer and run one SWAR pass
-    // instead of a per-byte scalar loop.
-    //
-    // `0xFF` filler lanes cannot produce a false hit: `(0xFF - 0x20) & !0xFF`
-    // is 0, so the high-bit test clears them even when a borrow from a real
-    // lane propagates into them.  And a borrow cannot make a *real* lane flag
-    // without a real `< 0x20` lane below it (the documented `hasless`
-    // argument), so the lowest flagged lane is always a true match.
-    let n = b.len() - i;
-    if n == 0 {
-        return None;
-    }
-    let mut buf = [0xFFu8; 8];
-    buf[..n].copy_from_slice(&b[i..]);
-    let x = u64::from_le_bytes(buf);
-    let ctrl = x.wrapping_sub(SP) & !x & HI;
-    (ctrl != 0).then(|| i + (ctrl.trailing_zeros() / 8) as usize)
+    CtrlIter::new(b).next()
 }
 
 /// Does `s` contain a byte that JSON must escape?  Test-only scalar-shaped
@@ -1142,26 +1332,26 @@ fn needs_json_escape(s: &str) -> bool {
 /// Append `s` to `out` with JSON string escaping (no surrounding quotes).
 /// Bulk-copies the runs between escape sites instead of a per-byte branch
 /// loop; the clean case (no escapes) is a single `write_str`.
-fn push_json_escaped_str<W: std::fmt::Write>(out: &mut W, s: &str) {
+fn push_json_escaped_str(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
     // Short strings (diagnostic messages, labels, help) take the fused scan:
     // one pass finds all three escape classes, and `memchr2`'s wider vectors
     // cannot amortize their setup below 64 bytes.  Each iteration resumes right
     // after the previous escape, so the total remains linear in `len`.
     if bytes.len() <= SHORT_FUSED_MAX {
+        // Drain every escape in the current 8-byte chunk before advancing: the
+        // old shape restarted the scan at `at + 1`, re-scanning the same chunk
+        // up to eight times on escape-dense input.
         let mut start = 0usize;
-        let mut i = 0usize;
-        while let Some(rel) = next_escape_swar(&bytes[i..]) {
-            let at = i + rel;
+        for at in EscapeIter::new(bytes) {
             if start < at {
-                let _ = out.write_str(&s[start..at]);
+                out.push_str(&s[start..at]);
             }
-            push_json_escaped(out, bytes[at] as char);
-            i = at + 1;
-            start = i;
+            push_json_escaped(out, bytes[at]);
+            start = at + 1;
         }
         if start < bytes.len() {
-            let _ = out.write_str(&s[start..]);
+            out.push_str(&s[start..]);
         }
         return;
     }
@@ -1171,35 +1361,38 @@ fn push_json_escaped_str<W: std::fmt::Write>(out: &mut W, s: &str) {
     // `bytes[start..]` on every iteration made control-heavy strings with no
     // quotes/backslashes O(n²) (one full `memchr2` miss per escaped control);
     // this makes the total scan linear.
+    // Two single-pass streams, merged: `memchr2` (SIMD) for the quote and
+    // backslash, and the SWAR control iterator.  The old shape restarted the
+    // control scan at `start` after every escape, re-scanning already-consumed
+    // chunks on control-dense input; a resumable iterator keeps its position, so
+    // each byte is examined exactly once.
     let mut structural = memchr::memchr2_iter(b'"', b'\\', bytes);
+    let mut ctrl = CtrlIter::new(bytes);
     let mut next_structural = structural.next();
+    let mut next_ctrl = ctrl.next();
     let mut start = 0usize;
-    while start < bytes.len() {
-        let limit = next_structural.unwrap_or(bytes.len());
-        let ctrl = if start < limit {
-            next_ctrl_byte(&bytes[start..limit]).map(|off| start + off)
-        } else {
-            None
-        };
-        let i = match (ctrl, next_structural) {
-            (Some(c), _) => c,
+    loop {
+        let i = match (next_ctrl, next_structural) {
+            (Some(c), Some(st)) => c.min(st),
+            (Some(c), None) => c,
             (None, Some(st)) => st,
             (None, None) => break,
         };
         if i > start {
-            let _ = out.write_str(&s[start..i]);
+            out.push_str(&s[start..i]);
         }
-        // The escape candidates (`< 0x20`, `"`, `\`) are all ASCII, so
-        // `bytes[i]` is a char boundary and `bytes[i] as char` is the
-        // codepoint to escape.
-        push_json_escaped(out, bytes[i] as char);
+        // Every escape candidate is ASCII, so `bytes[i]` is a char boundary.
+        push_json_escaped(out, bytes[i]);
         start = i + 1;
-        if Some(i) == next_structural {
+        if next_ctrl == Some(i) {
+            next_ctrl = ctrl.next();
+        }
+        if next_structural == Some(i) {
             next_structural = structural.next();
         }
     }
     if start < bytes.len() {
-        let _ = out.write_str(&s[start..]);
+        out.push_str(&s[start..]);
     }
 }
 
@@ -1224,6 +1417,65 @@ fn push_json_escaped_str<W: std::fmt::Write>(out: &mut W, s: &str) {
 /// also made `simdutf8` a runtime dependency the module's header contract does
 /// not mention.  The named escapes (`\"`, `\\`, `\n`, `\r`, `\t`) are matched
 /// before this table is consulted, so their slots are unreachable.
+/// Pretty-print indentation, two spaces per level.
+///
+/// At module scope (not inside `indent`) so `write_diagnostic::<LVL>` can index
+/// it with a compile-time constant, which folds the bounds check and the load
+/// away entirely; the runtime accessor is the fallback for callers that cannot
+/// name a level.
+const INDENTS: &[&str] = &["", "  ", "    ", "      ", "        ", "          "];
+
+/// Nesting level of one batch element: `[` at 0, the object's `{` at this level,
+/// its fields one deeper.  Named because two sites must agree — `render_into`
+/// writes real elements here, and `render_internal_error` must lay its
+/// placeholder out identically or the array visually breaks on a panic.
+const BATCH_LEVEL: usize = 2;
+
+/// `id` reported by the panic placeholder.
+///
+/// Every real element carries `"id": "0x<stable_id>"`; a consumer that reads
+/// `id` unconditionally must not meet an element without one.  This is a fixed
+/// sentinel (not a hash of anything the failing diagnostic might have produced),
+/// so a panic is identifiable and does not move between runs.
+const INTERNAL_ERROR_ID: u64 = 0x1DEA_D1ED_1DEA_D1ED;
+
+// Same machine-check `fmt.rs` applies to `SPACES`: indent widths are not pinned
+// by a test (pinning a guessed layout is how such a test rots), so a corrupted
+// table must fail the build instead of shipping valid-but-misaligned output.
+const _: () = {
+    let mut i = 0;
+    let mut ok = true;
+    while i < INDENTS.len() {
+        let b = INDENTS[i].as_bytes();
+        if b.len() != i * 2 {
+            ok = false;
+        }
+        let mut j = 0;
+        while j < b.len() {
+            if b[j] != b' ' {
+                ok = false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    assert!(ok, "INDENTS[i] must be exactly 2*i spaces (two per level)");
+};
+
+/// Machine-checked: every entry is exactly `\uXXXX` (6 ASCII bytes), the shape
+/// the six-byte fast path and the `\u` decode both assume.  A stray edit to a
+/// literal is a compile error instead of a wrong escape on the wire.
+const _: () = {
+    let mut i = 0;
+    while i < 32 {
+        assert!(C0_ESCAPED[i].len() == 6, "C0 escape entries are 6 bytes");
+        assert!(
+            C0_ESCAPED[i].as_bytes()[0] == b'\\',
+            "entries start with a backslash"
+        );
+        i += 1;
+    }
+};
 const C0_ESCAPED: [&str; 32] = [
     "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006", "\\u0007",
     "\\u0008", "\\u0009", "\\u000a", "\\u000b", "\\u000c", "\\u000d", "\\u000e", "\\u000f",
@@ -1231,38 +1483,26 @@ const C0_ESCAPED: [&str; 32] = [
     "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d", "\\u001e", "\\u001f",
 ];
 
-fn push_json_escaped<W: std::fmt::Write>(out: &mut W, c: char) {
+fn push_json_escaped(out: &mut String, b: u8) {
+    // The scanner (`next_escape_swar`, or the long path's `memchr2` + control
+    // scan) only ever *selects bytes*: `"`, `\`, or a byte `< 0x20`.  Taking
+    // `char` forced two arms the scanner can never reach — hex-building for C1
+    // controls and a `write_char` fallback — into the hottest escape path, and
+    // made the match non-total over the real domain.  The doc used to promise
+    // `\u007f` output that was unreachable by construction.
     debug_assert!(
-        matches!(c, '"' | '\\' | '\n' | '\r' | '\t' | '\u{0}'..='\u{1f}'),
-        "push_json_escaped called with a char the scanner would not select: {c:?}"
+        b < 0x20 || b == b'"' || b == b'\\',
+        "push_json_escaped called with a byte the scanner would not select: {b:#04x}"
     );
-    let _ = match c {
-        '"' => out.write_str("\\\""),
-        '\\' => out.write_str("\\\\"),
-        '\n' => out.write_str("\\n"),
-        '\r' => out.write_str("\\r"),
-        '\t' => out.write_str("\\t"),
-        // `\u{0}`–`\u{1f}` other than the named escapes above: one table load.
-        c if (c as u32) < 0x20 => out.write_str(C0_ESCAPED[c as usize]),
-        c if c.is_control() => {
-            // `0x7F`–`0x9F` are Unicode controls but not JSON-required escapes
-            // (JSON only requires `< 0x20`).  The scanner never selects them, but
-            // this arm still emits a valid `\uXXXX`; the six bytes are ASCII by
-            // construction, so the decode cannot fail.
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let n = c as u32;
-            let buf = [
-                b'\\',
-                b'u',
-                HEX[((n >> 12) & 0xf) as usize],
-                HEX[((n >> 8) & 0xf) as usize],
-                HEX[((n >> 4) & 0xf) as usize],
-                HEX[(n & 0xf) as usize],
-            ];
-            out.write_str(std::str::from_utf8(&buf).expect("hex escape is ASCII"))
-        }
-        c => out.write_char(c),
-    };
+    out.push_str(match b {
+        b'"' => "\\\"",
+        b'\\' => "\\\\",
+        b'\n' => "\\n",
+        b'\r' => "\\r",
+        b'\t' => "\\t",
+        // `0x00..=0x1f` other than the named escapes above: one table load.
+        b => C0_ESCAPED[b as usize],
+    });
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]
@@ -1278,6 +1518,52 @@ mod tests {
     /// `children[].span`, `callChain[].span`) and the header contract's "absent,
     /// not null".  An empty code counts as absent, like `short.rs`.
     #[test]
+    /// The label is the first field of the related-error object whenever it is
+    /// present, which is exactly where a `flat_key` (comma-prefixed) write and a
+    /// stale `first` both produced invalid JSON.  Pin the whole shape through a
+    /// real parser, not a substring check.
+    #[test]
+    fn related_errors_with_a_label_round_trip() {
+        use crate::diagnostics::RelatedError;
+        let span = Span::new(FileId::DUMMY, 3, 9);
+        for (label, code) in [
+            (Some("L"), None),
+            (Some("L"), Some(crate::diagnostics::ErrCode::new("E030"))),
+            (None, Some(crate::diagnostics::ErrCode::new("E030"))),
+            // A present-but-empty label must behave like any other present
+            // label: emitted as `""`, and the following field still gets its
+            // comma.  (`Some("")` is reachable from a backend that sanitized the
+            // label to nothing.)
+            (Some(""), Some(crate::diagnostics::ErrCode::new("E030"))),
+        ] {
+            let diag = Diagnostic::error("outer").with_related(RelatedError {
+                code,
+                message: "inner".into(),
+                span: Some(span),
+                label: label.map(std::borrow::Cow::Borrowed),
+            });
+            for pretty in [false, true] {
+                let out = json_of(&diag, pretty);
+                let v: serde_json::Value =
+                    serde_json::from_str(&out).expect("relatedErrors must stay valid JSON");
+                let rel = &v["relatedErrors"][0];
+                assert_eq!(rel["message"], "inner");
+                assert_eq!(rel["span"]["start"], 3);
+                match label {
+                    Some(l) => assert_eq!(rel["label"]["message"], l),
+                    None => assert!(rel.get("label").is_none(), "absent label must be omitted"),
+                }
+                // A leading comma (or a missing one after the label) is exactly
+                // what the broken `first` tracking produced; the parser above
+                // already rejects both, this only names the failure.
+                assert!(
+                    !out.contains("{,") && !out.contains("{ ,"),
+                    "leading comma in relatedErrors: {out}"
+                );
+            }
+        }
+    }
+
     fn related_errors_omit_absent_code_and_span() {
         use crate::diagnostics::RelatedError;
         let diag = Diagnostic::error("outer").with_related(RelatedError {
@@ -1330,7 +1616,7 @@ mod tests {
         let opts = crate::diagnostics::DiagOpts::default();
         let cx = crate::diagnostics::render::RenderCtx::new(&opts, None);
         let mut out = String::new();
-        JsonRenderer::new(pretty).write_diagnostic(diag, &cx, 0, &mut out);
+        JsonRenderer::new(pretty).write_diagnostic::<0>(diag, &cx, &mut out);
         out
     }
 
@@ -1341,10 +1627,13 @@ mod tests {
     /// through an intermediate `CompactString` on the heap.
     #[test]
     fn push_json_str_inlines_short_values() {
+        // The writer is `&mut String` (the production buffer), so the inline
+        // property is measured on the conversion: a short escaped result still
+        // fits `CompactString`'s 24-byte inline limit, a long one does not.
         fn render(s: &str) -> CompactString {
-            let mut out = CompactString::with_capacity(s.len() + 2);
+            let mut out = String::with_capacity(s.len() + 2);
             JsonRenderer::push_json_str(&mut out, s);
-            out
+            CompactString::from(out)
         }
 
         // Fast path: no characters need escaping.
@@ -1472,6 +1761,36 @@ mod tests {
         assert_eq!(v["callChain"][0]["kind"], "Call");
     }
 
+    /// A chain entry outside the anchor file can be *named* but not *located*:
+    /// `anchor_linecol` only computes coordinates for anchor-file spans, so the
+    /// entry must carry `file` and no `line`/`column`/`location` — never a
+    /// half-filled location and never the anchor's name in place of the real one.
+    #[test]
+    fn call_chain_foreign_entry_names_file_and_omits_coordinates() {
+        let foreign = FileId::from_raw(2);
+        let mut chain = CallChain::new();
+        chain.push(ChainEntry::new(
+            ChainEntryKind::Call,
+            Some(Span::new(foreign, 5, 9)),
+            "from real.rs",
+        ));
+        let diag = Diagnostic::error("x")
+            .with_source("a\nb\n")
+            .with_span(Span::new(FileId::DUMMY, 0, 1))
+            .with_foreign_source(foreign, "real.rs", "a\nb\n")
+            .with_call_chain(chain);
+        let v: serde_json::Value =
+            serde_json::from_str(&json_of(&diag, false)).expect("valid JSON");
+        let entry = &v["callChain"][0];
+        assert_eq!(entry["file"], "real.rs", "{entry}");
+        for absent in ["line", "column", "location", "fileId"] {
+            assert!(
+                entry.get(absent).is_none(),
+                "{absent} must be absent: {entry}"
+            );
+        }
+    }
+
     #[test]
     fn call_chain_file_and_location_agree_under_file_name_override() {
         // Anchor span in the diagnostic's own file, whose display name is
@@ -1595,6 +1914,63 @@ mod tests {
     /// replaces for every byte value and at every 8-byte chunk boundary — the
     /// `hasless`/`has_zero` tricks carry cross-byte borrows that are only
     /// sound for the "any byte" predicate, so this pins them exhaustively.
+    /// `needs_index` gates every coordinate on the diagnostic having a first
+    /// span.  A diagnostic with labels but *no* primary span must emit the labels
+    /// without coordinates — never line/column against a source its spans were
+    /// not resolved against.
+    #[test]
+    fn labels_without_a_primary_span_carry_no_coordinates() {
+        let diag = Diagnostic::error("x")
+            .with_source("a\nb\n")
+            .with_label(Span::new(FileId::DUMMY, 2, 3), "here");
+        let v: serde_json::Value =
+            serde_json::from_str(&json_of(&diag, false)).expect("valid JSON");
+        let label = &v["labels"][0];
+        assert_eq!(label["message"], "here");
+        for absent in ["line", "column", "location"] {
+            assert!(
+                label.get(absent).is_none(),
+                "{absent} must be absent without a primary span: {label}"
+            );
+        }
+    }
+
+    /// End-to-end differential against `serde_json`'s escaper, driven through the
+    /// **production** entry point rather than the test-only predicate view:
+    /// `next_json_escape_byte` mirrors the dispatch policy, so a change to
+    /// `SHORT_FUSED_MAX` or to the long path's stream merge could drift while that
+    /// test kept passing.  Also pins lengths 63/64/65 (the short/long boundary)
+    /// with an escape as the final byte, and a control-dense 4 KiB string, where
+    /// the old restart-per-hit scanner did ~8× redundant work.
+    #[test]
+    fn push_json_str_matches_serde_json_across_the_dispatch_boundary() {
+        fn check(s: &str, ctx: &str) {
+            let mut out = String::new();
+            JsonRenderer::push_json_str(&mut out, s);
+            let want = serde_json::to_string(s).expect("serde_json escapes any &str");
+            assert_eq!(out, want, "{ctx} (len {}): {s:?}", s.len());
+        }
+
+        // Boundary band: an escape as the last byte of a 63/64/65/66-byte value,
+        // plus the same with a control and with a quote.
+        for len in [0usize, 1, 7, 8, 9, 62, 63, 64, 65, 66, 127, 128, 129] {
+            for esc in ['\n', '"', '\\', '\u{7}'] {
+                let mut s = "a".repeat(len.saturating_sub(1));
+                if len > 0 {
+                    s.push(esc);
+                }
+                check(&s, "boundary");
+            }
+        }
+        // Control-dense long value: every byte an escape, past the fused threshold.
+        check(&"\n".repeat(4096), "dense-newline");
+        // Structural-dense long value (exercises the memchr2 stream).
+        check(&"\"".repeat(4096), "dense-quote");
+        // Mixed, including a multi-byte codepoint adjacent to escapes, so the
+        // byte-level scanner and the char-boundary slice agree.
+        check(&"é\n雪\"\\\u{1}".repeat(200), "mixed");
+    }
+
     #[test]
     fn needs_json_escape_matches_scalar() {
         fn scalar(s: &str) -> bool {
@@ -1603,11 +1979,23 @@ mod tests {
         // `needs_json_escape` and `next_json_escape_byte` are two views of the
         // same SWAR predicate — pin both against the scalar reference and, when
         // a candidate exists, confirm the position actually names one.
+        // The first-hit position is what the bulk copy in
+        // `push_json_escaped_str` slices on; asserting only that *some* escape
+        // byte was found let a regression that returns a later hit pass while
+        // silently copying an escape verbatim.
+        fn scalar_first(s: &str) -> Option<usize> {
+            s.bytes().position(|b| b < 0x20 || b == b'"' || b == b'\\')
+        }
         fn check(s: &str, ctx: &str) {
             let want = scalar(s);
             assert_eq!(needs_json_escape(s), want, "{ctx}: needs_json_escape");
             let pos = next_json_escape_byte(s.as_bytes());
             assert_eq!(pos.is_some(), want, "{ctx}: next_json_escape_byte");
+            assert_eq!(
+                pos,
+                scalar_first(s),
+                "{ctx}: next_json_escape_byte must name the first escape, not any"
+            );
             if let Some(i) = pos {
                 let b = s.as_bytes()[i];
                 assert!(
@@ -1741,6 +2129,15 @@ mod tests {
                     .is_some_and(|m| m.contains("panicked")),
                 "the placeholder must name the failure: {body:?}"
             );
+            // Schema uniformity: a consumer that reads `id` unconditionally must
+            // not meet an element without one — and the placeholder is exactly
+            // the element it most needs to identify.
+            let id = value["id"].as_str().expect("placeholder must carry an id");
+            assert!(
+                id.starts_with("0x") && id.len() > 2,
+                "placeholder id must be hex-shaped like a real one: {id:?}"
+            );
+            assert_eq!(value["id"], format!("0x{INTERNAL_ERROR_ID:016x}"));
 
             // …and inside a batch the array still parses end to end.
             let mut sink = crate::diagnostics::sink::StringSink::new();

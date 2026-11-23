@@ -400,9 +400,8 @@ impl DiagFilter {
         {
             return true;
         }
-        let set = verbatim;
         let canonical = code.canonical();
-        if set.contains(canonical) {
+        if verbatim.contains(canonical) {
             return true;
         }
         // `from_opts` stores every pattern uppercased.  Known and resolved
@@ -414,7 +413,7 @@ impl DiagFilter {
             return false;
         }
         let upper = canonical.to_ascii_uppercase();
-        set.contains(upper.as_str())
+        verbatim.contains(upper.as_str())
     }
 
     /// Whether `diag` passes the filter — mirrors the original
@@ -712,8 +711,9 @@ impl MultiSpan {
         // (the old `OnceLock::take` requires Rust 1.90; MSRV is 1.88).
         // Re-population only happens on the next dirty read.
         self.sorted_cache = std::sync::OnceLock::new();
+        // No equality arm: the early return above already handled `last == span`
+        // (and resetting the cache for a duplicate tail would be wrong there).
         match self.primary.last() {
-            Some(last) if *last == span => {}
             Some(last) if *last > span => {
                 self.primary.push(span);
                 self.dirty = true;
@@ -771,7 +771,10 @@ impl MultiSpan {
             // The cache is behind `&self`, so the borrowed view is exact.
             Cow::Borrowed(cached)
         } else {
-            let mut out: SmallVec<[Span; 2]> = self.primary.clone();
+            // `collect` on a `TrustedLen` iterator reserves exactly `len`, so the
+            // `into_boxed_slice` below is a no-op; cloning the `SmallVec` first could
+            // carry spare capacity and make it shrink (a second allocation).
+            let mut out: Vec<Span> = self.primary.iter().copied().collect();
             out.sort_unstable();
             out.dedup();
             debug_assert!(
@@ -785,7 +788,7 @@ impl MultiSpan {
             // against an `O(n log n)` sort per read.  Return a borrow of the
             // cache rather than cloning it: the cache lives behind `&self`,
             // so the borrow is exact and the dirty path costs no extra copy.
-            match self.sorted_cache.set(out.into_vec().into_boxed_slice()) {
+            match self.sorted_cache.set(out.into_boxed_slice()) {
                 Ok(()) => {
                     // Two threads may both compute and both attempt `set`; a
                     // successful `set` or the winner's value is visible here
@@ -1286,13 +1289,43 @@ impl<'src> Diagnostic<'src> {
 
     #[inline]
     fn compute_stable_id(&self) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut h = FNV_OFFSET;
-        let mut feed = |b: u8| {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(FNV_PRIME);
+        // Word-at-a-time mixer, the same core as `content_hash_of` (and the same
+        // reason): FNV-1a paid one loop-carried multiply *per byte*, so a
+        // 200-byte message was 200 dependent multiplies before the diagnostic
+        // could be deduped.  This mixes 8 bytes per step with an `h ^= h >> 29`
+        // avalanche, cutting the dependency chain by ~8x on the dedup path.
+        //
+        // Swapping the core is allowed by this accessor's own contract ("a
+        // cross-*run* key, not a persisted one"); what must NOT change is the
+        // length-prefix discipline below, which is the fix for the NUL-boundary
+        // collision, so it is preserved verbatim — and the tail is additionally
+        // tagged with its own length so `"a\0"` and `"a"` cannot collapse into
+        // one zero-padded word.
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut h: u64 = K ^ 0x2545_F491_4F6C_DD1D;
+        let mut feed_bytes = |h: &mut u64, bytes: &[u8]| {
+            let mut chunks = bytes.chunks_exact(8);
+            for chunk in &mut chunks {
+                let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8)"));
+                *h = (*h ^ w).wrapping_mul(K);
+                *h ^= *h >> 29;
+            }
+            let rem = chunks.remainder();
+            if !rem.is_empty() {
+                let mut buf = [0u8; 8];
+                buf[..rem.len()].copy_from_slice(rem);
+                let w = u64::from_le_bytes(buf) ^ (1u64 << (rem.len() * 8));
+                *h = (*h ^ w).wrapping_mul(K);
+                *h ^= *h >> 29;
+            }
         };
+        // A macro wrapper because the closure needs `&mut h`, which a second
+        // closure could not borrow alongside it.
+        macro_rules! feed_bytes {
+            ($bytes:expr) => {
+                feed_bytes(&mut h, $bytes)
+            };
+        }
         // Every variable-length field is length-prefixed rather than
         // NUL-separated: a message containing `\0` used to shift the field
         // boundaries, so `message = "a\0b", file = "c"` hashed identically to
@@ -1304,17 +1337,13 @@ impl<'src> Diagnostic<'src> {
         macro_rules! feed_field {
             ($field:expr) => {{
                 let field: &str = $field;
-                for b in (field.len() as u64).to_le_bytes() {
-                    feed(b);
-                }
-                for b in field.as_bytes() {
-                    feed(*b);
-                }
+                feed_bytes!(&(field.len() as u64).to_le_bytes());
+                feed_bytes!(field.as_bytes());
             }};
         }
         match self.code() {
             Some(c) => {
-                feed(1);
+                feed_bytes!(&[1u8]);
                 // `canonical`, not `code`: the latter echoes the verbatim
                 // spelling for `ErrCode::unknown("e030")`, while
                 // `PartialEq`/`Hash` treat it as `E030`.  Hashing the verbatim
@@ -1322,22 +1351,16 @@ impl<'src> Diagnostic<'src> {
                 // breaking the dedup contract this accessor exists for.
                 feed_field!(c.canonical());
             }
-            None => feed(0),
+            None => feed_bytes!(&[0u8]),
         }
         match self.spans().first() {
             Some(span) => {
-                feed(1);
-                for b in span.file.as_u32().to_le_bytes() {
-                    feed(b);
-                }
-                for b in span.start.to_le_bytes() {
-                    feed(b);
-                }
-                for b in span.end.to_le_bytes() {
-                    feed(b);
-                }
+                feed_bytes!(&[1u8]);
+                feed_bytes!(&span.file.as_u32().to_le_bytes());
+                feed_bytes!(&span.start.to_le_bytes());
+                feed_bytes!(&span.end.to_le_bytes());
             }
-            None => feed(0),
+            None => feed_bytes!(&[0u8]),
         }
         // `message_unchecked`, not `message()`: `stable_id` is a public
         // accessor with no documented humanize precondition, so it must not
@@ -1357,12 +1380,19 @@ impl<'src> Diagnostic<'src> {
 
     /// Clears the [`stable_id`](Self::stable_id) cache.
     ///
-    /// Every mutator that changes `code`, the first primary span, or
-    /// `message` must call this. Entry points that only touch fields not
-    /// covered by the hash (`source`, `file_name`, `level`, `labels`,
-    /// `related_errors`, `children`, `suggestions`, `help`, `call_chain`,
-    /// `kind`) do not need to — the cache is naturally immune to those
-    /// changes.
+    /// Every mutator that changes `code`, the first primary span, `message`, or
+    /// **`file_name`** must call this.  Entry points that only touch fields not
+    /// covered by the hash (`source`, `level`, `labels`, `related_errors`,
+    /// `children`, `suggestions`, `help`, `call_chain`) do not need to — the
+    /// cache is naturally immune to those changes.
+    ///
+    /// `file_name` belongs in the *covered* list: the id hashes the file *name*
+    /// (not the `FileId`) so identical diagnostics in different files stay
+    /// distinct in a tool's dedup set.  An earlier version of this comment listed
+    /// it as unhashed while `set_file_name`/`with_file_name` correctly
+    /// invalidated — exactly the reading that would reintroduce the cross-file
+    /// collision.  `kind` is special-cased: `with_kind` invalidates because
+    /// `humanize` turns the kind into the hashed message.
     #[inline]
     fn invalidate_stable_id(&mut self) {
         self.stable_id_cache.store(0, Ordering::Relaxed);
@@ -2035,7 +2065,11 @@ impl<'src> Diagnostic<'src> {
         // `to_add` collects first: the key set borrows `self.labels`, so it
         // must be dropped before the pushes.
         if !other.labels.is_empty() {
-            let mut to_add: SmallVec<[&Label<'src>; 4]> = SmallVec::new();
+            // Inline capacity covers the whole admitted range (8 per side):
+            // with 4 the scan path heap-allocated in its upper half — exactly
+            // the case it exists to keep allocation-free.  `&Label` is 8 bytes,
+            // so 8 slots are 64 bytes of stack versus one malloc.
+            let mut to_add: SmallVec<[&Label<'src>; 8]> = SmallVec::new();
             if self.labels.len() <= 8 && other.labels.len() <= 8 {
                 for lbl in &other.labels {
                     // `to_add` is checked too: a duplicate *within* `other`
@@ -2070,15 +2104,17 @@ impl<'src> Diagnostic<'src> {
             // while mutating ours is fine (different diagnostics), but the
             // `Arc::make_mut` below may clone the vector, and the loop must not
             // hold a borrow across that.
-            let to_add: Vec<(FileId, Cow<'src, str>, &'src str)> =
-                other_sources.iter().cloned().collect();
-            for (file, name, source) in to_add {
+            // No intermediate `Vec`: `other_sources` borrows `other` (a shared
+            // reference to a *different* diagnostic), so mutating ours inside the
+            // loop is fine — `Arc::make_mut` may clone **our** vector, which the
+            // borrow does not touch.
+            for (file, name, source) in other_sources.iter() {
                 let self_sources = self
                     .foreign_sources
                     .get_or_insert_with(std::sync::Arc::default);
                 let self_sources = std::sync::Arc::make_mut(self_sources);
-                if !self_sources.iter().any(|(f, _, _)| *f == file) {
-                    self_sources.push((file, name, source));
+                if !self_sources.iter().any(|(f, _, _)| f == file) {
+                    self_sources.push((*file, name.clone(), *source));
                 }
             }
         }
@@ -2320,12 +2356,19 @@ pub fn explain_error_code_with_depth(
     };
     const RESET: &str = "\x1b[0m";
 
+    // `"/" prose / "  code" / "" / "  code"` used to render *two* blank lines
+    // between the two code blocks: the source blank closed the first block *and*
+    // the second opening emitted its own.  Track the previous output line so the
+    // opening blank only separates when there is something to separate from.
+    let mut prev_blank = false;
     for line in explain.lines() {
         let trimmed = line.trim();
         if explain_line_is_code(line) {
             // Code/example line — apply syntax highlighting + background
             if !in_code_block {
-                swriteln!(out);
+                if !prev_blank {
+                    swriteln!(out);
+                }
                 in_code_block = true;
             }
             let highlighted = crate::diagnostics::glyph::highlight_code(line, use_color);
@@ -2335,10 +2378,10 @@ pub fn explain_error_code_with_depth(
                 swriteln!(out, "  {highlighted}");
             }
         } else if trimmed.is_empty() {
-            if in_code_block {
-                in_code_block = false;
-            }
+            in_code_block = false;
             swriteln!(out);
+            prev_blank = true;
+            continue;
         } else {
             if in_code_block {
                 in_code_block = false;
@@ -2549,7 +2592,18 @@ fn format_code_ranges(codes: &[&str]) -> String {
             .and_then(|s| s.parse::<u32>().ok())
             .map(u64::from)
     };
-    let mut parts: Vec<String> = Vec::new();
+    // Build the result in place.  The old shape pushed a `String` per code (or
+    // per range) into a `Vec` and joined it — one allocation per element plus
+    // the join copy, for text that is *already* borrowed.
+    //
+    // `itoa` is deliberately not used here even though the parts look numeric:
+    // the emitted text is the registry's spelling (`E030`, zero-padded to three
+    // digits), and `itoa::Buffer::format` renders `30`.  Re-deriving the digits
+    // from the parsed value would change the output for every padded code, and
+    // pushing the original `&str` is strictly cheaper than re-formatting a number
+    // we already parsed.  (The real `itoa` win in this subsystem is
+    // `renderers::fmt::push_uint`, which formats actual numbers.)
+    let mut out = String::with_capacity(codes.len().saturating_mul(9));
     let mut i = 0;
     while i < codes.len() {
         let start = codes[i];
@@ -2568,14 +2622,17 @@ fn format_code_ranges(codes: &[&str]) -> String {
                 _ => break,
             }
         }
-        if start == end {
-            parts.push(start.to_string());
-        } else {
-            parts.push(format!("{start}–{end}"));
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(start);
+        if start != end {
+            out.push('–');
+            out.push_str(end);
         }
         i += 1;
     }
-    parts.join(", ")
+    out
 }
 
 /// Insert `(dist, prefix, code)` into a fixed-size top-3 by
@@ -3017,10 +3074,14 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
     opts.use_color = use_color;
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
-    let _ = emitter.emit_all_iter(collector.iter_all_mut().map(|h| h.into_diagnostic()));
-    // `iter_mut`'s contract is humanize-only.  Recompute in release too so a
-    // future caller that changes a level cannot desynchronize `has_errors` /
-    // `check`; `summary` keeps the debug cross-check.
+    // Humanize first, then hand out read-only references: the emitter's batch
+    // paths take `&Diagnostic`, so nothing downstream can mutate a diagnostic
+    // (and therefore nothing can desynchronise the collector's tallies).
+    collector.humanize_pending();
+    let _ = emitter.emit_all_iter(collector.iter());
+    // The tallies can no longer drift through the emitter; this stays as the
+    // repair path for an external checkpoint consumer that mutated and did not
+    // recount.
     collector.recount_derived_state();
     #[cfg(debug_assertions)]
     let _ = collector.summary();
@@ -3029,12 +3090,13 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
 /// Emit an iterator of diagnostics through a fresh sink.
 ///
 /// Unlike [`emit_collector`], this avoids cloning each diagnostic into a
-/// `Vec` first — it iterates by mutable reference, which the emitter
-/// needs to humanize at its render boundary.
+/// `Vec` first.  The diagnostics must already be humanized (the emitter takes
+/// `&Diagnostic`); callers that own a `DiagCtxt` get that from
+/// [`DiagCtxt::humanize_pending`].
 pub fn emit_diagnostics_iter<'r, 'src, I>(diags: I, use_color: bool) -> io::Result<()>
 where
     'src: 'r,
-    I: IntoIterator<Item = &'r mut Diagnostic<'src>>,
+    I: IntoIterator<Item = &'r Diagnostic<'src>>,
     I::IntoIter: DoubleEndedIterator,
 {
     let mut opts = detected_opts();
@@ -3367,14 +3429,16 @@ fn has_c1_sequence(s: &[u8]) -> bool {
 /// [`sanitize_for_terminal_multiline`]: returns `(has_high, dirty, has_c1)`
 /// where `has_high` is any byte ≥ 0x80, `dirty` is any byte the multiline
 /// sanitizer must replace — a C0 byte other than `\t`/`\n`, or DEL — and
-/// `has_c1` is a `0xC2 0x80..=0x9F` sequence.  The
-/// `\t`/`\n` exclusion keeps the old dirty-chunk discipline: the `< 0x20`
-/// mask is only existentially exact (it cannot be masked per-lane), so a
-/// chunk that trips it gets its *flagged lanes* resolved by exact byte
-/// checks (`trailing_zeros`/8 → offset) — never a full 8-byte rescan, so a
-/// multiline message whose every chunk contains `\t`/`\n` stays near full
-/// SWAR speed.  C1 is probed separately via [`has_c1_sequence`], only when
-/// `has_high`.
+/// `has_c1` is a `0xC2 0x80..=0x9F` sequence.
+///
+/// The `\t`/`\n` exclusion is done **per lane**: the `| HI` before each
+/// subtraction keeps every lane ≥ 0x80, so the borrow cannot cross a lane and
+/// the `< 0x20` mask is exact per lane — the tab/newline masks are subtracted
+/// from it directly, with no flagged-lane resolution and no byte re-checks.  A
+/// chunk full of `\t`/`\n` therefore costs the same as a clean one.
+/// (`trailing_zeros`/8 still appears, but for the *C1* probe, not for this.)
+/// C1 is probed separately via [`has_c1_sequence`], only when `has_high`,
+/// because a C1 control needs a leading `0xC2`.
 pub(crate) fn scan_terminal_control_flags_multiline(s: &[u8]) -> (bool, bool, bool) {
     const HI: u64 = 0x8080_8080_8080_8080;
     const SP: u64 = 0x2020_2020_2020_2020;
@@ -3766,6 +3830,12 @@ fn scan_line_starts_and_ascii(source: &str) -> (Vec<u32>, bool, u64) {
     let mut ascii = true;
     // Fused content hash (see `content_hash_of`): identical chunking, so the
     // two implementations cannot drift.
+    //
+    // `memchr_iter` was considered here and declined: this loop is *fused* —
+    // one pass yields line starts, the ASCII flag and the content hash.  A
+    // vectorised memchr would skip the bytes the hash must consume, so it would
+    // buy a faster newline scan at the price of a second full pass.  The fused
+    // single pass is the right shape until profiling says otherwise.
     const HASH_K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut hash = HASH_K ^ (bytes.len() as u64).wrapping_mul(HASH_K);
     let mut i = 0;
@@ -4717,8 +4787,10 @@ mod tests {
                     .into())
             });
         assert!(result.is_err());
-        for mut diag in ctxt.iter_all_mut() {
-            diag.humanize();
+        // `humanize_pending` is the collector's boundary step now that the batch
+        // emitters take `&Diagnostic` (no `iter_all_mut` mutation channel).
+        ctxt.humanize_pending();
+        for diag in ctxt.iter() {
             assert_eq!(diag.spans.primary().as_slice(), &[adorn_span][..]);
             // Kind derivation itself is unaffected.
             assert_eq!(diag.labels.len(), 1);

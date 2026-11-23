@@ -126,7 +126,6 @@ impl<'a> ChainSuffix<'a> {
 ///
 /// `Debug` is hand-written ([below](ChainEntry)) so it cannot recurse through
 /// `children`; only `Clone` is derived.
-#[derive(Clone)]
 pub struct ChainEntry<'src> {
     pub(crate) kind: ChainEntryKind,
     /// Source location of this entry, or `None` when the caller has no
@@ -158,6 +157,35 @@ impl<'src> ChainEntry<'src> {
     pub fn with_children(mut self, children: Vec<CallChain<'src>>) -> Self {
         self.children = (!children.is_empty()).then(|| children.into_boxed_slice());
         self
+    }
+}
+
+impl<'src> ChainEntry<'src> {
+    /// Copy every field except `children`, which the caller attaches.
+    ///
+    /// The worklist in `CallChain::clone` builds each node shallowly and then
+    /// attaches the already-built child chains, which is what keeps cloning a
+    /// hostile 10^5-deep chain off the stack (the same reason `Drop` and `Debug`
+    /// are hand-written here).
+    fn clone_shallow(&self) -> Self {
+        ChainEntry {
+            kind: self.kind,
+            span: self.span,
+            message: self.message.clone(),
+            children: None,
+        }
+    }
+}
+
+impl<'src> Clone for ChainEntry<'src> {
+    fn clone(&self) -> Self {
+        // Children go through `CallChain::clone`, which is iterative, so this
+        // stays bounded no matter how deep the subtree is.
+        let mut out = self.clone_shallow();
+        if let Some(children) = &self.children {
+            out.children = Some(children.iter().map(CallChain::clone).collect());
+        }
+        out
     }
 }
 
@@ -222,11 +250,73 @@ impl ChainEntryKind {
 ///   referenced by:
 ///       main: file.ps:8:12
 ///       callMain: std/start.zig:698:59
-#[derive(Clone)]
 pub struct CallChain<'src> {
     entries: Vec<ChainEntry<'src>>,
     /// Per-chain memo for [`Self::scan`]; invalidated by [`Self::push`].
     facts: std::sync::OnceLock<ChainFacts>,
+}
+
+impl<'src> Clone for CallChain<'src> {
+    /// Iterative deep clone.
+    ///
+    /// `#[derive(Clone)]` here was the last *structurally recursive* path on a
+    /// chain: `Clone` is reachable through the public `with_children`, and a
+    /// hostile deep chain would overflow the stack through clone glue exactly as
+    /// it did through drop glue before `Drop` was hand-written.  Two passes:
+    ///
+    /// 1. preorder worklist — build every node shallowly, recording for each
+    ///    entry the arena indices of its child chains;
+    /// 2. reverse index order — attach children, which is safe because every
+    ///    child's index is greater than its parent's and its own children were
+    ///    therefore already attached.
+    ///
+    /// Cost is O(nodes + edges) heap, no recursion, no `unsafe`.
+    fn clone(&self) -> Self {
+        let mut arena: Vec<Option<CallChain<'src>>> = vec![None];
+        // Per node: (entry index, child node indices).
+        let mut kids: Vec<Vec<(usize, Vec<usize>)>> = vec![Vec::new()];
+        let mut stack: Vec<(&CallChain<'src>, usize)> = vec![(self, 0)];
+        while let Some((chain, idx)) = stack.pop() {
+            arena[idx] = Some(CallChain {
+                entries: chain
+                    .entries
+                    .iter()
+                    .map(ChainEntry::clone_shallow)
+                    .collect(),
+                facts: std::sync::OnceLock::new(),
+            });
+            for (entry_idx, entry) in chain.entries.iter().enumerate() {
+                let Some(children) = &entry.children else {
+                    continue;
+                };
+                let mut ids = Vec::with_capacity(children.len());
+                for child in children.iter() {
+                    let child_idx = arena.len();
+                    arena.push(None);
+                    kids.push(Vec::new());
+                    ids.push(child_idx);
+                    stack.push((child, child_idx));
+                }
+                kids[idx].push((entry_idx, ids));
+            }
+        }
+        for node in (0..arena.len()).rev() {
+            for (entry_idx, ids) in std::mem::take(&mut kids[node]) {
+                let built: Vec<CallChain<'src>> = ids
+                    .into_iter()
+                    .map(|child_idx| {
+                        arena[child_idx]
+                            .take()
+                            .expect("child chain is built before its parent is attached")
+                    })
+                    .collect();
+                let chain = arena[node].as_mut().expect("node built in pass 1");
+                chain.entries[entry_idx].children =
+                    (!built.is_empty()).then(|| built.into_boxed_slice());
+            }
+        }
+        arena.swap_remove(0).expect("root chain built in pass 1")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +657,17 @@ impl<'src> CallChain<'src> {
                 }
             }
         }
+        // The renderer consults `has_span_in(facts.first_file)` to decide whether
+        // it needs an index, so `first_file` must be one of the tracked files
+        // unless the tracking overflowed.  Implicit until now; the debug canary
+        // costs nothing in release.
+        debug_assert!(
+            first_file.is_none()
+                || spanned_overflow
+                || spanned_files[0] == first_file
+                || spanned_files[1] == first_file,
+            "first_file must be among the tracked (anchor-or-foreign) files"
+        );
         ChainFacts {
             spanned_files,
             spanned_overflow,
@@ -732,6 +833,13 @@ impl<'src> CallChain<'src> {
         facts: ChainFacts,
         out: &mut String,
     ) {
+        // Reserve from the facts walk (its whole purpose): `message_bytes`,
+        // `indent_bytes` and a per-entry allowance for the suffix/gutter.  A
+        // no-op when capacity already suffices, so small chains pay nothing, and
+        // a large chain stops growing organically through many reallocations.
+        out.reserve(
+            64 + facts.message_bytes + facts.indent_bytes + facts.entry_count.saturating_mul(64),
+        );
         if self.entries.is_empty() {
             return;
         }
@@ -782,8 +890,11 @@ impl<'src> CallChain<'src> {
         // `FileLineCol`; with no source every entry falls back to its kind
         // label, so paying `path_to_file_url` (canonicalize syscalls) plus the
         // byte-validation scan there is pure waste.
-        let hyperlink_enabled = use_color
-            && source.is_some()
+        // OSC 8 is zero-width and independent of SGR: a `--color=never` run on a
+        // hyperlink-capable terminal used to lose every clickable location
+        // because the click target was gated on the palette.  Capability probing
+        // is `supports_hyperlinks()`; colour is a separate question.
+        let hyperlink_enabled = source.is_some()
             && super::term::supports_hyperlinks()
             && super::is_real_file_name(file_name)
             && facts.has_span_in(anchor);
@@ -963,7 +1074,12 @@ impl<'src> CallChain<'src> {
         for entry in &self.entries {
             if rendered.get() >= MAX_RESERVE_ENTRIES {
                 if !capped.replace(true) {
-                    super::renderers::fmt::push_spaces(out, indent_cols);
+                    // Same clamp as the depth marker: `indent_cols` grows with
+                    // depth, and the entry-cap branch can be reached at any
+                    // depth, so an unclamped marker row would overrun the
+                    // terminal width on a 40-column measure.
+                    let marker_indent = indent_cols.min(max_width.saturating_sub(4));
+                    super::renderers::fmt::push_spaces(out, marker_indent);
                     out.push_str("...\n");
                 }
                 return;
@@ -1111,6 +1227,18 @@ impl<'src> CallChain<'src> {
                 // test pins.
                 let last = segs.len().saturating_sub(1);
                 for (i, seg) in segs.iter().enumerate() {
+                    // Contract: a wrap segment never contains a hard newline.
+                    // Three things here depend on it — the indent is pushed once
+                    // per segment, `color_on`/`color_off` wrap the whole segment
+                    // (an embedded `\n` would leak SGR state across rows), and
+                    // `expand_message_tabs` expanded every source line at
+                    // `indent_cols`, which is only right if each segment starts
+                    // at the indent column.  Silently violated, all three break
+                    // at once and rows overrun `max_width`.
+                    debug_assert!(
+                        !seg.contains('\n'),
+                        "wrap segment contains a hard newline: {seg:?}"
+                    );
                     super::renderers::fmt::push_spaces(out, indent_cols);
                     out.push_str(color_on);
                     out.push_str(seg.as_ref());
@@ -1151,6 +1279,115 @@ mod tests {
 
     fn take_rendered() -> usize {
         RENDERED.with(|c| c.replace(0))
+    }
+
+    /// 1.2's pin: a wrap segment never carries a hard newline, which is what the
+    /// indent-once push, the SGR wrapping and the tab pre-expansion all assume.
+    /// `Clone` is reachable through the public `with_children`, so a hostile deep
+    /// chain must clone without touching the stack — the same reason `Drop` and
+    /// `Debug` are hand-written here.  A recursive derive overflowed at a few
+    /// thousand levels.
+    #[test]
+    fn deep_chain_clones_iteratively() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        // Build bottom-up so the *source* is deep too (its `Drop` is iterative).
+        let mut chain = CallChain::push_call(span, "leaf");
+        for _ in 0..20_000 {
+            let entry = ChainEntry::new(ChainEntryKind::Call, Some(span), "frame")
+                .with_children(vec![chain]);
+            let mut next = CallChain::push_call(span, "frame");
+            next.entries[0] = entry;
+            chain = next;
+        }
+
+        let mut cloned = chain.clone();
+        // Same structure: the chain flattens to the same entry count.
+        assert_eq!(
+            cloned.flattened_entry_count(),
+            chain.flattened_entry_count()
+        );
+        // And the clone is independent (mutating it must not touch the original).
+        cloned.entries[0].message = "changed".into();
+        assert_ne!(cloned.entries[0].message, chain.entries[0].message);
+    }
+
+    /// A branching chain keeps its shape through the worklist clone.
+    #[test]
+    fn branching_chain_clone_preserves_shape() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        let leaf = |name: &'static str| CallChain::push_call(span, name);
+        let mut a = leaf("a");
+        a.entries[0] = a.entries[0].clone().with_children(vec![leaf("a1")]);
+        let mut b = leaf("b");
+        b.entries[0] = b.entries[0].clone();
+        let mut root = CallChain::push_call(span, "root");
+        root.entries[0] = root.entries[0]
+            .clone()
+            .with_children(vec![a.clone(), b.clone()]);
+        let cloned = root.clone();
+        let kids = cloned.entries[0]
+            .children
+            .as_ref()
+            .expect("children cloned");
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0].entries[0].message, "a");
+        assert_eq!(kids[1].entries[0].message, "b");
+        assert!(
+            kids[0].entries[0].children.is_some(),
+            "the grandchild survived the two-pass clone"
+        );
+    }
+
+    #[test]
+    fn wrap_segments_never_contain_hard_newlines() {
+        let corpus = [
+            "a\nb",
+            "one\ntwo\nthree",
+            "line one is long enough to need wrapping at a narrow measure\nshort",
+            "\n\n\n",
+            "trailing\n",
+            "\nleading",
+            "word word word word word word\nword word word word word word word word",
+            "tab\there\nand\tthere",
+        ];
+        for msg in corpus {
+            for width in [10usize, 20, 33, 80] {
+                for tw in [1usize, 4] {
+                    let segs = crate::diagnostics::wrap::wrap_optimal_reserved(msg, width, tw, 0);
+                    for seg in &segs {
+                        assert!(
+                            !seg.contains('\n'),
+                            "segment {seg:?} of {msg:?} at width {width} carries a newline"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 1.3's pin: the capped-width scan and the tab expander implement one
+    /// tab-stop rule in two places; this is the differential that keeps them one.
+    #[test]
+    fn tab_width_formula_matches_the_expander() {
+        for tw in [1usize, 2, 4, 8] {
+            for start_col in 0..(3 * tw).max(1) {
+                let mut buf = String::new();
+                for pos in 0..32usize {
+                    buf.clear();
+                    buf.extend(std::iter::repeat_n('x', pos));
+                    buf.push('\t');
+                    buf.extend(std::iter::repeat_n('y', 3));
+                    let expanded =
+                        crate::diagnostics::glyph::expand_tabs_from_col(&buf, tw, start_col);
+                    let want = crate::diagnostics::glyph::visible_width(&expanded);
+                    // A cap large enough that the scan cannot clamp.
+                    let got =
+                        CallChain::ascii_tabbed_width_capped(&buf, start_col, tw, usize::MAX / 2)
+                            .expect("no clamp can occur with a huge cap");
+                    assert_eq!(got, want, "tw={tw} start={start_col} pos={pos} buf={buf:?}");
+                }
+            }
+        }
     }
 
     #[test]

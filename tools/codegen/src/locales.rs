@@ -486,7 +486,14 @@ pub fn generate_fluent_functions(dir: &Path) -> String {
              \x20       ZERO_ARG_TABLE[idx][li]\n\
              \x20           .get_or_init(|| match super::format_slug(super::lang_id_at(li), slug, None) {\n\
              \x20               Some(s) => s,\n\
-             \x20               None => slug.to_string(),\n\
+             // `format_slug` already walks this language -> `en`, so this arm is\n\
+             \x20               // reached only when the slug is missing from *both* bundles — a\n\
+             \x20               // build-time failure of the locale validator.  Without the assert the\n\
+             \x20               // UI silently renders the raw slug name in that case.\n\
+             \x20               None => {\n\
+             \x20                   debug_assert!(false, \"slug is missing from every bundle\");\n\
+             \x20                   slug.to_string()\n\
+             \x20               }\n\
              \x20           })\n\
              \x20           .as_str(),\n\
              \x20   )\n\

@@ -6,8 +6,11 @@
 //! (and get it subtly wrong).
 //!
 //! Every public detector is **process-stable with first-call-wins semantics**:
-//! the first call snapshots the environment (and, where relevant, the `stderr`
-//! `isatty` state) into a `OnceLock`, and later calls are a single atomic load.
+//! the first call snapshots its capability's environment (and, where relevant,
+//! the `stderr` `isatty` state) into a per-capability `LazyLock`, and later
+//! calls are a single atomic load.  The snapshots are per-capability on purpose
+//! — a caller that only asks for colour must not pay `TIOCGWINSZ`.  The one
+//! documented exception is [`TermCaps::detect`], which always re-probes.
 //! The real hazard is therefore *ordering*, not instability — whatever the
 //! environment looks like when the first detector runs decides the answer for
 //! the whole run, so a CLI flag must be applied through
@@ -141,9 +144,10 @@ fn detect_width_fresh() -> usize {
 // share one cache — while `unicode`, `width` and `hyperlinks` are independent
 // readings nothing depends on agreeing.
 //
-// `LazyLock`'s deref is one atomic load with no branch (the initialiser is
-// guaranteed to have run for any observed reference), where `OnceLock::get` is a
-// load + test + branch per detector call on the per-diagnostic path.
+// `LazyLock` is used for initialisation ergonomics, *not* because its deref is
+// cheaper: after initialisation it is an acquire load plus a state check, the
+// same steady-state cost as `OnceLock::get().unwrap()`.  What it removes is the
+// unwrap (and the `Option` in the type), not a branch.
 static COLOR_CAPS: std::sync::LazyLock<ColorCaps> =
     std::sync::LazyLock::new(detect_color_caps_fresh);
 static UNICODE_CAP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(detect_unicode_fresh);
@@ -531,9 +535,9 @@ pub(crate) fn color_decision_env(env: &ColorEnv<'_>) -> bool {
 /// colour forced on but `LANG=C` must still get ASCII box-drawing, not
 /// mojibake.
 pub fn detect_unicode() -> bool {
-    // Process-stable snapshot (see `GLOBAL_CAPS`): the locale/`TERM` reads and
-    // the `isatty`/TIOCGWINSZ probes happen once per process instead of once
-    // per optional-detection call.
+    // Process-stable snapshot (`UNICODE_CAP`): the locale/`TERM` reads happen
+    // once per process instead of once per optional-detection call.  No
+    // `isatty`/TIOCGWINSZ probe is paid here.
     *UNICODE_CAP
 }
 
@@ -564,10 +568,10 @@ fn unicode_decision_os(locale: Option<&OsStr>, term_dumb: bool) -> bool {
 /// there), falling back to [`DEFAULT_MAX_WIDTH`] when the probe returns
 /// `None`.
 pub fn detect_width() -> usize {
-    // Process-stable snapshot (see `GLOBAL_CAPS`): one TIOCGWINSZ per process
-    // instead of one per call.  The `COLUMNS`/`terminal_size_of` derivation
-    // lives in `TermCaps::detect`, which still reads `COLUMNS` via `var_os` +
-    // `to_str` like the rest of the module.
+    // Process-stable snapshot (`WIDTH_CAP`): at most one TIOCGWINSZ per process,
+    // and none at all when `COLUMNS` resolves.  The derivation lives in
+    // `detect_width_fresh`, which reads `COLUMNS` via `var_os` + `to_str` like
+    // the rest of the module.
     *WIDTH_CAP
 }
 
@@ -605,19 +609,27 @@ fn width_from_columns(columns: Option<&str>) -> Option<usize> {
         .map(|w| w.min(u16::MAX as usize))
 }
 
-pub(crate) fn width_decision(columns: Option<&str>, term_size: Option<usize>) -> usize {
-    width_from_columns(columns)
-        .or(term_size.filter(|&w| w > 0))
-        .unwrap_or(DEFAULT_MAX_WIDTH)
-}
-
-/// `width_decision` with a lazy terminal-size probe, for the one production
-/// caller: the probe is a syscall and must not run when `COLUMNS` wins.
-fn width_decision_lazy(columns: Option<&str>, probe: impl FnOnce() -> Option<usize>) -> usize {
+/// The single width-decision core: `COLUMNS` first, then the probe, then the
+/// default.  `probe` is lazy so the one production caller does not pay a
+/// `TIOCGWINSZ` syscall when `COLUMNS` already wins.
+fn width_decision_impl(columns: Option<&str>, probe: impl FnOnce() -> Option<usize>) -> usize {
     width_from_columns(columns)
         .or_else(probe)
         .filter(|&w| w > 0)
         .unwrap_or(DEFAULT_MAX_WIDTH)
+}
+
+/// Test-facing form: the probe result is passed by value.  Was two hand-kept
+/// copies of the decision (`or` vs `or_else`), which is exactly the drift this
+/// consolidation removes; also `#[cfg(test)]` because no production caller uses
+/// the eager shape (the un-gated version tripped `dead_code` in plain builds).
+#[cfg(test)]
+pub(crate) fn width_decision(columns: Option<&str>, term_size: Option<usize>) -> usize {
+    width_decision_impl(columns, || term_size)
+}
+
+fn width_decision_lazy(columns: Option<&str>, probe: impl FnOnce() -> Option<usize>) -> usize {
+    width_decision_impl(columns, probe)
 }
 
 /// Whether the terminal can render OSC 8 hyperlinks (`ESC ] 8 ; ; URL ST`).
@@ -656,16 +668,21 @@ pub(crate) fn hyperlink_decision(
     !no_hyperlink && !term_dumb && probe_on_stderr
 }
 
-/// The `URL_SAFE` predicate as a 256-bit mask: four `u64` words, one cache line,
-/// versus 256 `bool`s spread over four.  `scan_url_path` touches it once per
-/// path byte, so the locality is free to improve.
-/// Only indices 0 and 1 are ever read: `is_url_safe` short-circuits on
-/// `b < 0x80`, and the `matches!` below covers ASCII ranges only (the upper half
-/// would const-evaluate to zero).  Two words = 16 bytes instead of 32.
+/// The `URL_SAFE` predicate as a 128-bit mask: two `u64` words, 16 bytes,
+/// versus 256 `bool`s spread over four cache lines.  `scan_url_path` touches it
+/// once per path byte, so the locality is worth having.
+///
+/// Only indices 0 and 1 are ever read (`is_url_safe` short-circuits on
+/// `b < 0x80`), and the builder below intentionally loops over the **full byte
+/// domain**: a future "safe" byte ≥ 0x80 would index `bits[2]` and fail
+/// const-evaluation, i.e. a compile error instead of the silent loss of the
+/// ASCII invariant that the two `from_utf8_unchecked` calls rely on.
 const URL_SAFE_BITS: [u64; 2] = {
     let mut bits = [0u64; 2];
     let mut i = 0usize;
-    while i < 128 {
+    // Full domain on purpose: see the doc above — a non-ASCII entry would index
+    // past `bits` and turn into a const-eval error.
+    while i < 256 {
         // RFC 3986 unreserved characters plus the path delimiters this crate
         // emits.  This `matches!` is the single source of truth for the set.
         if matches!(
@@ -881,6 +898,37 @@ fn encode_file_url_path_pre(out: &mut Vec<u8>, s: &[u8], first_unsafe: usize, un
 /// keeps a filename from terminating the enclosing OSC 8 hyperlink early or
 /// injecting terminal control codes.
 pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
+    // Short paths — the overwhelmingly common case — take **one** fused pass that
+    // both decides "already safe" and emits the encoded bytes, so a clean path
+    // pays no scan and a dirty one pays one pass instead of two (`scan_url_path`
+    // followed by `encode_scanned_path` re-walked the unsafe tail).  Long paths
+    // keep the two-pass shape: an exact reserve matters precisely there, and its
+    // own comment argues that.
+    const FUSED_MAX: usize = 4096;
+    if s.len() <= FUSED_MAX {
+        let mut out: Vec<u8> = Vec::new();
+        let mut escaped = false;
+        for &b in s {
+            if is_url_safe(b) {
+                out.push(b);
+            } else {
+                escaped = true;
+                out.push(b'%');
+                out.push(HEX_UPPER[(b >> 4) as usize]);
+                out.push(HEX_UPPER[(b & 0xF) as usize]);
+            }
+        }
+        if !escaped {
+            debug_assert!(s.iter().all(u8::is_ascii));
+            // SAFETY: every byte matched `is_url_safe`, whose mask is
+            // const-evaluated over ASCII ranges only, so `s` is pure ASCII and
+            // therefore valid UTF-8.
+            return Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(s) });
+        }
+        debug_assert!(out.iter().all(u8::is_ascii));
+        // SAFETY: every byte is either an ASCII-safe byte or part of `%XX`.
+        return Cow::Owned(unsafe { String::from_utf8_unchecked(out) });
+    }
     let (first_unsafe, unsafe_count) = scan_url_path(s);
     if first_unsafe == s.len() {
         // As above: the safe set is ASCII, so this is valid UTF-8.
@@ -1114,6 +1162,13 @@ fn file_url_cached(path: &[u8]) -> std::sync::Arc<str> {
             cache.cold = hot;
             cache.hot_bytes = 0;
         }
+        // Deliberately still admitted even when the entry alone exceeds
+        // `max_bytes`: the documented per-thread ceiling is `2 * max_bytes + one
+        // entry` precisely because an oversized path is cached once and then
+        // demoted, and `url_cache_promote_respects_the_byte_budget` pins that the
+        // promote path never brings it back.  Refusing it here would change that
+        // contract (and the test) for a pathological input whose recompute cost is
+        // the only thing saved.
         cache.account(path, &url);
         cache.hot.insert(
             path.to_vec().into_boxed_slice(),
@@ -1306,10 +1361,12 @@ mod tests {
 
     /// Child mode for [`env_wiring_drives_term_caps`].
     ///
-    /// A no-op unless the parent asks for it.  `TermCaps::detect` is memoized in
-    /// a process-wide `OnceLock`, so the *only* way to probe a given environment
-    /// is a fresh process — the test binary re-executes itself with a scrubbed
-    /// env instead.
+    /// A no-op unless the parent asks for it.  The production detectors are
+    /// per-capability `LazyLock` snapshots, so the *only* way to probe a given
+    /// environment is a fresh process — the test binary re-executes itself with
+    /// a scrubbed env instead.  (`TermCaps::detect` itself always re-probes; it
+    /// is the one non-memoized path, which is exactly why this test cannot just
+    /// call it with a mutated environment.)
     #[test]
     fn caps_probe_child() {
         if std::env::var_os("PONENT_CAPS_PROBE").is_none() {
@@ -1688,7 +1745,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// `FORCE_COLOR="   "` trims to empty, which is the chalk force-on rule —
     /// the same answer as `FORCE_COLOR=""`.  Unpinned until now, so a templated
     /// CI matrix materialising a padded value could have been "fixed" into

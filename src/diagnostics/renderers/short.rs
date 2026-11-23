@@ -52,6 +52,18 @@ impl Default for ShortRenderer {
     }
 }
 
+/// Byte offset of the first break character the flattening rule recognises.
+///
+/// **Test-only.**  The oracle used `memchr3` on the original byte set, which
+/// cannot express U+2028/U+2029 (multi-byte), so it silently stopped being an
+/// oracle for the whole rule the moment those were added.
+#[cfg(test)]
+fn first_break_byte(s: &str) -> Option<usize> {
+    s.char_indices()
+        .find(|&(_, c)| matches!(c, '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}'))
+        .map(|(i, _)| i)
+}
+
 /// Reference implementation of the flattening rule — **test-only**.
 ///
 /// Production goes through [`push_sanitized_flattened`], which fuses sanitizing
@@ -87,7 +99,9 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
     // spaces of every segment that a break precedes, drop what is left empty,
     // and join with exactly one space.  This is the rule the fused path above
     // implements in one pass; the differential test pins them together.
-    let mut segs = msg.split(['\n', '\r', '\t']).peekable();
+    let mut segs = msg
+        .split(['\n', '\r', '\t', '\u{2028}', '\u{2029}'])
+        .peekable();
     let mut first_seg = true;
     let mut index = 0usize;
     while let Some(raw) = segs.next() {
@@ -130,11 +144,62 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
     let mut emitted = false; // a non-space char survives the truncation
     let mut pending_break = false;
     let mut space_run: Option<usize> = None; // where the trailing space run began
-    for c in msg.chars() {
+    // Bulk path.  A run of *plain* chars — not a break, not a space, not a
+    // control, not a bidi override — is copied with one `push_str` instead of one
+    // `push` per char.  It cannot interact with the space/break state machine
+    // (a run contains neither), so the rules above stay in force; only the store
+    // changes.  Messages are the hot component of this format, and the dominant
+    // case is a long ASCII sentence.
+    let mut run_start: Option<usize> = None;
+    let mut flush_run = |out: &mut String,
+                         msg: &str,
+                         upto: usize,
+                         run_start: &mut Option<usize>,
+                         pending_break: &mut bool,
+                         space_run: &mut Option<usize>,
+                         emitted: &mut bool| {
+        let Some(start) = run_start.take() else {
+            return;
+        };
+        if *pending_break {
+            if *emitted {
+                out.push(' ');
+            }
+            *pending_break = false;
+        }
+        out.push_str(&msg[start..upto]);
+        *space_run = None;
+        *emitted = true;
+    };
+    for (i, c) in msg.char_indices() {
+        if !matches!(c, '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' | ' ')
+            && !c.is_control()
+            && !crate::diagnostics::is_bidi_override(c)
+        {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+            continue;
+        }
+        flush_run(
+            out,
+            msg,
+            i,
+            &mut run_start,
+            &mut pending_break,
+            &mut space_run,
+            &mut emitted,
+        );
         if crate::diagnostics::is_bidi_override(c) {
             continue;
         }
-        if matches!(c, '\n' | '\r' | '\t') {
+        // U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR are Zl/Zp, so
+        // `char::is_control` (Cc only) misses them — they used to reach the
+        // output raw and split the "exactly one physical line" contract in
+        // editors and JS consumers.  U+0085 (NEL) *is* Cc, so it becomes U+FFFD
+        // below; treating the two separators as breaks is the consistent choice
+        // for a format whose contract is one row.
+        if matches!(c, '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}') {
             pending_break = true;
             if let Some(mark) = space_run.take() {
                 out.truncate(mark);
@@ -165,6 +230,15 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
         }
         out.push(c);
     }
+    flush_run(
+        out,
+        msg,
+        msg.len(),
+        &mut run_start,
+        &mut pending_break,
+        &mut space_run,
+        &mut emitted,
+    );
 }
 
 /// Flatten one untrusted single-line component (`file` name, unknown code),
@@ -179,7 +253,9 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
 /// break semantics.
 fn flatten_component(s: &str) -> Cow<'_, str> {
     let dirty = s.chars().any(|c| {
-        matches!(c, '\n' | '\r' | '\t') || c.is_control() || crate::diagnostics::is_bidi_override(c)
+        matches!(c, '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}')
+            || c.is_control()
+            || crate::diagnostics::is_bidi_override(c)
     });
     if !dirty {
         return Cow::Borrowed(s);
@@ -255,9 +331,10 @@ impl Renderer for ShortRenderer {
                 }
                 len += fmt::dec_digits(line as u64) + 1 + fmt::dec_digits(col as u64) + 2; // "line:col: "
             }
-            // Byte-range fallback: reserve a generous bound for `Span`'s
-            // `Display` rather than formatting it twice.  Not on the hot
-            // path; over-reserving a few dozen bytes here is fine.
+            // Byte-range fallback: two `push_uint` calls (start, end) need at
+            // most 20 digits each plus the `..`, i.e. 44 bytes — reserved here so
+            // the two writes cannot grow the buffer.  (The old comment claimed a
+            // bound for `Span`'s `Display`, which this branch never calls.)
             (None, Some(_)) => {
                 if !file.is_empty() {
                     len += file.len() + 1;
@@ -371,6 +448,21 @@ impl Renderer for ShortRenderer {
         ""
     }
 
+    /// F1: `render_summary_full` defaults to `render_summary`, and this format
+    /// overrides that to `""` — pin it, because a batch rendered with
+    /// `--summary-full` must not gain a prose trailer in a machine format.
+    fn render_summary_full(&self, _errors: usize, _warnings: usize, _files: usize) -> String {
+        String::new()
+    }
+
+    /// The default marker has no trailing newline and no `level[code]:` prefix,
+    /// so in this format it concatenated onto the next row
+    /// (`...panickedsrc/main.pn:2:2: error…`) and carried no token a CI
+    /// summariser can grep.  Every other row ends in `\n`, so this one does too.
+    fn render_internal_error(&self, out: &mut String) {
+        out.push_str("error[internal]: diagnostic rendering panicked\n");
+    }
+
     fn render_suppressed_note(&self, _count: usize) -> String {
         String::new()
     }
@@ -388,8 +480,11 @@ mod tests {
         RenderCtx::new(opts, None)
     }
 
-    /// The reservation now uses the sanitized lengths directly, so the only
-    /// property it relies on is that `push_flattened` never grows its input.
+    /// The reservation is `raw_msg.len()`, a **lower bound**: U+FFFD replacement
+    /// and the joiner spaces can grow the output by a byte or two, which `String`
+    /// absorbs by reallocating.  What this test actually pins is the other half —
+    /// that `push_flattened` never grows its input — so keep that separate from
+    /// the "reservation is exact" claim the old comment made.
     /// Pin that over a random corpus in both sanitizer modes — a future
     /// "improvement" to `push_flattened` that grows output would otherwise
     /// make the reserve under-book.
@@ -422,7 +517,7 @@ mod tests {
             "a\t\t  b",
         ] {
             let sanitized = crate::diagnostics::sanitize_for_terminal_flatten(raw);
-            let break_at = memchr::memchr3(b'\n', b'\r', b'\t', sanitized.as_bytes());
+            let break_at = first_break_byte(&sanitized);
             let mut want = String::new();
             push_flattened(&mut want, &sanitized, break_at);
             let mut got = String::new();
@@ -468,11 +563,7 @@ mod tests {
                     crate::diagnostics::sanitize_for_terminal(s)
                 };
                 let mut want = String::new();
-                push_flattened(
-                    &mut want,
-                    &sanitized,
-                    memchr::memchr3(b'\n', b'\r', b'\t', sanitized.as_bytes()),
-                );
+                push_flattened(&mut want, &sanitized, first_break_byte(&sanitized));
                 assert!(
                     want.len() <= sanitized.len(),
                     "push_flattened grew {s:?} (keep_breaks={keep_breaks}): \
@@ -585,6 +676,31 @@ mod tests {
     }
 
     #[test]
+    /// F1/F2 pins: a machine format must never grow a prose trailer, and a
+    /// contained render panic must still produce a greppable, newline-terminated
+    /// row (the default marker was prose with neither).
+    fn machine_format_rows_and_summary_stay_machine_shaped() {
+        use super::Renderer as _;
+        let renderer = super::ShortRenderer::default();
+        let diag = Diagnostic::error("boom");
+        let opts = crate::diagnostics::DiagOpts::default();
+        let cx = crate::diagnostics::render::RenderCtx::new(&opts, None);
+        let mut out = String::new();
+        renderer.render_into(&diag, &cx, &mut out);
+        assert!(
+            out.ends_with('\n'),
+            "every short row ends in a newline: {out:?}"
+        );
+        assert_eq!(renderer.render_summary_full(1, 0, 3), "");
+        let mut panic_row = String::new();
+        renderer.render_internal_error(&mut panic_row);
+        assert!(panic_row.ends_with('\n'), "{panic_row:?}");
+        assert!(
+            panic_row.starts_with("error[internal]: "),
+            "a CI summariser must be able to grep the row: {panic_row:?}"
+        );
+    }
+
     fn separator_is_empty() {
         // A non-empty separator would double-space the output and break the
         // one-line contract the summary/suppressed hooks were given.

@@ -488,7 +488,7 @@ struct BatchShared<'a, 'src, R: Renderer> {
     /// Claim order (weights descending for throughput, index order for
     /// streaming).
     order: &'a [usize],
-    cells: Vec<Padded<std::sync::Mutex<&'a mut Diagnostic<'src>>>>,
+    cells: Vec<Padded<std::sync::Mutex<&'a Diagnostic<'src>>>>,
     slots: Vec<Padded<std::sync::Mutex<Option<(String, usize)>>>>,
     slot_cv: std::sync::Condvar,
     renderer: &'a R,
@@ -634,13 +634,16 @@ fn worker_render_dynamic<R: Renderer>(
         buf.clear();
         let buf = match &cx {
             Some(cx) => {
-                let mut guard = shared.cells[orig]
+                let guard = shared.cells[orig]
                     .0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let diag: &mut Diagnostic<'_> = &mut **guard;
+                let diag: &Diagnostic<'_> = *guard;
                 let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    diag.humanize();
+                    // Already humanized by the caller: batches are rendered from
+                    // `&Diagnostic`, so the emitter has no way to mutate a
+                    // diagnostic (and therefore no way to desynchronise a
+                    // collector's tallies).
                     shared.renderer.render_into(diag, cx, &mut buf);
                 }));
                 if rendered.is_err() {
@@ -863,13 +866,16 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // A failed `humanize` already forces the internal-error placeholder, so a
         // line table built for it would be pure waste (the old order did exactly
         // that).
-        let prebuilt = if humanized {
+        let mut prebuilt = if humanized {
             diag.source()
                 .map(|src| self.prebuilt_for_single(src, diag.spans().first().map(|s| s.file)))
                 .unwrap_or_default()
         } else {
             SmallVec::new()
         };
+        // `RenderCtx` binary-searches this slice (see `line_index`), and the
+        // tier-0 hit path must not depend on the prebuild's emission order.
+        prebuilt.sort_unstable_by_key(|e| (e.ptr, e.len));
         let cx = if prebuilt.is_empty() {
             RenderCtx::hoisted(&self.opts, None, &self.shared)
         } else {
@@ -906,9 +912,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// deliberate (the budget follows what the user sees first) but is spelled
     /// out here because "same set, reversed" would otherwise be the natural
     /// reading.
-    pub fn emit_all(&mut self, diags: &mut [Diagnostic<'_>]) -> io::Result<()> {
+    pub fn emit_all(&mut self, diags: &[Diagnostic<'_>]) -> io::Result<()> {
         let mut sink = self.make_sink.make();
-        self.emit_ordered(diags.iter_mut(), &mut sink, false)
+        self.emit_ordered(diags.iter(), &mut sink, false)
     }
 
     /// Dispatch a double-ended diagnostic iterator through the batch loop in
@@ -924,7 +930,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     where
         S: DiagnosticSink,
         'src: 'r,
-        I: IntoIterator<Item = &'r mut Diagnostic<'src>>,
+        I: IntoIterator<Item = &'r Diagnostic<'src>>,
         I::IntoIter: DoubleEndedIterator,
     {
         let iter = iter.into_iter();
@@ -941,7 +947,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     pub fn emit_all_iter<'r, 'src, I>(&mut self, diags: I) -> io::Result<()>
     where
         'src: 'r,
-        I: IntoIterator<Item = &'r mut Diagnostic<'src>>,
+        I: IntoIterator<Item = &'r Diagnostic<'src>>,
         I::IntoIter: DoubleEndedIterator,
     {
         let mut sink = self.make_sink.make();
@@ -955,7 +961,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     pub fn emit_all_streaming<'r, 'src, I>(&mut self, diags: I) -> io::Result<()>
     where
         'src: 'r,
-        I: IntoIterator<Item = &'r mut Diagnostic<'src>>,
+        I: IntoIterator<Item = &'r Diagnostic<'src>>,
         I::IntoIter: DoubleEndedIterator,
     {
         let mut sink = self.make_sink.make();
@@ -969,7 +975,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         diags: &mut [Diagnostic<'_>],
         sink: &mut S,
     ) -> io::Result<()> {
-        self.emit_ordered(diags.iter_mut(), sink, true)
+        self.emit_ordered(diags.iter(), sink, true)
     }
 
     /// Escape hatch: write to a caller-provided sink without a `MakeSink`.
@@ -980,7 +986,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         diags: &mut [Diagnostic<'_>],
         sink: &mut S,
     ) -> io::Result<()> {
-        self.emit_ordered(diags.iter_mut(), sink, false)
+        self.emit_ordered(diags.iter(), sink, false)
     }
 
     fn emit_batch_iter<'r, 'src, S, I>(
@@ -992,7 +998,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     where
         S: DiagnosticSink,
         'src: 'r,
-        I: Iterator<Item = &'r mut Diagnostic<'src>>,
+        I: Iterator<Item = &'r Diagnostic<'src>>,
     {
         self.renderer.begin(sink)?;
 
@@ -1036,7 +1042,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let mut batch = std::mem::take(&mut self.batch);
         batch.weights.clear();
         batch.weights.reserve(cap);
-        let mut filtered: SmallVec<[&'r mut Diagnostic<'src>; 64]> = SmallVec::with_capacity(cap);
+        let mut filtered: SmallVec<[&'r Diagnostic<'src>; 64]> = SmallVec::with_capacity(cap);
         // Cheap render-cost proxy summed over the batch.  The parallel
         // decision gates on this as well as the count: 64 one-line notes cost
         // less to render than the ~50 µs/thread spawn, so they stay serial.
@@ -1156,7 +1162,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // The gate's premise was also wrong — the cold branch below uses the
             // fused `LineIndex::new_hashed`, so prebuilding is scan-neutral and
             // strictly better once a batch touches one file several times.
-            let prebuilt = self.prebuild_sources(&filtered[..], &batch.weights).0;
+            let mut prebuilt = self.prebuild_sources(&filtered[..], &batch.weights).0;
+            // Sorted for the tier-0 `binary_search` in `RenderCtx::line_index`.
+            prebuilt.sort_unstable_by_key(|e| (e.ptr, e.len));
             let cx = RenderCtx::hoisted_with_prebuilt(&self.opts, None, &self.shared, &prebuilt);
             self.render_sequential(filtered.as_mut_slice(), sink, &cx)
         };
@@ -1186,7 +1194,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// single-core hosts.  `filtered` contains only rendered diagnostics.
     fn render_sequential<S: DiagnosticSink>(
         &self,
-        filtered: &mut [&mut Diagnostic<'_>],
+        filtered: &mut [&Diagnostic<'_>],
         sink: &mut S,
         cx: &RenderCtx<'_>,
     ) -> io::Result<()> {
@@ -1198,7 +1206,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // borrowable; the renderer never re-enters the emitter, so there is
         // no nested borrow.
         let mut first = true;
-        for diag in filtered.iter_mut() {
+        for diag in filtered.iter() {
             // Render boundary: materialize `kind` only for diagnostics we
             // are actually about to render.  Suppressed entries never get
             // here, so a filter-skipped diagnostic costs no Fluent lookup
@@ -1213,7 +1221,10 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             let mut buf = self.shared.render_buf.borrow_mut();
             buf.clear();
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                diag.humanize();
+                // No `humanize()` here: the batch entry points take
+                // `&Diagnostic`, so humanization is the caller's step (see
+                // `DiagCtxt::humanize_pending`) and the emitter cannot mutate a
+                // diagnostic — hence no channel to desynchronise tallies.
                 self.renderer.render_into(diag, &cx, &mut buf);
             }));
             if rendered.is_err() {
@@ -1247,7 +1258,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// small LRU with the sources they are most likely to touch.
     fn prebuild_sources(
         &self,
-        filtered: &[&mut Diagnostic<'_>],
+        filtered: &[&Diagnostic<'_>],
         weights: &[usize],
     ) -> (Vec<Prebuilt>, std::sync::Arc<SharedSources>) {
         let mut seen: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
@@ -1353,7 +1364,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// stitched in order, preserving byte-identical output.
     fn render_dynamic<S: DiagnosticSink>(
         &self,
-        filtered: &mut [&mut Diagnostic<'_>],
+        filtered: &mut [&Diagnostic<'_>],
         scratch: &mut BatchScratch,
         sink: &mut S,
         num_workers: usize,
@@ -1370,9 +1381,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         scratch
             .order
             .sort_unstable_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
-        let cells: Vec<Padded<std::sync::Mutex<&mut Diagnostic<'_>>>> = filtered
-            .iter_mut()
-            .map(|diag| Padded(std::sync::Mutex::new(&mut **diag)))
+        let cells: Vec<Padded<std::sync::Mutex<&Diagnostic<'_>>>> = filtered
+            .iter()
+            .map(|diag| Padded(std::sync::Mutex::new(*diag)))
             .collect();
         let shared = BatchShared {
             next: std::sync::atomic::AtomicUsize::new(0),
@@ -1464,7 +1475,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// immediately.  The ordinary non-streaming path remains the default.
     fn render_streaming<S: DiagnosticSink>(
         &self,
-        filtered: &mut [&mut Diagnostic<'_>],
+        filtered: &mut [&Diagnostic<'_>],
         scratch: &mut BatchScratch,
         sink: &mut S,
         num_workers: usize,
@@ -1477,9 +1488,9 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         let n = filtered.len();
         scratch.order.clear();
         scratch.order.extend(0..n);
-        let cells: Vec<Padded<std::sync::Mutex<&mut Diagnostic<'_>>>> = filtered
-            .iter_mut()
-            .map(|diag| Padded(std::sync::Mutex::new(&mut **diag)))
+        let cells: Vec<Padded<std::sync::Mutex<&Diagnostic<'_>>>> = filtered
+            .iter()
+            .map(|diag| Padded(std::sync::Mutex::new(*diag)))
             .collect();
         let shared = BatchShared {
             next: std::sync::atomic::AtomicUsize::new(0),
@@ -1742,11 +1753,11 @@ mod tests {
         }
 
         let mut serial_diags = mk();
-        let mut refs: Vec<&mut Diagnostic<'static>> = serial_diags.iter_mut().collect();
+        let refs: Vec<&Diagnostic<'static>> = serial_diags.iter().collect();
         let mut serial_sink = StringSink::new();
         let cx = RenderCtx::new(&opts, None);
         emitter
-            .render_sequential(&mut refs, &mut serial_sink, &cx)
+            .render_sequential(&mut { refs }, &mut serial_sink, &cx)
             .unwrap();
         let serial = serial_sink.into_string();
         assert_eq!(
@@ -1775,11 +1786,11 @@ mod tests {
         }
 
         let mut serial_diags = alternating_diags(N);
-        let mut serial_refs: Vec<&mut Diagnostic<'static>> = serial_diags.iter_mut().collect();
+        let serial_refs: Vec<&Diagnostic<'static>> = serial_diags.iter().collect();
         let mut serial_sink = StringSink::new();
         let cx = RenderCtx::new(&opts, None);
         emitter
-            .render_sequential(&mut serial_refs, &mut serial_sink, &cx)
+            .render_sequential(&mut { serial_refs }, &mut serial_sink, &cx)
             .unwrap();
         let serial = serial_sink.into_string();
 
@@ -1908,11 +1919,11 @@ mod tests {
         }
 
         let mut serial_diags = alternating_diags(N);
-        let mut serial_refs: Vec<&mut Diagnostic<'static>> = serial_diags.iter_mut().collect();
+        let serial_refs: Vec<&Diagnostic<'static>> = serial_diags.iter().collect();
         let mut serial_sink = StringSink::new();
         let cx = RenderCtx::new(&opts, None);
         emitter
-            .render_sequential(&mut serial_refs, &mut serial_sink, &cx)
+            .render_sequential(&mut { serial_refs }, &mut serial_sink, &cx)
             .unwrap();
         assert_eq!(
             streaming,

@@ -48,6 +48,37 @@ jobs:
           cargo test --bin ponent --locked --
           --skip test_loop_vars_collected_from_assign_bodies
 
+  # The NEON tier (`src/diagnostics/ascii.rs`) and the aarch64-only paths are
+  # otherwise never compiled: `cross-platform` covers macOS/Windows on x86, and
+  # nothing in the default matrix builds for a non-x86 architecture.  A
+  # type-check on aarch64 is the cheapest way to keep that code from rotting
+  # between the rare reports of a NEON-specific break.
+  #
+  # wasm32 is deliberately **not** here: `z3 = { features = ["vendored"] }` needs
+  # a C++ toolchain for the target, and there is none for
+  # `wasm32-unknown-unknown`, so the check dies in `z3-sys`'s build script before
+  # any of this crate compiles.  Fixing that needs a non-vendored or feature-gated
+  # z3, not a CI line.
+  cross-aarch64:
+    name: Check (aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64
+      # z3 is `vendored`, so the C/C++ sources must be cross-compiled too; the
+      # crate's build script probes for `aarch64-linux-gnu-gcc`.
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - run: cargo check --bin ponent --locked --target aarch64-unknown-linux-gnu
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+
   msrv:
     name: MSRV (rust-version)
     runs-on: ubuntu-latest
@@ -116,6 +147,46 @@ jobs:
       - name: Diagnostic hot paths (ignored measurement probes)
         # Scoped to `diagnostics::` so the query-engine perf probes (12 ignored
         # tests under `hir::query::defense_tests`) do not run in this job.
+        # Includes `perf_wrap_optimal`, the only measurement of the
+        # Larmore-Schieber crossover (`n* ~ 10-15` words) the wrap comment
+        # derives but does not measure.
         run: >
           cargo test --bin ponent --release --locked --
           --ignored --nocapture --test-threads=1 diagnostics::
+      - name: ASCII dispatch at the decision lengths
+        # The kernel thresholds are tuned at exactly these lengths: the tier
+        # boundaries (16/32/64/128) plus the lengths the overlap tails changed
+        # (65, 129, 257).  Kept separate from the full sweep above so the numbers
+        # a reviewer reads are the ones the constants are decided at.
+        run: >
+          cargo bench --bench ascii_dispatch --features bench-hooks --
+          'ascii_dispatch/(classify|predicates)/printable/(16|32|64|65|128|129|255|256|257)$'
+      - name: Summarise criterion medians
+        # Machine-readable, so two runs can be diffed without reading logs.  The
+        # medians land in the step summary *and* in the uploaded artifact.
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, json, os
+          rows = []
+          for path in glob.glob("target/criterion/**/new/estimates.json", recursive=True):
+              parts = path.split(os.sep)
+              name = "/".join(parts[2:-2])
+              median = json.load(open(path))["median"]["point_estimate"]
+              base = path.replace(os.sep + "new" + os.sep, os.sep + "base" + os.sep)
+              delta = ""
+              try:
+                  b = json.load(open(base))["median"]["point_estimate"]
+                  delta = f"{(median - b) / b * 100:+.1f}%"
+              except Exception:
+                  pass
+              rows.append((name, median, delta))
+          print("| benchmark | median ns | vs base |")
+          print("|---|---|---|")
+          for name, median, delta in sorted(rows):
+              print(f"| {name} | {median:.3f} | {delta} |")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ github.run_id }}
+          path: target/criterion
+          retention-days: 30

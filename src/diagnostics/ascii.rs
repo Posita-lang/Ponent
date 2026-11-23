@@ -45,6 +45,16 @@ fn x86_level() -> u8 {
     if swar_forced() {
         return 0;
     }
+    #[cfg(any(test, feature = "bench-hooks"))]
+    {
+        let want = LEVEL_OVERRIDE.with(std::cell::Cell::get);
+        if want != 0 {
+            // Clamped to what the host actually has — see the doc on
+            // `set_x86_level_override`.  `min` keeps a 3 request on an AVX2-only
+            // box at 2 instead of executing an illegal instruction.
+            return want.min(x86_level_detected());
+        }
+    }
     let cached = LEVEL.load(std::sync::atomic::Ordering::Relaxed);
     if cached != 0 {
         return cached;
@@ -55,6 +65,26 @@ fn x86_level() -> u8 {
 /// One-time detection.  `swar_forced()` is checked by the caller and the forced
 /// path returns before reaching here, so a test that forces SWAR can never
 /// poison the cache for the rest of the process.
+/// The host's real tier, ignoring both the cache and any override.
+#[cfg(any(test, feature = "bench-hooks"))]
+fn x86_level_detected() -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+        if std::arch::is_x86_feature_detected!("avx512bw") && has_avx2 {
+            3
+        } else if has_avx2 {
+            2
+        } else {
+            1
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        1
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[cold]
 #[inline(never)]
@@ -109,6 +139,11 @@ fn x86_level_init() -> u8 {
 /// AVX2 step saves little over SSE2's 16 below 128, and AVX-512 wins clearly from
 /// 128 up.  So `classify` uses SSE2 from [`CLASSIFY_SSE2_MIN_LEN`] and the wide
 /// tiers from [`CLASSIFY_AVX2_MIN_LEN`] / [`CLASSIFY_AVX512_MIN_LEN`] — 16 and
+/// (Kernel tails: every tier now ends with an overlapping masked load, so the
+/// `next_non_ascii_byte_*` "inline one SSE2 step and then hand the remainder to
+/// the SWAR short path" description below is historical — the SSE2 step survives
+/// only as the sub-chunk fallback for 16..chunk remainders that the overlap
+/// cannot cover, and is dead once the canary floors hold.)
 /// 128.  A re-measurement may move the SSE2 floor up (the `/31`, `/32` rows
 /// favoured SWAR under the *old* tail); it is a one-line change here.
 ///
@@ -136,10 +171,33 @@ const NNA_AVX512_MIN_LEN: usize = 64;
 // that would be a production stack overflow; here it is a build error.
 const _: () = assert!(CLASSIFY_AVX512_MIN_LEN >= 64);
 const _: () = assert!(NNA_AVX512_MIN_LEN >= 64);
+// Same hazard one tier down: `classify_ascii_avx2`'s masked tail is guarded by
+// `s.len() >= 32`, so a threshold below 32 would re-enter the dispatcher at the
+// same length and recurse in release.  `NNA_AVX2_MIN_LEN` is pinned too: its
+// sub-32 termination today depends on an inline SSE2 step a future cleanup could
+// delete as dead code.
+const _: () = assert!(CLASSIFY_AVX2_MIN_LEN >= 32);
+const _: () = assert!(NNA_AVX2_MIN_LEN >= 32);
+const _: () = assert!(CLASSIFY_SSE2_MIN_LEN >= 16);
 
 #[cfg(any(test, feature = "bench-hooks"))]
 thread_local! {
     static SWAR_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Requested vector tier for the current thread; `0` means "detected".
+    static LEVEL_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Pin the vector tier for the current thread (`0` restores detection).
+///
+/// Why this exists: on an AVX-512 host the dispatch never reaches
+/// `classify_ascii_avx2` (128+ goes to AVX-512, 16..127 to SSE2), so that kernel
+/// was only tested when CI happened to run on an AVX2-only machine.  The override
+/// is **clamped to the detected level** inside `x86_level`: forcing tier 3 on a
+/// non-AVX-512 host would execute kernels without their `#[target_feature]`
+/// precondition, i.e. exactly the UB the SAFETY comments guard against.
+#[cfg(any(test, feature = "bench-hooks"))]
+pub(crate) fn set_x86_level_override(level: u8) {
+    LEVEL_OVERRIDE.with(|f| f.set(level));
 }
 
 /// Pin the SWAR tier on/off for the current thread.
@@ -506,7 +564,10 @@ fn classify_ascii_bounded(s: &[u8], stop_at: AsciiClass) -> AsciiClass {
     // therefore never touches the level cache line, and the cold cpuid probe
     // defers until a row that can actually use a vector kernel arrives.
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= CLASSIFY_AVX512_MIN_LEN && x86_level() >= 3 {
+    // `!swar_forced()` is redundant *today* — `x86_level()` reads the forced flag
+    // first and returns 0 — but it is the only thing making this arm safe on its
+    // own, and the forced-SWAR tier exists to run the SWAR body.
+    if !swar_forced() && s.len() >= CLASSIFY_AVX512_MIN_LEN && x86_level() >= 3 {
         // SAFETY: `level >= 3` iff `is_x86_feature_detected!("avx512bw")`
         // succeeded inside `x86_level_init`; `avx512f` is implied by
         // `avx512bw` on every part implementing both, which is exactly what
@@ -515,7 +576,7 @@ fn classify_ascii_bounded(s: &[u8], stop_at: AsciiClass) -> AsciiClass {
         return unsafe { x86_64::classify_ascii_avx512(s, stop_at) };
     }
     #[cfg(target_arch = "x86_64")]
-    if s.len() >= CLASSIFY_AVX2_MIN_LEN && x86_level() >= 2 {
+    if !swar_forced() && s.len() >= CLASSIFY_AVX2_MIN_LEN && x86_level() >= 2 {
         // SAFETY: `level >= 2` iff `is_x86_feature_detected!("avx2")`
         // succeeded; the kernel's 32-byte loads are AVX2-only.  The tail is
         // deferred back to this function, so a kernel never re-enters the
@@ -654,7 +715,7 @@ pub(crate) fn next_non_ascii_byte(s: &[u8]) -> usize {
             }
             return usize::MAX;
         }
-        return s.iter().position(|&b| b >= 0x80).map_or(usize::MAX, |p| p);
+        return s.iter().position(|&b| b >= 0x80).unwrap_or(usize::MAX);
     }
     // Same shape as `classify_ascii_bounded`: the level is consulted behind the
     // length gate, so a short run never loads it.
@@ -818,12 +879,23 @@ mod x86_64 {
                 super::AsciiClass::Printable,
             );
         }
-        if s.len() >= 32 {
+        // No `if s.len() >= 32` gate: the dispatcher only enters this kernel for
+        // `len >= CLASSIFY_AVX2_MIN_LEN` (128), and a re-entrant tail call from a
+        // wider kernel lands in the SSE2 arm, so the fall-through to
+        // `compose_classify_tail` below was unreachable.  The canary on the
+        // constant is asserted next to its definition.
+        {
+            debug_assert!(s.len() >= 32, "AVX2 kernel entered below its minimum");
             // 32-byte peer of the SSE2 tier's masked tail: one overlapping load
             // covers the 1..=31-byte remainder that used to re-enter the
             // dispatcher (measured on the SSE2 tier as ~1.5 ns per tail byte).
             let base = s.len() - 32;
             let skip = i - base; // 1..=31
+            // The `keep` shift is only defined for 1..=31: `skip == 0` would keep
+            // lanes before `i` (already scanned) and `skip == 32` is a shift
+            // overflow.  Both bounds come from the loop invariant and the early
+            // return above; pin them so a future loop rewrite cannot shift into UB.
+            debug_assert!((1..32).contains(&skip), "tail skip out of range: {skip}");
             let keep = (!0i32) << skip;
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(base) as *const __m256i) };
             let (bad_v, tab_v_, nl_v_) = {
@@ -900,6 +972,7 @@ mod x86_64 {
             // nothing over, and `(!0i32) << 32` would be a shift overflow.
             let base = s.len() - 32;
             let skip = i - base; // 1..=31
+            debug_assert!((1..32).contains(&skip), "tail skip out of range: {skip}");
             let keep = (!0i32) << skip;
             let v = unsafe { _mm256_loadu_si256(s.as_ptr().add(base) as *const __m256i) };
             let mask = unsafe { _mm256_movemask_epi8(v) } & keep;
@@ -908,18 +981,6 @@ mod x86_64 {
             } else {
                 base + mask.trailing_zeros() as usize
             };
-        }
-        if i + 16 <= s.len() {
-            // SSE2 is baseline on x86_64, so inline the 16-byte step instead of
-            // re-entering the dispatcher: that re-entry ran the SSE2 kernel and
-            // then the short path, which is the measured 48..63 / 96..127 cliff
-            // (one chunk plus a full dispatch for the remainder).
-            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
-            let mask = unsafe { _mm_movemask_epi8(v) };
-            if mask != 0 {
-                return i + mask.trailing_zeros() as usize;
-            }
-            i += 16;
         }
         let tail = super::next_non_ascii_byte(&s[i..]);
         if tail == usize::MAX {
@@ -991,11 +1052,31 @@ mod x86_64 {
                 super::AsciiClass::Printable,
             );
         }
-        super::compose_classify_tail(
-            saw_tab,
-            saw_newline,
-            super::classify_ascii_bounded(&s[i..], stop_at),
-        )
+        // Overlapping final load — the same protocol the SSE2 and AVX2 classify
+        // kernels already use.  This kernel was the only wide one without it, so
+        // a 1..=63-byte remainder re-entered the dispatcher (two length gates, a
+        // level load, then a whole SSE2 kernel call) instead of one masked load;
+        // that is the `/255` spike in the bench table.  The `>= 64` canary above
+        // makes `s.len() >= 64` always true here.
+        let base = s.len() - 64;
+        let skip = i - base; // 1..=63
+        debug_assert!((1..64).contains(&skip), "tail skip out of range: {skip}");
+        let keep = (!0u64) << skip;
+        let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(base).cast()) };
+        let lt = unsafe { _mm512_cmpgt_epi8_mask(sp, v) };
+        let tab = unsafe { _mm512_cmpeq_epi8_mask(v, tab_v) };
+        let nl = unsafe { _mm512_cmpeq_epi8_mask(v, nl_v) };
+        let bad = (unsafe { _mm512_cmpeq_epi8_mask(v, del) } | (lt & !(tab | nl))) & keep;
+        if bad != 0 {
+            return super::compose_classify_tail(
+                saw_tab,
+                saw_newline,
+                super::classify_ascii_bounded(&s[base + bad.trailing_zeros() as usize..], stop_at),
+            );
+        }
+        saw_tab |= tab & keep != 0;
+        saw_newline |= nl & keep != 0;
+        super::compose_classify_tail(saw_tab, saw_newline, super::AsciiClass::Printable)
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
@@ -1034,35 +1115,6 @@ mod x86_64 {
             let keep = (!0u64) << skip;
             let v = unsafe { _mm512_loadu_si512(s.as_ptr().add(base).cast()) };
             let mask = unsafe { _mm512_movepi8_mask(v) } & keep;
-            return if mask == 0 {
-                usize::MAX
-            } else {
-                base + mask.trailing_zeros() as usize
-            };
-        }
-        if i + 16 <= s.len() {
-            // SSE2 is baseline on x86_64, so inline the 16-byte step instead of
-            // re-entering the dispatcher: that re-entry ran the SSE2 kernel and
-            // then the short path, which is the measured 48..63 / 96..127 cliff
-            // (one chunk plus a full dispatch for the remainder).
-            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(i) as *const __m128i) };
-            let mask = unsafe { _mm_movemask_epi8(v) };
-            if mask != 0 {
-                return i + mask.trailing_zeros() as usize;
-            }
-            i += 16;
-        }
-        // Same overlapping-load trick as the classify tier: only the first
-        // surviving high bit matters, so the mask is exact.
-        if i < s.len() && s.len() >= 16 {
-            let base = s.len() - 16;
-            let skip = i - base; // 1..=15: lanes already scanned
-            // `_mm_movemask_epi8` yields 16 bits in an `i32`, so the keep mask
-            // is built in the same signed type; the bits above 15 are masked off
-            // by the AND anyway.
-            let keep = !((1i32 << skip) - 1);
-            let v = unsafe { _mm_loadu_si128(s.as_ptr().add(base) as *const __m128i) };
-            let mask = unsafe { _mm_movemask_epi8(v) } & keep;
             return if mask == 0 {
                 usize::MAX
             } else {
@@ -1168,6 +1220,7 @@ mod x86_64 {
             // class.
             let base = s.len() - 16;
             let skip = i - base; // 1..=15: lanes already scanned
+            debug_assert!((1..16).contains(&skip), "tail skip out of range: {skip}");
             // `_mm_movemask_epi8` yields 16 bits in an `i32`, so the keep mask
             // is built in the same signed type; the bits above 15 are masked off
             // by the AND anyway.
@@ -1424,6 +1477,18 @@ mod neon {
         (bits != 0).then_some((bits.trailing_zeros() / 4) as usize)
     }
 
+    /// `a & !b` — the convention every backend in this module shares.
+    ///
+    /// NEON's `vbicq_u8(a, b)` already computes `a & !b`, the **opposite**
+    /// argument order from x86's `_mm256_andnot_si256(a, b)` (`!a & b`).  The
+    /// wasm backend wraps the same asymmetry; wrapping it here means a future
+    /// x86↔NEON port cannot silently swap the operands, which is the port bug the
+    /// wasm module's docstring warns about.
+    #[inline]
+    unsafe fn andnot(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+        unsafe { vbicq_u8(a, b) }
+    }
+
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn classify_ascii(s: &[u8], stop_at: super::AsciiClass) -> super::AsciiClass {
         let sp = unsafe { vdupq_n_s8(0x20) };
@@ -1440,7 +1505,7 @@ mod neon {
                 let lt = vcltq_s8(vreinterpretq_s8_u8(v), sp);
                 let tab = vceqq_u8(v, tab_v);
                 let nl = vceqq_u8(v, nl_v);
-                let off = vbicq_u8(lt, vorrq_u8(tab, nl));
+                let off = andnot(lt, vorrq_u8(tab, nl));
                 (
                     vorrq_u8(vceqq_u8(v, del), off),
                     any_nonzero(tab),
@@ -1464,7 +1529,7 @@ mod neon {
             let lt = unsafe { vcltq_s8(vreinterpretq_s8_u8(v), sp) };
             let tab = unsafe { vceqq_u8(v, tab_v) };
             let nl = unsafe { vceqq_u8(v, nl_v) };
-            let off = unsafe { vbicq_u8(lt, vorrq_u8(tab, nl)) };
+            let off = unsafe { andnot(lt, vorrq_u8(tab, nl)) };
             let eq = unsafe { vceqq_u8(v, del) };
             if unsafe { any_nonzero(vorrq_u8(eq, off)) } {
                 return super::AsciiClass::Other;
@@ -1528,6 +1593,86 @@ mod neon {
 
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
+    /// The AVX2 classify kernel is unreachable on an AVX-512 host (128+ goes to
+    /// AVX-512, 16..127 to SSE2), so without the level override it is only
+    /// exercised when CI happens to run on an AVX2-only machine.  Pin it against
+    /// the scalar reference across the 128..=300 band on any host that has AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_classify_kernel_matches_scalar_under_level_override() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // RAII, like `ForceSwarGuard`: a panic or early return inside this test
+        // would otherwise leak the override onto the worker thread.
+        let _guard = LevelOverrideGuard::new(2);
+        let cases: [&[u8]; 8] = [
+            b"plain ascii text, nothing to see here but words and spaces and more words",
+            b"with\ttab and\nnewline and plenty of printable padding to reach the tail",
+            b"\x01control byte forces Other classification at some position in the buffer",
+            &[b'a'; 300],
+            &[b'\t'; 200],
+            &[b'\n'; 200],
+            &[b'\x7f'; 190],
+            &[0x80u8; 187],
+        ];
+        for case in cases {
+            for len in [128usize, 129, 150, 191, 256, 257, 300] {
+                let slice = &case[..len.min(case.len())];
+                let got = super::classify_ascii(slice);
+                let want = super::classify_scalar(slice);
+                assert_eq!(got, want, "len {} case {:?}", slice.len(), &slice[..8]);
+            }
+        }
+    }
+
+    /// Restores the previous per-thread level override on drop (nesting-safe, the
+    /// same reason `ForceSwarGuard` restores instead of clearing).
+    struct LevelOverrideGuard(u8);
+
+    impl LevelOverrideGuard {
+        fn new(level: u8) -> Self {
+            let prev = super::LEVEL_OVERRIDE.with(std::cell::Cell::get);
+            super::set_x86_level_override(level);
+            Self(prev)
+        }
+    }
+
+    impl Drop for LevelOverrideGuard {
+        fn drop(&mut self) {
+            super::set_x86_level_override(self.0);
+        }
+    }
+
+    /// `x86_level()` clamps the requested tier to what the host actually has —
+    /// the safety property that keeps a tier-3 request on an AVX2-only box from
+    /// executing an AVX-512 kernel without its `#[target_feature]` precondition.
+    /// Documented but previously unpinned: dropping the `.min()` would only show
+    /// up as an illegal instruction on a restricted host.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn level_override_is_clamped_to_detected_capability() {
+        let detected = super::x86_level_detected();
+        for want in [0u8, 1, 2, 3, 255] {
+            super::set_x86_level_override(want);
+            let got = super::LEVEL_OVERRIDE.with(std::cell::Cell::get);
+            // `0` means "detected", which `x86_level()` resolves to the detected
+            // tier; anything else is clamped down to it.
+            let expect = if want == 0 {
+                detected
+            } else {
+                want.min(detected)
+            };
+            let seen = if got == 0 {
+                detected
+            } else {
+                got.min(detected)
+            };
+            assert_eq!(seen, expect, "want {want}, detected {detected}");
+        }
+        super::set_x86_level_override(0);
+    }
+
     /// Test-side view of the sentinel API: the explicit import shadows the
     /// glob-imported `next_non_ascii_byte`, so every existing assertion keeps
     /// comparing against `Some(offset)`.

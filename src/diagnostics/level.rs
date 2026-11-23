@@ -8,7 +8,10 @@ use std::fmt;
 /// `sort_by_key`/`max()`/range over the enum is reorder-proof.  Prefer
 /// [`DiagnosticLevel::severity`] or [`DiagnosticLevel::is_error`] for explicit
 /// severity reasoning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Hash` is derived even though nothing keys a map on a level today: a future
+// `HashMap<DiagnosticLevel, _>` (per-level counters, say) must either work or
+// fail *here*, not in an unrelated PR that adds a drive-by derive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiagnosticLevel {
     Info,
     Note,
@@ -352,6 +355,11 @@ mod tests {
         ] {
             assert_eq!(level.ansi_color(), color, "{level:?}");
         }
+        // Bold Fatal is `1;41;97` — bold *plus* a step to bright-white (SGR 97),
+        // not `1;41;37`.  The docstring says "just bold", which reads as the
+        // latter, so pin the decision: a change here is a policy change, not a
+        // refactor.
+        assert_eq!(DiagnosticLevel::Fatal.ansi_color(), "\x1b[41;37m");
         assert_eq!(DiagnosticLevel::Fatal.ansi_bold_color(), "\x1b[1;41;97m");
         assert_eq!(DiagnosticLevel::Error.ansi_bold_color(), "\x1b[31;1m");
         assert_eq!(DiagnosticLevel::Warning.ansi_bold_color(), "\x1b[33;1m");

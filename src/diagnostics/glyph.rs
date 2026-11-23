@@ -3078,6 +3078,11 @@ pub(crate) struct LabelWindow<'a> {
     scratch: LabelWindowScratch,
     /// Index into `scratch.order` of the first label not yet folded in.
     cursor: usize,
+    /// Debug-only: the last row folded in.  `advance` is *contractually*
+    /// idempotent for the same row — the HTML renderer calls it again after a
+    /// fast-skip — and that only holds if the fold never walks backwards.
+    #[cfg(debug_assertions)]
+    last_advanced: Option<usize>,
 }
 
 /// Reusable scratch state for a [`LabelWindow`].
@@ -3213,6 +3218,8 @@ impl<'a> LabelWindow<'a> {
             label_lines,
             scratch,
             cursor: 0,
+            #[cfg(debug_assertions)]
+            last_advanced: None,
         }
     }
 
@@ -3238,6 +3245,19 @@ impl<'a> LabelWindow<'a> {
     }
 
     pub(crate) fn advance(&mut self, line_idx: usize) {
+        // Re-advancing the same row is a no-op by construction (the cursor is
+        // already past it), and a *backwards* advance would silently mis-fold
+        // labels; the HTML fast-skip relies on the former, so pin the shape that
+        // makes both true.
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.last_advanced.is_none_or(|prev| prev <= line_idx),
+                "LabelWindow::advance went backwards: {:?} -> {line_idx}",
+                self.last_advanced
+            );
+            self.last_advanced = Some(line_idx);
+        }
         let lines = self.label_lines;
         let scratch = &mut self.scratch;
 

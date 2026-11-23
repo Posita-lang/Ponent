@@ -235,6 +235,44 @@ fn format_slug_into(
     )
 }
 
+/// Walk the `primary -> en` chain, retrying on the next bundle when a bundle
+/// has the message but its pattern fails to format (a broken translation, an
+/// argument missing from the translation, or a malformed pattern).
+///
+/// One implementation for every render path.  `format_slug_in_into`,
+/// `try_fluent_into`, `try_fluent_owned_into` and `render_into_count` each
+/// inlined this walk with slightly different tripwire text, so a future change to
+/// the retry policy needed four coordinated edits — the "they agreed by
+/// maintenance only" shape this module already documents elsewhere.
+fn walk_chain<F>(primary: &Bundle, en: &Bundle, out: &mut String, mut fmt: F) -> bool
+where
+    F: FnMut(&Bundle, &mut String) -> bool,
+{
+    for b in std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en)) {
+        if fmt(b, out) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Tripwire for the *render* paths: a slug that exists in `en` yet formatted on
+/// no bundle is a caller/translation bug (a missing or misspelled argument), not
+/// an unknown slug.
+///
+/// Deliberately separate from [`walk_chain`]: the text accessors
+/// (`format_slug_into`, used by generated `fluent::foo(...)`) degrade to "return
+/// the caller's string" and must stay silent — `format_slug_into_degrades_without_touching_out`
+/// pins that.  One message for every render path, so the wording cannot drift.
+#[cold]
+fn tripwire_unformatted(msg: &str, en: &Bundle, formatted: bool) {
+    debug_assert!(
+        formatted || en.get_message(msg).is_none(),
+        "slug {msg:?} exists but formatting failed on every bundle — \
+         missing or misspelled argument?"
+    );
+}
+
 fn format_slug_in_into(
     primary: &Bundle,
     en: &Bundle,
@@ -242,12 +280,10 @@ fn format_slug_in_into(
     args: Option<&FluentArgs>,
     out: &mut String,
 ) -> bool {
-    // Hoisted out of `try_bundle`: a fresh `Vec::new()` per attempt is free
-    // on the success path (lazy allocation) but pays a fresh `Drop` per
-    // bundle attempt on the fallback path; one buffer reused across the
-    // chain removes both.
+    // One `errors` buffer reused across bundle attempts (a fresh `Vec` per
+    // attempt paid a `Drop` on the fallback path).
     let mut errors = Vec::new();
-    let mut try_bundle = |b: &Bundle, out: &mut String| -> bool {
+    walk_chain(primary, en, out, |b, out| {
         errors.clear();
         let Some(pattern) = b.get_message(slug).and_then(|m| m.value()) else {
             return false;
@@ -259,15 +295,7 @@ fn format_slug_in_into(
         } else {
             false
         }
-    };
-
-    let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
-    for b in chain {
-        if try_bundle(b, out) {
-            return true;
-        }
-    }
-    false
+    })
 }
 
 /// `LANG` sentinel meaning "not yet detected".
@@ -510,6 +538,13 @@ pub fn render_into<'msg, 'src>(
 /// machinery: duplicating the resolve/retry loop would be the drift risk the
 /// `render_into`/`try_fluent_into` pair exists to avoid.
 pub fn render_into_count(msg: &str, key: &'static str, n: u64, out: &mut String) {
+    // Legacy keys have no placeable, so the count would be *silently* dropped.
+    // They are dead today, but a future caller could pass one and lose the
+    // number with no signal; the sibling entry points assert on the same shape.
+    debug_assert!(
+        is_ftl_slug(msg),
+        "render_into_count requires an FTL slug; legacy keys cannot substitute a count ({msg:?})"
+    );
     if is_ftl_slug(msg) {
         if let Some(cached) = fluent::zero_arg_slug(msg) {
             // A zero-arg slug cannot consume a count.  Falling through (as this
@@ -530,28 +565,31 @@ pub fn render_into_count(msg: &str, key: &'static str, n: u64, out: &mut String)
         let mut args = FluentArgs::new();
         args.set(key, FluentValue::from(n));
         let mut errors = Vec::new();
-        // Same resolve-then-retry-on-format-failure policy as
-        // `try_fluent_into`: a translation that fails to format falls back to
-        // `en` rather than disappearing.
-        for b in std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en)) {
+        // Same resolve-then-retry-on-format-failure policy as the `tr!` paths.
+        let formatted = walk_chain(primary, en, out, |b, out| {
             let Some(pattern) = b.get_message(msg).and_then(|m| m.value()) else {
-                continue;
+                return false;
             };
             errors.clear();
             let val = b.format_pattern(pattern, Some(&args), &mut errors);
             if errors.is_empty() {
                 out.push_str(&val);
-                return;
+                true
+            } else {
+                false
             }
-        }
-        // Tripwire parity with `try_fluent_into`: a slug that exists in `en` but
+        });
+        // Tripwire parity with the render paths: a slug that exists in `en` but
         // fails to format here (a missing or misspelled argument) used to fall
         // through to the raw slug with no assert at all.
-        debug_assert!(
-            en.get_message(msg).is_none(),
-            "slug {msg:?} exists but formatting failed (numeric-count path) — \
-             missing or misspelled argument?"
-        );
+        tripwire_unformatted(msg, en, formatted);
+        if formatted {
+            // `walk_chain` already pushed the rendered value.  Without this the
+            // function fell through and appended the *raw slug* after the text
+            // (caught by `fold_marker_shape_is_pinned`): the pre-refactor loop
+            // returned from inside the success arm.
+            return;
+        }
     }
     out.push_str(msg);
 }
@@ -661,10 +699,9 @@ fn try_fluent_into<'msg, 'src>(
     // translation, a missing argument in a translation, or a malformed
     // pattern).
     let mut errors = Vec::new();
-    let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
-    for b in chain {
+    let formatted = walk_chain(primary, en, out, |b, out| {
         let Some(pattern) = b.get_message(msg).and_then(|m| m.value()) else {
-            continue;
+            return false;
         };
         let args = built_args.get_or_insert_with(|| {
             let mut args = FluentArgs::new();
@@ -686,15 +723,10 @@ fn try_fluent_into<'msg, 'src>(
             out.push_str(&val);
             return true;
         }
-    }
-    // Cold path only: a slug that exists in `en` yet fails to format there is
-    // a caller/translation bug (bad argument key), not an unknown slug.
-    debug_assert!(
-        bundles[0].get_message(msg).is_none(),
-        "slug {msg:?} exists but formatting failed on every bundle — \
-         missing or misspelled argument? errors: {errors:?}"
-    );
-    false
+        false
+    });
+    tripwire_unformatted(msg, en, formatted);
+    formatted
 }
 
 /// Consuming variant of [`render_into`]: moves `pairs` by value so
@@ -773,17 +805,14 @@ fn try_fluent_owned_into<'msg, 'src>(
     // per bundle.  The argument map is built once, only after a bundle with
     // the message is found — `pairs` is consumed, so the build cannot sit
     // inside the loop.
-    let chain = std::iter::once(primary).chain((!std::ptr::eq(primary, en)).then_some(en));
-    // Retry formatting on the next bundle when this one has the message but
-    // fails to format it (see `try_fluent_into`).  `pairs` is consumed to
-    // build the map, so build it lazily once and reuse it for the fallback
-    // attempt instead of trying to reconstruct it.
+    // `pairs` is consumed to build the map, so build it lazily once and reuse it
+    // for the fallback attempt instead of reconstructing it.
     let mut pending_pairs = Some(pairs);
     let mut built_args: Option<FluentArgs> = None;
     let mut errors = Vec::new();
-    for b in chain {
+    let formatted = walk_chain(primary, en, out, |b, out| {
         let Some(pattern) = b.get_message(msg).and_then(|m| m.value()) else {
-            continue;
+            return false;
         };
         let args = built_args.get_or_insert_with(|| {
             let mut args = FluentArgs::new();
@@ -794,9 +823,7 @@ fn try_fluent_owned_into<'msg, 'src>(
                 .for_each(|(k, v)| {
                     // Owned path: `FluentValue::try_number` borrows the input,
                     // but `v` is consumed here, so parse into an owned
-                    // `FluentNumber` instead.  The policy is the same as the
-                    // borrowed path (`try_number` is `parse::<FluentNumber>` with
-                    // a `String` fallback).
+                    // `FluentNumber` instead.  Same policy as the borrowed path.
                     let value = make_value(v, &k);
                     debug_assert!(args.get(k).is_none(), "duplicate tr! argument {k:?}");
                     args.set(k, value);
@@ -807,17 +834,13 @@ fn try_fluent_owned_into<'msg, 'src>(
         let val = b.format_pattern(pattern, Some(args), &mut errors);
         if errors.is_empty() {
             out.push_str(&val);
-            return true;
+            true
+        } else {
+            false
         }
-    }
-    // Same cold-path probe as `try_fluent_into`: a slug that exists in `en`
-    // yet fails to format there is a caller/translation bug.
-    debug_assert!(
-        bundles[0].get_message(msg).is_none(),
-        "slug {msg:?} exists but formatting failed — missing or \
-         misspelled argument? errors: {errors:?}"
-    );
-    false
+    });
+    tripwire_unformatted(msg, en, formatted);
+    formatted
 }
 
 /// Direct-indexed per-`Lang` cache for a fixed table of zero-argument
@@ -927,6 +950,80 @@ pub(crate) use cached_label_static;
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    /// The classifier's safety argument is a claim about the *legacy corpus*:
+    /// "every legacy English message contains spaces, backticks or braces, so the
+    /// two key spaces cannot collide".  A single word (`"error"`, `"note"`) has
+    /// none of those, so it would classify as a slug and — if a slug of that name
+    /// ever existed — render translated text instead of the caller's string.
+    ///
+    /// Pin the corpus the way `literal_codes_are_all_in_code_table` pins the code
+    /// space: scan the diagnostics sources for `Diagnostic::<level>("…")`
+    /// literals and require that none is slug-shaped.
+    #[test]
+    fn no_legacy_diagnostic_message_is_slug_shaped() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/diagnostics");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "source scan found no files under {root:?}"
+        );
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let Ok(src) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            // Production half only: test fixtures use bare words (`"boom"`,
+            // `"first"`) that are slug-shaped by construction, and a test module
+            // never reaches a user-visible render.  Cutting at the first
+            // `#[cfg(test` occurrence keeps the scan honest about the corpus the
+            // classifier's argument is actually about.
+            let cut = ["#[cfg(test", "#[cfg(all(test"]
+                .iter()
+                .filter_map(|marker| src.find(marker))
+                .min();
+            let src = cut.map_or(src.as_str(), |cut| &src[..cut]);
+            for ctor in [
+                "Diagnostic::error(\"",
+                "Diagnostic::warning(\"",
+                "Diagnostic::note(\"",
+                "Diagnostic::help(\"",
+            ] {
+                let mut from = 0;
+                while let Some(pos) = src[from..].find(ctor) {
+                    let start = from + pos + ctor.len();
+                    let Some(end) = src[start..].find('"') else {
+                        break;
+                    };
+                    let lit = &src[start..start + end];
+                    if is_ftl_slug(lit) {
+                        offenders.push(format!("{}: {lit:?}", file.display()));
+                    }
+                    from = start + end;
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "slug-shaped legacy messages would be dispatched to Fluent: {offenders:#?}"
+        );
+    }
 
     /// Static half of the runtime retry logic in [`try_fluent_into`].
     ///

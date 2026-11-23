@@ -6324,9 +6324,8 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         let exit_res = guard.commit();
 
         if let Err(mut diags) = exit_res {
-            for mut d in diags.iter_all_mut() {
-                d.humanize();
-            }
+            // The batch emitters take `&Diagnostic`; humanize at the owner.
+            diags.humanize_pending();
             let details: Vec<String> = diags.iter().map(|d| d.message().to_string()).collect();
             return Err(
                 Diagnostic::error(format!("inference failure: {}", details.join("; ")))

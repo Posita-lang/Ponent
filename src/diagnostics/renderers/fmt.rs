@@ -1,4 +1,11 @@
-//! Shared integer/space formatting primitives — no `core::fmt`, no allocation.
+//! Shared integer/space formatting primitives — straight div-mod loops instead
+//! of `core::fmt`, and no allocation.
+//!
+//! "No `core::fmt`" is a property of the *algorithms* here, not of the sink
+//! bounds: the writers take `std::fmt::Write`, so the guarantee holds because
+//! `String::write_str`/`push_str` are `#[inline]` in practice.  It would not hold
+//! for a `dyn Write`, and is unverified for `CompactString` — see the F20 note in
+//! the review backlog about a `JsonSink` trait if that ever matters.
 //!
 //! `core::fmt` for integers drags in the width/precision/flags machinery and
 //! an indirect call through `Formatter`; these are straight div-mod loops
@@ -31,38 +38,32 @@ static DIGITS: [u8; 200] = build_digit_pairs();
 /// Two digits per iteration (halving the div-mod count for `n ≥ 100`) and a
 /// single write of a stack buffer instead of one capacity-checked `push` per
 /// digit.  20 digits covers every 64-bit value (`2^64 - 1` has 20).
+///
+/// Backed by `itoa` rather than a hand-rolled div-mod ladder: `itoa` is the
+/// fastest known integer formatter (two-digit table + one reciprocal multiply
+/// per pair), and — the part that matters here — it returns a `&str`, which
+/// deletes the `from_utf8_unchecked` this function used to need.  The bytes are
+/// pinned by `push_uint_matches_display` and `push_u32_matches_push_uint`, so a
+/// formatter swap cannot change output silently.
 #[inline]
-pub fn push_uint<W: std::fmt::Write + ?Sized>(out: &mut W, mut n: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    while n >= 100 {
-        let r = (n % 100) as usize * 2;
-        i -= 2;
-        buf[i] = DIGITS[r];
-        buf[i + 1] = DIGITS[r + 1];
-        n /= 100;
-    }
-    if n >= 10 {
-        let r = n as usize * 2;
-        i -= 2;
-        buf[i] = DIGITS[r];
-        buf[i + 1] = DIGITS[r + 1];
-    } else {
-        i -= 1;
-        buf[i] = b'0' + n as u8;
-    }
-    // Keep the `unsafe` contract honest if this loop ever grows a
-    // sign/prefix/point; the assert is compiled out in release.
-    debug_assert!(buf[i..].iter().all(u8::is_ascii_digit));
-    // SAFETY: `buf[i..]` holds only ASCII digit bytes — written from `DIGITS`
-    // (const-built from `b'0' + …`) or `b'0' + n as u8` with `n < 10`, all in
-    // `0x30..=0x39`.
-    //
+pub fn push_uint<W: std::fmt::Write + ?Sized>(out: &mut W, n: u64) {
+    let mut buf = itoa::Buffer::new();
     // The `write_str` result is discarded deliberately: these sinks are
-    // infallible in practice (`String`, `ArrayString`), and the value is a
-    // compile-time-valid decimal — an error would mean the sink is broken, not
-    // that the number is unrepresentable.
-    let _ = out.write_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+    // infallible in practice (`String`, `ArrayString`), and an error would mean
+    // the sink is broken, not that the number is unrepresentable.
+    let _ = out.write_str(buf.format(n));
+}
+
+/// `push_uint` for the u32 values this module is almost always given (span
+/// offsets, file ids, line/column numbers).
+///
+/// A separate entry point because callers hold `u32` and the `as u64` widening
+/// used to be the only way in; `itoa` has a dedicated `u32` path, so the call
+/// site and the formatter agree on the width.
+#[inline]
+pub fn push_u32<W: std::fmt::Write + ?Sized>(out: &mut W, n: u32) {
+    let mut buf = itoa::Buffer::new();
+    let _ = out.write_str(buf.format(n));
 }
 
 /// Const-built table mapping each `u8` to its two lowercase hex digits,
@@ -110,20 +111,22 @@ pub fn push_hex64<W: std::fmt::Write + ?Sized>(out: &mut W, mut n: u64) {
 /// counts (line-number widths, label indentation) are a single sliced push.
 #[inline]
 pub fn push_spaces(out: &mut String, n: usize) {
-    const SPACES: &str = "                                                                ";
-    // Machine-checked: the chunk loop assumes `SPACES.len()` is the stride,
-    // and the tail slice assumes every byte is a space.  A stray edit to the
-    // literal is a compile error here instead of a wrong indent at runtime.
-    const _: () = assert!(SPACES.len() == 64, "push_spaces chunks on SPACES.len()");
-    const _: () = assert!(all_spaces(SPACES), "tail slice assumes spaces");
-    out.reserve(n);
-    let mut remaining = n;
-    while remaining >= SPACES.len() {
-        out.push_str(SPACES);
-        remaining -= SPACES.len();
+    if n == 0 {
+        return;
     }
-    if remaining > 0 {
-        out.push_str(&SPACES[..remaining]);
+    out.reserve(n);
+    // One `memset` (libc's SIMD fill) instead of `n / 64` `push_str` calls, each
+    // re-checking capacity and copying a 64-byte literal.  Indents are wide
+    // enough to matter on a table-heavy render and this is the only fill.
+    //
+    // SAFETY: `reserve(n)` guarantees `n` spare bytes; `0x20` is ASCII, so
+    // appending `n` space bytes keeps the buffer valid UTF-8; `n > 0` was
+    // handled above, so the pointer is non-dangling and `add` stays in bounds.
+    unsafe {
+        let v = out.as_mut_vec();
+        let len = v.len();
+        std::ptr::write_bytes(v.as_mut_ptr().add(len), b' ', n);
+        v.set_len(len + n);
     }
 }
 
@@ -262,6 +265,31 @@ mod tests {
     }
 
     #[test]
+    /// `push_u32` must be byte-identical to `push_uint` on every value the
+    /// formatters actually pass it — otherwise the JSON `start`/`end`/`fileId`
+    /// fields would silently diverge from the `line`/`column` ones.
+    #[test]
+    fn push_u32_matches_push_uint() {
+        let mut x = 0x2545_F491u32;
+        for extra in [0u32, 1, 9, 10, 99, 100, 999, 1_000, u32::MAX - 1, u32::MAX] {
+            for _ in 0..500 {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let mut a = String::new();
+                let mut b = String::new();
+                push_u32(&mut a, x);
+                push_uint(&mut b, x as u64);
+                assert_eq!(a, b, "push_u32({x})");
+                let mut a = String::new();
+                let mut b = String::new();
+                push_u32(&mut a, extra);
+                push_uint(&mut b, extra as u64);
+                assert_eq!(a, b, "push_u32({extra})");
+            }
+        }
+    }
+
     fn dec_digits_boundaries() {
         for (n, want) in [
             (0u64, 1usize),
@@ -272,6 +300,32 @@ mod tests {
             (u64::MAX, 20),
         ] {
             assert_eq!(dec_digits(n), want, "dec_digits({n})");
+        }
+        // Every `10^k` and `10^k - 1` for k = 1..=19: exactly where a
+        // log-approximation table errs.  `to_string().len()` is the oracle, so
+        // this also pins the table against the standard library rather than
+        // against a second copy of the same arithmetic.
+        let mut pow = 1u64;
+        for _ in 0..20 {
+            if pow > 1 {
+                assert_eq!(
+                    dec_digits(pow - 1),
+                    pow.to_string().len() - 1,
+                    "10^k-1 ({})",
+                    pow - 1
+                );
+            }
+            assert_eq!(dec_digits(pow), pow.to_string().len(), "10^k ({pow})");
+            pow = pow.saturating_mul(10);
+        }
+        // A deterministic spread of random values (xorshift, so a failure is
+        // reproducible without a seed file).
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            assert_eq!(dec_digits(x), x.to_string().len(), "dec_digits({x})");
         }
     }
 

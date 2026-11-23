@@ -2,9 +2,9 @@
 //! and generation of the `error_codes_gen.rs` table source.
 
 use std::collections::{HashMap, HashSet};
-use swrite::{SWrite, swrite, swriteln};
 use std::fs;
 use std::path::Path;
+use swrite::{SWrite, swrite, swriteln};
 
 const CTX: &str = "error_codes/codes.toml";
 
@@ -347,7 +347,11 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
         let n = (b[1] - b'0') as usize * 100 + (b[2] - b'0') as usize * 10 + (b[3] - b'0') as usize;
         swriteln!(rs, "        slot: {},", prefix * 1000 + n);
         swriteln!(rs, "        title: {:?},", e.title);
-        swriteln!(rs, "        category: ErrorCategory::{},", e.category_variant);
+        swriteln!(
+            rs,
+            "        category: ErrorCategory::{},",
+            e.category_variant
+        );
         swrite!(rs, "        related: &[");
         for (i, rel) in e.related.iter().enumerate() {
             if i > 0 {
@@ -391,6 +395,17 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
         swriteln!(rs, "    ErrCodeInner {{");
         swriteln!(rs, "        display: {:?},", e.code);
         swriteln!(rs, "        canonical: {:?},", e.code);
+        // The slot is emitted literally (not re-derived through `CODE_INDEX`):
+        // `ErrCode` is one `&'static ErrCodeInner`, so storing it here turns
+        // `slot()` for a registry code into a single field load instead of an
+        // entry -> slot two-hop.
+        {
+            let b = e.code.as_bytes();
+            let prefix = if b[0] == b'E' { 0 } else { 1 };
+            let n =
+                (b[1] - b'0') as usize * 100 + (b[2] - b'0') as usize * 10 + (b[3] - b'0') as usize;
+            swriteln!(rs, "        slot: {},", prefix * 1000 + n);
+        }
         swriteln!(rs, "        entry: Some(&CODE_TABLE[{i}]),");
         swriteln!(rs, "        known: true,");
         swriteln!(rs, "        hash: {:#x},", fnv1a(e.code.as_bytes()));

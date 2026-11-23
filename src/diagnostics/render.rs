@@ -270,7 +270,15 @@ pub struct RenderCtx<'a> {
     /// build — roughly a hundred times a whole diagnostic's render — so one
     /// table per line per batch is what makes long-line sources tractable.  A
     /// single slot suffices: a render's sections sit on the same line range.
-    line_columns: RefCell<Option<(usize, usize, crate::diagnostics::glyph::LineColumns)>>,
+    line_columns: RefCell<
+        Option<(
+            usize,
+            usize,
+            usize,
+            usize,
+            crate::diagnostics::glyph::LineColumns,
+        )>,
+    >,
     /// Cross-emit content-verified cache, present only on the hoisted
     /// single-diagnostic path.  Entries carry a source copy so a hit cannot
     /// alias a freed/reused allocation.
@@ -302,6 +310,10 @@ pub struct RenderCtx<'a> {
     /// `Emitter::file_index_cache` holds content keys: an LSP re-publish is the
     /// same file in a *new* source allocation, so all three `(ptr, len)` tiers
     /// miss and the whole file would be rescanned for every publish.
+    /// Sorted by `(ptr, len)` at every construction site, so the tier-0 lookup
+    /// is `binary_search` instead of a linear `find`.  The emitter's
+    /// content-addressed cache grows across LSP publishes, so `P` can reach
+    /// hundreds and every `line_index` call would otherwise pay the scan.
     prebuilt: Option<&'a [PreloadedSource]>,
 }
 
@@ -383,8 +395,19 @@ impl<'a> RenderCtx<'a> {
         byte_in_line: usize,
         tab_width: usize,
     ) -> usize {
+        // The key must include *which* line, not merely its number.  A batch ctx
+        // renders diagnostics over several files, so "line 5" of file A and
+        // "line 5" of file B used to hit the same slot and the second one got the
+        // first one's tab-expanded columns — silent, user-visible wrong headers.
+        // `(ptr, len)` of the line slice identifies the buffer (all sources are
+        // alive for the batch, the same invariant `line_index` already relies on),
+        // and a re-published file gets a new allocation, hence a new pointer.
+        let line_ptr = line.as_ptr() as usize;
+        let line_len = line.len();
         let mut slot = self.line_columns.borrow_mut();
-        if let Some((no, tab, cols)) = slot.as_ref()
+        if let Some((p, l, no, tab, cols)) = slot.as_ref()
+            && *p == line_ptr
+            && *l == line_len
             && *no == line_no
             && *tab == tab_width
         {
@@ -392,7 +415,7 @@ impl<'a> RenderCtx<'a> {
         }
         let cols = crate::diagnostics::glyph::LineColumns::new(line, tab_width);
         let col = cols.display(byte_in_line);
-        *slot = Some((line_no, tab_width, cols));
+        *slot = Some((line_ptr, line_len, line_no, tab_width, cols));
         col
     }
 
@@ -425,7 +448,8 @@ impl<'a> RenderCtx<'a> {
         // sites), so a sentinel here is a producer bug: loud in debug, a miss
         // (never wrong output) in release.
         if let Some(prebuilt) = self.prebuilt
-            && let Some(e) = prebuilt.iter().find(|e| e.ptr == ptr && e.len == len)
+            && let Ok(pos) = prebuilt.binary_search_by_key(&(ptr, len), |e| (e.ptr, e.len))
+            && let Some(e) = prebuilt.get(pos)
             && e.fingerprint != 0
             && e.fingerprint == source_fingerprint(source)
         {
@@ -449,6 +473,7 @@ impl<'a> RenderCtx<'a> {
                         ascii: e.ascii,
                         char_prefixes: Arc::clone(&e.char_prefixes),
                         generation: e.generation,
+                        #[cfg(debug_assertions)]
                         fingerprint: e.fingerprint,
                     },
                 );
@@ -565,12 +590,45 @@ impl<'a> RenderCtx<'a> {
                         cache.insert(0, entry);
                     }
                     let entry = &cache[0];
-                    return LineIndex::from_shared(
-                        source,
+                    let (starts, ascii, char_prefixes, generation) = (
                         Arc::clone(&entry.starts),
                         entry.ascii,
                         Arc::clone(&entry.char_prefixes),
                         entry.generation,
+                    );
+                    drop(cache);
+                    // Backfill the per-ctx LRU: without this, every later render
+                    // of the same source re-pays this whole tier walk — including
+                    // the O(len) `entry.text == source` memcmp, up to 512 KB per
+                    // render — before reaching this branch again.  The entry is
+                    // content-verified above, so the LRU tripwire invariant holds.
+                    {
+                        let mut lru = self.source_index.borrow_mut();
+                        if let Some(pos) = lru.iter().position(|c| c.ptr == ptr && c.len == len) {
+                            lru.remove(pos);
+                        } else if lru.len() >= CACHE_SLOTS {
+                            lru.pop();
+                        }
+                        lru.insert(
+                            0,
+                            CachedSourceIndex {
+                                ptr,
+                                len,
+                                starts: Arc::clone(&starts),
+                                ascii,
+                                char_prefixes: Arc::clone(&char_prefixes),
+                                generation,
+                                #[cfg(debug_assertions)]
+                                fingerprint,
+                            },
+                        );
+                    }
+                    return LineIndex::from_shared(
+                        source,
+                        starts,
+                        ascii,
+                        char_prefixes,
+                        generation,
                     );
                 }
             }
@@ -801,6 +859,79 @@ mod tests {
         let b = "HEADER00\nab\n\nTAIL0000";
         assert_eq!(a.len(), b.len());
         assert_ne!(source_fingerprint(a), source_fingerprint(b));
+    }
+
+    /// The single-slot column cache must be keyed by the line *slice*, not just
+    /// its line number.  Before that, two sources rendered through one batch ctx
+    /// whose line 2 both had a leading tab run shared the slot, so the second
+    /// diagnostic's header used the first file's tab-expanded columns — plausible
+    /// output with no crash, the exact class this cache stack exists to exclude.
+    #[test]
+    fn display_col_in_line_is_keyed_by_the_line_slice() {
+        let opts = DiagOpts::default();
+        let cx = RenderCtx::new(&opts, None);
+        // Same line number, same tab width, different indent: the old key
+        // `(line_no, tab_width)` matched across sources.
+        let a = "\t\tcode_a";
+        let b = "\tcode_b";
+        let want_a = crate::diagnostics::glyph::LineColumns::new(a, 4).display(a.len());
+        let want_b = crate::diagnostics::glyph::LineColumns::new(b, 4).display(b.len());
+        assert_ne!(want_a, want_b, "the fixture must distinguish the two");
+
+        assert_eq!(cx.display_col_in_line(a, 2, a.len(), 4), want_a);
+        // Interleaved: this is the cross-source hit that used to alias.
+        assert_eq!(cx.display_col_in_line(b, 2, b.len(), 4), want_b);
+        assert_eq!(cx.display_col_in_line(a, 2, a.len(), 4), want_a);
+    }
+
+    /// Tier-0 pins.  A `fingerprint == 0` sentinel must degrade to a *miss*
+    /// (never wrong numbers), and the binary-searched lookup must still resolve
+    /// the right entry when two prebuilt sources share a length.
+    #[test]
+    fn prebuilt_tier_falls_back_on_a_sentinel_and_disambiguates_by_pointer() {
+        let opts = DiagOpts::default();
+        let a = "aa
+bb
+";
+        let b = "cc
+dd
+ee
+";
+        assert_ne!(a.len(), b.len());
+        let same_len_a = "x1
+y2
+";
+        let same_len_b = "p1
+q2
+";
+        assert_eq!(same_len_a.len(), same_len_b.len());
+
+        let entry = |src: &str, fingerprint: u64| PreloadedSource {
+            ptr: src.as_ptr() as usize,
+            len: src.len(),
+            starts: Arc::from(LineIndex::new(src).starts_arc().to_vec()),
+            ascii: true,
+            char_prefixes: Arc::default(),
+            generation: 7,
+            fingerprint,
+        };
+        let mut prebuilt = vec![
+            entry(a, 0), // sentinel: must never be trusted
+            entry(b, source_fingerprint(b)),
+            entry(same_len_a, source_fingerprint(same_len_a)),
+            entry(same_len_b, source_fingerprint(same_len_b)),
+        ];
+        prebuilt.sort_unstable_by_key(|e| (e.ptr, e.len));
+        let shared = SharedRenderState::new();
+        let cx = RenderCtx::hoisted_with_prebuilt(&opts, None, &shared, &prebuilt);
+
+        // Sentinel → miss → rebuilt table (correct, just not prebuilt).
+        assert_eq!(cx.line_index(a).line_of(a.len()), 2);
+        // Correct entry at the right pointer.
+        assert_eq!(cx.line_index(b).line_of(b.len()), 3);
+        // Two entries of equal length must not be confused by the search.
+        assert_eq!(cx.line_index(same_len_b).line_of(3), 1);
+        assert_eq!(cx.line_index(same_len_a).line_of(3), 1);
     }
 
     /// The whole point of the cache: the second render of the same source
@@ -1041,5 +1172,82 @@ pub trait Renderer: Send + Sync {
     fn end(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
         let _ = out;
         Ok(())
+    }
+}
+
+/// Measurement probes for the two decisions the review says must be *measured*
+/// before any code: whether `linecol_display` re-walks the line per query (the
+/// monotone-cursor optimization is only worth it if it does), and what the
+/// serial batch prebuild actually costs (it is the candidate for `thread::scope`
+/// parallelism).
+///
+/// `#[ignore]`d so ordinary runs stay fast; CI's `benchmark` job runs every
+/// `diagnostics::`-scoped ignored probe and prints the numbers.  Nothing here
+/// asserts a wall-clock threshold — shared runners are too noisy to gate on, and
+/// the point is a recorded baseline, not a tripwire.
+#[cfg(all(test, not(feature = "shuttle")))]
+mod perf_probes {
+    use super::*;
+
+    fn line_of_len(n: usize) -> String {
+        // Tab-indented so the display-column path (not the ASCII fast path) runs.
+        let mut s = String::from("\t\t");
+        s.push_str(&"x".repeat(n));
+        s
+    }
+
+    /// Per-query cost of `linecol_display` at several in-line offsets.
+    ///
+    /// If the column is recomputed by walking the line prefix, cost grows with
+    /// the offset (and with span count per line); if it is cached/`O(log)`, the
+    /// numbers stay flat and the monotone-cursor idea in the review is dropped.
+    #[test]
+    #[ignore = "measurement only"]
+    fn perf_linecol_display_repeated_queries() {
+        let opts = DiagOpts::default();
+        let cx = RenderCtx::new(&opts, None);
+        for len in [64usize, 512, 4096] {
+            let src = line_of_len(len);
+            let idx = cx.line_index(&src);
+            let probes: Vec<usize> = (0..16).map(|i| 2 + len * i / 16).collect();
+            // Warm the lazily-built per-line tables so the measurement is steady
+            // state, which is what a batch actually sees.
+            for &p in &probes {
+                std::hint::black_box(idx.linecol_display(p));
+            }
+            let iters = 2_000;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                for &p in &probes {
+                    std::hint::black_box(idx.linecol_display(p));
+                }
+            }
+            let ns = t.elapsed().as_secs_f64() * 1e9 / (iters * probes.len()) as f64;
+            println!(
+                "[perf] linecol_display len={len:>5} x{}: {ns:.1} ns/query",
+                probes.len()
+            );
+        }
+    }
+
+    /// Cost of the tier walk on a repeat render of the same source: the LRU hit
+    /// path (no fingerprint), the tier-0 prebuilt path, and the rebuild.
+    #[test]
+    #[ignore = "measurement only"]
+    fn perf_line_index_lookup_tiers() {
+        let opts = DiagOpts::default();
+        let src = "a\nb\nc\n".repeat(4_000);
+        let cx = RenderCtx::new(&opts, None);
+        std::hint::black_box(cx.line_index(&src)); // cold: rebuild + publish
+        let iters = 20_000;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(cx.line_index(&src));
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
+        println!(
+            "[perf] line_index LRU hit ({} bytes source): {ns:.1} ns/lookup",
+            src.len()
+        );
     }
 }

@@ -124,6 +124,9 @@ base64 = "0.23.1"
 iddqd = "0.5.0"
 simdutf8 = "0.1.5"
 swrite = "0.1.0"
+# Fast integer-to-string rendering for the range formatter.
+itoa = "1"
+iota = "0.2.3"
 
 # The AUTHORITATIVE Polonius R1-R8 engine (rustc's own), used as a
 # differential oracle in tests: our `evaluate_rules` must agree with it

@@ -89,44 +89,28 @@ pub struct DiagCtxt<'src> {
     /// audit.  Counted so tests can assert exactly-once without parsing stderr;
     /// like `suppressed_warnings` it is monotone and never reset by `clear`.
     internal_bugs: usize,
-    /// Conservative "some diagnostic may lack a source" marker, so
-    /// [`Self::audit_source_attachment`] can skip its O(suffix) scan on the
-    /// happy path.  Set by `push` when it sees a sourceless diagnostic, cleared
-    /// by [`Self::attach_source`] (which patches every one) and by the audit
-    /// itself when it finds nothing.  Staleness is sound in one direction only:
-    /// a stale `true` costs a scan, a stale `false` would skip a real audit, so
-    /// every mutator that can remove diagnostics leaves it set.
-    may_have_unsourced: bool,
+    /// "Some diagnostic in the *reported prefix* may lack a source."
+    ///
+    /// Two flags rather than one: the audit scans only the unreported suffix, so
+    /// a single flag could not be cleared on a clean suffix (a nonempty prefix
+    /// was unaudited) and `reported_len > 0` froze it at `true` for the rest of
+    /// the context's life — permanently disabling the O(1) gate on exactly the
+    /// LSP re-publish loop it exists for.  Each region now carries the exact flag
+    /// its own tally describes: `mark_all_reported` transfers suffix→prefix,
+    /// prefix removal clears the prefix flag, `attach_source` (a full-vector
+    /// patch) clears both.  Staleness remains sound in one direction only: a
+    /// stale `true` costs a scan, a stale `false` would skip a real audit.
+    may_have_unsourced_prefix: bool,
+    /// Same, for the unreported suffix.  Armed by a sourceless `push`, cleared by
+    /// a clean suffix audit (which covers exactly that region) and by
+    /// `attach_source`.
+    may_have_unsourced_suffix: bool,
 }
 
 /// The inline `SmallVec<[Diagnostic; 2]>` is what keeps a zero/one-diagnostic
 /// context on the stack; fail the build if `DiagCtxt` (or `Diagnostic`) grows
 /// enough to make that a silent per-context stack cost.
 const _: () = assert!(std::mem::size_of::<DiagCtxt<'_>>() <= 1024);
-
-/// Mutable view restricted to the emitter's humanize boundary.  `Deref`
-/// exposes read access; obtaining `&mut Diagnostic` requires the explicit
-/// `into_diagnostic`, so a future caller cannot change a level through the
-/// iterator by accident.
-pub(crate) struct HumanizeOnly<'a, 'src>(&'a mut Diagnostic<'src>);
-
-impl<'a, 'src> HumanizeOnly<'a, 'src> {
-    pub(crate) fn humanize(&mut self) {
-        self.0.humanize();
-    }
-
-    /// Explicit escape for the emitter's render path.
-    pub(crate) fn into_diagnostic(self) -> &'a mut Diagnostic<'src> {
-        self.0
-    }
-}
-
-impl<'a, 'src> std::ops::Deref for HumanizeOnly<'a, 'src> {
-    type Target = Diagnostic<'src>;
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
 
 impl<'src> DiagCtxt<'src> {
     /// Enable/disable warning emission for **subsequent** pushes.
@@ -147,7 +131,8 @@ impl<'src> DiagCtxt<'src> {
         DiagCtxt {
             diags: SmallVec::new(),
             reported_len: 0,
-            may_have_unsourced: false,
+            may_have_unsourced_prefix: false,
+            may_have_unsourced_suffix: false,
             can_emit_warnings: true,
             errors: 0,
             warnings: 0,
@@ -199,7 +184,7 @@ impl<'src> DiagCtxt<'src> {
         // diagnostic arrives without a source, cleared by `attach_source` (which
         // patches every one).  Staleness only costs a scan, never a missed audit.
         if diag.source().is_none() {
-            self.may_have_unsourced = true;
+            self.may_have_unsourced_suffix = true;
         }
         self.diags.push(diag);
         EmissionGuarantee::emitted()
@@ -286,7 +271,13 @@ impl<'src> DiagCtxt<'src> {
                 for diag in iter {
                     self.push(diag);
                 }
-                self.diags.shrink_to_fit();
+                // Give the optimistic slack back only when it dominates: a
+                // repeatedly mixed batch would otherwise shrink and regrow every
+                // call, resurrecting the reallocation chain the reserve exists to
+                // avoid.  An all-warning batch (slack == u) still reclaims it.
+                if self.diags.len() * 2 < u {
+                    self.diags.shrink_to_fit();
+                }
             }
             _ => {
                 for diag in iter {
@@ -299,9 +290,11 @@ impl<'src> DiagCtxt<'src> {
     /// Extend from an owned batch, pre-filtering warnings in place.
     ///
     /// The `Vec` case of [`Self::extend`], made explicit: `retain` compacts the
-    /// input without a temporary buffer, so the exact surviving count is free and
-    /// the reserve is exact.  An all-warning batch (what a warnings-disabled
-    /// build receives) costs one scan and zero allocations.
+    /// input without a temporary buffer, so the surviving count is exact and the
+    /// reserve matches it.  An all-warning batch (what a warnings-disabled build
+    /// receives) costs one scan and no allocation for the survivors, and the
+    /// warnings it drops are credited to `suppressed_warnings` exactly as the
+    /// `push` gate would credit them.
     pub fn extend_from_vec(&mut self, mut diags: Vec<Diagnostic<'src>>) {
         if self.can_emit_warnings {
             let kept = diags.len();
@@ -313,7 +306,14 @@ impl<'src> DiagCtxt<'src> {
             }
             return;
         }
+        // `retain` drops the warnings before `push` can see them, so the
+        // suppression tally has to be credited here.  Without this the same batch
+        // through `extend` (one `push` per item) reported N suppressed warnings
+        // and through this path reported zero — the "N warnings suppressed"
+        // surface under-reported by exactly the batch size.
+        let before = diags.len();
         diags.retain(|d| !d.is_warning());
+        self.suppressed_warnings += before - diags.len();
         let kept = diags.len();
         if kept > 0 {
             self.diags.reserve(kept);
@@ -345,12 +345,11 @@ impl<'src> DiagCtxt<'src> {
     /// production sites (two in the checker, two in the resolver), each once
     /// per file.
     pub fn attach_source(&mut self, source: &'src str) {
-        if !self.may_have_unsourced {
-            // `false` means every stored diagnostic is known-sourced: set by a
-            // full-coverage audit, a full-vector patch, or a sourced-only
-            // batch, and only ever re-armed by a sourceless `push`.  So the
-            // common steady state (producer attaches after each push batch)
-            // skips the scan entirely.
+        if !(self.may_have_unsourced_prefix || self.may_have_unsourced_suffix) {
+            // Both `false` means every stored diagnostic is known-sourced: set by
+            // two clean audits, a full-vector patch, or a sourced-only batch, and
+            // only ever re-armed by a sourceless `push`.  So the common steady
+            // state (producer attaches after each push batch) skips the scan.
             return;
         }
         for diag in &mut self.diags {
@@ -360,12 +359,10 @@ impl<'src> DiagCtxt<'src> {
         }
         // Post-condition: *every* diagnostic in the vector now carries a source
         // (the loop is unconditional over the vector, and an already-sourced one
-        // is left alone), so the audit's "may be unsourced" marker is clear.
-        // Without this the flag stuck at its first `true` and every later
-        // `emit` on a long-lived context paid the O(suffix) audit forever —
-        // precisely the LSP re-publish loop the O(1) gate exists for.  A new
-        // sourceless `push` sets it again.
-        self.may_have_unsourced = false;
+        // is left alone), so both region flags are clear.  A new sourceless
+        // `push` re-arms the suffix flag.
+        self.may_have_unsourced_prefix = false;
+        self.may_have_unsourced_suffix = false;
     }
 
     /// Total diagnostics (reported + unreported).
@@ -384,18 +381,6 @@ impl<'src> DiagCtxt<'src> {
     #[must_use]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Diagnostic<'src>> + ExactSizeIterator {
         self.diags.iter()
-    }
-
-    /// Iterate mutably over ALL diagnostics (reported first, then
-    /// unreported).  The name states the region explicitly: `emit` covers only
-    /// the unreported suffix, so a caller that pairs this iterator with an
-    /// emitter must intend a full re-render (the `emit_all_iter` contract),
-    /// not a checkpoint emit.  `HumanizeOnly` still restricts mutation to
-    /// humanization.
-    pub(crate) fn iter_all_mut(
-        &mut self,
-    ) -> impl DoubleEndedIterator<Item = HumanizeOnly<'_, 'src>> + ExactSizeIterator {
-        self.diags.iter_mut().map(HumanizeOnly)
     }
 
     /// Humanize every unreported diagnostic in place.
@@ -519,7 +504,8 @@ impl<'src> DiagCtxt<'src> {
     #[inline]
     fn refresh_unsourced_flag(&mut self) {
         if self.diags.is_empty() {
-            self.may_have_unsourced = false;
+            self.may_have_unsourced_prefix = false;
+            self.may_have_unsourced_suffix = false;
         }
     }
 
@@ -533,9 +519,9 @@ impl<'src> DiagCtxt<'src> {
         self.reported_errors = 0;
         self.reported_warnings = 0;
         // Derived state: the vector is empty, so "some diagnostic may lack a
-        // source" is provably false.  Leaving it set made the first post-clear
-        // emit pay a wasted audit and blocked `attach_source`'s O(1) path.
-        self.may_have_unsourced = false;
+        // source" is provably false for both regions.
+        self.may_have_unsourced_prefix = false;
+        self.may_have_unsourced_suffix = false;
         // `suppressed_warnings` is deliberately NOT reset: it is a
         // session-lifetime observation, not derived state.
     }
@@ -561,27 +547,15 @@ impl<'src> DiagCtxt<'src> {
             return Ok(());
         }
         self.audit_source_attachment();
-        // Scan the *diagnostics* before and after the handover.  Comparing the
-        // collector's own tallies would be structurally dead: the emitter holds
-        // no reference to this context, so those fields cannot change across the
-        // call.  The raw `&mut [Diagnostic]` it receives is the real mutation
-        // surface (`render_into` takes `&mut Diagnostic`), and the post-condition
-        // this asserts is the one `augment_last_diagnostic`'s doc warns about
-        // ("`check()` can return `Ok` for a context holding an `Error`").
-        //
-        // A sampled `recount_derived_state` cannot substitute: it would rewrite
-        // the tallies from the post-mutation diagnostics and launder the flip.
-        // Debug-only, and deliberately unconditional — sampling here would
-        // reintroduce exactly that laundering.
-        #[cfg(debug_assertions)]
-        let pre_emit = scan_derived(&self.diags[self.reported_len..], 0);
-        emitter.emit_all(&mut self.diags[self.reported_len..])?;
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            scan_derived(&self.diags[self.reported_len..], 0),
-            pre_emit,
-            "emitter mutated a diagnostic's severity through the raw `&mut` slice"
-        );
+        // §3.1: the mutation channel is closed by the *type*, not by an
+        // observation.  `DiagCtxt` humanizes at the boundary (the emitter's batch
+        // paths take `&Diagnostic`, since every `Renderer::render_into` already
+        // does), so nothing downstream can change a severity — the pre/post
+        // `scan_derived` pair that existed only to detect such a change, and the
+        // `HumanizeOnly` wrapper that tried to restrict it, are both gone.  In
+        // release the guarantee used to be "trust"; now it is the borrow checker.
+        self.humanize_pending();
+        emitter.emit_all(&self.diags[self.reported_len..])?;
         // Repair path (not a detector): an external checkpoint consumer may
         // have called `recount_derived_state` between emits, and this keeps the
         // tallies consistent with the vectors it owns.  Sampled rather than
@@ -805,6 +779,10 @@ impl<'src> DiagCtxt<'src> {
     /// everything.  Useful after a checkpoint / snapshot in incremental
     /// compilation.
     pub fn mark_all_reported(&mut self) {
+        // The suffix's unsourced set becomes the prefix's: the same diagnostics,
+        // unaudited, on the other side of the partition.
+        self.may_have_unsourced_prefix |= self.may_have_unsourced_suffix;
+        self.may_have_unsourced_suffix = false;
         self.reported_errors += self.unreported_errors;
         self.reported_warnings += self.unreported_warnings;
         self.reported_len = self.diags.len();
@@ -1031,23 +1009,20 @@ impl<'src> DiagCtxt<'src> {
     /// constructing an emitter.  Scans only the batch about to be emitted, so a
     /// long-lived context stays O(suffix) per emit rather than O(n).
     pub(crate) fn audit_source_attachment(&mut self) {
-        if !self.may_have_unsourced {
-            // Every push carried a source and no later step can remove one, so
-            // the O(suffix) scan below is dead work on the happy path.
+        if !self.may_have_unsourced_suffix {
+            // Every push since the last clean scan carried a source and no later
+            // step can remove one, so the O(suffix) scan below is dead work.
             return;
         }
         let start = self.reported_len;
         let suffix = &self.diags[start..];
         let Some(first) = suffix.iter().position(|d| d.source().is_none()) else {
-            // Clear only when the scan covered the whole vector.  `reported_len
-            // > 0` means `mark_all_reported` moved diagnostics into the prefix
-            // *without* auditing them, so a clean suffix says nothing about
-            // them: clearing here would manufacture exactly the stale `false`
-            // that the flag's one-way soundness doc forbids (a later
-            // `attach_source` fast path would then skip patching the prefix).
-            if self.reported_len == 0 {
-                self.may_have_unsourced = false;
-            }
+            // Exact now: this scan covered precisely the suffix, so it clears
+            // precisely the suffix flag.  The prefix keeps its own flag (armed by
+            // `mark_all_reported`), so a clean suffix with a nonempty prefix no
+            // longer freezes the gate permanently *and* still cannot manufacture
+            // the stale `false` the one-way soundness rule forbids.
+            self.may_have_unsourced_suffix = false;
             return;
         };
         // Bug state only, so the second pass is acceptable — and reporting just
@@ -1223,10 +1198,11 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
             reported_warnings: 0,
             suppressed_warnings: 0,
             internal_bugs: 0,
-            // The constructor's own scan already answered this; assuming
-            // `true` made every sourced batch pay one wasted audit at first
-            // emit and gave up the O(1) `attach_source` path.
-            may_have_unsourced: has_unsourced,
+            // The constructor's own scan already answered this for the whole
+            // (unreported) vector; assuming `true` made every sourced batch pay
+            // one wasted audit at first emit and gave up the O(1) path.
+            may_have_unsourced_prefix: false,
+            may_have_unsourced_suffix: has_unsourced,
         }
     }
 }
@@ -1561,6 +1537,68 @@ mod tests {
     /// pushes are suppressed.  Pinning this so the doc contract cannot drift
     /// into an emit-time filter silently.
     #[test]
+    /// 1.1's pin: the same batch through `extend` and through `extend_from_vec`
+    /// must report the same number of suppressed warnings.  The `retain` path
+    /// dropped them before `push` could count them, so this parity was the whole
+    /// bug.
+    #[test]
+    fn suppressed_count_parity_between_extend_and_extend_from_vec() {
+        let batch = || {
+            (0..8)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        Diagnostic::warning("w")
+                    } else {
+                        Diagnostic::error("e")
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut via_extend = DiagCtxt::new();
+        via_extend.set_can_emit_warnings(false);
+        via_extend.extend(batch());
+
+        let mut via_vec = DiagCtxt::new();
+        via_vec.set_can_emit_warnings(false);
+        via_vec.extend_from_vec(batch());
+
+        assert_eq!(via_extend.suppressed_warning_count(), 4);
+        assert_eq!(
+            via_vec.suppressed_warning_count(),
+            via_extend.suppressed_warning_count(),
+            "the pre-filtered path must credit the same suppressions"
+        );
+        assert_eq!(via_vec.error_count(), via_extend.error_count());
+        assert_eq!(via_vec.warning_count(), 0);
+    }
+
+    /// 1.4's pin: the two region flags are exact, so a clean suffix audit clears
+    /// only the suffix flag and the O(1) `attach_source` gate survives a
+    /// long-lived context with a reported prefix.
+    #[test]
+    fn unsourced_flags_are_per_region() {
+        let mut ctx = DiagCtxt::new();
+        ctx.push(Diagnostic::error("no source"));
+        ctx.mark_all_reported();
+        assert!(ctx.may_have_unsourced_prefix);
+        assert!(!ctx.may_have_unsourced_suffix);
+
+        // A clean suffix audit must not clear the prefix flag (the prefix was
+        // never audited), but it does clear the suffix flag exactly.
+        ctx.audit_source_attachment();
+        assert!(ctx.may_have_unsourced_prefix);
+        assert!(!ctx.may_have_unsourced_suffix);
+
+        // A full-vector patch clears both, and the fast path is armed again.
+        ctx.attach_source("src/x.pn");
+        assert!(!ctx.may_have_unsourced_prefix);
+        assert!(!ctx.may_have_unsourced_suffix);
+        for d in ctx.iter() {
+            assert!(d.source().is_some());
+        }
+    }
+
     fn warning_gate_is_push_time_not_emit_time() {
         use crate::diagnostics::DiagOpts;
         use crate::diagnostics::renderers::JsonRenderer;

@@ -1,4 +1,5 @@
 use crate::ast::Span;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 
 /// Kind of annotation underline.
@@ -169,7 +170,14 @@ pub struct Snippet<'a> {
     /// The raw source text (may span multiple lines).
     pub source: &'a str,
     /// Annotations (labels) attached to this snippet.
-    pub annotations: Vec<Label<'a>>,
+    ///
+    /// `SmallVec<[Label; 2]>`, not `Vec`: an annotated snippet carries one or two
+    /// labels in every realistic shape, so the inline case skips the allocation
+    /// entirely.  This is the same reasoning `Diagnostic::labels` uses with
+    /// `CovariantVec<_, 1>` — the inline capacity differs only because
+    /// `Diagnostic` has a 384-byte size guard while `Snippet` is built and
+    /// consumed within one render.
+    pub annotations: SmallVec<[Label<'a>; 2]>,
     /// Whether to fold long runs of unannotated lines into `…`.
     pub fold: bool,
 }
@@ -181,7 +189,7 @@ impl<'a> Snippet<'a> {
             origin: origin.into(),
             line_start: 1,
             source,
-            annotations: Vec::new(),
+            annotations: SmallVec::new(),
             fold: false,
         }
     }

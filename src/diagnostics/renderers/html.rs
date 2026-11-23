@@ -179,10 +179,25 @@ impl Renderer for HtmlRenderer {
         page.push_str(template);
         page.push_str(dark);
         page.push_str(rest);
+        // `replacen(.., 1)` rather than `replace`: a translation that happened
+        // to contain another marker would otherwise be substituted again by the
+        // next pass, and every substitution is escaped because the page is HTML
+        // and Fluent text is external input (`<` or `&` in a translation must not
+        // become markup).  Three full-string scans remain; the page is built once
+        // per batch, so a single-pass writer would be a larger rewrite for no
+        // measurable gain.
         let localized = page
-            .replace("__PONENT_TITLE__", &localized_slug("html-doc-title"))
-            .replace("__PONENT_H1__", &localized_slug("html-h1"))
-            .replace("__PONENT_TOGGLE__", &localized_slug("html-toggle-theme"));
+            .replacen(
+                "__PONENT_TITLE__",
+                &self.escape(&localized_slug("html-doc-title")),
+                1,
+            )
+            .replacen("__PONENT_H1__", &self.escape(&localized_slug("html-h1")), 1)
+            .replacen(
+                "__PONENT_TOGGLE__",
+                &self.escape(&localized_slug("html-toggle-theme")),
+                1,
+            );
         out.write_str(&localized)
     }
 
@@ -415,6 +430,14 @@ impl HtmlRenderer {
                     html.push_str(&self.escape(&lbl.span.to_string()));
                     html.push_str("</span>\n");
                 }
+                // Additional primaries carry no message but *do* carry a
+                // location; the source-less path already emits `at <span>` for
+                // them, and dropping them here silently lost where they point.
+                for sp in anchor_primary_spans.iter().skip(1) {
+                    html.push_str("<span class='label'>= note: at ");
+                    html.push_str(&self.escape(&sp.to_string()));
+                    html.push_str("</span>\n");
+                }
             }
             // Labels filtered out of the source section (from other files)
             // stay visible as range notes; their line/col would be
@@ -484,6 +507,11 @@ impl HtmlRenderer {
                     }
                 }
             }
+            // Sorted once so the fallback loops below are `O(log F)` per label
+            // with no linear `contains` over the foreign files (the glyph
+            // renderer moved to a map for the same reason).
+            foreign_rendered_files.sort_unstable();
+            foreign_rendered_files.dedup();
             for lbl in diag
                 .labels
                 .iter()
@@ -492,7 +520,7 @@ impl HtmlRenderer {
                 if lbl.message.is_empty() {
                     continue;
                 }
-                if foreign_rendered_files.contains(&lbl.span.file) {
+                if foreign_rendered_files.binary_search(&lbl.span.file).is_ok() {
                     continue;
                 }
                 html.push_str("<span class='label'>= note: ");
@@ -505,7 +533,9 @@ impl HtmlRenderer {
             // section could not draw) must not vanish: surface each as a
             // location-only note, mirroring the glyph renderer's fallback.
             for sp in primary_spans.iter() {
-                if Some(sp.file) == anchor_file || foreign_rendered_files.contains(&sp.file) {
+                if Some(sp.file) == anchor_file
+                    || foreign_rendered_files.binary_search(&sp.file).is_ok()
+                {
                     continue;
                 }
                 // Per-span file name: a foreign span must keep its own name,
@@ -633,6 +663,13 @@ impl HtmlRenderer {
             {
                 continue;
             }
+            // Anchor source when there is one (this path renders in-place edits
+            // against it); otherwise the span is used as-is and `to_linecol`'s
+            // own bounds apply.
+            let span = match diag.source() {
+                Some(src) => Self::clamp_span_to_source(span, src.len()),
+                None => span,
+            };
             let start_pos = idx.to_linecol(span.start_as_usize());
             let end_pos = idx.to_linecol(span.end_as_usize());
             let (line, col) = (start_pos.line, start_pos.col);
@@ -739,6 +776,18 @@ impl HtmlRenderer {
     /// Render the source context as HTML, directly from the Diagnostic's
     /// source text, spans, and labels — without going through GlyphRenderer's
     /// terminal-formatted output.
+    /// Clamp a span's byte offsets into `source_len`.
+    ///
+    /// The header of the rendered section has always done this, because a
+    /// malformed or foreign span can carry an offset past the buffer; the
+    /// `to_linecol`/`span_lines` callers below did not, so the same input that
+    /// the header tolerated could panic (or silently slice a wrong window) on the
+    /// underline path.  Every index query now goes through this.
+    fn clamp_span_to_source(sp: Span, source_len: usize) -> Span {
+        let len = u32::try_from(source_len).unwrap_or(u32::MAX);
+        Span::new(sp.file, sp.start.min(len), sp.end.min(len))
+    }
+
     fn render_source_html_into<'src>(
         &self,
         source: &str,
@@ -791,6 +840,7 @@ impl HtmlRenderer {
         let primary_lines: SmallVec<[(usize, usize); 4]> = primary_spans
             .iter()
             .map(|&sp| {
+                let sp = Self::clamp_span_to_source(sp, source.len());
                 let s = idx.to_linecol(sp.start_as_usize());
                 // End line comes from `span_lines`, not `to_linecol(end)`:
                 // the exclusive-end byte can land on a line start, which
@@ -850,6 +900,12 @@ impl HtmlRenderer {
         for &(s_line, e_line) in &sorted_lines {
             let s0 = s_line.saturating_sub(context_lines);
             let e0 = std::cmp::min(e_line.saturating_add(context_lines), text_last_line);
+            // Defensive: an inverted window is only reachable from a malformed
+            // span, and it must not advance the fold cursor (`prev_section_last`)
+            // into a marker for rows it never rendered.
+            if s0 > e0 {
+                continue;
+            }
             if let Some(last) = sections.last_mut()
                 && s0 <= last.1.saturating_add(1)
             {
@@ -863,8 +919,10 @@ impl HtmlRenderer {
         // `SmallVec<[(usize, usize); 4]>`: labels-per-diagnostic rarely exceeds
         // 4, so the common case stays inline — one fewer heap allocation per
         // source section.
-        let label_line_ranges: SmallVec<[(usize, usize); 4]> =
-            all_labels.iter().map(|l| idx.span_lines(l.span)).collect();
+        let label_line_ranges: SmallVec<[(usize, usize); 4]> = all_labels
+            .iter()
+            .map(|l| idx.span_lines(Self::clamp_span_to_source(l.span, source.len())))
+            .collect();
         // Start-line-sorted permutation, computed once and shared by every
         // section so `LabelWindow` merges into a pre-sorted order instead of
         // re-sorting the union per section (`K·L log L` → `L log L + K·L`),
@@ -1255,6 +1313,20 @@ impl HtmlRenderer {
             out.push_str(escaped.as_ref());
             return;
         }
+        // The cache is a map plus a FIFO of the same keys; every path keeps them
+        // in step, and the eviction loop below *relies* on that (it pops while
+        // `len >= 1024`, breaking when the FIFO runs dry).  If they ever desync,
+        // that loop stops truncating and the map grows without bound, so make the
+        // invariant loud in debug and recover instead of unbounding in release.
+        #[cfg(debug_assertions)]
+        ESCAPE_CACHE.with(|cell| {
+            let cache = cell.borrow();
+            debug_assert_eq!(
+                cache.0.len(),
+                cache.1.len(),
+                "escape cache map/FIFO desynchronised"
+            );
+        });
         let hit = ESCAPE_CACHE.with(|cell| {
             let mut cache = cell.borrow_mut();
             cache.0.get_mut(s).map(|entry| {
@@ -1278,6 +1350,12 @@ impl HtmlRenderer {
             let mut cache = cell.borrow_mut();
             while cache.0.len() >= 1024 {
                 let Some(old) = cache.1.pop_front() else {
+                    // Desync recovery (the invariant is asserted above in debug):
+                    // without a FIFO entry this `break` would leave the map at or
+                    // above the cap, and every subsequent insert would grow it
+                    // without bound.  Dropping the map is always correct — it is
+                    // a cache.
+                    cache.0.clear();
                     break;
                 };
                 let evict = match cache.0.get_mut(&old) {
@@ -1451,6 +1529,17 @@ fn push_html_escaped(out: &mut String, s: &str) {
     // message path already sanitizes).  Per-run sanitization keeps offsets
     // within the callback; the row/annotation columns were computed before
     // this point.
+    //
+    // KNOWN LIMITATION (reviewed, deliberately not "fixed" by sanitizing the
+    // whole line up front): the underline columns come from
+    // `compute_line_annotation_ranges`, which measures the **raw** line, while
+    // this callback replaces one control byte with the three-byte U+FFFD.  A
+    // source line containing C0/DEL/C1 can therefore show its carets shifted
+    // relative to the visible text.  Hoisting the sanitize before the row
+    // renderer would fix the alignment but invalidate every byte offset the
+    // ranges were built from (they index the raw line), so it is a change to the
+    // shared row pipeline, not a local one.  `control_byte_in_a_source_row_shifts_the_caret_lane`
+    // pins the current behaviour so a future fix is a visible diff.
     let sanitized = crate::diagnostics::sanitize_for_terminal_multiline(s);
     let s = sanitized.as_ref();
     let bytes = s.as_bytes();
@@ -2069,6 +2158,29 @@ mod tests {
             let html = HtmlRenderer::new().diagnostic_to_html(&diag);
             assert!(html.contains("at eof"), "EOF label dropped: {html}");
         }
+    }
+
+    /// Pins the reviewed, deliberately unfixed limitation: the caret lane is
+    /// measured on the **raw** line, while the emitted text replaces a control
+    /// byte with the wider U+FFFD.  A future fix (sanitizing the whole row
+    /// before the ranges are computed) must show up as a change here, not as a
+    /// silent shift.
+    #[test]
+    fn control_byte_in_a_source_row_shifts_the_caret_lane() {
+        // One C0 byte before the labelled token: 1 raw byte becomes 3 bytes of
+        // U+FFFD, so the raw-column caret no longer sits under the token.
+        let source = "a\x07bc def\n";
+        let start = source.find("bc").unwrap() as u32;
+        let diag = Diagnostic::error("ctrl")
+            .with_span(Span::new(FileId::DUMMY, start, start + 2))
+            .with_label(Span::new(FileId::DUMMY, start, start + 2), "here")
+            .with_source(source);
+        let html = HtmlRenderer::new().diagnostic_to_html(&diag);
+        assert!(
+            html.contains('\u{FFFD}'),
+            "the control byte must not reach the page raw: {html}"
+        );
+        assert!(html.contains("here"), "the label must still render: {html}");
     }
 
     #[test]

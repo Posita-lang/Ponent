@@ -304,6 +304,12 @@ pub trait Humanizer<'src> {
     /// kind skips the intermediate `Vec` allocation the old `Vec` return
     /// forced.  (The inline capacity stays 1: widening it to 2 grows every
     /// `Diagnostic` past its 384-byte size guard.)
+    ///
+    /// **Labels are resolved eagerly**, against the `Lang` active at call time
+    /// (`Label` carries text, not a slug), while messages stay lazy.  That is the
+    /// existing design, not drift: `humanize` runs immediately before render, so
+    /// the window is small — but a caller that switches `Lang` in between sees
+    /// the labels in the old language.
     fn labels(&self) -> CovariantVec<'src, Label<'src>, 1>;
 
     /// Optional help text.
@@ -311,7 +317,17 @@ pub trait Humanizer<'src> {
         None
     }
 
-    /// Optional suggestions.
+    /// Structured suggestions — the lazy twin of `humanize_into`'s fourth tuple
+    /// slot.
+    ///
+    /// **No variant overrides this today**: `NameNotFound` and friends put their
+    /// advice in `help()` (a `DiagMessage`), so both humanize paths return an
+    /// empty vector and `Diagnostic::suggestions` is populated by the caller, not
+    /// by a kind.  Kept as the documented extension point (a future variant with
+    /// structured data — import paths, similar-identifier spans — overrides here
+    /// *and* in `humanize_into`, which `humanizer_and_humanize_into_agree` pins
+    /// equal) rather than deleted and re-added: it costs one empty `Vec` (no
+    /// allocation) and keeps the two humanize paths symmetric.
     fn suggestions(&self) -> Vec<Cow<'src, str>> {
         vec![]
     }
@@ -380,9 +396,15 @@ fn name_not_found_help<'src>(suggestions: &[Cow<'src, str>]) -> Option<Cow<'src,
     Some(crate::diagnostics::i18n::fluent::did_you_mean(joined).lift())
 }
 
+/// Build the `TypeMismatch` message.
+///
+/// `found` is taken **by value**: the consuming `humanize_into` path moves it in
+/// unless a `found_span` label also needs it, which is the only case where the
+/// old `&found` form's clone was actually required.  The borrowing
+/// `Humanizer::message` path clones once, as it must.
 fn type_mismatch_message<'src>(
     expected: &Cow<'src, str>,
-    found: &Cow<'src, str>,
+    found: Cow<'src, str>,
     reason: Option<&Cow<'src, str>>,
     context: Option<TypeCtx>,
 ) -> DiagMessage<'src> {
@@ -402,7 +424,7 @@ fn type_mismatch_message<'src>(
         (true, false) => "type-mismatch-ctx",
         (true, true) => "type-mismatch-ctx-reason",
     };
-    let mut pairs = smallvec![("expected", expected.clone()), ("found", found.clone()),];
+    let mut pairs = smallvec![("expected", expected.clone()), ("found", found),];
     if let Some(label) = ctx_label {
         // `TypeCtx::label()` returns `&'static str`; the message slug wants a
         // `Cow`, and borrowing is free (no copy, no refcount).
@@ -424,6 +446,16 @@ fn type_mismatch_message<'src>(
 /// is the traceback's.
 const MAX_TRACEBACK_FRAMES: usize = 16;
 
+/// Build a `Comptime` message, appending the call stack when there is one.
+///
+/// **Language contract (asymmetric on purpose).**  With an empty traceback this
+/// returns a lazy [`DiagMessage`] slug, resolved against the active `Lang` at
+/// *render* time like every other variant.  With a non-empty traceback the base
+/// message is rendered **now** (it is concatenated with the frame lines, and
+/// `DiagMessage` has no composed form), so it freezes whatever `Lang` was active
+/// at `humanize` time.  A caller that switches `Lang` between `humanize` and
+/// render therefore sees mixed-language output for this one shape.  The frame
+/// labels are eager for the same reason (see `Humanizer::labels`).
 fn comptime_message_with_traceback<'src>(
     kind: &ComptimeErrorKind,
     traceback: &[(ComptimeReason, Option<Span>)],
@@ -506,7 +538,7 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
                 reason,
                 context,
                 ..
-            } => type_mismatch_message(expected, found, reason.as_ref(), *context),
+            } => type_mismatch_message(expected, found.clone(), reason.as_ref(), *context),
             DiagnosticKind::NoSuchField {
                 field_name,
                 type_name,
@@ -748,10 +780,14 @@ impl<'src> DiagnosticKind<'src> {
                 reason,
                 context,
             } => {
-                let message = type_mismatch_message(&expected, &found, reason.as_ref(), context);
+                // `found` is needed twice only when there is a `found_span`
+                // label; with no label the old `&found` signature cloned an owned
+                // type name that was then dropped unused.
+                let found_for_label = found_span.is_some().then(|| found.clone());
+                let message = type_mismatch_message(&expected, found, reason.as_ref(), context);
                 let mut labels = CovariantVec::new();
                 labels.push(Label::new(span, fluent::label_expected(expected).lift()));
-                if let Some(fs) = found_span {
+                if let (Some(fs), Some(found)) = (found_span, found_for_label) {
                     labels.push(Label::secondary(fs, found));
                 }
                 (
@@ -1222,6 +1258,39 @@ mod humanizer_differential_tests {
     /// The borrowing `Humanizer` impl and the consuming `humanize_into`
     /// duplicate every variant's formatting with no oracle. Pin them equal for
     /// a corpus covering every variant and the main option combinations.
+    /// The `Comptime` message is lazy (slug) without a traceback and eager
+    /// (rendered text) with one, because the frames are concatenated and
+    /// `DiagMessage` has no composed form.  That asymmetry is the only place a
+    /// message freezes the active `Lang`, so pin the *shape* — a future
+    /// `DiagMessage` variant could legitimately change it, but not silently.
+    #[test]
+    fn comptime_message_is_lazy_without_a_traceback_and_eager_with_one() {
+        use super::{ComptimeErrorKind, ComptimeReason};
+
+        let span = crate::ast::Span::new(crate::ast::FileId::DUMMY, 0, 1);
+        let kind = || ComptimeErrorKind::TypeError(std::sync::Arc::from("Int vs Unit"));
+
+        let plain = DiagnosticKind::Comptime {
+            kind: kind(),
+            span,
+            traceback: Vec::new(),
+        };
+        assert!(
+            matches!(plain.message(), DiagMessage::Slug { .. }),
+            "no traceback must stay a lazy slug"
+        );
+
+        let with_frames = DiagnosticKind::Comptime {
+            kind: kind(),
+            span,
+            traceback: vec![(ComptimeReason::ComptimeBlock, Some(span))],
+        };
+        assert!(
+            matches!(with_frames.message(), DiagMessage::Static(_)),
+            "a traceback pre-renders the message (and freezes `Lang`)"
+        );
+    }
+
     #[test]
     fn humanizer_and_humanize_into_agree() {
         let _lang_guard = crate::diagnostics::i18n::acquire_test_lang_lock();
