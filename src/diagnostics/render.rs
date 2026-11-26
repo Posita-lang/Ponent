@@ -37,54 +37,48 @@ const STABLE_CACHE_MAX_SOURCE: usize = 512 * 1024;
 pub(crate) const PRELOAD_SLOTS: usize = 4;
 const _: () = assert!(PRELOAD_SLOTS <= CACHE_SLOTS);
 
-/// One `OnceLock` per file name (2.1): concurrent workers racing on the same
+/// Decision record for the remaining open questions in this module.
+///
+/// Recorded here (next to the constants they concern) so the next reader does not
+/// re-derive them; each entry names the evidence, not just a verdict.
+///
+/// * **In-flight dedup of `SharedSources` builds — already covered, no change.**
+///   A racing name pays one `canonicalize` because the map stores a `OnceLock`
+///   per name (below), the *line-table* work is shared per batch through
+///   [`SharedSources`], and across batches through the emitter's
+///   `file_index_cache` (content-hash keyed).  A per-build in-flight cell would
+///   add a second state machine on top of two that already exist.
+/// * **Storing a hash instead of the source text in the stable tier — rejected as
+///   a policy change.**  The stored text is what makes the tier's verification
+///   *absolute*: a hash trades that for a probability, and the tier exists
+///   precisely to be the one path that cannot serve the wrong file's tables.
+///   Sources above `STABLE_CACHE_MAX_SOURCE` re-scan instead; the cost is
+///   documented rather than hidden.
+/// * **A "tier 0.5" fingerprint-only tier — rejected** for the same reason: it is
+///   the hash-tier idea with a smaller cache.
+/// * **A monotone cursor for `linecol_display` — measurement-gated.**  The
+///   `perf_linecol_display_repeated_queries` probe exists to answer whether
+///   repeated queries re-walk the line; the cursor only pays if they do.
+/// * **Sizing `PRELOAD_SLOTS` from batch metadata — measurement-gated.**  The
+///   constant is 4 because that is the measured knee; sizing it dynamically
+///   needs a benchmark at 0/4/8/16 distinct files, not an argument.
+/// * **No action on the remaining open questions:** the two-tier cache split is
+///   deliberate, and the perf probes are already
+///   `#[cfg(all(test, not(feature = "shuttle")))]`.
+///
+/// One `OnceLock` per file name: concurrent workers racing on the same
 /// name pay one `canonicalize`, not one each.
+///
+/// **Growth model (deliberate):** entries are never evicted — a `OnceLock` slot
+/// cannot be reset, and the map is hoisted on `SharedRenderState`, so a
+/// long-lived LSP emitter accumulates ~200 bytes per *distinct spelling* of a
+/// path (`src/lib.rs` and `./src/lib.rs` are two entries and two
+/// `canonicalize`s) for the process lifetime.  That is bounded by the session's
+/// file count, not by renders, which is why it is acceptable; the
+/// `debug_assert` in `file_url` turns a pathological producer into a loud
+/// failure instead of silent unbounded growth.
 pub(crate) type FileUrlMap =
     Arc<std::sync::RwLock<FxHashMap<String, Arc<std::sync::OnceLock<Arc<str>>>>>>;
-
-/// One cached per-line sparse table plus its last-access timestamp.
-///
-/// The timestamp lives behind an atomic so a cache *hit* can refresh LRU
-/// recency while holding only the map's read lock.  Eviction (which needs a
-/// write lock) scans for the smallest timestamp; this happens only when the
-/// soft cap is reached, so the hot path stays a single atomic load/store.
-#[derive(Debug)]
-pub(crate) struct CharPrefixEntry {
-    pub table: Option<(Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>,
-    last_used: std::sync::atomic::AtomicU64,
-}
-
-impl CharPrefixEntry {
-    pub(crate) fn new(table: Option<(Arc<[(u32, u32)]>, std::sync::atomic::AtomicUsize)>) -> Self {
-        Self {
-            table,
-            last_used: std::sync::atomic::AtomicU64::new(next_char_prefix_tick()),
-        }
-    }
-
-    pub(crate) fn touch(&self) {
-        self.last_used.store(
-            next_char_prefix_tick(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    pub(crate) fn last_used(&self) -> u64 {
-        self.last_used.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-static CHAR_PREFIX_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn next_char_prefix_tick() -> u64 {
-    CHAR_PREFIX_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Shared sparse non-ASCII char-extra cache (see
-/// [`LineIndex::char_prefixes_arc`]): per-line tables behind an atomic hint,
-/// so a racy store can only cost a re-anchor, never a wrong answer.
-/// `Send + Sync`, so the parallel path shares one map across workers.
-pub(crate) type CharPrefixMap = std::sync::RwLock<FxHashMap<usize, CharPrefixEntry>>;
 
 /// One cached line index, keyed by source identity `(ptr, len)`.
 struct CachedSourceIndex {
@@ -95,7 +89,7 @@ struct CachedSourceIndex {
     /// Shared sparse non-ASCII char-extra cache, threaded through so a cache
     /// hit reuses the per-line tables a previous render built instead of
     /// rebuilding them per diagnostic.
-    char_prefixes: Arc<CharPrefixMap>,
+    char_prefixes: crate::diagnostics::LinePrefixTables,
     /// Generation id from the `LineIndex::new` that built these tables —
     /// threaded through so `from_shared` indexes keep the ABA-proof memo key.
     generation: u64,
@@ -119,7 +113,7 @@ struct StableSourceIndex {
     fingerprint: u64,
     starts: Arc<[u32]>,
     ascii: bool,
-    char_prefixes: Arc<CharPrefixMap>,
+    char_prefixes: crate::diagnostics::LinePrefixTables,
     generation: u64,
 }
 
@@ -161,7 +155,7 @@ pub(crate) struct PreloadedSource {
     pub len: usize,
     pub starts: Arc<[u32]>,
     pub ascii: bool,
-    pub char_prefixes: Arc<CharPrefixMap>,
+    pub char_prefixes: crate::diagnostics::LinePrefixTables,
     pub generation: u64,
     pub fingerprint: u64,
 }
@@ -172,7 +166,7 @@ pub(crate) struct PreloadedSource {
 struct SharedSourceIndex {
     starts: Arc<[u32]>,
     ascii: bool,
-    char_prefixes: Arc<CharPrefixMap>,
+    char_prefixes: crate::diagnostics::LinePrefixTables,
     generation: u64,
     #[cfg(debug_assertions)]
     fingerprint: u64,
@@ -187,7 +181,19 @@ struct SharedSourceIndex {
 /// builds at most once per batch.  It is dropped with the batch, so a
 /// `(ptr, len)` key can never outlive its source.
 pub(crate) struct SharedSources {
-    map: std::sync::RwLock<FxHashMap<(usize, usize), SharedSourceIndex>>,
+    map: std::sync::RwLock<FxHashMap<SourceKey, SharedSourceIndex>>,
+}
+
+/// Identity of a source buffer: base pointer + length.
+///
+/// A named struct, not a `(usize, usize)` tuple: the two fields are both `usize`,
+/// adjacent in every call, and a swapped pair is a *silent* wrong-key (it simply
+/// never hits, or — worse — hits another buffer's entry when two allocations
+/// happen to alias).  Named fields make the swap a type error instead.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SourceKey {
+    pub ptr: usize,
+    pub len: usize,
 }
 
 impl SharedSources {
@@ -196,12 +202,27 @@ impl SharedSources {
     pub(crate) fn from_entries(entries: &[PreloadedSource]) -> Arc<Self> {
         let mut map = FxHashMap::default();
         for e in entries {
+            // Same policy as the tier-0 check: a sentinel entry ("tables built
+            // without source text") cannot be pointer-keyed, because nothing could
+            // ever verify its `(ptr, len)`.  Admitting one made the *other* tiers'
+            // ABA tripwire skippable (`fingerprint != 0` guards) for that entry
+            // forever — tier-0's fix was not propagated here.
+            debug_assert!(
+                e.fingerprint != 0,
+                "sentinel entry passed to SharedSources::from_entries — a table built                  without source text cannot be pointer-keyed"
+            );
+            if e.fingerprint == 0 {
+                continue;
+            }
             map.insert(
-                (e.ptr, e.len),
+                SourceKey {
+                    ptr: e.ptr,
+                    len: e.len,
+                },
                 SharedSourceIndex {
                     starts: Arc::clone(&e.starts),
                     ascii: e.ascii,
-                    char_prefixes: Arc::clone(&e.char_prefixes),
+                    char_prefixes: e.char_prefixes.clone(),
                     generation: e.generation,
                     #[cfg(debug_assertions)]
                     fingerprint: e.fingerprint,
@@ -268,16 +289,23 @@ pub struct RenderCtx<'a> {
     /// diagnostic performs it once for the header plus once per note locator.
     /// Measured on a 200 KB single line it costs ~55 ms per call in a debug
     /// build — roughly a hundred times a whole diagnostic's render — so one
-    /// table per line per batch is what makes long-line sources tractable.  A
-    /// single slot suffices: a render's sections sit on the same line range.
+    /// table per line per batch is what makes long-line sources tractable.
+    ///
+    /// **Four slots, not one.**  The single slot assumed "a render's sections sit
+    /// on the same line range", but a diagnostic converts its primary span's line
+    /// and then each label's line, so the dominant shape *alternates* two distant
+    /// lines — and every alternation was a full `LineColumns::new` rebuild (~55 ms
+    /// per call on a long line).  Slots are indexed by `line_no & 3` with full key
+    /// validation (a collision just misses and recomputes), so there is no
+    /// eviction policy to get wrong.
     line_columns: RefCell<
-        Option<(
+        [Option<(
             usize,
             usize,
             usize,
             usize,
             crate::diagnostics::glyph::LineColumns,
-        )>,
+        )>; 4],
     >,
     /// Cross-emit content-verified cache, present only on the hoisted
     /// single-diagnostic path.  Entries carry a source copy so a hit cannot
@@ -320,12 +348,19 @@ pub struct RenderCtx<'a> {
 impl<'a> RenderCtx<'a> {
     /// Build a batch context.  One per batch: the per-source line index is
     /// reused across every `render` call made through this ctx.
+    ///
+    /// This is the *unhoisted* constructor: it allocates a fresh section scratch
+    /// and URL map per ctx.  The hoisted forms (`hoisted`,
+    /// `hoisted_with_prebuilt`) are `pub(crate)` because they need the emitter's
+    /// `SharedRenderState`; an external caller that renders many diagnostics
+    /// should therefore build **one** ctx and render them all through it rather
+    /// than calling this per diagnostic.
     pub fn new(opts: &'a DiagOpts, uri: Option<&'a str>) -> Self {
         Self {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
-            line_columns: RefCell::new(None),
+            line_columns: RefCell::new([const { None }; 4]),
             line_cache: None,
             file_urls: Arc::default(),
             scratch: CtxCell::Owned(RefCell::new(SectionScratch::new())),
@@ -350,7 +385,7 @@ impl<'a> RenderCtx<'a> {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
-            line_columns: RefCell::new(None),
+            line_columns: RefCell::new([const { None }; 4]),
             line_cache: Some(&shared.line_cache),
             file_urls: Arc::clone(&shared.file_urls),
             scratch: CtxCell::Borrowed(&shared.scratch),
@@ -372,7 +407,7 @@ impl<'a> RenderCtx<'a> {
             opts,
             uri,
             source_index: RefCell::new(SmallVec::new()),
-            line_columns: RefCell::new(None),
+            line_columns: RefCell::new([const { None }; 4]),
             line_cache: Some(&shared.line_cache),
             file_urls: Arc::clone(&shared.file_urls),
             scratch: CtxCell::Borrowed(&shared.scratch),
@@ -385,9 +420,10 @@ impl<'a> RenderCtx<'a> {
     /// is `line_no`), sharing one [`LineColumns`] table per `(line, tab width)`
     /// for the whole batch.
     ///
-    /// Falls back to the one-shot walk only if the table cannot be built, which
-    /// it always can; the fallback exists so a future line representation can
-    /// decline without changing call sites.
+    /// Table construction is currently infallible ([`LineColumns::new`] always
+    /// returns a table); the single call site below is the seam where a future
+    /// line representation that declines would plug in.  (This used to document a
+    /// fallback that does not exist.)
     pub(crate) fn display_col_in_line(
         &self,
         line: &str,
@@ -404,8 +440,16 @@ impl<'a> RenderCtx<'a> {
         // and a re-published file gets a new allocation, hence a new pointer.
         let line_ptr = line.as_ptr() as usize;
         let line_len = line.len();
-        let mut slot = self.line_columns.borrow_mut();
-        if let Some((p, l, no, tab, cols)) = slot.as_ref()
+        // An empty line has no columns to compute, and distinct *literal* empty
+        // slices share one static pointer — so the cache would be pure overhead
+        // here and would alias two different files' blank lines whenever
+        // `line_no` and `tab_width` agree.
+        if line.is_empty() {
+            return 0;
+        }
+        let mut slots = self.line_columns.borrow_mut();
+        let slot_idx = line_no & 3;
+        if let Some((p, l, no, tab, cols)) = slots[slot_idx].as_ref()
             && *p == line_ptr
             && *l == line_len
             && *no == line_no
@@ -415,7 +459,7 @@ impl<'a> RenderCtx<'a> {
         }
         let cols = crate::diagnostics::glyph::LineColumns::new(line, tab_width);
         let col = cols.display(byte_in_line);
-        *slot = Some((line_ptr, line_len, line_no, tab_width, cols));
+        slots[slot_idx] = Some((line_ptr, line_len, line_no, tab_width, cols));
         col
     }
 
@@ -447,6 +491,15 @@ impl<'a> RenderCtx<'a> {
         // from the source text (`source_fingerprint(source)` at the construction
         // sites), so a sentinel here is a producer bug: loud in debug, a miss
         // (never wrong output) in release.
+        // Sortedness is a documented construction invariant; unenforced, a missed
+        // sort turns every tier-0 lookup into a silent O(n)-tier fallback with no
+        // wrongness and no signal.
+        debug_assert!(
+            self.prebuilt.is_none_or(|p| p
+                .windows(2)
+                .all(|w| (w[0].ptr, w[0].len) <= (w[1].ptr, w[1].len))),
+            "prebuilt must be sorted by (ptr, len) for the tier-0 binary search"
+        );
         if let Some(prebuilt) = self.prebuilt
             && let Ok(pos) = prebuilt.binary_search_by_key(&(ptr, len), |e| (e.ptr, e.len))
             && let Some(e) = prebuilt.get(pos)
@@ -471,7 +524,7 @@ impl<'a> RenderCtx<'a> {
                         len,
                         starts: Arc::clone(&e.starts),
                         ascii: e.ascii,
-                        char_prefixes: Arc::clone(&e.char_prefixes),
+                        char_prefixes: e.char_prefixes.clone(),
                         generation: e.generation,
                         #[cfg(debug_assertions)]
                         fingerprint: e.fingerprint,
@@ -482,7 +535,7 @@ impl<'a> RenderCtx<'a> {
                 source,
                 Arc::clone(&e.starts),
                 e.ascii,
-                Arc::clone(&e.char_prefixes),
+                e.char_prefixes.clone(),
                 e.generation,
             );
         }
@@ -494,14 +547,16 @@ impl<'a> RenderCtx<'a> {
                 // reused the allocation, every line number would be silently
                 // wrong.  `0` is the "unknown" sentinel set by `preload`
                 // (which has no source text).
+                // Unconditional: sentinels are refused at every insertion site
+                // (`preload_line_index`, `from_entries`, and the content-verified
+                // tier-0 backfill), so a `0` here means the invariant was violated,
+                // not "unverifiable".
                 #[cfg(debug_assertions)]
-                if cache[pos].fingerprint != 0 {
-                    debug_assert_eq!(
-                        cache[pos].fingerprint,
-                        source_fingerprint(source),
-                        "(ptr,len) collision — cached line table belongs to a different source"
-                    );
-                }
+                debug_assert_eq!(
+                    cache[pos].fingerprint,
+                    source_fingerprint(source),
+                    "(ptr,len) collision — cached line table belongs to a different source"
+                );
                 // LRU: promote the hit to MRU so it survives eviction longest.
                 // N ≤ 4, so the shifts are a handful of pointer moves.
                 if pos > 0 {
@@ -512,7 +567,7 @@ impl<'a> RenderCtx<'a> {
                     source,
                     Arc::clone(&cache[0].starts),
                     cache[0].ascii,
-                    Arc::clone(&cache[0].char_prefixes),
+                    cache[0].char_prefixes.clone(),
                     cache[0].generation,
                 );
             }
@@ -533,18 +588,18 @@ impl<'a> RenderCtx<'a> {
                 .map
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .get(&(ptr, len))
+                .get(&SourceKey { ptr, len })
             {
                 #[cfg(debug_assertions)]
                 let fingerprint = {
                     let fp = source_fingerprint(source);
-                    if e.fingerprint != 0 {
-                        debug_assert_eq!(
-                            e.fingerprint, fp,
-                            "SharedSources entry belongs to a different source — \
-                             batch-scoped lifetime violated"
-                        );
-                    }
+                    // Unconditional, for the same reason as the LRU check above:
+                    // `from_entries` refuses sentinels.
+                    debug_assert_eq!(
+                        e.fingerprint, fp,
+                        "SharedSources entry belongs to a different source — \
+                         batch-scoped lifetime violated"
+                    );
                     fp
                 };
                 let mut cache = self.source_index.borrow_mut();
@@ -560,7 +615,7 @@ impl<'a> RenderCtx<'a> {
                         len,
                         starts: Arc::clone(&e.starts),
                         ascii: e.ascii,
-                        char_prefixes: Arc::clone(&e.char_prefixes),
+                        char_prefixes: e.char_prefixes.clone(),
                         generation: e.generation,
                         #[cfg(debug_assertions)]
                         fingerprint,
@@ -571,7 +626,7 @@ impl<'a> RenderCtx<'a> {
                     source,
                     Arc::clone(&e.starts),
                     e.ascii,
-                    Arc::clone(&e.char_prefixes),
+                    e.char_prefixes.clone(),
                     e.generation,
                 );
             }
@@ -593,15 +648,20 @@ impl<'a> RenderCtx<'a> {
                     let (starts, ascii, char_prefixes, generation) = (
                         Arc::clone(&entry.starts),
                         entry.ascii,
-                        Arc::clone(&entry.char_prefixes),
+                        entry.char_prefixes.clone(),
                         entry.generation,
                     );
                     drop(cache);
-                    // Backfill the per-ctx LRU: without this, every later render
-                    // of the same source re-pays this whole tier walk — including
-                    // the O(len) `entry.text == source` memcmp, up to 512 KB per
-                    // render — before reaching this branch again.  The entry is
-                    // content-verified above, so the LRU tripwire invariant holds.
+                    // Backfill the per-ctx LRU.  Scope, stated correctly: this
+                    // saves the whole tier walk (including the O(len)
+                    // `entry.text == source` memcmp, up to 512 KB) for **later
+                    // renders through this same ctx** — i.e. multi-diagnostic
+                    // batches.  On the single-emit path the ctx is fresh per call,
+                    // so the backfill saves nothing there and each emit re-pays the
+                    // memcmp; that floor is what `perf_line_index_lookup_tiers`
+                    // measures, and the comment used to imply the backfill helped
+                    // the per-call case too.  The entry is content-verified above,
+                    // so the LRU tripwire invariant holds.
                     {
                         let mut lru = self.source_index.borrow_mut();
                         if let Some(pos) = lru.iter().position(|c| c.ptr == ptr && c.len == len) {
@@ -616,7 +676,7 @@ impl<'a> RenderCtx<'a> {
                                 len,
                                 starts: Arc::clone(&starts),
                                 ascii,
-                                char_prefixes: Arc::clone(&char_prefixes),
+                                char_prefixes: char_prefixes.clone(),
                                 generation,
                                 #[cfg(debug_assertions)]
                                 fingerprint,
@@ -638,27 +698,34 @@ impl<'a> RenderCtx<'a> {
         // a worker rendering a 5th+ distinct source still shares its scan.
         // The losing racer must use the winner's Arcs; keeping its own would
         // retain a second full `starts`/prefix table until LRU eviction.
+        // Debug builds used to hash the same source twice (once for the LRU entry,
+        // once for the shared one); one 24-byte fingerprint per rebuild makes
+        // "one content, one fingerprint" locally obvious.
+        #[cfg(debug_assertions)]
+        let rebuilt_fingerprint = source_fingerprint(source);
         let shared_entry = if let Some(shared) = &self.shared {
             let mut map = shared.map.write().unwrap_or_else(|e| e.into_inner());
-            let e = map.entry((ptr, len)).or_insert_with(|| SharedSourceIndex {
-                starts: Arc::clone(idx.starts_arc()),
-                ascii: idx.ascii(),
-                char_prefixes: Arc::clone(idx.char_prefixes_arc()),
-                generation: idx.generation(),
-                #[cfg(debug_assertions)]
-                fingerprint: source_fingerprint(source),
-            });
+            let e = map
+                .entry(SourceKey { ptr, len })
+                .or_insert_with(|| SharedSourceIndex {
+                    starts: Arc::clone(idx.starts_arc()),
+                    ascii: idx.ascii(),
+                    char_prefixes: idx.char_prefixes_arc().clone(),
+                    generation: idx.generation(),
+                    #[cfg(debug_assertions)]
+                    fingerprint: rebuilt_fingerprint,
+                });
             (
                 Arc::clone(&e.starts),
                 e.ascii,
-                Arc::clone(&e.char_prefixes),
+                e.char_prefixes.clone(),
                 e.generation,
             )
         } else {
             (
                 Arc::clone(idx.starts_arc()),
                 idx.ascii(),
-                Arc::clone(idx.char_prefixes_arc()),
+                idx.char_prefixes_arc().clone(),
                 idx.generation(),
             )
         };
@@ -674,10 +741,10 @@ impl<'a> RenderCtx<'a> {
                 len,
                 starts: Arc::clone(&shared_entry.0),
                 ascii: shared_entry.1,
-                char_prefixes: Arc::clone(&shared_entry.2),
+                char_prefixes: shared_entry.2.clone(),
                 generation: shared_entry.3,
                 #[cfg(debug_assertions)]
-                fingerprint: source_fingerprint(source),
+                fingerprint: rebuilt_fingerprint,
             },
         );
         if len <= STABLE_CACHE_MAX_SOURCE {
@@ -693,7 +760,7 @@ impl<'a> RenderCtx<'a> {
                         fingerprint: source_fingerprint(source),
                         starts: Arc::clone(&shared_entry.0),
                         ascii: shared_entry.1,
-                        char_prefixes: Arc::clone(&shared_entry.2),
+                        char_prefixes: shared_entry.2.clone(),
                         generation: shared_entry.3,
                     },
                 );
@@ -751,7 +818,15 @@ impl<'a> RenderCtx<'a> {
     ///
     /// Order matters for hit rate: the seeded slots are the first `entries`,
     /// so a `reverse_errors` batch should pass its list in *render* order or
-    /// the first renders miss and backfill from the shared map.  `&mut self`
+    /// Sources longer than `STABLE_CACHE_MAX_SOURCE` are deliberately **not**
+    /// cached here (the tier stores the full text for absolute verification, so a
+    /// 5 MB entry would pin 5 MB).  The cost is a full `LineIndex::new` scan per
+    /// emit call for such a source — the single largest remaining per-emit cost in
+    /// this architecture, documented rather than hidden: raising the cap trades
+    /// memory 1:1, and the fingerprint-verified alternative (no stored text) is a
+    /// policy change, not a tweak.
+    ///
+    /// The first renders miss and backfill from the shared map.  `&mut self`
     /// (not `&self`) makes a mid-batch reseed a compile error — the pop-tail
     /// eviction below is live, so reseeding between renders would silently
     /// evict warm tables.
@@ -765,8 +840,19 @@ impl<'a> RenderCtx<'a> {
              the tail would be evicted before the first render",
             entries.len()
         );
+        // Deterministic in *release* too: the assert above is debug-only, so a
+        // caller passing more entries silently seeded the first slots and evicted
+        // the tail mid-loop — the exact failure the message names.
+        let entries = &entries[..entries.len().min(PRELOAD_SLOTS)];
         let mut cache = self.source_index.borrow_mut();
         for e in entries.iter().rev() {
+            debug_assert!(
+                e.fingerprint != 0,
+                "sentinel entry seeded into the LRU — a table built without source                  text cannot be pointer-keyed (see `from_entries`)"
+            );
+            if e.fingerprint == 0 {
+                continue;
+            }
             if cache.len() >= CACHE_SLOTS {
                 cache.pop();
             }
@@ -777,7 +863,7 @@ impl<'a> RenderCtx<'a> {
                     len: e.len,
                     starts: Arc::clone(&e.starts),
                     ascii: e.ascii,
-                    char_prefixes: Arc::clone(&e.char_prefixes),
+                    char_prefixes: e.char_prefixes.clone(),
                     generation: e.generation,
                     #[cfg(debug_assertions)]
                     fingerprint: e.fingerprint,
@@ -792,8 +878,14 @@ impl<'a> RenderCtx<'a> {
     /// Callers gate this on `use_color && supports_hyperlinks() &&
     /// is_real_file_name(name)`; the cache itself is unconditional so the
     /// hit/miss logic stays here and the caller stays mechanical.
+    /// The key is the *caller's spelling*, verbatim.  `src/lib.rs` and
+    /// `./src/lib.rs` are therefore two entries and two `canonicalize` calls; the
+    /// cache assumes a batch reports paths in a consistent form (the compiler
+    /// does — it renders `SourceFile` names).  Normalizing here would cost a
+    /// comparison on every lookup to save one syscall in a case that does not
+    /// occur in-tree.
     pub(crate) fn file_url(&self, name: &str) -> Arc<str> {
-        // 2.1: one `OnceLock` per name.  The read lock covers the hit path and
+        // One `OnceLock` per name.  The read lock covers the hit path and
         // the write lock is held only to obtain/insert the slot, never across
         // `canonicalize`; the per-name `OnceLock` serializes the expensive
         // syscall so a batch with W workers and F files pays F calls, not W·F.
@@ -911,7 +1003,7 @@ q2
             len: src.len(),
             starts: Arc::from(LineIndex::new(src).starts_arc().to_vec()),
             ascii: true,
-            char_prefixes: Arc::default(),
+            char_prefixes: crate::diagnostics::LinePrefixTables::default(),
             generation: 7,
             fingerprint,
         };
@@ -1094,18 +1186,29 @@ pub trait Renderer: Send + Sync {
         Ok(())
     }
 
-    /// Render one diagnostic.  No sink I/O; may `stat` the filesystem for
-    /// hyperlink targets (`file_url`), cached once per file per batch.
-    fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String;
-
     /// Render one diagnostic into a caller-supplied buffer.
     ///
-    /// The default appends [`render`](Self::render); renderers that already
-    /// build into an internal buffer override this to skip the intermediate
-    /// `String`, so the emitter's batch loop reuses one scratch buffer across
-    /// the whole batch instead of allocating one `String` per diagnostic.
-    fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
-        out.push_str(&self.render(diag, cx));
+    /// **Required**, and the orientation is deliberate: the emitter's batch loop
+    /// renders into one reused scratch buffer, so the buffered form is the hot
+    /// path.  It used to be the *override* while [`render`](Self::render) was
+    /// required — every renderer had to implement both (one duplicating the
+    /// other), and a renderer that could only produce a `String` paid an extra
+    /// full copy per diagnostic.  No sink I/O here; may `stat` the filesystem for
+    /// hyperlink targets (`file_url`), cached once per file per batch.
+    fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String);
+
+    /// Render one diagnostic into a fresh `String`.
+    ///
+    /// Convenience for callers that need an owned value (tests, single-shot
+    /// formatting).  Do **not** override it for "efficiency": implement
+    /// [`render_into`](Self::render_into) instead, which is where the buffer reuse
+    /// lives.  (`JsonRenderer` is the one legitimate override: a standalone object
+    /// is laid out at nesting level 1, while a batch element sits at level 2, so
+    /// it is a different layout and not a copy of the batch path.)
+    fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String {
+        let mut out = String::new();
+        self.render_into(diag, cx, &mut out);
+        out
     }
 
     /// Text written between two adjacent rendered diagnostics in a batch.
@@ -1127,15 +1230,40 @@ pub trait Renderer: Send + Sync {
     /// array produces output no consumer can parse, which is strictly worse than
     /// omitting the item — the batch would fail at the parser instead of
     /// surfacing one broken diagnostic.
+    /// Whether this renderer emits a *machine-parsed* format.
+    ///
+    /// The placeholder below is flat text: correct for every human format and
+    /// fatal for a structured one (prose inside a JSON array yields a stream no
+    /// consumer can parse).  Until now "structured renderers must override
+    /// `render_internal_error`" was prose only, so a new JSON/HTML renderer that
+    /// forgot the override turned *one* broken diagnostic into *zero*
+    /// parseable output for the whole batch.  Declaring the format makes the
+    /// omission loud in debug and harmless in release.
+    fn is_structured(&self) -> bool {
+        false
+    }
+
+    /// Fill `out` with a placeholder for a diagnostic whose render panicked.
+    ///
+    /// A structured renderer must override this (it can emit a valid dummy
+    /// element).  If one forgets, debug builds fail loudly and release builds emit
+    /// *nothing* — omitting one item keeps the stream parseable, which is the
+    /// lesser failure and the outcome the old docs described as preferred.
     fn render_internal_error(&self, out: &mut String) {
-        out.push_str(super::emitter::RENDER_PANIC_PLACEHOLDER);
+        debug_assert!(
+            !self.is_structured(),
+            "a structured renderer must override `render_internal_error`"
+        );
+        if !self.is_structured() {
+            out.push_str(super::emitter::RENDER_PANIC_PLACEHOLDER);
+        }
     }
 
     /// Render the summary line.  Empty string means "no summary".
     fn render_summary(&self, errors: usize, warnings: usize) -> String;
 
     /// Render the summary line with a distinct-file count for the
-    /// "N errors in M files" overview (checklist item 8).
+    /// "N errors in M files" overview.
     ///
     /// Default impl ignores `files` and delegates to [`render_summary`](Self::render_summary)
     /// so existing renderers keep working; human/HTML overrides include
@@ -1154,18 +1282,29 @@ pub trait Renderer: Send + Sync {
     /// plural categories (Russian has one/few/many, not a binary —s).
     fn render_suppressed_note(&self, count: usize) -> String {
         let mut s = String::new();
+        self.render_suppressed_note_into(count, &mut s);
+        s
+    }
+
+    /// [`render_suppressed_note`](Self::render_suppressed_note) into an existing
+    /// buffer.
+    ///
+    /// The i18n call already writes into a `String`, and the emitter renders into
+    /// its own scratch/reused buffer, so the `String`-returning form allocated a
+    /// second one purely to hand it over.  Fires whenever `max_errors` cuts a
+    /// batch.
+    fn render_suppressed_note_into(&self, count: usize, out: &mut String) {
         // rustc-style annotation prefixes (`= note:`) stay English by
         // convention; only the payload goes through Fluent.  This keeps the
         // terminal summary lexically stable for tools while localized counts
         // still follow CLDR plurals.
-        s.push_str("  = note: ");
+        out.push_str("  = note: ");
         crate::diagnostics::i18n::render_into(
             "suppressed-note",
             &[("count", Cow::Owned(count.to_string()))],
-            &mut s,
+            out,
         );
-        s.push('\n');
-        s
+        out.push('\n');
     }
 
     /// Called once per batch, after all diagnostics and the summary.
@@ -1175,8 +1314,8 @@ pub trait Renderer: Send + Sync {
     }
 }
 
-/// Measurement probes for the two decisions the review says must be *measured*
-/// before any code: whether `linecol_display` re-walks the line per query (the
+/// Measurement probes for the two decisions that must be *measured* before any
+/// code: whether `linecol_display` re-walks the line per query (the
 /// monotone-cursor optimization is only worth it if it does), and what the
 /// serial batch prebuild actually costs (it is the candidate for `thread::scope`
 /// parallelism).
@@ -1196,11 +1335,14 @@ mod perf_probes {
         s
     }
 
-    /// Per-query cost of `linecol_display` at several in-line offsets.
+    /// Per-query cost of `linecol_display` under three access orders.
     ///
-    /// If the column is recomputed by walking the line prefix, cost grows with
-    /// the offset (and with span count per line); if it is cached/`O(log)`, the
-    /// numbers stay flat and the monotone-cursor idea in the review is dropped.
+    /// The order matters: ascending offsets are the *best* case for a monotone
+    /// cursor (each query advances it), so an ascending-only probe would bless the
+    /// optimization even if random access stayed O(line length).  Real label
+    /// offsets arrive in arbitrary order, so ascending / descending / shuffled are
+    /// all measured and only a flat-vs-growing delta across *all three* justifies
+    /// the cursor.
     #[test]
     #[ignore = "measurement only"]
     fn perf_linecol_display_repeated_queries() {
@@ -1209,34 +1351,96 @@ mod perf_probes {
         for len in [64usize, 512, 4096] {
             let src = line_of_len(len);
             let idx = cx.line_index(&src);
-            let probes: Vec<usize> = (0..16).map(|i| 2 + len * i / 16).collect();
-            // Warm the lazily-built per-line tables so the measurement is steady
-            // state, which is what a batch actually sees.
-            for &p in &probes {
-                std::hint::black_box(idx.linecol_display(p));
+            let ascending: Vec<usize> = (0..16).map(|i| 2 + len * i / 16).collect();
+            let mut descending = ascending.clone();
+            descending.reverse();
+            // Deterministic shuffle (fixed-seed LCG): no `rand` dependency and the
+            // same order on every run, so successive measurements are comparable.
+            let mut shuffled = ascending.clone();
+            let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+            for i in (1..shuffled.len()).rev() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let j = (state >> 33) as usize % (i + 1);
+                shuffled.swap(i, j);
             }
-            let iters = 2_000;
-            let t = std::time::Instant::now();
-            for _ in 0..iters {
-                for &p in &probes {
+            for (order, probes) in [
+                ("ascending", &ascending),
+                ("descending", &descending),
+                ("shuffled", &shuffled),
+            ] {
+                // Warm the lazily-built per-line tables so the measurement is
+                // steady state, which is what a batch actually sees.
+                for &p in probes {
                     std::hint::black_box(idx.linecol_display(p));
                 }
+                let iters = 2_000;
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    for &p in probes {
+                        std::hint::black_box(idx.linecol_display(p));
+                    }
+                }
+                let ns = t.elapsed().as_secs_f64() * 1e9 / (iters * probes.len()) as f64;
+                println!(
+                    "[perf] linecol_display len={len:>5} {order:<10} x{}: {ns:.1} ns/query",
+                    probes.len()
+                );
             }
-            let ns = t.elapsed().as_secs_f64() * 1e9 / (iters * probes.len()) as f64;
-            println!(
-                "[perf] linecol_display len={len:>5} x{}: {ns:.1} ns/query",
-                probes.len()
-            );
         }
     }
 
-    /// Cost of the tier walk on a repeat render of the same source: the LRU hit
-    /// path (no fingerprint), the tier-0 prebuilt path, and the rebuild.
+    /// Cross-line alternation: a diagnostic whose labels sit on two distant lines
+    /// alternates the single `line_columns` slot, which (if it rebuilds per query)
+    /// is the pattern that would justify a small multi-slot table.
+    #[test]
+    #[ignore = "measurement only"]
+    fn perf_display_col_alternating_lines() {
+        let opts = DiagOpts::default();
+        let cx = RenderCtx::new(&opts, None);
+        let a = line_of_len(4096);
+        let b = line_of_len(4096);
+        let cols = [("a", a.as_str()), ("b", b.as_str())];
+        for &(name, line) in &cols {
+            std::hint::black_box(cx.display_col_in_line(line, 0, 100, 4));
+        }
+        let iters = 20_000;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            for &(name, line) in &cols {
+                let _ = name;
+                std::hint::black_box(cx.display_col_in_line(line, 0, 100, 4));
+            }
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / (iters * cols.len()) as f64;
+        println!("[perf] display_col_in_line 2 alternating 4 KB lines: {ns:.1} ns/query");
+    }
+
+    /// Cost of each of the three `line_index` tiers, labelled by what it measures.
+    ///
+    /// The old version claimed to cover "the LRU hit path, the tier-0 prebuilt
+    /// path, and the rebuild" but timed only the LRU loop, so a regression in
+    /// `LineIndex::new` or in the tier-0 fingerprint check was invisible.
     #[test]
     #[ignore = "measurement only"]
     fn perf_line_index_lookup_tiers() {
         let opts = DiagOpts::default();
         let src = "a\nb\nc\n".repeat(4_000);
+        let shared = self::SharedRenderState::new();
+        let prebuilt = {
+            let mut c = RenderCtx::hoisted(&opts, None, &shared);
+            let idx = c.line_index(&src);
+            [PreloadedSource {
+                ptr: src.as_ptr() as usize,
+                len: src.len(),
+                starts: Arc::clone(idx.starts_arc()),
+                ascii: idx.ascii(),
+                char_prefixes: idx.char_prefixes_arc().clone(),
+                generation: idx.generation(),
+                fingerprint: source_fingerprint(&src),
+            }]
+        };
+
+        // (a) LRU hit inside one ctx: no fingerprint, O(4) scan.
         let cx = RenderCtx::new(&opts, None);
         std::hint::black_box(cx.line_index(&src)); // cold: rebuild + publish
         let iters = 20_000;
@@ -1246,8 +1450,115 @@ mod perf_probes {
         }
         let ns = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
         println!(
-            "[perf] line_index LRU hit ({} bytes source): {ns:.1} ns/lookup",
+            "[perf] line_index (a) LRU hit          ({} B source): {ns:.1} ns/lookup",
             src.len()
         );
+
+        // (b) tier-0 prebuilt: fresh ctx each iteration → binary search +
+        // fingerprint + backfill + ctx construction (NOT a bare lookup).
+        let iters = 20_000;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut c = RenderCtx::hoisted_with_prebuilt(&opts, None, &shared, &prebuilt);
+            std::hint::black_box(c.line_index(&src));
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
+        println!(
+            "[perf] line_index (b) tier-0 + new ctx ({} B source): {ns:.1} ns/lookup",
+            src.len()
+        );
+
+        // (c) full rebuild: fresh ctx, no prebuilt, no shared entry hit.
+        let shared_cold = self::SharedRenderState::new();
+        let iters = 2_000;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut c = RenderCtx::hoisted(&opts, None, &shared_cold);
+            std::hint::black_box(c.line_index(&src));
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
+        println!(
+            "[perf] line_index (c) rebuild          ({} B source): {ns:.1} ns/lookup",
+            src.len()
+        );
+    }
+
+    /// Gate for the deferred `short.rs` SWAR plain-run rewrite and for the
+    /// `has_e2` gating fused into the control scanners.
+    ///
+    /// The numbers this prints are the *decision input*: the rewrite is only
+    /// justified if the per-byte cost of the current per-char flatten loop is far
+    /// above the sanitizer's SWAR cost on the same input, and the `has_e2` gate
+    /// only pays if the gated `memchr` was a visible share of a non-ASCII render.
+    /// Run in CI (or locally) with
+    /// `cargo test --bin ponent --offline -- --ignored perf_ --nocapture`.
+    #[test]
+    #[ignore = "measurement only"]
+    fn perf_sanitizers_by_content_class() {
+        let cases: [(&str, String); 5] = [
+            ("ascii", "a".repeat(4096)),
+            ("cyrillic", "привет ".repeat(512)),
+            ("cjk", "错误".repeat(1024)),
+            // A bidi override forces the owned path; the `0xE2` gate is what
+            // decides whether the probe runs at all.
+            ("bidi", format!("{}x\u{202E}y", "a".repeat(4000))),
+            ("controls", "a\u{1}b".repeat(1000)),
+        ];
+        for (name, s) in cases {
+            let iters = 2_000u32;
+            for (label, f) in [
+                (
+                    "sanitize_for_terminal",
+                    crate::diagnostics::sanitize_for_terminal
+                        as fn(&str) -> std::borrow::Cow<'_, str>,
+                ),
+                ("sanitize_for_terminal_multiline", |x| {
+                    crate::diagnostics::sanitize_for_terminal_multiline(x)
+                }),
+                ("sanitize_for_terminal_flatten", |x| {
+                    crate::diagnostics::sanitize_for_terminal_flatten(x)
+                }),
+            ] {
+                // Warm any lazily-built state before timing.
+                std::hint::black_box(f(&s));
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    std::hint::black_box(f(&s));
+                }
+                let ns_per_byte =
+                    t.elapsed().as_secs_f64() * 1e9 / (f64::from(iters) * s.len() as f64);
+                println!(
+                    "[perf] {label:<32} {name:<9} {} bytes: {ns_per_byte:.4} ns/byte",
+                    s.len()
+                );
+            }
+        }
+    }
+
+    /// Per-render cost of the short renderer on a long clean message — the hot
+    /// loop `push_sanitized_flattened` decodes char by char.  Compare with
+    /// `perf_sanitizers_by_content_class`'s `ascii` row: both walk the same bytes.
+    #[test]
+    #[ignore = "measurement only"]
+    fn perf_short_render_long_message() {
+        let opts = DiagOpts::default();
+        let cx = RenderCtx::new(&opts, None);
+        for len in [128usize, 1024, 4096] {
+            let msg = "word ".repeat(len / 5 + 1);
+            let diag = Diagnostic::error(msg.as_str()).with_file_name("src/lib.pn");
+            let renderer = crate::diagnostics::renderers::short::ShortRenderer::new();
+            let mut out = String::new();
+            renderer.render_into(&diag, &cx, &mut out);
+            out.clear();
+            let iters = 2_000u32;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                out.clear();
+                renderer.render_into(&diag, &cx, &mut out);
+            }
+            let ns_per_byte =
+                t.elapsed().as_secs_f64() * 1e9 / (f64::from(iters) * f64::from(len as u32));
+            println!("[perf] short render message len={len:>5}: {ns_per_byte:.4} ns/byte");
+        }
     }
 }

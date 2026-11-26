@@ -205,12 +205,6 @@ impl Renderer for HtmlRenderer {
         self.diagnostic_to_html_impl(diag, Some(cx), out);
     }
 
-    fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String {
-        let mut out = String::new();
-        self.render_into(diag, cx, &mut out);
-        out
-    }
-
     fn render_summary(&self, errors: usize, warnings: usize) -> String {
         let mut s = String::from("<div class='summary' role='status'>");
         summary_inner(&mut s, errors, warnings, None);
@@ -327,10 +321,33 @@ impl HtmlRenderer {
         let source_ctx = diag.source.as_ref();
         let mut idx_opt: Option<LineIndex<'_>> = None;
         if let Some(source) = source_ctx {
-            idx_opt = Some(match cx {
-                Some(cx) => cx.line_index(source),
-                None => LineIndex::new(source),
-            });
+            // Only build it when something below actually reads line/column:
+            // the span header, a label, a related error, a same-file chain entry,
+            // or an in-place suggestion diff.  A source-attached diagnostic with
+            // none of those (summary-level errors do occur) previously paid an
+            // O(file) scan on an LRU miss plus a full `LineIndex::new` when
+            // single-shot.
+            //
+            // This disjunction IS the pin, as in `human.rs`: narrowing it
+            // silently drops coordinates rather than failing loudly, so keep it
+            // in sync with the `idx_opt` reads in this function.
+            let needs_index = diag.spans().first().is_some()
+                || !diag.labels().is_empty()
+                || !diag.related_errors().is_empty()
+                || diag
+                    .call_chain
+                    .as_ref()
+                    .is_some_and(|c| c.entries().iter().any(|e| e.span.is_some()))
+                || diag
+                    .suggestions()
+                    .iter()
+                    .any(|s| s.span.is_some() && s.replacement.is_some());
+            if needs_index {
+                idx_opt = Some(match cx {
+                    Some(cx) => cx.line_index(source),
+                    None => LineIndex::new(source),
+                });
+            }
         }
 
         if let Some(span) = diag.spans.first() {
@@ -392,7 +409,7 @@ impl HtmlRenderer {
             let mut labels: SmallVec<[&Label<'_>; 4]> = SmallVec::new();
             let mut foreign_labels_by_file: LiteMap<FileId, SmallVec<[&Label<'_>; 4]>> =
                 LiteMap::new();
-            for lbl in &diag.labels {
+            for lbl in diag.labels() {
                 if anchor_file.is_none_or(|anchor| lbl.span.file == anchor) {
                     labels.push(lbl);
                 } else {
@@ -561,7 +578,7 @@ impl HtmlRenderer {
                 html.push_str(&self.escape(&loc));
                 html.push_str("</div>\n");
             }
-            for lbl in &diag.labels {
+            for lbl in diag.labels() {
                 if lbl.message.is_empty() {
                     continue;
                 }
@@ -581,7 +598,7 @@ impl HtmlRenderer {
         // renderer's `1.` / `2.` header numbering).
         if !diag.related_errors.is_empty() {
             html.push_str("<ul class='related'>\n");
-            for rel in &diag.related_errors {
+            for rel in diag.related_errors() {
                 html.push_str("<li class='related-entry'>");
                 if let Some(c) = &rel.code {
                     html.push_str("<span class='code'>");
@@ -603,7 +620,7 @@ impl HtmlRenderer {
 
         // Child diagnostics (notes/help) are part of the diagnostic model;
         // machine and HTML renderers must not silently drop them.
-        for child in &diag.children {
+        for child in diag.children() {
             html.push_str("<div class='label'>");
             html.push_str(child.level.label());
             html.push_str(": ");
@@ -637,7 +654,7 @@ impl HtmlRenderer {
         // not become user-facing HTML.  `Suggestion`'s `Display` also carries
         // the applicability tag (`(maybe incorrect)`, …), so a consumer sees
         // the same confidence signal as the terminal output.
-        for suggestion in &diag.suggestions {
+        for suggestion in diag.suggestions() {
             if matches!(
                 suggestion.style,
                 crate::diagnostics::SuggestionStyle::HideCodeAlways
@@ -1097,8 +1114,8 @@ impl HtmlRenderer {
                 // ── Line number ─────────────────────────────────────
                 // write! straight into the output buffer (reuses its
                 // capacity) instead of two per-row format! allocations.
-                // `data-location` carries the click-to-copy target
-                // (item 22): the primary span's line gets the full
+                // `data-location` carries the click-to-copy target: the
+                // primary span's line gets the full
                 // `file:line:col` (1-based col from the span start),
                 // every other row gets `file:line` (or `line` when the
                 // diagnostic's filename is empty).  The filename is
@@ -1530,7 +1547,7 @@ fn push_html_escaped(out: &mut String, s: &str) {
     // within the callback; the row/annotation columns were computed before
     // this point.
     //
-    // KNOWN LIMITATION (reviewed, deliberately not "fixed" by sanitizing the
+    // KNOWN LIMITATION (deliberately not "fixed" by sanitizing the
     // whole line up front): the underline columns come from
     // `compute_line_annotation_ranges`, which measures the **raw** line, while
     // this callback replaces one control byte with the three-byte U+FFFD.  A
@@ -2160,7 +2177,7 @@ mod tests {
         }
     }
 
-    /// Pins the reviewed, deliberately unfixed limitation: the caret lane is
+    /// Pins the deliberately unfixed limitation: the caret lane is
     /// measured on the **raw** line, while the emitted text replaces a control
     /// byte with the wider U+FFFD.  A future fix (sanitizing the whole row
     /// before the ranges are computed) must show up as a change here, not as a

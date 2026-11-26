@@ -49,6 +49,8 @@ smallvec = "1.13"
 bitflags = "2.13.0"
 clap = { version = "4.6.1", features = ["derive"] }
 crossbeam-channel = "0.5"
+# Lock-free bounded pool for the diagnostic sink buffers (`sink.rs`).
+crossbeam-queue = "0.3"
 ena = "0.14"
 arrayvec = "0.7"
 indexmap = "2.14.0"
@@ -81,6 +83,10 @@ shuttle = { version = "0.9.5", optional = true }
 # provides `FluentValue` for the argument maps `tr!` builds.
 fluent-templates = "0.15.1"
 fluent-bundle = "0.16.0"
+# Naming `FluentMessage::value()`'s pattern type so the render path can memoize
+# the per-(language, slug) bundle lookup. Already in the lockfile via
+# `fluent-bundle`, so this adds no new code to build.
+fluent-syntax = "0.12.0"
 thread_local = "1.1.10"
 # `CompactString` stores short strings (≤24 bytes) inline with no heap
 # allocation — used for error codes (`ErrCode`) and JSON-escaped field
@@ -127,6 +133,7 @@ swrite = "0.1.0"
 # Fast integer-to-string rendering for the range formatter.
 itoa = "1"
 iota = "0.2.3"
+duplicate = "2.0.1"
 
 # The AUTHORITATIVE Polonius R1-R8 engine (rustc's own), used as a
 # differential oracle in tests: our `evaluate_rules` must agree with it

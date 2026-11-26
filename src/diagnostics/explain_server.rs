@@ -276,7 +276,11 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     }
 
     let _nonblocking_guard = RestoreNonblocking::new(listener, true)?;
-    let _defer_accept = enable_tcp_defer_accept(listener);
+    // Held in an `Option` so it can be restored at the moment it stops being useful —
+    // see the `take()` in the accept loop.  A plain binding lived until function exit,
+    // i.e. through the entire request drain, leaving every later pending connection under
+    // the deferred wakeup the guard exists to release.
+    let mut defer_accept = Some(enable_tcp_defer_accept(listener));
 
     let html = std::sync::Arc::<str>::from(build_explain_page(&ec));
     // only a request for this code's page consumes the one-shot server.
@@ -314,7 +318,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     #[cfg(unix)]
     let mut poll_gave_up = false;
 
-    // A9.2: accept speculative preconnects into a poll-set instead of
+    // Accept speculative preconnects into a poll-set instead of
     // servicing them serially.  A silent preconnect sends nothing, so `poll`
     // never marks it readable and it cannot delay the socket that carries the
     // real request; a socket that *has* bytes is served immediately.  The
@@ -323,11 +327,11 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
     {
         const MAX_PENDING: usize = 32;
         let mut pending: Vec<PendingConn> = Vec::new();
-        // Reuse one fd array across rounds (M3): the loop runs up to 10×/s
+        // Reuse one fd array across rounds: the loop runs up to 10×/s
         // and a fresh `Vec` per round is pure allocator churn.
         let mut fds: Vec<libc::pollfd> = Vec::with_capacity(1 + MAX_PENDING);
         let mut poll_errors = 0u32;
-        // Finding 9: repeated `poll` failures must back off instead of
+        // Repeated `poll` failures must back off instead of
         // exhausting the counter in microseconds.
         let mut poll_backoff_ms = 1u64;
         // consecutive `accept()` failures while the listener stays
@@ -360,7 +364,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 }
             }
             fds.clear();
-            // Finding 1: only ask for the listener when a pending slot is
+            // Only ask for the listener when a pending slot is
             // free.  At capacity new connections stay in the kernel backlog
             // instead of being accepted and immediately discarded.
             let listener_offset = usize::from(pending.len() < MAX_PENDING);
@@ -382,7 +386,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             let phase_deadline = idle_deadline.unwrap_or(deadline);
             let wait_until = earliest.map_or(phase_deadline, |e| e.min(phase_deadline));
             let remaining = wait_until.saturating_duration_since(Instant::now());
-            // Poll for the whole remaining budget (M2): the fd set is
+            // Poll for the whole remaining budget: the fd set is
             // level-triggered and nothing in the loop is time-driven except
             // the deadline, so a fixed 100 ms tick only burns wakeups.
             // Ceiling, not truncation: a positive sub-millisecond remainder
@@ -402,7 +406,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                     // wall-clock deadline, exactly as `wait_readable` does.
                     continue;
                 }
-                // M5: a transient `ENOMEM`/`EINTR`-class failure must not end
+                // A transient `ENOMEM`/`EINTR`-class failure must not end
                 // the wait while the browser may still connect.  Give up only
                 // after a sustained, consecutive error run.
                 poll_errors += 1;
@@ -560,7 +564,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                         }
                         let handle =
                             std::thread::Builder::new()
-                                .stack_size(64 * 1024)
+                                .stack_size(128 * 1024)
                                 .spawn(move || {
                                     if stream.set_nonblocking(false).is_err() {
                                         let _ = stream.shutdown(Shutdown::Both);
@@ -586,7 +590,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                     let delivered = std::sync::Arc::clone(&delivered);
                     let handle =
                         std::thread::Builder::new()
-                            .stack_size(64 * 1024)
+                            .stack_size(128 * 1024)
                             .spawn(move || {
                                 let r =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -626,6 +630,10 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // The connection the deferral was waiting for has arrived: restore the
+                // listener's previous setting *now*, before draining, so the next
+                // connection is accepted eagerly.
+                drop(defer_accept.take());
                 match serve_page_expected(&mut stream, html.as_ref(), Some(expected_path.as_ref()))
                 {
                     Ok(true) => {
@@ -751,7 +759,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
 /// Resource cap for a declared request body.
 const MAX_BODY_DRAIN: usize = 8 * 1024 * 1024;
 
-/// Framing facts extracted from the header block in ONE pass (P2-13).
+/// Framing facts extracted from the header block in ONE pass.
 ///
 /// The old two-function version (`parse_content_length` + a separate
 /// `Transfer-Encoding` scan) could also turn a conflicting/malformed or
@@ -759,6 +767,14 @@ const MAX_BODY_DRAIN: usize = 8 * 1024 * 1024;
 /// then reported as `Complete` — a false completion that let the RST/RST-free
 /// close happen with request bytes still unread .
 /// Resource caps shared by every HTTP backend.
+/// Idle window of a reused keep-alive connection, shared by every serve loop.
+///
+/// Defined twice before (once per loop), so a change to one left the other silently
+/// different: the persistent reactor and the one-shot/poll paths would then release idle
+/// sockets on different schedules — invisible until a browser reuses a connection the
+/// other mode would already have closed.
+const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(2);
+
 const MAX_HEADER: usize = 64 * 1024;
 /// Linger after a one-shot response is already on the wire: long enough for a
 /// local browser to drain the final bytes (avoiding an RST that discards the
@@ -912,22 +928,31 @@ impl HeaderScan {
 /// accepting both CRLFCRLF and bare LFLF.  The thread path is deliberately
 /// LF-lenient; the reactor must not reject a request the thread path serves.
 fn header_end(buf: &[u8]) -> Option<usize> {
-    static CRLF: std::sync::OnceLock<memchr::memmem::Finder<'static>> = std::sync::OnceLock::new();
-    static LF: std::sync::OnceLock<memchr::memmem::Finder<'static>> = std::sync::OnceLock::new();
-    let crlf = CRLF
-        .get_or_init(|| memchr::memmem::Finder::new(b"\r\n\r\n"))
-        .find(buf)
-        .map(|pos| pos + 4);
-    let lf = LF
-        .get_or_init(|| memchr::memmem::Finder::new(b"\n\n"))
-        .find(buf)
-        .map(|pos| pos + 2);
-    match (crlf, lf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    // One forward scan, not two `memmem` passes.  Both old finders started at offset 0, so
+    // a head terminated by `\r\n\r\n` scanned everything before it twice and then took a
+    // minimum; a single `memchr` cursor with a short look-back finds the *smallest* end
+    // directly, which is what the minimum computed.
+    //
+    // Truth table, for a `\n` at index `i` (the head ends at `i + 1`):
+    //   `...\r\n\r\n`  → `buf[i-3..i] == "\r\n\r"`            CRLFCRLF
+    //   `......\n\n`    → `buf[i-1] == b'\n'`                  LFLF
+    //   `...\r\n\n`    → also `buf[i-1] == b'\n'`             CRLF then a bare LF
+    //                                                     terminator (the old
+    //                                                     `\n\n` finder matched this)
+    // A single trailing `\n` (`...\r\n` at end of buffer) terminates nothing: a head
+    // needs the blank line, so one `\n` after the last field is not enough.
+    let mut from = 0usize;
+    while let Some(rel) = memchr::memchr(b'\n', &buf[from..]) {
+        let i = from + rel;
+        if i >= 3 && &buf[i - 3..i] == b"\r\n\r" {
+            return Some(i + 1);
+        }
+        if i >= 1 && buf[i - 1] == b'\n' {
+            return Some(i + 1);
+        }
+        from = i + 1;
     }
+    None
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1133,7 +1158,20 @@ fn scan_framing(headers: &[u8], first_line_is_request: bool) -> HeaderFraming {
                 framing.content_length = Some(n);
             }
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-            framing.has_transfer_encoding = true;
+            // `identity` is RFC 9112 §6.1's "no transfer coding" token: it leaves the
+            // framing provable, yet any TE header used to set this flag, so
+            // `DrainOutcome` fell back to "wait for peer EOF" — and a keep-alive client
+            // never sends EOF, so every such request sat out the full 1 s read budget.
+            // A list that names any *real* coding (`chunked`, or `identity, chunked`) is
+            // still unprovable and must keep the flag.
+            let only_identity = value
+                .split(|&b| b == b',')
+                .map(|token| token.trim_ascii())
+                .filter(|token| !token.is_empty())
+                .all(|token| token.eq_ignore_ascii_case(b"identity"));
+            if !only_identity {
+                framing.has_transfer_encoding = true;
+            }
         } else if name.eq_ignore_ascii_case(b"connection") {
             // Token list: `keep-alive, close`, extra whitespace, mixed case.
             if value
@@ -1171,7 +1209,7 @@ enum DrainOutcome {
 }
 
 /// Clamp the socket read timeout to the remaining wall-clock budget, so a
-/// blocking `read` cannot outlive the declared drain deadline (Finding 5).
+/// blocking `read` cannot outlive the declared drain deadline.
 fn arm_read_timeout_until(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<()> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
@@ -1284,69 +1322,37 @@ fn drain_after_request_line(
     prefix: &[u8],
     budget: Duration,
 ) -> DrainOutcome {
-    let mut tail_len = 0;
-    let mut wants_close = false;
-    let mut is_head = false;
-    drain_request_tracked(
+    drain_with(
         stream,
         prefix,
         budget,
-        &mut tail_len,
-        &mut wants_close,
-        &mut is_head,
-        false,
-        None,
-        0,
+        DrainOptions {
+            prefix_has_request_line: false,
+            report_head: false,
+        },
     )
+    .0
 }
 
-/// Drain a request whose prefix still **begins with the request line** (the
-/// test-only whole-head path).
+/// The two flags that actually differ between the drain wrappers.
 ///
-/// The flag matters: [`drain_after_request_line`]'s `false` is right for every
-/// production caller, but this one passes the unparsed buffer, and treating its
-/// request line as a colonless header marked the framing untrusted — which
-/// drained unframed (read to EOF/1 s) where the request already had no body.
-fn drain_whole_head(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> DrainOutcome {
-    let mut tail_len = 0;
-    let mut wants_close = false;
-    let mut is_head = false;
-    drain_request_tracked(
-        stream,
-        prefix,
-        budget,
-        &mut tail_len,
-        &mut wants_close,
-        &mut is_head,
-        true,
-        None,
-        0,
-    )
+/// Every wrapper used to repeat the same three `&mut` scratch bindings and the same
+/// nine-argument call in its own body, so four copies of "drain and discard the trackers"
+/// existed; only these two things ever varied.
+#[derive(Clone, Copy)]
+struct DrainOptions {
+    /// The prefix still begins with the request line (the test-only whole-head path).
+    prefix_has_request_line: bool,
+    /// The caller needs to know whether the request line named `HEAD`.
+    report_head: bool,
 }
 
-/// Drain a request whose bytes arrive fresh on `stream` (empty-prefix paths).
-fn drain_request(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> DrainOutcome {
-    let mut tail_len = 0;
-    let mut wants_close = false;
-    let mut is_head = false;
-    drain_request_tracked(
-        stream,
-        prefix,
-        budget,
-        &mut tail_len,
-        &mut wants_close,
-        &mut is_head,
-        true,
-        None,
-        0,
-    )
-}
-
-/// [`drain_request`] plus whether the request line named `HEAD`.
-fn drain_request_with_head(
+/// The single body behind the drain wrappers.
+fn drain_with(
     stream: &mut TcpStream,
     prefix: &[u8],
     budget: Duration,
+    opts: DrainOptions,
 ) -> (DrainOutcome, bool) {
     let mut tail_len = 0;
     let mut wants_close = false;
@@ -1358,11 +1364,65 @@ fn drain_request_with_head(
         &mut tail_len,
         &mut wants_close,
         &mut is_head,
-        true,
+        opts.prefix_has_request_line,
         None,
         0,
     );
-    (outcome, is_head)
+    (outcome, if opts.report_head { is_head } else { false })
+}
+
+/// Drain a request whose prefix still **begins with the request line** (the
+/// test-only whole-head path).
+///
+/// The flag matters: [`drain_after_request_line`]'s `false` is right for every
+/// production caller, but this one passes the unparsed buffer, and treating its
+/// request line as a colonless header marked the framing untrusted — which
+/// drained unframed (read to EOF/1 s) where the request already had no body.
+fn drain_whole_head(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> DrainOutcome {
+    // Same flags as `drain_request`; only the *caller's* prefix contract differs (this
+    // one is the test-only whole-head path).  The names stay because they document the
+    // prefix shape at each call site.
+    drain_with(
+        stream,
+        prefix,
+        budget,
+        DrainOptions {
+            prefix_has_request_line: true,
+            report_head: false,
+        },
+    )
+    .0
+}
+
+/// Drain a request whose bytes arrive fresh on `stream` (empty-prefix paths).
+fn drain_request(stream: &mut TcpStream, prefix: &[u8], budget: Duration) -> DrainOutcome {
+    drain_with(
+        stream,
+        prefix,
+        budget,
+        DrainOptions {
+            prefix_has_request_line: true,
+            report_head: false,
+        },
+    )
+    .0
+}
+
+/// [`drain_request`] plus whether the request line named `HEAD`.
+fn drain_request_with_head(
+    stream: &mut TcpStream,
+    prefix: &[u8],
+    budget: Duration,
+) -> (DrainOutcome, bool) {
+    drain_with(
+        stream,
+        prefix,
+        budget,
+        DrainOptions {
+            prefix_has_request_line: true,
+            report_head: true,
+        },
+    )
 }
 
 /// [`drain_request`], additionally reporting how many bytes past this
@@ -1424,7 +1484,7 @@ fn drain_request_tracked(
             hit_cap = true;
             break;
         }
-        // Finding 8: never read past the header cap; a terminator arriving
+        // Never read past the header cap; a terminator arriving
         // beyond it must not be accepted as a valid header block.
         let want = (header_budget - collected.len()).min(buf.len());
         if want == 0 {
@@ -1760,7 +1820,7 @@ fn write_response(
     body: &str,
 ) -> std::io::Result<()> {
     let header = render_head(status, extra_headers, body.len());
-    // Finding 7: every one-shot response closes the connection, so it must
+    // Every one-shot response closes the connection, so it must
     // say so; route through the same writer the cached pages use.
     write_prepared_conn(stream, [&header, "", ""], body, false)
 }
@@ -2035,7 +2095,7 @@ fn serve_page_after_prefix(
             .as_bytes()
             .strip_prefix(b"HEAD")
             .is_some_and(|rest| rest.first().is_some_and(|&b| b == b' ' || b == b'\t'));
-        // Finding 6: validate the full three-token grammar and version before
+        // Validate the full three-token grammar and version before
         // any routing decision, exactly like the persistent dispatcher.
         let Some(req) = parse_request_line(line.as_ref()) else {
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
@@ -2049,7 +2109,7 @@ fn serve_page_after_prefix(
             let resp = if head_only { resp.as_head() } else { resp };
             return finish_response(stream, drain, &resp, false);
         }
-        // [4]2: origin-form is required; `GET E030 HTTP/1.1` must not be
+        // Origin-form target is required; `GET E030 HTTP/1.1` must not be
         // served by the one-shot while the persistent router rejects it.
         if !req.target.starts_with('/') {
             let drain = drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1));
@@ -2073,8 +2133,15 @@ fn serve_page_after_prefix(
             let raw = target.split('?').next().unwrap_or("/");
             let alt = format!("{expected}/");
             let canonical = canonical_path_code(target);
-            let matches =
-                canonical.as_deref() == Some(expected_code) || raw == expected || raw == alt;
+            let matches = canonical.as_deref() == Some(expected_code)
+                || raw == expected
+                || raw == alt
+                // A browser's first hit on a one-shot server is almost always `/` — the
+                // server was started for exactly one page, so serving it on the root is
+                // the whole point.  It used to 404 the first click and then sit out the
+                // remaining accept budget.  (See-also navigation is unaffected: those
+                // targets carry a code and are handled below.)
+                || raw == "/";
             if !matches {
                 // See-also navigation: a registered code is a real page even
                 // when it is not this one-shot's initial target.  Only an
@@ -2178,7 +2245,7 @@ fn serve_page_after_prefix(
         }
         DrainOutcome::Complete => {
             write_response(stream, "200 OK", "", body)?;
-            // C2: residual drain after the response, overlapping the client's
+            // Residual drain after the response, overlapping the client's
             // read, instead of a 20 ms sleep before it.
             drain_residual(stream);
             // Fully drained: no unread inbound bytes, so a hard close is FIN.
@@ -2219,13 +2286,6 @@ fn canonical_path_code(target: &str) -> Option<&'static str> {
     ErrCode::try_new(p)
         .ok()
         .and_then(|e| e.entry().map(|entry| entry.code))
-}
-
-/// Pre-rendered 405 head built through the normal `render_head`, so the
-/// one-shot and persistent 405 responses cannot drift on security headers.
-fn method_not_allowed_head() -> &'static str {
-    static HEAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HEAD.get_or_init(|| render_head("405 Method Not Allowed", "Allow: GET, HEAD\r\n", 0))
 }
 
 /// Write a head-only response after the request drain, choosing the same
@@ -2522,8 +2582,7 @@ fn simple_page(title: &str, heading: &str, detail_html: &str) -> String {
 fn build_explain_page(ec: &ErrCode) -> String {
     let title = escape_html(ec.title());
     let code = escape_html(ec.code());
-    let category_label = ec.category().label();
-    let category = escape_html(&category_label);
+    let category = escape_html(ec.category().label());
     let explain = escape_html(ec.explain());
     // `url()` owns the result, so it must outlive the borrow that
     // `escape_html` makes into it.
@@ -2592,7 +2651,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 const SHED_BODY: &str = "<!DOCTYPE html><html><head><title>503 — busy</title></head>\
 <body><h1>503 — busy</h1><p>Too many concurrent connections; retry shortly.</p></body></html>";
 
-/// Pre-rendered 503 for the shed path (P2-16).  The overload path must not
+/// Pre-rendered 503 for the shed path.  The overload path must not
 /// pay `format!` + CSP lookups; it is the one response that runs under load.
 fn shed_page() -> &'static CachedPage {
     static PAGE: std::sync::OnceLock<CachedPage> = std::sync::OnceLock::new();
@@ -2681,7 +2740,7 @@ fn serve_explain_persistent_impl(
     // other connections.  The shared caches (`explain_page_cached`,
     // `not_found_page_cached` are `Mutex`-guarded, `build_index_page` sits
     // behind a `OnceLock`) are already thread-safe.
-    // A6: prewarm the page cache. Every page is a pure function of the static
+    // Prewarm the page cache. Every page is a pure function of the static
     // error-code tables, so building them once at startup turns the first
     // request for any code into a pure `Arc` clone instead of a synchronous
     // build on the connection thread. ~452 pages ≈ a few ms and a few MB.
@@ -2827,7 +2886,7 @@ fn serve_explain_persistent_impl(
                         let served_thread = std::sync::Arc::clone(&served_count);
                         let spawned = std::thread::Builder::new()
                             .name("ponent-explain".into())
-                            .stack_size(64 * 1024)
+                            .stack_size(128 * 1024)
                             .spawn_scoped(scope, move || {
                                 let _guard = guard;
                                 // H6: `thread::scope` re-raises a scoped thread's
@@ -2943,7 +3002,6 @@ fn serve_explain_persistent_epoll(
     let _defer_accept = enable_tcp_defer_accept(listener);
 
     const MAX_EVENTS: usize = 64;
-    const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(2);
     const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
     /// Shared post-response drain budget for a response whose body is already
     /// drained.  Same *order* as the thread path's post-response budgets, but not
@@ -3455,7 +3513,10 @@ fn serve_explain_persistent_epoll(
                     });
                     conn.conn_hdr = b"Connection: close\r\n\r\n";
                     conn.keep_alive = false;
-                    conn.consumed = head_end;
+                    // No `conn.consumed` here: the buffer was cleared above, and the field
+                    // is only read by the keep-alive reuse assert — which this path can
+                    // never reach.  Setting it anyway pointed past the end of the buffer.
+                    conn.consumed = 0;
                     conn.progress = [0; 6];
                     conn.state = ConnState::Writing;
                     conn.header_deadline = None;
@@ -3533,11 +3594,22 @@ fn serve_explain_persistent_epoll(
                     && decision.keep_alive_allowed
                     && conn.buf.len() == head_end;
                 conn.keep_alive = keep;
-                if !keep {
+                if keep {
+                    // The field is the whole point of the keep-alive reuse path: reuse
+                    // requires the buffer to end exactly at the header terminator, so
+                    // `drain(..consumed)` shifts nothing.  Assert it here, where both
+                    // quantities are live, instead of only at the distant reuse site.
+                    debug_assert_eq!(
+                        conn.buf.len(),
+                        head_end,
+                        "keep-alive reuse with a pipelined remainder would lose bytes"
+                    );
+                    conn.consumed = conn.buf.len();
+                } else {
                     conn.buf.clear();
                     conn.buf.shrink_to_fit();
+                    conn.consumed = 0;
                 }
-                conn.consumed = head_end;
                 conn.response = Some(response);
                 conn.conn_hdr = if keep {
                     b"Connection: keep-alive\r\n\r\n"
@@ -3748,7 +3820,6 @@ fn handle_persistent_connection(
     // pages used to open six TCP connections; reuse costs one handshake.
     // The idle slot is released after `KEEP_ALIVE_IDLE` so an idle socket
     // cannot starve `MAX_CONCURRENT_CONNECTIONS`.
-    const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(2);
     let mut first_request = true;
     loop {
         // The first request may follow a speculative preconnect; subsequent
@@ -3958,7 +4029,7 @@ fn read_request_line(
     // connection for minutes.  Combined with the inline fallback at
     // `MAX_CONCURRENT_CONNECTIONS`, that was a local DoS on the accept loop.
     // The caller chooses the budget: first-request preconnect detection uses
-    // `FIRST_BYTE_READ_TIMEOUT`, keep-alive uses `KEEP_ALIVE_IDLE` (finding 1).
+    // `FIRST_BYTE_READ_TIMEOUT`, keep-alive uses `KEEP_ALIVE_IDLE`.
     let deadline = Instant::now() + budget;
     let mut line: SmallVec<[u8; 512]> = SmallVec::new();
     line.extend_from_slice(prefix);
@@ -4068,11 +4139,11 @@ impl OwnedPage {
     }
 }
 
-/// A fully rendered response for a cached page (/F9): the head already
+/// A fully rendered response for a cached page: the head already
 /// contains the correct `Content-Length`, so a hot request is two pointer
 /// copies and one vectored write — no lock, no hash, no formatting.
 ///
-/// O4: the page owns its strings (`Box<str>`) rather than `Box::leak`ing all
+/// The page owns its strings (`Box<str>`) rather than `Box::leak`ing all
 /// three allocations.  The surrounding `OnceLock` is process-long anyway, so
 /// residency is unchanged while ownership/destruction become explicit.
 struct CachedPage {
@@ -4122,7 +4193,7 @@ fn explain_page_cached(code: &str) -> Option<&'static CachedPage> {
     Some(cell.get_or_init(|| CachedPage::build("200 OK", "", build_explain_page(&ec))))
 }
 
-/// A routed HTTP response. The page is referenced once (O6): a static explain
+/// A routed HTTP response. The page is referenced once: a static explain
 /// page borrows its immortal `CachedPage`, a cached 404 shares one
 /// `Arc<OwnedPage>` — no second `Arc` clone per response.
 enum PageRef {
@@ -4161,6 +4232,14 @@ impl HttpResponse {
         extra_headers: &'static str,
         page: &'static CachedPage,
     ) -> Self {
+        // `extra_headers` records *why* this head carries the headers it does, but it was
+        // write-only (one test read it), so the field and the prebuilt head could drift
+        // apart without a symptom.  `page.head` is rendered from the same argument, so the
+        // linkage is checkable at construction for free.
+        debug_assert!(
+            extra_headers.is_empty() || page.head.iter().any(|part| part.contains(extra_headers)),
+            "the prebuilt head does not carry the stored extra_headers"
+        );
         HttpResponse {
             status,
             extra_headers,
@@ -4169,7 +4248,7 @@ impl HttpResponse {
         }
     }
 
-    /// C3/O6: share the cached page's single allocation instead of cloning
+    /// Share the cached page's single allocation instead of cloning
     /// both `Arc` fields.
     fn from_owned(
         status: &'static str,
@@ -4259,7 +4338,14 @@ fn response_allows_keep_alive(status: &str) -> bool {
 }
 
 fn dispatch_request_meta(request_line: &str) -> (HttpResponse, bool) {
-    // Finding 6/M2: one shared three-token parser for both servers.
+    // One shared three-token parser for both servers.
+    //
+    // This arm **is** reachable: `parse_request_line` returns `None` for a malformed
+    // three-token line (bad method token, missing target, junk version), and the caller
+    // reaches here with the raw line after the UTF-8 check.  It is not a defensive `else`
+    // for an "impossible" case — a review of this function read it as unreachable; the
+    // `invalid_utf8_and_syntax_errors_share_one_bad_request_shape` test exercises the
+    // sibling early exit, and this one answers the same 400 shape.
     let Some(req) = parse_request_line(request_line) else {
         return (bad_request_response(), false);
     };
@@ -4421,7 +4507,7 @@ fn build_index_page_uncached() -> String {
 fn build_not_found_page(code: &str) -> String {
     let mut out = page_head("Not found — Ponent", "");
     out.push_str("<h1>404 — not found</h1>\n<p>No error code <code>");
-    // O5: filter control characters and escape HTML in one pass straight into
+    // Filter control characters and escape HTML in one pass straight into
     // the destination — no intermediate `sanitized` String and no collected
     // positions for this untrusted-input path.
     let echo = match code.char_indices().nth(256) {
@@ -4438,7 +4524,7 @@ fn build_not_found_page(code: &str) -> String {
 }
 
 /// Append `input` to `out`, dropping control characters and HTML-escaping the
-/// five text-node specials, in one pass (O5).
+/// five text-node specials, in one pass.
 fn write_html_escaped_filtered(out: &mut String, input: &str) {
     for ch in input.chars() {
         if ch.is_control() {
@@ -4492,7 +4578,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     // proportional to collisions, not to total traffic.
     const SHARDS: usize = 16;
     const PER_SHARD_CAP: usize = NOT_FOUND_CACHE_CAP / SHARDS;
-    // O3: CLOCK (second-chance) admission instead of evicting an arbitrary
+    // CLOCK (second-chance) admission instead of evicting an arbitrary
     // map key.  A cache hit sets the referenced bit; eviction sweeps the ring,
     // clearing bits and skipping referenced entries.
     struct Entry {
@@ -4504,11 +4590,18 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     struct Shard {
         map: rustc_hash::FxHashMap<CompactString, std::sync::Arc<Entry>>,
         ring: std::collections::VecDeque<std::sync::Arc<Entry>>,
-        /// Admission window: keys observed once but not yet cached.  A key must
-        /// be seen twice before it may enter `map`, so a flood of one-hit paths
-        /// (broken links, favicon probes) cannot displace pages that are
-        /// actually requested repeatedly.  Bounded exactly like the map.
-        seen: std::collections::VecDeque<CompactString>,
+        /// Admission window: keys observed once, **with the page that first
+        /// observation already built**.  A key must be seen twice before it may enter
+        /// `map`, so a flood of one-hit paths (broken links, favicon probes) cannot
+        /// displace pages that are actually requested repeatedly.
+        ///
+        /// A map, not a deque: the old `iter().position(..)` was O(window) on the
+        /// adversarial path (every request, hit or miss), and the strike-1 page was
+        /// dropped and rebuilt on strike 2 — two full page builds per admitted key.
+        seen: rustc_hash::FxHashMap<CompactString, std::sync::Arc<OwnedPage>>,
+        /// FIFO order for evicting `seen`, bounded exactly like it.  A key admitted (or
+        /// re-struck) since it was queued is simply absent and gets skipped.
+        seen_order: std::collections::VecDeque<CompactString>,
     }
     /// Per-shard size of the two-strike admission window.
     const SEEN_CAP: usize = PER_SHARD_CAP;
@@ -4529,7 +4622,8 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
                 std::sync::Mutex::new(Shard {
                     map: rustc_hash::FxHashMap::default(),
                     ring: std::collections::VecDeque::new(),
-                    seen: std::collections::VecDeque::new(),
+                    seen: rustc_hash::FxHashMap::default(),
+                    seen_order: std::collections::VecDeque::new(),
                 })
             })
             .collect::<Vec<_>>()
@@ -4553,29 +4647,35 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         drop(guard);
         return std::sync::Arc::clone(entry.page.get_or_init(|| std::sync::Arc::new(build(code))));
     }
-    // Two-strike admission (O4).  The first observation records the key in the
+    // Two-strike admission.  The first observation records the key in the
     // bounded window and serves the page *without* caching it; the second
     // observation admits.  Repeatedly requested paths — the ones a cache
     // actually helps — therefore survive a flood of unique ones, which under
     // the previous one-strike policy could cycle the whole ring.
     let key = CompactString::from(code);
-    let admit = match guard.seen.iter().position(|k| k == &key) {
-        Some(pos) => {
-            guard.seen.remove(pos);
-            true
-        }
+    // Strike 2 carries the page strike 1 built, so admission publishes it instead of
+    // rebuilding.  (The old code built it, dropped it, and built it again.)
+    let window_page = match guard.seen.remove(&key) {
+        Some(page) => page,
         None => {
+            // First observation: build (it must be served anyway), keep it for the
+            // possible second strike, and serve it uncached.
+            let page = std::sync::Arc::new(build(code));
             if guard.seen.len() >= SEEN_CAP {
-                guard.seen.pop_front();
+                // Evict the oldest window entry; one that was admitted since it was
+                // queued is already gone from the map, so keep popping until one dies.
+                while let Some(old) = guard.seen_order.pop_front() {
+                    if guard.seen.remove(&old).is_some() {
+                        break;
+                    }
+                }
             }
-            guard.seen.push_back(key.clone());
-            false
+            guard.seen.insert(key.clone(), std::sync::Arc::clone(&page));
+            guard.seen_order.push_back(key.clone());
+            drop(guard);
+            return page;
         }
     };
-    if !admit {
-        drop(guard);
-        return std::sync::Arc::new(build(code));
-    }
     // ── Global admission ────────────────────────────────────────────────
     // The shard mutex protects one shard, so the previous
     // `if TOTAL.load() >= CAP { evict }; …insert…; TOTAL.fetch_add(1)`
@@ -4709,7 +4809,7 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         // duplicate entry for the same key.
         if guard.map.contains_key(code) {
             drop(guard);
-            return std::sync::Arc::new(build(code));
+            return window_page;
         }
         if !freed {
             break;
@@ -4717,11 +4817,17 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
     }
     if !admitted {
         drop(guard);
-        return std::sync::Arc::new(build(code));
+        return window_page;
     }
     let entry = std::sync::Arc::new(Entry {
         key: key.clone(),
-        page: std::sync::OnceLock::new(),
+        // Pre-filled with the page strike 1 built: `get_or_init` below would otherwise
+        // rebuild it, so admission paid two full page builds per admitted key.
+        page: {
+            let cell = std::sync::OnceLock::new();
+            let _ = cell.set(window_page);
+            cell
+        },
         referenced: std::sync::atomic::AtomicBool::new(true),
         live: std::sync::atomic::AtomicBool::new(true),
     });
@@ -4901,7 +5007,7 @@ mod tests {
         assert!(page.contains(r#"id="theme-toggle""#));
     }
 
-    /// F1 regression: the shard mutex protects one shard, so admission has to be
+    /// Regression: the shard mutex protects one shard, so admission has to be
     /// transactional.  Before the reservation protocol two threads in different
     /// shards could both observe `TOTAL < CAP`, both skip eviction, and both
     /// publish, exceeding the advertised bound by one per racing pair.  This
@@ -5107,10 +5213,16 @@ mod tests {
         std::thread::spawn(move || {
             let _ = serve_explain_persistent(&listener);
         });
-        // Hold the reactor at its connection cap without sending anything.
+        // Hold the reactor at its connection cap.  Each holder writes **one byte** of an
+        // incomplete request line: a connected socket that sends nothing sits in the
+        // reactor's first-byte window, so the cap only filled after that timeout expired
+        // and the 50 ms sleep below was a race against it.  A partial line is unambiguously
+        // "Reading", which is the state the cap counts.
         let mut idle = Vec::new();
         for _ in 0..MAX_CONCURRENT_CONNECTIONS {
-            idle.push(TcpStream::connect(addr).unwrap());
+            let mut holder = TcpStream::connect(addr).unwrap();
+            holder.write_all(b" ").unwrap();
+            idle.push(holder);
         }
         std::thread::sleep(Duration::from_millis(50));
         let mut client = TcpStream::connect(addr).unwrap();
@@ -5670,6 +5782,90 @@ mod tests {
             response.starts_with(b"HTTP/1.1 200"),
             "reactor was pinned by the draining connection: {:?}",
             String::from_utf8_lossy(&response[..response.len().min(32)])
+        );
+    }
+
+    /// Both 400 exits on the one-shot path must be the *same* 400.
+    ///
+    /// A request whose first line is not valid UTF-8 took a separate exit that wrote the
+    /// response directly, while a syntax failure went through `finish_response` — two
+    /// policies for one status code, so a client could observe different headers (and a
+    /// different keep-alive answer) purely from *why* its request was malformed.
+    #[test]
+    fn invalid_utf8_and_syntax_errors_share_one_bad_request_shape() {
+        fn run(request: &[u8]) -> Vec<u8> {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || serve_explain(&listener, "E030"));
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            client.write_all(request).unwrap();
+            let _ = client.shutdown(std::net::Shutdown::Write);
+            let mut response = Vec::new();
+            let _ = client.read_to_end(&mut response);
+            let _ = server.join().unwrap();
+            response
+        }
+        /// The status line and headers, minus `Date` — that one changes between the two
+        /// requests (second granularity), so comparing it would make this flaky rather
+        /// than catch the policy divergence it is looking for.
+        fn head_block(response: &[u8]) -> String {
+            let end = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .unwrap_or(response.len());
+            String::from_utf8_lossy(&response[..end])
+                .lines()
+                .filter(|line| !line.starts_with("Date:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let utf8 = run(b"\xff\xfe / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let syntax = run(b"GET\x00 / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            utf8.starts_with(b"HTTP/1.1 400"),
+            "invalid UTF-8 must be a 400: {:?}",
+            String::from_utf8_lossy(&utf8[..utf8.len().min(48)])
+        );
+        assert!(
+            syntax.starts_with(b"HTTP/1.1 400"),
+            "a NUL in the request line must be a 400: {:?}",
+            String::from_utf8_lossy(&syntax[..syntax.len().min(48)])
+        );
+        assert_eq!(
+            head_block(&utf8),
+            head_block(&syntax),
+            "the two 400 paths must not disagree on headers or connection policy"
+        );
+    }
+
+    /// `Transfer-Encoding: identity` must not make the framing unprovable.
+    ///
+    /// `identity` is RFC 9112 §6.1's "no transfer coding" token.  Treating it like
+    /// `chunked` sent every drain to the "wait for peer EOF" fallback, and a keep-alive
+    /// client never closes — so each such request paid the full 1 s read budget.
+    #[test]
+    fn transfer_encoding_identity_keeps_the_framing_provable() {
+        let identity = scan_framing(b"Transfer-Encoding: identity\r\nContent-Length: 0", false);
+        assert!(
+            !identity.has_transfer_encoding,
+            "`identity` is not a transfer coding"
+        );
+        assert_eq!(identity.content_length, Some(0));
+        assert!(
+            scan_framing(b"Transfer-Encoding: chunked", false).has_transfer_encoding,
+            "`chunked` must stay unprovable"
+        );
+        assert!(
+            scan_framing(b"Transfer-Encoding: identity, chunked", false).has_transfer_encoding,
+            "a mixed list still names a real coding"
+        );
+        assert!(
+            scan_framing(b"Transfer-Encoding: Identity", false).has_transfer_encoding == false,
+            "the token is case-insensitive"
         );
     }
 

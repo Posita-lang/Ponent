@@ -172,9 +172,9 @@ impl DiagnosticLevel {
     }
 
     pub fn label(&self) -> &'static str {
-        // Explicit variant → index mapping: `*self as usize` would silently
-        // swap labels if the enum were ever reordered; a match arms the
-        // reorder into a non-exhaustive compile error instead.
+        // The index comes from `cache_slot`, which is where the "explicit arms,
+        // not `*self as usize`" rationale lives — restating it here gave the rule
+        // two homes and one of them was going to drift.
         let idx = self.cache_slot();
         crate::diagnostics::i18n::cached_label_static! {
             n = 6,
@@ -328,16 +328,17 @@ mod tests {
     /// (an ASCII fold would leave Cyrillic lowercase).
     #[test]
     fn label_upper_uses_unicode_folding() {
-        let _guard = crate::diagnostics::i18n::acquire_test_lang_lock();
-        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::Ru);
+        let _lock = crate::diagnostics::i18n::acquire_test_lang_lock();
+        // `LangGuard`, not a trailing manual `Lang::set(En)`: the assertion used to
+        // sit *between* the set and the restore, so a failure left the
+        // process-global latch at `Ru` — and a hardcoded restore is wrong even on
+        // success, because the previous language need not have been En.
+        let _lang = crate::diagnostics::i18n::LangGuard::new(crate::diagnostics::i18n::Lang::Ru);
         let err = DiagnosticLevel::Error;
+        // The folding oracle is the real pin; `assert_ne!(label, label_upper)`
+        // only held while ru's label happened to be lowercase (a translation could
+        // legitimately make it uppercase).
         assert_eq!(err.label_upper(), err.label().to_uppercase());
-        assert_ne!(
-            err.label(),
-            err.label_upper(),
-            "ru error label is lowercase"
-        );
-        crate::diagnostics::i18n::Lang::set(crate::diagnostics::i18n::Lang::En);
     }
 
     /// SGR goldens: a typo (`32m` where `31m` belongs) ships as green errors and

@@ -27,6 +27,12 @@ jobs:
       - run: cargo xtask site --out target/error_codes_site
       - run: cargo test --workspace --features omniml_pool,slow-tests --locked
       - run: cargo test --features shuttle --locked
+      # Release-mode type check: several diagnostics paths differ by `cfg`
+      # (`debug_assert` tripwires disappear, `#[cfg(not(debug_assertions))]` release
+      # clamps appear).  A debug-only matrix compiled none of the latter, which is how
+      # a release-only break (the `i18n` macro arity, the `explain` capacity) shipped
+      # past green CI.
+      - run: cargo check --release --bin ponent --locked
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-features --locked
 
@@ -59,6 +65,28 @@ jobs:
   # `wasm32-unknown-unknown`, so the check dies in `z3-sys`'s build script before
   # any of this crate compiles.  Fixing that needs a non-vendored or feature-gated
   # z3, not a CI line.
+  # A 32-bit target compiles the *fallback* tier (`classify_word8`,
+  # `classify_swar_wide`) and every `usize`-width assumption (`u32::MAX/4` guards,
+  # `SmallVec` inline sizes) with a different word size.  Nothing else in the matrix
+  # does: the OS matrix is x86_64-only and the aarch64 job is 64-bit.
+  cross-i686:
+    name: Check (i686)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: i686
+      # z3 is `vendored`, so its C/C++ sources need a 32-bit toolchain too.
+      - run: sudo apt-get update && sudo -A apt-get install -y gcc-multilib g++-multilib
+      - run: cargo check --bin ponent --locked --target i686-unknown-linux-gnu
+        env:
+          CC_i686_unknown_linux_gnu: gcc
+          CXX_i686_unknown_linux_gnu: g++
+
   cross-aarch64:
     name: Check (aarch64)
     runs-on: ubuntu-latest
@@ -160,7 +188,7 @@ jobs:
         # a reviewer reads are the ones the constants are decided at.
         run: >
           cargo bench --bench ascii_dispatch --features bench-hooks --
-          'ascii_dispatch/(classify|predicates)/printable/(16|32|64|65|128|129|255|256|257)$'
+          'ascii_dispatch/(classify|predicates)/printable/(16|32|40|48|56|64|65|72|96|112|128|129|255|256|257)$'
       - name: Summarise criterion medians
         # Machine-readable, so two runs can be diffed without reading logs.  The
         # medians land in the step summary *and* in the uploaded artifact.

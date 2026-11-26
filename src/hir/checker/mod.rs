@@ -2596,8 +2596,18 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             let mut smt = String::new();
             smt.push_str("(set-logic BV)\n");
             for (idx, sym) in vars.iter().enumerate() {
-                swrite!(smt, "(declare-const {} (_ BitVec {}))\n", sym.as_str(), widths[idx]);
-                swrite!(smt, "(declare-const {}_p (_ BitVec {}))\n", sym.as_str(), widths[idx]);
+                swrite!(
+                    smt,
+                    "(declare-const {} (_ BitVec {}))\n",
+                    sym.as_str(),
+                    widths[idx]
+                );
+                swrite!(
+                    smt,
+                    "(declare-const {}_p (_ BitVec {}))\n",
+                    sym.as_str(),
+                    widths[idx]
+                );
             }
             // Declare the SSA intermediate variables `xs_{step}_{i}` used
             // by the sequential transition BEFORE any assert references
@@ -2610,7 +2620,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     crate::hir::loop_infer::LoopInstr::AddVar(i, _)
                     | crate::hir::loop_infer::LoopInstr::ConstVar(i, _)
                     | crate::hir::loop_infer::LoopInstr::CopyVar(i, _) => {
-                        swrite!(smt, "(declare-const xs_{}_{} (_ BitVec {}))\n", decl_step, i, widths[*i]);
+                        swrite!(
+                            smt,
+                            "(declare-const xs_{}_{} (_ BitVec {}))\n",
+                            decl_step,
+                            i,
+                            widths[*i]
+                        );
                         decl_step += 1;
                     }
                     _ => {}
@@ -2739,13 +2755,24 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     crate::hir::loop_infer::LoopInstr::AddVar(i, c) => {
                         let name = format!("xs_{}_{}", step, i);
                         step += 1;
-                        swrite!(smt, "(assert (= {} (bvadd {} {})))\n", name, cur[*i], crate::hir::smt::bv_const_pub(*c, widths[*i]));
+                        swrite!(
+                            smt,
+                            "(assert (= {} (bvadd {} {})))\n",
+                            name,
+                            cur[*i],
+                            crate::hir::smt::bv_const_pub(*c, widths[*i])
+                        );
                         cur[*i] = name;
                     }
                     crate::hir::loop_infer::LoopInstr::ConstVar(i, c) => {
                         let name = format!("xs_{}_{}", step, i);
                         step += 1;
-                        swrite!(smt, "(assert (= {} {}))\n", name, crate::hir::smt::bv_const_pub(*c, widths[*i]));
+                        swrite!(
+                            smt,
+                            "(assert (= {} {}))\n",
+                            name,
+                            crate::hir::smt::bv_const_pub(*c, widths[*i])
+                        );
                         cur[*i] = name;
                     }
                     crate::hir::loop_infer::LoopInstr::CopyVar(i, j) => {
@@ -2781,7 +2808,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
             } else {
                 "bvult"
             };
-            swrite!(smt, "(assert (not ({} {} {})))\n", dec_cmp, dec_next, dec_cur);
+            swrite!(
+                smt,
+                "(assert (not ({} {} {})))\n",
+                dec_cmp,
+                dec_next,
+                dec_cur
+            );
             smt.push_str("(check-sat)\n");
             let smt_solver = self
                 .smt_solver
@@ -2836,7 +2869,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                     swrite!(smt, "(assert (<= {} {}))\n", vars[*i].as_str(), c);
                 }
                 crate::hir::loop_infer::LoopInstr::TestDiffLe(i, j, c) => {
-                    swrite!(smt, "(assert (<= (- {} {}) {}))\n", vars[*i].as_str(), vars[*j].as_str(), c);
+                    swrite!(
+                        smt,
+                        "(assert (<= (- {} {}) {}))\n",
+                        vars[*i].as_str(),
+                        vars[*j].as_str(),
+                        c
+                    );
                 }
                 _ => {}
             }
@@ -2850,7 +2889,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         for instr in body {
             match instr {
                 crate::hir::loop_infer::LoopInstr::AddVar(i, c) => {
-                    swrite!(smt, "(assert (= {}_p (+ {} {})))\n", vars[*i].as_str(), cur[*i], c);
+                    swrite!(
+                        smt,
+                        "(assert (= {}_p (+ {} {})))\n",
+                        vars[*i].as_str(),
+                        cur[*i],
+                        c
+                    );
                     cur[*i] = format!("{}_p", vars[*i].as_str());
                     assigned[*i] = true;
                 }
@@ -2875,7 +2920,12 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
         // Unassigned variables keep their value across the transition.
         for (i, a) in assigned.iter().enumerate() {
             if !a {
-                swrite!(smt, "(assert (= {}_p {}))\n", vars[i].as_str(), vars[i].as_str());
+                swrite!(
+                    smt,
+                    "(assert (= {}_p {}))\n",
+                    vars[i].as_str(),
+                    vars[i].as_str()
+                );
             }
         }
         // The negation of `dec(X') < dec(X)` — expect `unsat`.
@@ -8113,7 +8163,13 @@ impl<'a, 'src, 'input: 'a> TypeChecker<'a, 'src, 'input> {
                         ));
                     }
                 }
-                return Err(std::mem::replace(d, Diagnostic::error("placeholder")));
+                // A take-and-replace placeholder: never rendered, but a bare
+                // slug-shaped message would be dispatched to Fluent by the
+                // message classifier, so it spells out that it is not a slug.
+                return Err(std::mem::replace(
+                    d,
+                    Diagnostic::error("internal placeholder (never rendered)"),
+                ));
             }
         }
         Ok(())

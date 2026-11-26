@@ -622,11 +622,12 @@ fn wrap_optimal_with<'a>(
 /// slack than an equally short alternative.
 ///
 /// **Infeasible instances** (the last word alone exceeds
-/// `max_width - last_reserve`) take policy P1 of `solution.md` §4: wrap at the
+/// `max_width - last_reserve`) take the policy of `solution.md` §4: wrap at the
 /// full measure and let the locator overflow.  It is the minimum-line-count
-/// policy and the one the renderer's row-count contract already assumed.  P2
-/// (locator on its own line) doubles the row count for deep chains, which is
-/// the row-budget hazard `chain.rs` documents; P3 (truncate the locator) would
+/// policy and the one the renderer's row-count contract already assumed.
+/// Putting the locator on its own line doubles the row count for deep chains,
+/// which is
+/// the row-budget hazard `chain.rs` documents; truncating the locator would
 /// break its click target and oscillate with the line/column digits.
 ///
 /// The reserve is Monge-compatible (`solution.md` §3c): a budget *decrease* on
@@ -713,9 +714,10 @@ fn reserved_ranges(
     scratch: &mut WrapScratch,
 ) -> SmallVec<[Range<usize>; 4]> {
     // No floor: `max_width - last_reserve == 0` is genuinely infeasible
-    // (`solution.md` §2.1 requires `|w_n| <= A - s`), so it must take P1 below.
-    // Flooring at 1 would instead spend a whole extra row to carry one body
-    // column, which P1 strictly dominates on row count.
+    // (`solution.md` §2.1 requires `|w_n| <= A - s`), so it must take the
+    // infeasible branch below.  Flooring at 1 would instead spend a whole
+    // extra row to carry one body column, which the infeasible branch strictly
+    // dominates on row count.
     let budget_last = max_width.saturating_sub(last_reserve);
     if para.is_empty() {
         return smallvec![0..0];
@@ -769,7 +771,7 @@ fn reserved_ranges(
         }
     }
     let ranges = match split {
-        // P1: no legal layout — the last word alone overruns the last line's
+        // No legal layout — the last word alone overruns the last line's
         // budget.  Wrap at the full measure; the locator overflows this one row.
         None => wrap_dp(&words, max_width, tables, None, scratch),
         Some(j) => {
@@ -1899,6 +1901,28 @@ fn wrap_dp(
         // short 2-3-char words (large `n` and large `k` at once), or
         // a future caller that wraps a whole file's contents.)
         //
+        // Decision record for the "λ-shifted single-pass CHT" proposal: it is
+        // **not** adopted, and the reason is structural rather than budgetary.  The
+        // proposed proof is for one class — `dp[j] = min_i (dp[i] + C_j(i))` whose
+        // cost matrix is totally monotone.  This DP has `N_FITNESS` classes with a
+        // class-dependent `JUMP` demerit, and that term is *not* a per-row offset:
+        // it depends on the predecessor class, so the expanded `(i, p) → (j, c)`
+        // block matrix is not Monge under any order that keeps the `i`/`j` coupling
+        // (counterexamples: a uniform switching penalty `J[c][p] = δ[c ≠ p]` breaks
+        // it by exactly `δ` on a same-`(i, j)` quadruple, independent of `g`).  A
+        // single pass is therefore only sound after collapsing the classes, i.e. in
+        // the `N_FITNESS == 1` case, which is not this function's shape.
+        //
+        // What *is* sound is the per-class decomposition: `B[i][c] = min_p(dp[i][p] +
+        // J[c][p])` costs `O(n·k²)` and each fixed-`c` matrix is Monge (this file's
+        // derivation), so `k` independent online-Monge instances give `O(n·k·α(n))`.
+        // That is the design to implement if the crossover is ever reached — and the
+        // crossover is exactly what `perf_wrap_optimal` (now running in CI with the
+        // extended probe) measures.  Until a measured workload crosses it, the
+        // monotone window stays: the repo's own rule is that a plausible argument is
+        // not a measurement, and the derived `n* ≈ 30–60` (pointer pinned at the
+        // window's lower bound) is above every current call site's `n ≈ 5–50`.
+        //
         // Decision (recorded so this does not get "optimised" back):
         // keep the naive monotone window.  Crossover is
         // `n* ≈ 2·c_LS·α(n)/c_scan` ≈ 10-15 for the mid constants
@@ -2178,7 +2202,7 @@ mod tests {
 
     /// Exhaustive sweep: the reserve changes only the last row, the layout
     /// never beats the minimal-line model, never exceeds the composition it
-    /// replaces, and the infeasible branch is exactly P1.
+    /// replaces, and the infeasible branch is exactly the full-measure wrap.
     #[test]
     fn reserved_last_line_invariants() {
         for n in 1..=5usize {
@@ -2230,7 +2254,7 @@ mod tests {
                             None => assert_eq!(
                                 out.as_slice(),
                                 wrap_optimal(&msg, max_width, 4).as_slice(),
-                                "infeasible must take P1 (full measure): {msg:?} A={max_width} s={reserve}"
+                                "infeasible must take the full-measure wrap: {msg:?} A={max_width} s={reserve}"
                             ),
                         }
                         assert!(
@@ -2977,8 +3001,8 @@ mod tests {
     #[test]
     #[ignore = "measurement only"]
     fn perf_wrap_optimal() {
-        // Three shapes: diagnostic-scale prose, the review's "long explanation
-        // body", and a pathological short-word paragraph (large n * k).
+        // Three shapes: diagnostic-scale prose, a "long explanation body", and
+        // a pathological short-word paragraph (large n * k).
         for (words, width) in [(130usize, 80usize), (500, 80), (1000, 100)] {
             let mut text = String::new();
             for i in 0..words {

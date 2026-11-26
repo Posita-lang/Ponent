@@ -20,7 +20,7 @@ expression: out
     {"start": 9, "end": 69, "line": 1, "column": 10, "file": "example.ps", "message": "spans four lines", "kind": "Primary"}
   ],
   "relatedErrors": [
-    {"file": "example.ps", "code": "E019", "message": "duplicate definition of `i`", "span": {"start": 43, "end": 56, "line": 3, "column": 2}}
+    {"code": "E019", "message": "duplicate definition of `i`", "span": {"start": 43, "end": 56, "line": 3, "column": 2, "file": "example.ps"}}
   ],
   "children": [
     {"level": "note", "message": "expected Int<32>", "styledMessage": [{"text": "expected ", "highlighted": false},{"text": "Int<32>", "highlighted": true}]}

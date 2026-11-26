@@ -82,6 +82,19 @@ pub trait DiagnosticSink: sealed::Sealed {
     /// would pay that silently.
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()>;
 
+    /// Write several pieces in one logical operation.
+    ///
+    /// Renderers emit many small pieces per diagnostic; on an **unbuffered**
+    /// sink each one is a separate `write(2)`.  The default is the sequential
+    /// loop (byte-identical to calling `write_str` N times), so this is purely
+    /// additive: a sink that can do better overrides it.
+    fn write_parts(&mut self, parts: &[&str]) -> io::Result<()> {
+        for p in parts {
+            self.write_str(p)?;
+        }
+        Ok(())
+    }
+
     /// Flush any buffered output.  Defaults to a no-op.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -99,6 +112,47 @@ impl<W: Write> DiagnosticSink for W {
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
         // Write directly into the underlying stream; no `String` detour.
         Write::write_fmt(self, args)
+    }
+
+    fn write_parts(&mut self, parts: &[&str]) -> io::Result<()> {
+        // With one piece there is nothing to vectorise.  `Write::is_write_vectored`
+        // is still unstable (`can_vector`, #69941), so the capability query cannot
+        // be used here; instead rely on the *documented* contract that the default
+        // `write_vectored` writes only the first slice — the advance loop below
+        // then makes progress one slice at a time, exactly as the sequential path
+        // would, so a sink without real vectored support is correct (never wrong
+        // bytes, just no syscall win).
+        if parts.len() < 2 {
+            for p in parts {
+                self.write_all(p.as_bytes())?;
+            }
+            return Ok(());
+        }
+        // `UIO_MAXIOV` is 1024 on Linux; std has no stable `write_all_vectored`,
+        // so the partial-write loop is explicit: `write_vectored` may consume
+        // only a prefix (and some impls only look at the first slice), a short
+        // write must advance across slices, and a zero-progress write is an
+        // error rather than a spin.
+        const MAX_IOV: usize = 1024;
+        for chunk in parts.chunks(MAX_IOV) {
+            let mut slices: Vec<io::IoSlice<'_>> = chunk
+                .iter()
+                .map(|p| io::IoSlice::new(p.as_bytes()))
+                .collect();
+            // An empty slice carries no progress and would make `advance_slices`
+            // a no-op; drop them so the loop can never stall on one.
+            slices.retain(|s| !s.is_empty());
+            let mut pending = slices.as_mut_slice();
+            while !pending.is_empty() {
+                match self.write_vectored(pending) {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                    Ok(n) => io::IoSlice::advance_slices(&mut pending, n),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -162,6 +216,13 @@ impl DiagnosticSink for StringSink {
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
         use std::fmt::Write as _;
+        // Literal fast path, matching `ChannelSink`/`BufferedChannelSink`/
+        // `PooledStringSink`: renderers emit many bare literals (gutters,
+        // headers, newlines) and this skips the whole `Formatter` setup.
+        if let Some(s) = args.as_str() {
+            self.buf.push_str(s);
+            return Ok(());
+        }
         // Write straight into the internal buffer, avoiding a temporary
         // `String`.
         //
@@ -190,6 +251,13 @@ impl DiagnosticSink for StringSink {
 }
 
 /// Creates a fresh [`DiagnosticSink`] for each batch.
+///
+/// **Design stance:** the emitter takes a *factory*, not a sink, because a sink
+/// carries per-batch state (a buffer, a lock, a pool claim) and reusing one across
+/// batches would leak that state into the next batch's output ordering.  A sink
+/// whose state is genuinely process-global (a channel sender) should wrap the
+/// shared handle in a cheap per-batch value rather than asking the emitter to
+/// reuse anything.
 pub trait MakeSink {
     type Sink: DiagnosticSink;
 
@@ -206,6 +274,145 @@ where
 
     fn make(&self) -> S {
         self()
+    }
+}
+
+/// Batch small writes for **any** [`DiagnosticSink`].
+///
+/// [`io::BufWriter`] only helps sinks that are `io::Write`.  A sink that is not —
+/// a channel sink, a pooled `String` collector, an LSP transport — had no way to
+/// coalesce, so every `write_str`/`write_parts` piece the renderer emitted
+/// crossed its boundary (a channel `send`, a mutex acquire, a syscall), i.e. the
+/// ~2N-per-batch cost that `stderr_buffered` fixes for stderr only.  This wrapper
+/// gives every sink the same coalescing, with the same flush discipline:
+/// the emitter flushes at the end of every batch.
+///
+/// A single piece at least as large as the buffer bypasses it (topping up and
+/// flushing immediately would copy it twice), matching `BufWriter`'s own
+/// behaviour.
+pub struct CoalescingSink<S: DiagnosticSink> {
+    inner: S,
+    buf: String,
+    capacity: usize,
+    /// When set, the buffer is taken from (and returned to) this pool on
+    /// creation/drop, so a per-batch sink does not allocate its buffer every
+    /// batch.  `None` keeps the plain owning behaviour.
+    pool: Option<&'static crossbeam_queue::ArrayQueue<String>>,
+}
+
+impl<S: DiagnosticSink> sealed::Sealed for CoalescingSink<S> {}
+
+impl<S: DiagnosticSink> CoalescingSink<S> {
+    /// Wrap `inner` with the default 8 KiB buffer.
+    #[must_use]
+    pub fn new(inner: S) -> Self {
+        Self::with_capacity(inner, 8 * 1024)
+    }
+
+    /// Wrap `inner` with a chosen capacity (clamped like `stderr_buffered_with`).
+    #[must_use]
+    pub fn with_capacity(inner: S, capacity: usize) -> Self {
+        CoalescingSink {
+            inner,
+            buf: String::new(),
+            // Same clamping rationale as `stderr_buffered_with`: 0 would make
+            // every write flush twice, and an absurd value could abort in
+            // `String` growth.
+            capacity: capacity.clamp(1024, MAX_SINK_CAPACITY),
+            pool: None,
+        }
+    }
+
+    /// Wrap `inner`, taking the buffer from `pool` (and returning it on drop).
+    ///
+    /// This is the pooling that `stderr_buffered` lacks: `BufWriter` owns its
+    /// `Vec`, so a batch-per-`make()` factory allocated a fresh 16 KiB buffer for
+    /// every batch.  The pool degrades to "allocate fresh" when empty, exactly
+    /// like [`PooledStringSink`].
+    #[must_use]
+    pub fn with_pool(
+        inner: S,
+        capacity: usize,
+        pool: &'static crossbeam_queue::ArrayQueue<String>,
+    ) -> Self {
+        let mut buf = pool.pop().unwrap_or_default();
+        buf.clear();
+        let mut sink = Self::with_capacity(inner, capacity);
+        sink.buf = buf;
+        sink.pool = Some(pool);
+        sink
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        // Clear even on error: the partial bytes were handed to the inner sink (or
+        // the write failed wholesale), and keeping them would replay them after
+        // the error, which violates the "bytes before the error stay written"
+        // invariant.
+        let result = self.inner.write_str(&self.buf);
+        self.buf.clear();
+        result
+    }
+}
+
+impl<S: DiagnosticSink> Drop for CoalescingSink<S> {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool else {
+            return;
+        };
+        // Only recycle a buffer that is within the documented bound; a runaway
+        // render must not park a huge allocation in the pool forever.
+        if self.buf.capacity() > MAX_RECYCLED_CAPACITY {
+            return;
+        }
+        let buf = std::mem::take(&mut self.buf);
+        // A full pool drops the buffer (the documented degradation).
+        let _ = pool.push(buf);
+    }
+}
+
+impl<S: DiagnosticSink> DiagnosticSink for CoalescingSink<S> {
+    fn write_str(&mut self, s: &str) -> io::Result<()> {
+        if s.len() >= self.capacity {
+            self.drain()?;
+            return self.inner.write_str(s);
+        }
+        if self.buf.len() + s.len() > self.capacity {
+            self.drain()?;
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
+        use fmt::Write as _;
+        // Format into the buffer, not into the inner sink: one flush per batch
+        // instead of one boundary crossing per formatted fragment.
+        if fmt::write(&mut self.buf, args).is_err() {
+            // Keep whatever the formatter wrote (the partial-prefix invariant) and
+            // report it the way every other sink does.
+            return Err(io::Error::other("formatter error"));
+        }
+        if self.buf.len() >= self.capacity {
+            self.drain()?;
+        }
+        Ok(())
+    }
+
+    fn write_parts(&mut self, parts: &[&str]) -> io::Result<()> {
+        // Deliberately the sequential path: the inner sink sees one coalesced
+        // `write_str`, so vectorising here would only add a branch per call.
+        for p in parts {
+            self.write_str(p)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain()?;
+        self.inner.flush()
     }
 }
 
@@ -235,11 +442,13 @@ pub fn stderr() -> impl MakeSink<Sink = io::StderrLock<'static>> {
 /// `inner, outer-prefix, outer-suffix` rather than emission order.  The
 /// unbuffered [`stderr`] does not have this hazard.  Use it when the renderer
 /// can re-enter; the buffered factory trades that guarantee for fewer syscalls.
+#[must_use]
 pub fn stderr_buffered() -> impl MakeSink<Sink = io::BufWriter<io::StderrLock<'static>>> {
     stderr_buffered_with(16 * 1024)
 }
 
 /// [`stderr_buffered`] with a caller-chosen buffer capacity.
+#[must_use]
 pub fn stderr_buffered_with(
     capacity: usize,
 ) -> impl MakeSink<Sink = io::BufWriter<io::StderrLock<'static>>> {
@@ -248,17 +457,40 @@ pub fn stderr_buffered_with(
     // `stderr()`.  A caller asking for 0 wants "no buffering", which the
     // unbuffered factory already provides; clamping keeps this one a real
     // buffer.
-    let capacity = capacity.max(1024);
+    // Clamped at both ends now: the minimum keeps it a real buffer, the maximum
+    // stops one annotated-but-fat-fingered value from aborting the process in
+    // `Vec::with_capacity`.
+    let capacity = capacity.clamp(1024, MAX_SINK_CAPACITY);
     move || io::BufWriter::with_capacity(capacity, io::stderr().lock())
 }
 
+/// Upper bound any sink capacity may request.
+///
+/// A caller passing `usize::MAX` (or a fat-fingered huge value) previously
+/// reached `Vec::with_capacity` and **aborted the process**; a zero capacity made
+/// `pooled_string_with_capacity(0)` a silently dead pool (the seed buffer had
+/// capacity 0, so `Drop`'s `capacity() == 0` guard rejected every returned
+/// buffer and pooling was disabled with no diagnostic).  One helper keeps all
+/// four factories consistent in both directions.
+const MAX_SINK_CAPACITY: usize = 16 * 1024 * 1024;
+/// Floor for a *pooled/buffered* capacity: below this the buffer is a shell and
+/// the pool would refuse it back (see above).
+const MIN_SINK_CAPACITY: usize = 16;
+
+fn clamp_capacity(capacity: usize) -> usize {
+    capacity.clamp(MIN_SINK_CAPACITY, MAX_SINK_CAPACITY)
+}
+
 /// Test sink factory: produce a fresh [`StringSink`] per batch.
+#[must_use]
 pub fn string() -> impl MakeSink<Sink = StringSink> {
     StringSink::new
 }
 
 /// Like [`string`], with the batch buffer pre-sized.
+#[must_use]
 pub fn string_with_capacity(capacity: usize) -> impl MakeSink<Sink = StringSink> {
+    let capacity = capacity.min(MAX_SINK_CAPACITY);
     move || StringSink::with_capacity(capacity)
 }
 
@@ -268,6 +500,13 @@ pub fn string_with_capacity(capacity: usize) -> impl MakeSink<Sink = StringSink>
 /// over the channel) — per-chunk streaming is the intended LSP semantics, not
 /// an oversight.  Callers that want fewer allocations and can tolerate larger
 /// messages should batch on their side.
+///
+/// The "format small chunks into a stack buffer" optimization does
+/// **not** apply while the payload is `String`: the channel needs an owned value,
+/// so `String::from(&stack_buf)` allocates exactly once — the same count as
+/// `args.to_string()`, plus a copy.  Removing the allocation requires changing
+/// the payload type (`Arc<str>`/`Bytes`, i.e. a copy-free send), which is a wire
+/// change for every consumer; until that is decided, this path stays as is.
 pub struct ChannelSink {
     tx: crossbeam_channel::Sender<String>,
     /// Set once `send` reports the receiver gone.  A channel cannot come back, so
@@ -338,6 +577,14 @@ impl DiagnosticSink for ChannelSink {
 /// There is deliberately no wrapper factory that "adds" a bound: the bound
 /// belongs to the channel the caller creates, and a factory that silently
 /// wrapped a different one would make the actual depth invisible.
+/// **Zero-copy payload verdict — recorded so it is not re-attempted:**
+/// switching the payload to `Arc<str>`/`Bytes` does *not* remove a copy here.  The
+/// renderer produces bytes incrementally, so the batch buffer must be a growable
+/// `String`; wrapping it in an `Arc<str>` copies it exactly once either way (the
+/// `String` is sent by move today, and `Arc::from(String)`/`Bytes::from(String)`
+/// both allocate + copy).  A genuinely zero-copy payload would need the renderer
+/// to emit into a fixed-capacity shared buffer it hands over whole — a different
+/// architecture, not a type change.
 pub fn channel(tx: crossbeam_channel::Sender<String>) -> impl MakeSink<Sink = ChannelSink> {
     move || ChannelSink {
         tx: tx.clone(),
@@ -361,16 +608,29 @@ pub fn channel(tx: crossbeam_channel::Sender<String>) -> impl MakeSink<Sink = Ch
 pub struct BufferedChannelSink {
     tx: crossbeam_channel::Sender<String>,
     buf: String,
+    /// Capacity every replacement buffer is seeded with (see `send_buffered`).
+    capacity: usize,
     disconnected: bool,
 }
 
 impl BufferedChannelSink {
     /// Frame and send the buffered text, clearing it for the next batch.
     fn send_buffered(&mut self) -> io::Result<()> {
-        if self.disconnected || self.buf.is_empty() {
+        // Sticky, like `write_str`/`write_fmt`: once the channel is gone every
+        // method keeps reporting it.  Landing on `Ok(())` here made a flush retry
+        // at batch end look successful on a dead channel — the "silently
+        // succeeding" failure mode this module's docs forbid.
+        if self.disconnected {
+            return Err(broken_pipe());
+        }
+        if self.buf.is_empty() {
             return Ok(());
         }
-        let payload = std::mem::take(&mut self.buf);
+        // Hand the payload on and keep the configured capacity.  `mem::take` left
+        // a capacity-0 shell, so the *second* diagnostic of a batch (and all
+        // later ones) regrew through the doubling chain — exactly the cost
+        // `buffered_channel_with_capacity` exists to avoid.
+        let payload = std::mem::replace(&mut self.buf, String::with_capacity(self.capacity));
         match self.tx.send(payload) {
             Ok(()) => Ok(()),
             Err(_) => {
@@ -381,6 +641,31 @@ impl BufferedChannelSink {
             }
         }
     }
+
+    /// Non-blocking variant, used from `Drop` while unwinding.
+    ///
+    /// A blocking `send` there can hang forever: with a `bounded` channel the
+    /// receiver being stalled is *why* it is full, and the panicking thread is
+    /// inside a destructor — the receiver may be waiting on it.  Losing the
+    /// buffered tail is strictly better than a deadlock.
+    fn try_flush(&mut self) -> io::Result<()> {
+        if self.disconnected {
+            return Err(broken_pipe());
+        }
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let payload = std::mem::replace(&mut self.buf, String::with_capacity(self.capacity));
+        match self.tx.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                self.disconnected = true;
+                Err(broken_pipe())
+            }
+            // Full: drop the tail (documented above).
+            Err(crossbeam_channel::TrySendError::Full(_)) => Ok(()),
+        }
+    }
 }
 
 impl Drop for BufferedChannelSink {
@@ -389,7 +674,14 @@ impl Drop for BufferedChannelSink {
         // disconnected one has nowhere to go.  The error is swallowed for the
         // same reason `BufWriter::drop` swallows its flush error — there is no
         // caller left to report to.
-        let _ = self.send_buffered();
+        //
+        // While unwinding the send must not block (see `try_flush`); the
+        // documented backpressure semantics stay for ordinary drops.
+        let _ = if std::thread::panicking() {
+            self.try_flush()
+        } else {
+            self.send_buffered()
+        };
     }
 }
 
@@ -425,6 +717,7 @@ impl DiagnosticSink for BufferedChannelSink {
 }
 
 /// [`channel`] with one message per batch instead of per write.
+#[must_use]
 pub fn buffered_channel(
     tx: crossbeam_channel::Sender<String>,
 ) -> impl MakeSink<Sink = BufferedChannelSink> {
@@ -432,13 +725,16 @@ pub fn buffered_channel(
 }
 
 /// [`buffered_channel`] with an explicit initial buffer size.
+#[must_use]
 pub fn buffered_channel_with_capacity(
     tx: crossbeam_channel::Sender<String>,
     capacity: usize,
 ) -> impl MakeSink<Sink = BufferedChannelSink> {
+    let capacity = clamp_capacity(capacity);
     move || BufferedChannelSink {
         tx: tx.clone(),
         buf: String::with_capacity(capacity),
+        capacity,
         disconnected: false,
     }
 }
@@ -446,6 +742,13 @@ pub fn buffered_channel_with_capacity(
 /// Retained buffers for [`pooled_string`].  Bounded: a process that renders one
 /// huge batch and then many small ones must not pin the huge allocation forever.
 const MAX_POOLED_BUFFERS: usize = 8;
+/// Capacity ceiling for a recycled buffer.
+///
+/// `MAX_POOLED_BUFFERS` bounds the *count*; without a byte bound a single 1 MB
+/// batch buffer entered the (LIFO) pool and was popped first by every later
+/// small batch — pinned forever and charged to each of them, exactly the
+/// "must not pin the huge allocation" failure the pool's doc claims to prevent.
+const MAX_RECYCLED_CAPACITY: usize = 64 * 1024;
 
 /// [`StringSink`] whose buffer is returned to a shared pool on drop.
 ///
@@ -460,7 +763,13 @@ const MAX_POOLED_BUFFERS: usize = 8;
 /// error.
 pub struct PooledStringSink {
     buf: String,
-    pool: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Bounded MPMC stack.  The pool's semantics were always exactly that
+    /// (`push` fails when full, `pop` fails when empty → allocate fresh), so the
+    /// `Mutex<Vec<_>>` only added an acquire/release per batch and made the cap an
+    /// `if` instead of a capacity.  `ArrayQueue` is lock-free and its capacity *is*
+    /// `MAX_POOLED_BUFFERS`; a poisoned pool cannot exist, so "pool unavailable →
+    /// allocate" is simply `pop() == None`.
+    pool: std::sync::Arc<crossbeam_queue::ArrayQueue<String>>,
 }
 
 impl PooledStringSink {
@@ -497,11 +806,15 @@ impl Drop for PooledStringSink {
         if buf.capacity() == 0 {
             return;
         }
-        if let Ok(mut pool) = self.pool.lock() {
-            if pool.len() < MAX_POOLED_BUFFERS {
-                pool.push(buf);
-            }
+        // Oversized buffers are not recycled (see `MAX_RECYCLED_CAPACITY`):
+        // dropping the allocation is cheaper than pinning a megabyte for the
+        // lifetime of the pool, and LIFO would hand it to every small batch.
+        if buf.capacity() > MAX_RECYCLED_CAPACITY {
+            return;
         }
+        // Fails (and drops `buf`) when the pool is full — the bound is the
+        // queue's capacity now, so there is no separate length check to drift.
+        let _ = self.pool.push(buf);
     }
 }
 
@@ -538,20 +851,22 @@ impl DiagnosticSink for PooledStringSink {
 }
 
 /// [`string`] backed by a shared, bounded buffer pool.
+#[must_use]
 pub fn pooled_string() -> impl MakeSink<Sink = PooledStringSink> {
     pooled_string_with_capacity(4096)
 }
 
 /// [`pooled_string`] with an explicit initial buffer size (used only on the first
 /// batch, before the pool warms up).
+#[must_use]
 pub fn pooled_string_with_capacity(capacity: usize) -> impl MakeSink<Sink = PooledStringSink> {
-    let pool: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(vec![String::with_capacity(capacity)]));
+    let capacity = clamp_capacity(capacity);
+    let pool: std::sync::Arc<crossbeam_queue::ArrayQueue<String>> =
+        std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(MAX_POOLED_BUFFERS));
+    let _ = pool.push(String::with_capacity(capacity));
     move || {
         let buf = pool
-            .lock()
-            .ok()
-            .and_then(|mut pool| pool.pop())
+            .pop()
             .unwrap_or_else(|| String::with_capacity(capacity));
         PooledStringSink {
             buf,
@@ -561,11 +876,177 @@ pub fn pooled_string_with_capacity(capacity: usize) -> impl MakeSink<Sink = Pool
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]
+mod coalescing_probe_tests {
+    use super::*;
+
+    /// Counts boundary crossings (the thing buffering exists to reduce) without
+    /// timing: a shared counter behind an `io::Write`.
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl io::Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn coalescing_cuts_boundary_crossings_but_not_bytes() {
+        let pieces: Vec<String> = (0..64).map(|i| format!("line {i}\n")).collect();
+        let plain_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut plain = Counting(std::sync::Arc::clone(&plain_counter));
+        let mut plain_bytes = String::new();
+        for p in &pieces {
+            io::Write::write_all(&mut plain, p.as_bytes()).expect("write");
+            plain_bytes.push_str(p);
+        }
+        io::Write::flush(&mut plain).expect("flush");
+        let plain_crossings = plain_counter.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(plain_crossings, pieces.len(), "one crossing per piece");
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut coalesced =
+            CoalescingSink::with_capacity(Counting(std::sync::Arc::clone(&counter)), 1024);
+        let mut coalesced_bytes = String::new();
+        for p in &pieces {
+            coalesced.write_str(p).expect("write");
+            coalesced_bytes.push_str(p);
+        }
+        coalesced.flush().expect("flush");
+        assert_eq!(
+            coalesced_bytes, plain_bytes,
+            "coalescing must not change the bytes"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "64 short pieces fit one 1 KiB buffer"
+        );
+    }
+
+    #[test]
+    fn coalescing_bypasses_the_buffer_for_an_oversized_piece() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sink =
+            CoalescingSink::with_capacity(Counting(std::sync::Arc::clone(&counter)), 1024);
+        let huge = "x".repeat(4096);
+        sink.write_str("small").expect("write");
+        sink.write_str(&huge).expect("write");
+        sink.flush().expect("flush");
+        // small → buffered, huge → direct, flush → the buffered prefix: two
+        // crossings, because the oversized piece never entered the buffer.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn coalescing_pool_returns_the_buffer_on_drop() {
+        // `ArrayQueue::new` is not a const fn, so the pool lives behind a
+        // `LazyLock` (the production pools do the same).
+        static POOL: std::sync::LazyLock<crossbeam_queue::ArrayQueue<String>> =
+            std::sync::LazyLock::new(|| crossbeam_queue::ArrayQueue::new(4));
+        drop(CoalescingSink::with_pool(Vec::<u8>::new(), 1024, &POOL));
+        assert_eq!(POOL.len(), 1, "the buffer must be recycled on drop");
+    }
+}
+
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
 
     /// One batch, one message — and a batch that is dropped without an explicit
     /// `flush` still reaches the receiver (the panic-containment path).
+    /// `write_parts` must be byte-identical to the sequential default even when
+    /// the sink reports vectored support but only ever consumes a *prefix* of the
+    /// iovecs — the case std's (still unstable) `write_all_vectored` exists for,
+    /// and the one a hand-rolled loop gets wrong.
+    #[test]
+    fn write_parts_matches_sequential_on_partial_writes() {
+        use std::io::{IoSlice, Write};
+
+        struct Trickle {
+            buf: Vec<u8>,
+            per_call: usize,
+            /// `false` models a sink with the *default* `write_vectored` (first
+            /// slice only), which is what a console/`Write` without real support
+            /// looks like.
+            vectored: bool,
+        }
+        impl Write for Trickle {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                let n = b.len().min(self.per_call.max(1));
+                self.buf.extend_from_slice(&b[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+                if !self.vectored {
+                    // std's default: only the first slice is considered.
+                    return match bufs.first() {
+                        Some(b) => self.write(b),
+                        None => Ok(0),
+                    };
+                }
+                let mut written = 0;
+                for b in bufs {
+                    if written >= self.per_call {
+                        break;
+                    }
+                    let n = b.len().min(self.per_call - written);
+                    self.buf.extend_from_slice(&b[..n]);
+                    written += n;
+                }
+                Ok(written)
+            }
+        }
+
+        // Empty pieces and multi-byte UTF-8 are the interesting cases: an empty
+        // `IoSlice` would stall `advance_slices`, and `γ` straddles slice
+        // boundaries in the per-byte trickle.
+        let parts = ["head\n", "", "  \u{3b3}  label\n", "tail\n", ""];
+        let mut expected = Vec::new();
+        for p in parts {
+            expected.extend_from_slice(p.as_bytes());
+        }
+        for per_call in [1usize, 2, 3, 7, 64, usize::MAX] {
+            for vectored in [false, true] {
+                let mut sink = Trickle {
+                    buf: Vec::new(),
+                    per_call,
+                    vectored,
+                };
+                sink.write_parts(&parts).unwrap();
+                assert_eq!(
+                    sink.buf, expected,
+                    "per_call={per_call} vectored={vectored}"
+                );
+            }
+        }
+
+        // A sink that accepts nothing must surface `WriteZero`, not spin.
+        struct Stuck;
+        impl Write for Stuck {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn write_vectored(&mut self, _: &[IoSlice<'_>]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        let mut stuck = Stuck;
+        assert_eq!(
+            stuck.write_parts(&["a", "b"]).unwrap_err().kind(),
+            io::ErrorKind::WriteZero
+        );
+    }
+
     #[test]
     fn buffered_channel_sends_one_message_per_batch() {
         use crate::diagnostics::sink::MakeSink as _;
@@ -583,11 +1064,22 @@ mod tests {
         assert_eq!(msg, "head\n  ^^^^ label\ntail\n");
         assert!(rx.try_recv().is_err(), "exactly one message, not three");
 
-        // Drop without flush: best-effort delivery.
+        // Drop without flush: best-effort delivery — the receiver must be *alive*
+        // for this to test anything.  The old block dropped the receiver
+        // immediately (`unbounded().0`), so the sink was disconnected from birth,
+        // the drop-flush failed silently, and no assertion covered the path the
+        // comment claims.
         {
-            let mut sink =
-                buffered_channel_with_capacity(crossbeam_channel::unbounded().0, 16).make();
+            let (tx_drop, rx_drop) = crossbeam_channel::unbounded();
+            let mut sink = buffered_channel_with_capacity(tx_drop, 16).make();
             sink.write_str("dropped").unwrap();
+            drop(sink);
+            assert_eq!(
+                rx_drop
+                    .try_recv()
+                    .expect("drop must flush the buffered tail"),
+                "dropped"
+            );
         }
 
         // A disconnected receiver short-circuits without allocating.

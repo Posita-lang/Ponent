@@ -408,7 +408,6 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
         }
         swriteln!(rs, "        entry: Some(&CODE_TABLE[{i}]),");
         swriteln!(rs, "        known: true,");
-        swriteln!(rs, "        hash: {:#x},", fnv1a(e.code.as_bytes()));
         let doc = format!("{DOC_URL_PREFIX}{}.html", e.code);
         swriteln!(rs, "        doc_url: {doc:?},");
         let ansi = format!("\u{1b}]8;;{doc}\u{1b}\\{}\u{1b}]8;;\u{1b}\\", e.code);
@@ -433,5 +432,82 @@ fn generate_table(entries: &[RegistryEntry]) -> String {
     }
     rs.push_str("}\n");
 
+    // Build-time `known_code_ranges`, so the "valid codes are …" hint is a
+    // `&'static str` instead of a first-use sort of ~450 entries plus a heap
+    // `String`.  The runtime `format_code_ranges` stays as the *differential
+    // oracle*: `known_code_ranges_match_the_runtime_formatter` asserts the two
+    // agree, so this duplication cannot drift silently.
+    let ranges = format_ranges(entries);
+    rs.push_str(
+        "\n/// Every registry code, summarised as contiguous numeric ranges.\n\
+         ///\n\
+         /// Generated: see `tools/codegen/src/codes.rs::format_ranges`, whose output is\n\
+         /// pinned against the runtime `diagnostics::format_code_ranges` by a test.\n",
+    );
+    swriteln!(
+        rs,
+        "pub(crate) const KNOWN_CODE_RANGES: &str = {:?};",
+        ranges
+    );
+
     rs
+}
+
+/// Summarise the registry's codes as contiguous numeric ranges.
+///
+/// Must stay byte-identical to `src/diagnostics/mod.rs::format_code_ranges`
+/// (pinned by `known_code_ranges_match_the_runtime_formatter`): the same sort by
+/// `(prefix, numeric)`, the same `start–end` grouping for adjacent numerics, and
+/// the same `", "` join.  The `–` is U+2013.
+fn format_ranges(entries: &[RegistryEntry]) -> String {
+    let mut keyed: Vec<(u8, u64, &str)> = entries
+        .iter()
+        .map(|e| {
+            let c = e.code.as_str();
+            (
+                c.as_bytes().first().copied().unwrap_or(b'?'),
+                c.get(1..)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .map(u64::from)
+                    .unwrap_or(u64::MAX),
+                c,
+            )
+        })
+        .collect();
+    keyed.sort_unstable();
+    let numeric = |c: &str| {
+        c.get(1..)
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(u64::from)
+    };
+    let mut out = String::with_capacity(keyed.len().saturating_mul(9));
+    let mut i = 0;
+    while i < keyed.len() {
+        let start = keyed[i].2;
+        let prefix = start.get(..1).unwrap_or("?");
+        let mut end = start;
+        while i + 1 < keyed.len() {
+            let next = keyed[i + 1].2;
+            if next.get(..1).unwrap_or("?") != prefix {
+                break;
+            }
+            match (numeric(end), numeric(next)) {
+                (Some(a), Some(b)) if a.checked_add(1) == Some(b) => {
+                    end = next;
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(start);
+        if start != end {
+            out.push('\u{2013}');
+            out.push_str(end);
+        }
+        i += 1;
+    }
+    out
 }

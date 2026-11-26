@@ -232,7 +232,7 @@ impl Styles {
 
 // ── GlyphRenderer ───────────────────────────────────────────────
 
-/// What a source section actually drew (1.2). `drew_primary` means the primary
+/// What a source section actually drew. `drew_primary` means the primary
 /// span's start line was inside the drawn window — the only case in which the
 /// location is visible and the caller may suppress its fallback note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,7 +280,7 @@ pub(crate) struct SectionScratch {
     pub all_label_lines: SmallVec<[(usize, usize); 4]>,
     // ── Row-loop scratch (reused across rows within a section) ─
     // `row_buf` is used by the HTML renderer; the glyph path appends rows
-    // directly to its output (P4) and no longer copies through it.
+    // directly to its output and no longer copies through it.
     pub row_buf: String,
     /// Pre-built per-row gutter fragments (`│ <num> ` head/tail), cleared and
     /// refilled once per section instead of allocating twice per section.
@@ -372,7 +372,7 @@ impl SectionScratch {
 }
 
 /// Re-apply `color` after every `\x1b[22m\x1b[39m` pair injected by the
-/// code highlighter, writing straight into `out` (B3).  Shared by the inline
+/// code highlighter, writing straight into `out`.  Shared by the inline
 /// and connector label-message paths so the two cannot drift.
 fn push_recologored(out: &mut String, text: &str, color: &str) {
     const PAT: &str = "\x1b[22m\x1b[39m";
@@ -741,6 +741,13 @@ impl GlyphRenderer {
             // against this buffer, so only anchor-file spans and labels
             // render in sections; the rest stay visible as byte-range
             // notes after the sections.
+            // Every coordinate consumer below is gated on `span.file == anchor`: labels
+            // (755/776), `additionalSpans` (766), related-error synthetic labels (796)
+            // and the underlines (809).  That is what keeps a foreign-file span — whose
+            // offsets are valid only in *its* buffer — from drawing markers on this
+            // excerpt; `json.rs` documents the same hazard for its coordinates.  The
+            // audit that asked for this note found the gate present at all four sites,
+            // so it is stated here as the invariant to preserve rather than re-derived.
             let anchor_file = sorted_spans.first().map(|sp| sp.file);
             // Each merged label's (start_line, end_line), converted once
             // per render and shared by every source section below.
@@ -870,7 +877,12 @@ impl GlyphRenderer {
             // none of which varies per section.  `canonicalize` is cached in
             // `RenderCtx` so a batch of M diagnostics over one file pays one
             // syscall instead of M (matching `chain.rs`'s hoist).
-            let hyperlink_enabled = self.s.use_color && super::term::supports_hyperlinks();
+            // **Capability, not palette.**  OSC 8 is zero-width and orthogonal to
+            // SGR: a `--color=never` run on a hyperlink-capable terminal used to
+            // lose every clickable link because the click target was gated on
+            // colour.  `chain.rs` already decoupled this; the two surfaces must
+            // answer the same question the same way.
+            let hyperlink_enabled = super::term::supports_hyperlinks();
             let anchor_fname: &str = &diag.file_name;
             let anchor_file_url: Option<Arc<str>> =
                 if hyperlink_enabled && super::is_real_file_name(anchor_fname) {
@@ -914,7 +926,7 @@ impl GlyphRenderer {
                 // section's window start. `None` (first section) draws no marker;
                 // `Some(n)` always has `n >= 1` — contiguous sections are merged by
                 // the predicate above, so the old "0 draws a bare `...`" state was
-                // unreachable (C8).
+                // unreachable.
                 let folded_lines = i
                     .checked_sub(1)
                     .and_then(|prev_i| merged.get(prev_i))
@@ -1105,7 +1117,7 @@ impl GlyphRenderer {
                             suggestion_lines_buf[i] = None;
                         }
                         // Only a section that actually drew the primary span
-                        // counts as "rendered" (1.2): an empty foreign source or
+                        // counts as "rendered": an empty foreign source or
                         // a primary past EOF must fall through to the
                         // location-note fallbacks below, or its spans and labels
                         // would be silently suppressed.
@@ -1151,7 +1163,7 @@ impl GlyphRenderer {
                 // that may be unrelated.
                 let foreign = anchor_file.is_none_or(|anchor| lbl.span.file != anchor);
                 let pos = (!foreign).then(|| idx.to_linecol(lbl.span.start_as_usize()));
-                // B4: one canonical note path.  A locatable label gets
+                // One canonical note path.  A locatable label gets
                 // `line:col`; a foreign/unlocatable one gets its byte range so
                 // it stays identifiable.  `write_note_line_with` owns the
                 // gutter, wrapping, note color, and continuation padding.
@@ -1197,7 +1209,7 @@ impl GlyphRenderer {
                     Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {sp}"),
                     _ => sp.to_string(),
                 };
-                // C7: route through the wrapping note writer so a long location
+                // Route through the wrapping note writer so a long location
                 // cannot overflow `max_width` on the no-source path, and the
                 // continuation gutter matches every other note.
                 self.write_note_line(out, &format!("at {loc}"));
@@ -1220,7 +1232,7 @@ impl GlyphRenderer {
                     Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {sp}"),
                     _ => sp.to_string(),
                 };
-                // C7: route through the wrapping note writer so a long location
+                // Route through the wrapping note writer so a long location
                 // cannot overflow `max_width` on the no-source path, and the
                 // continuation gutter matches every other note.
                 self.write_note_line(out, &format!("at {loc}"));
@@ -1245,7 +1257,7 @@ impl GlyphRenderer {
                     Some(f) if !f.is_empty() && f != "<input>" => format!("{f} {}", lbl.span),
                     _ => lbl.span.to_string(),
                 };
-                // C7: wrap the whole `message at location` through the shared
+                // Wrap the whole `message at location` through the shared
                 // note writer (localized label + pad-only continuations) so a
                 // long label cannot break the width contract on this path.
                 self.write_note_line(out, &format!("{} at {}", sanitized, loc));
@@ -1498,7 +1510,7 @@ impl GlyphRenderer {
         // is `header_cols - (if numbered { 3 } else { 0 })`.
         let prefix_no_num = header_cols - usize::from(numbered) * 3;
         let cont_number = if numbered { "   " } else { "" };
-        // B5: the continuation reserves the same 3-column numbered slot as
+        // The continuation reserves the same 3-column numbered slot as
         // the first line; pin the invariant so a future literal edit fails
         // loudly instead of silently shifting wrapped header messages.
         debug_assert_eq!(
@@ -1552,7 +1564,9 @@ impl GlyphRenderer {
                         if i > 0 {
                             out.push(',');
                         }
-                        out.push_str(&c.url_ansi());
+                        // Write form: no owned wrapper for an uncacheable spelling.
+                        // `String`'s `fmt::Write` never fails.
+                        let _ = c.write_ansi_hyperlink(out);
                     }
                 } else {
                     for (i, s) in sanitized_codes.iter().enumerate() {
@@ -2182,7 +2196,7 @@ impl GlyphRenderer {
             if !underlines.is_empty() {
                 let lane_count = lanes.assign(underlines);
                 for lane_idx in 0..lane_count {
-                    // P4: emit the gutter first, then append the underline
+                    // Emit the gutter first, then append the underline
                     // cells straight into `out`; roll the gutter back if the
                     // lane turned out invisible (all entries clipped).
                     let mark = out.len();
@@ -2258,7 +2272,7 @@ impl GlyphRenderer {
                     // line only, so reserve that gutter too.
                     // A help label prepends the localized `help: ` gutter on its first
                     // line only, so reserve its display width — not the ASCII
-                    // literal's 6 cells (C6: `ru` was over-reserving).
+                    // literal's 6 cells (`ru` was over-reserving).
                     let help_label = crate::diagnostics::DiagnosticLevel::Help.label();
                     let help_cols = visible_width(help_label.as_ref()) + 2;
                     let prefix_cols = BOX_VERT_WIDTH
@@ -2279,6 +2293,17 @@ impl GlyphRenderer {
                         let msg_prefix = BOX_VERT_WIDTH + indent.len() + BOX_VERT_WIDTH + 1;
                         let segments = self.wrap_msg(&sanitized_msg, msg_prefix);
                         for seg in segments.iter() {
+                            // The whole segment is emitted with one indent prefix and
+                            // one SGR on/off pair, and the tab expander ran at
+                            // `start_col = indent_cols`; an embedded hard newline
+                            // would break all three at once (indent once, SGR leaking
+                            // across rows, wrong tab columns) with no other assertion
+                            // firing.  `wrap_segments_never_contain_hard_newlines`
+                            // is the differential; this is the cheap local tripwire.
+                            debug_assert!(
+                                !seg.contains('\n'),
+                                "wrap segment carries a hard newline: {seg:?}"
+                            );
                             // Highlight straight into the section scratch, then
                             // copy once — the gutter pieces below interleave, so
                             // the highlighted text must be assembled first.
@@ -2529,7 +2554,7 @@ impl GlyphRenderer {
             let glyph = match applicability {
                 // ASCII markers, not `√`: `√` is East-Asian-Ambiguous width, so
                 // CJK terminals render it two cells wide and shift the `-`/`+`
-                // payload out of alignment with the source rows above (C10).
+                // payload out of alignment with the source rows above.
                 crate::diagnostics::Applicability::MachineApplicable => ">",
                 crate::diagnostics::Applicability::MaybeIncorrect => "?",
                 _ => "",
@@ -2926,7 +2951,7 @@ impl GlyphRenderer {
         self.write_note_line_with(out, msg, None);
     }
 
-    /// Canonical note emitter (B4).  `suffix` is appended to the final wrapped
+    /// Canonical note emitter.  `suffix` is appended to the final wrapped
     /// segment as ` at <suffix>`; the fallback-label loop and the foreign-span
     /// loop both route through this so coloring, continuation padding, and
     /// locator placement cannot diverge.
@@ -3649,13 +3674,15 @@ fn line_needs_sanitize(line: &str) -> bool {
 
     // 1) C0 (excluding tab/newline) and DEL: reuse the shared scanner rather
     // than maintaining a second, drift-prone copy of the same SWAR masks.
-    let (_, dirty, has_c1) = super::scan_terminal_control_flags_multiline(bytes);
-    if dirty || has_c1 {
+    let scan = super::scan_terminal_control_flags_multiline(bytes);
+    if scan.dirty || scan.has_c1 {
         return true;
     }
 
-    // 4) Bidi overrides / isolates — exact byte predicate from `mod.rs`.
-    super::has_bidi_override_bytes(bytes)
+    // 4) Bidi overrides / isolates — exact byte predicate from `mod.rs`, gated on
+    // the `0xE2` flag the control scan already computed (every override is a
+    // leading-`0xE2` sequence), so a Cyrillic/CJK line skips the `memchr` pass.
+    scan.has_e2 && super::has_bidi_override_bytes(bytes)
 }
 
 /// Emit bytes `[a, b)` of a printable-ASCII+tab line, splitting at tabs:
@@ -4871,7 +4898,7 @@ impl UnderlineLanes {
                 comp_lanes.clear();
                 comp_lanes.extend(comp_weights.iter().map(|&(lane_idx, _)| lane_idx));
                 comp_lanes.sort_unstable();
-                // C2: exact tier for χ ≤ 3.  The permutation search below only
+                // Exact tier for χ ≤ 3.  The permutation search below only
                 // renumbers the greedy colouring, while a component can have a
                 // *different* proper colouring with strictly lower WDS.  The
                 // sweep DP explores all of them, so for the shape that dominates
@@ -5004,7 +5031,7 @@ impl UnderlineLanes {
     ) -> bool {
         // Callers that own only a scratch row buffer (the HTML renderer) get
         // the historical clear-then-write contract; the glyph renderer appends
-        // straight to its output via `row_append` (P4).
+        // straight to its output via `row_append`.
         out.clear();
         self.row_append(underlines, index, display_width, out, color_for, reset)
     }
@@ -5023,7 +5050,7 @@ impl UnderlineLanes {
         reset: &'a str,
     ) -> bool {
         let lane = &self.lanes[index];
-        // P4: append straight into the caller's buffer (no per-row scratch
+        // Append straight into the caller's buffer (no per-row scratch
         // copy). The caller saves a mark, emits the gutter, and truncates
         // back to it when this returns `false`.
         // First column not yet emitted.
@@ -6147,8 +6174,8 @@ fn highlight_code_impl_into(
     // layout bytes and the PASS arm copies them through.
     debug_assert!(
         {
-            let (_, dirty, has_c1) = super::scan_terminal_control_flags_multiline(line.as_bytes());
-            !dirty && !has_c1
+            let scan = super::scan_terminal_control_flags_multiline(line.as_bytes());
+            !scan.dirty && !scan.has_c1
         },
         "highlight input must be sanitized first, got {line:?}"
     );
@@ -6464,7 +6491,7 @@ mod tests {
         assert!(output.contains("<input>"));
     }
 
-    /// C6: `grapheme_width` is `pub(crate)` and reached directly by
+    /// `grapheme_width` is `pub(crate)` and reached directly by
     /// `expand_tabs_from_col` / test oracles, so a caller-supplied
     /// `tab_width == 0` must not divide by zero.
     /// `LineColumns` must be byte-for-byte equivalent to the per-query walk it
@@ -7275,14 +7302,23 @@ mod tests {
             .with_span(Span::new(FileId::DUMMY, 0, 3))
             .with_source(src)
             .with_file_name(name);
-        let out = GlyphRenderer::new(true).render_diagnostic(&diag);
-        if crate::diagnostics::term::supports_hyperlinks() {
+        // Pinned on: a bare test process reports no hyperlink support, so this branch used
+        // to be skipped exactly when it was the only thing testing the URL *inside* OSC 8.
+        // The capability is a test input now (`with_hyperlinks_override`), and the render
+        // must happen inside the pin — rendering outside it produced no hyperlink at all
+        // and made the new "links were emitted" assertion fail in every terminal.
+        crate::diagnostics::term::with_hyperlinks_override(true, || {
+            let out = GlyphRenderer::new(true).render_diagnostic(&diag);
             assert!(
                 !out.contains("\x1b]8;;evil"),
                 "control char leaked into OSC 8 URL: {out:?}"
             );
             assert!(out.contains("%20"), "space not encoded: {out:?}");
-        }
+            assert!(
+                out.contains("\x1b]8;;"),
+                "hyperlinks were not emitted: {out:?}"
+            );
+        });
     }
 
     // ── Message wrapping ────────────────────────────────────────
@@ -8087,9 +8123,9 @@ mod tests {
         );
     }
 
-    // ── P2 layout tests (compact mode, fold counts, width unify, inline labels) ──
+    // ── Layout tests (compact mode, fold counts, width unify, inline labels) ──
 
-    /// Item 16: compact mode drops the sub-box header prefix, the spacing
+    /// Compact mode drops the sub-box header prefix, the spacing
     /// row, and the close row; the full layout keeps all three.
     #[test]
     fn compact_mode_drops_box_furniture() {
@@ -8179,7 +8215,7 @@ mod tests {
         );
     }
 
-    /// Item 18: a gap between disjoint sections gets a line count in the
+    /// A gap between disjoint sections gets a line count in the
     /// fold marker; contiguous sections get a bare `...`.
     #[test]
     fn fold_marker_reports_omitted_line_count() {
@@ -8200,7 +8236,7 @@ mod tests {
         );
     }
 
-    /// Item 19: sections keep one shared line-number column width even when
+    /// Sections keep one shared line-number column width even when
     /// the file's last line only appears in the final section.
     #[test]
     fn line_number_width_is_unified_across_sections() {
@@ -8255,7 +8291,7 @@ mod tests {
         );
     }
 
-    /// Item 17: a single non-multiline label renders its message inline
+    /// A single non-multiline label renders its message inline
     /// (no vertical-bar connector row); two labels on the same row keep
     /// the connector layout.
     #[test]
@@ -8590,12 +8626,7 @@ mod tests {
         }
     }
 
-    /// The per-component relabel must reach the exact minimum of the
-    /// weighted-depth-sum objective over all per-component labelings, checked
-    /// against an independent brute force on small random interval families,
-    /// plus a hand-verifiable witness.
-    #[test]
-    /// C2's exactness pin.
+    /// Exactness pin.
     ///
     /// For a row whose every component has `χ ≤ 3`, the sweep DP must return the
     /// minimum `Σ w·lane` over **all proper colourings**, not merely over
@@ -8725,6 +8756,14 @@ mod tests {
         }
     }
 
+    /// The per-component relabel must reach the exact minimum of the
+    /// weighted-depth-sum objective over all per-component labelings, checked
+    /// against an independent brute force on small random interval families,
+    /// plus a hand-verifiable witness.
+    ///
+    /// (The `#[test]` here had slid onto the function above, so this pin never ran;
+    /// `every_test_module_fn_is_collected` in `mod.rs` now catches the family.)
+    #[test]
     fn lane_relabel_per_component_matches_exhaustive_search() {
         // (a) Deterministic LCG (no `rand` crate): ≤ 6 intervals over 24
         // columns, so a row tops out at a handful of lanes.
@@ -8797,7 +8836,7 @@ mod tests {
 
     // ── Regression tests: context window, diff block, no-source labels ──
 
-    /// F1: `context_lines = 0` must show exactly the covered lines — the
+    /// `context_lines = 0` must show exactly the covered lines — the
     /// old `end_line + 1 + context_lines` window dragged one line below the
     /// span in even at zero context.
     #[test]
@@ -8823,7 +8862,7 @@ mod tests {
         );
     }
 
-    /// F1: `context_lines = 2` shows exactly two lines below the covered
+    /// `context_lines = 2` shows exactly two lines below the covered
     /// lines — not three.
     #[test]
     fn context_lines_two_shows_exactly_two_lines_below() {
@@ -8849,7 +8888,7 @@ mod tests {
         );
     }
 
-    /// F1: a span whose end sits exactly on a line start does not drag the
+    /// A span whose end sits exactly on a line start does not drag the
     /// following line into the window (`span_lines` already attributes the
     /// end to the previous line).
     #[test]
@@ -8872,7 +8911,7 @@ mod tests {
         );
     }
 
-    /// F2: on the final covered line of a multi-line label, the message loop
+    /// On the final covered line of a multi-line label, the message loop
     /// owns the connector + message row; the connector loop must not draw a
     /// second, stray `|` row for the `end` part.
     #[test]
@@ -8936,7 +8975,7 @@ mod tests {
         );
     }
 
-    /// F3: wrapped structural-suggestion continuations align under the
+    /// Wrapped structural-suggestion continuations align under the
     /// message, not under the glyph.
     #[test]
     fn wrapped_suggestion_continuations_align_under_message() {
@@ -8981,7 +9020,7 @@ mod tests {
         );
     }
 
-    /// F4: a single-line span whose replacement contains a newline must
+    /// A single-line span whose replacement contains a newline must
     /// fall back to the text-only suggestion path — splicing it into the
     /// `-`/`+` rows would produce a malformed multi-line diff row.
     #[test]
@@ -9008,7 +9047,7 @@ mod tests {
         );
     }
 
-    /// F5: a tab-indented source line in the diff block expands tabs like
+    /// A tab-indented source line in the diff block expands tabs like
     /// the main source rows do — no raw `\t` may reach the diff rows.
     #[test]
     fn diff_block_lines_expand_tabs() {
@@ -9063,7 +9102,7 @@ mod tests {
         assert_eq!(d_ws, 4, "diff row tab must stop-align from col 8:\n{out}");
     }
 
-    /// F6: labels are not dropped when no source is attached — each label
+    /// Labels are not dropped when no source is attached — each label
     /// message stays visible as an `= note: <msg> at <span>` line.
     #[test]
     fn labels_render_without_source() {
@@ -9084,7 +9123,7 @@ mod tests {
         );
     }
 
-    /// F7: a lifetime must not enter the char-literal scan — the scanner
+    /// A lifetime must not enter the char-literal scan — the scanner
     /// used to pair the lifetime's apostrophe with a later one and swallow
     /// the tokens between (here, the `set` keyword).
     #[test]
@@ -9102,7 +9141,7 @@ mod tests {
         );
     }
 
-    /// F7: real char literals keep working — plain, escaped, and the
+    /// Real char literals keep working — plain, escaped, and the
     /// quote-as-char corner.
     #[test]
     fn char_literals_still_scan_correctly() {
@@ -9135,7 +9174,7 @@ mod tests {
         i
     }
 
-    /// F9 differential test: the SWAR run scan must advance exactly as far
+    /// Differential test: the SWAR run scan must advance exactly as far
     /// as the scalar bitmap loop — over all 256 byte values (at every
     /// substring offset) and over deterministic pseudo-random byte strings
     /// (at every alignment, exercising unaligned 8-byte chunk loads).

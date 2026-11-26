@@ -10,9 +10,10 @@
 //! span offsets still refer to the original source, so a later edit never sees
 //! an earlier replacement and no reverse-order dance is needed.  The
 //! `start >= last` guard in `apply_slice_count` (the body shared by every
-//! public `apply` entry point) therefore holds by construction for same-file,
-//! in-order edits; it is a cross-file safety guard for a caller that mixes files
-//! into one buffer.
+//! public `apply` entry point) therefore holds by construction; it exists as a
+//! **corrupted-set backstop**, not as a policy — no public path can mix files
+//! into one buffer (`edits` is private and `apply_for_file*` filters by
+//! `FileId`), so a trigger means the disjointness invariant was broken upstream.
 //!
 //! The write-back path itself (reading the source, writing the fixed file,
 //! re-running the check) belongs in the CLI; this is the library layer that
@@ -24,8 +25,10 @@
 //! use ponent::diagnostics::{FixHints, FixSet};
 //!
 //! let set = FixSet::collect(&diags, FixHints::Auto);
-//! if !set.is_empty() {
-//!     let fixed = set.apply(source);          // Cow: borrows when empty
+//! for (file, path) in files {
+//!     // Per-file application: `apply(source)` is only correct for a single-file
+//!     // set (otherwise the first file's edits are all that land).
+//!     let fixed = set.apply_for_file(source, file);   // Cow: borrows when empty
 //!     std::fs::write(path, fixed.as_bytes())?;
 //! }
 //! ```
@@ -57,6 +60,7 @@ pub enum FixHints {
 }
 
 impl FixHints {
+    #[inline]
     fn accepts(self, app: Applicability) -> bool {
         match self {
             FixHints::Auto => matches!(app, Applicability::MachineApplicable),
@@ -99,7 +103,8 @@ impl FixHints {
 ///
 /// The constant is policy, not a theorem; change it here if `--fix` grows an
 /// objective flag.
-fn applicability_weight(app: Applicability) -> u64 {
+#[inline]
+fn applicability_weight(app: Applicability) -> u32 {
     match app {
         Applicability::MachineApplicable => 4,
         Applicability::MaybeIncorrect => 2,
@@ -123,9 +128,19 @@ pub struct FixEdit<'src> {
 
 /// Non-overlapping edits for one source buffer.
 ///
-/// Sorted by `(file, start, end)`.  Overlapping candidates are resolved by
-/// maximum total applicability weight (weighted interval scheduling); equal
-/// weights retain the edit that ends first, then the one that starts first.
+/// Sorted by `(file, start, end)`.  That order is *extensional*, not the order
+/// the resolver works in: `resolve_overlaps` emits per-file groups in `(end,
+/// start)` order, and non-overlapping edits in `(end, start)` order necessarily
+/// have non-decreasing starts — which is exactly `(file, start, end)` order.  Do
+/// not "fix" the resolver to sort by start: its `partition_point` prefix
+/// computation requires end order.
+///
+/// Overlapping candidates are resolved by maximum total applicability weight
+/// (weighted interval scheduling); equal weights retain the edit that ends first,
+/// then the one that starts first.
+///
+/// `Clone` is a **deep** copy of any `Cow::Owned` replacement — collect once and
+/// share by reference; do not clone a set per file.
 #[derive(Debug, Default, Clone)]
 pub struct FixSet<'src> {
     edits: Vec<FixEdit<'src>>,
@@ -147,7 +162,6 @@ struct ResolveScratch {
     // a ~1.9× cache-density win on exactly the loop that touches them randomly.
     p: Vec<u32>,
     w: Vec<u32>,
-    take: Vec<bool>,
     /// Backtrack result (indices, ascending) — reused across groups.
     idx: Vec<u32>,
 }
@@ -175,14 +189,29 @@ impl<'src> FixSet<'src> {
     /// *total-weight* ties between different geometries are resolved by that
     /// consideration order rather than by a rule on widths — see
     /// [`applicability_weight`] for the two pinned directions.
+    #[must_use]
     pub fn collect(diags: &[Diagnostic<'src>], hints: FixHints) -> Self {
         // Exact reservation: one pre-pass sums the suggestion counts, so the
         // vector does not pay its 4→8→16 growth chain on a suggestion-heavy
         // batch.  (`diags.len()` was neither an upper nor even a lower bound —
         // a diagnostic carries *all* of its suggestions — so calling it an
         // upper bound was simply wrong.)
-        let mut candidates: Vec<FixEdit<'src>> =
-            Vec::with_capacity(diags.iter().map(|d| d.suggestions().len()).sum());
+        // Count only the *eligible* suggestions: hidden styles and
+        // applicability-rejected ones never become edits, and a batch where most
+        // suggestions are hidden (common for `Review`/`Auto` filtering) was
+        // reserving for all of them.  One O(suggestions) walk buys an exact
+        // reservation; the growth chain it avoids is 4→8→16→…
+        let eligible = diags
+            .iter()
+            .flat_map(|d| d.suggestions())
+            .filter(|sug| {
+                !matches!(
+                    sug.style,
+                    SuggestionStyle::HideCodeAlways | SuggestionStyle::CompletelyHidden
+                ) && hints.accepts(sug.applicability)
+            })
+            .count();
+        let mut candidates: Vec<FixEdit<'src>> = Vec::with_capacity(eligible);
         for diag in diags {
             for sug in diag.suggestions() {
                 match sug.style {
@@ -221,11 +250,17 @@ impl<'src> FixSet<'src> {
         // Stable sort is load-bearing: zero-length dedup and the DP
         // `include > exclude` tiebreak preserve diagnostic input order for
         // equal keys.  Do not swap for `sort_unstable_by_key`.
+        // One sort, keyed for the DP: `(file, end, start)` is what
+        // `resolve_file`'s prefix computation needs, and re-sorting per file
+        // afterwards was a second full comparison sort of the same elements.
+        // Zero-length dedup adjacency survives because a zero-length edit keys on
+        // `(file, p, p)` — equal keys are still adjacent (the dedup compares the
+        // full key, not just `end`).
         if !candidates
-            .is_sorted_by_key(|e| (e.span.file, e.span.start_as_usize(), e.span.end_as_usize()))
+            .is_sorted_by_key(|e| (e.span.file, e.span.end_as_usize(), e.span.start_as_usize()))
         {
             candidates
-                .sort_by_key(|e| (e.span.file, e.span.start_as_usize(), e.span.end_as_usize()));
+                .sort_by_key(|e| (e.span.file, e.span.end_as_usize(), e.span.start_as_usize()));
         }
         // A single valid edit cannot overlap anything; skip the dedup/group/DP
         // machinery entirely (the common one-fix batch).
@@ -240,9 +275,10 @@ impl<'src> FixSet<'src> {
 
     /// Maximum-weight independent set on the per-file interval graph.
     ///
-    /// `candidates` must be sorted by `(file, start, end)` — `collect` sorts
-    /// before calling; the zero-length dedup relies on equal
-    /// `(file, start, start)` being adjacent.
+    /// `candidates` must be sorted by `(file, end, start)` — `collect` sorts
+    /// before calling (that is the order `resolve_file`'s `partition_point` needs),
+    /// and a zero-length edit keys as `(file, p, p)`, so duplicate insertions are
+    /// still adjacent for the dedup below.
     ///
     /// Intervals are half-open `[start, end)` **except zero-length edits, which
     /// are closed points**: a point conflicts with any interval *containing* its
@@ -301,6 +337,33 @@ impl<'src> FixSet<'src> {
         }
         candidates.truncate(write);
         let deduped = candidates;
+        // Fast path: a conflict-free batch — the overwhelmingly common
+        // "suggestions rarely overlap" case — needs neither the per-file grouping
+        // nor the DP/greedy.  One linear scan decides it.
+        //
+        // Consecutive checks suffice under `(file, end, start)` order: if `a`
+        // conflicts with some later `b`, then the immediate successor `c` of `a`
+        // has `c.start <= b.start < a.end` for interval/interval and
+        // interval/point, and for point/point the same offset is already deduped;
+        // a point is emitted before an interval containing it (smaller `end`), so
+        // the pair is consecutive there too.
+        {
+            let mut disjoint = true;
+            let mut prev: Option<(FileId, usize)> = None;
+            for e in &deduped {
+                if let Some((f, prev_end)) = prev
+                    && f == e.span.file
+                    && prev_end > e.span.start_as_usize()
+                {
+                    disjoint = false;
+                    break;
+                }
+                prev = Some((e.span.file, e.span.end_as_usize()));
+            }
+            if disjoint {
+                return deduped;
+            }
+        }
 
         let mut result: Vec<FixEdit<'src>> = Vec::with_capacity(deduped.len());
         let mut scratch = ResolveScratch::default();
@@ -357,7 +420,8 @@ impl<'src> FixSet<'src> {
         out: &mut Vec<FixEdit<'src>>,
         scratch: &mut ResolveScratch,
     ) -> Vec<FixEdit<'src>> {
-        group.sort_by_key(|e| (e.span.end_as_usize(), e.span.start_as_usize()));
+        // No sort here: `collect` already sorted by `(file, end, start)`, which
+        // within one file group is exactly the `(end, start)` order the DP needs.
         let n = group.len();
         if n == 0 {
             return group;
@@ -383,7 +447,14 @@ impl<'src> FixSet<'src> {
         // `p[i]`/`w[i]`/`take[i]` are `u32`/`u32`/`bool`; the bound is structural
         // (`n` is a diagnostic batch size), and the DP's three arrays are its
         // dominant working set, so the narrower width is a cache win.
-        debug_assert!(n < u32::MAX as usize, "fix batch larger than u32::MAX");
+        // `w[i] <= 4i` (a weight is <= 4), so the totals that reach `u32` are
+        // bounded by `4n` — `n < u32::MAX` claimed four times the headroom the
+        // arithmetic has, and past `u32::MAX / 4` release builds would silently
+        // wrap to a wrong optimum.
+        debug_assert!(
+            n <= u32::MAX as usize / 4,
+            "fix batch too large for the 4n weight bound"
+        );
         // p[i] = number of earlier edits compatible with i.
         //
         // The backtrack collects *indices* rather than moving edits out of an
@@ -391,8 +462,14 @@ impl<'src> FixSet<'src> {
         // doubling the DP's per-element footprint) plus a per-element
         // `take().expect()`, which is exactly the shape the dedup pass above
         // brags about avoiding.
-        scratch.p.clear();
-        scratch.p.resize(n, 0);
+        // `p` is fully overwritten below before anything reads it, so reusing the
+        // allocation needs no zero-fill: grow+fill only when short, otherwise
+        // truncate and let the loop overwrite the stale values.
+        if scratch.p.len() < n {
+            scratch.p.resize(n, 0);
+        } else {
+            scratch.p.truncate(n);
+        }
         let p = &mut scratch.p;
         for (i, edit) in group.iter().enumerate() {
             p[i] = group[..i].partition_point(|earlier| {
@@ -402,32 +479,49 @@ impl<'src> FixSet<'src> {
         // W[i] = best weight over the first i edits.  On equal weight we
         // exclude the current edit; because `group` is end-sorted, this
         // retains the edit that ends first, then starts first.
-        scratch.w.clear();
-        scratch.w.resize(n + 1, 0);
-        scratch.take.clear();
-        scratch.take.resize(n + 1, false);
+        // Same for `w`: every cell in `1..=n` is written, and `w[0]` is the only
+        // read-before-write cell (reset explicitly).  `take` is gone — the
+        // backtrack re-derives each decision from `w`/`p` below.
+        if scratch.w.len() < n + 1 {
+            scratch.w.resize(n + 1, 0);
+        } else {
+            scratch.w.truncate(n + 1);
+        }
+        scratch.w[0] = 0;
         let w = &mut scratch.w;
-        let take = &mut scratch.take;
         for i in 1..=n {
             // The DP arrays are `u32` (see `ResolveScratch`); a weight is ≤ 4 by
             // construction, so narrowing here is exact.
-            let weight = applicability_weight(group[i - 1].applicability) as u32;
+            let weight = applicability_weight(group[i - 1].applicability);
             let include = weight + w[p[i - 1] as usize];
             let exclude = w[i - 1];
-            if include > exclude {
-                w[i] = include;
-                take[i] = true;
-            } else {
-                w[i] = exclude;
-            }
+            w[i] = if include > exclude { include } else { exclude };
         }
         // Backtrack to indices (ascending), then merge once over the owned group.
         // The earlier shape built a `Vec<Option<..>>` shadow, collected a second
         // `Vec` of chosen edits and reversed it — two allocations and a doubled
         // element footprint for the same answer.
+        //
+        // `idx` is reused across file groups (this function is called once per
+        // file), so it MUST be cleared here: without this, group *k*−1's leftover
+        // indices sit behind the `reverse()`ed new ones, and the merge loop below
+        // compares every enumeration index against them.  A stale index that
+        // happens to match pushes an edit the DP *rejected*, so the file's
+        // `FixSet` holds an overlapping, non-independent set — the type's headline
+        // invariant — and the `next == len` canary below still passes.  In debug
+        // it usually trips `debug_assert_eq!(next, ...)` instead, i.e. a panic on
+        // legitimate multi-file input.  `p`/`w`/`take` were cleared; this one was
+        // not.
+        scratch.idx.clear();
+        debug_assert!(scratch.idx.is_empty(), "stale backtrack indices");
+        // The decision is re-derived from the identical expression the DP used,
+        // so it cannot diverge — and it removes an `n+1`-element `bool` vector plus
+        // its writes (and the "the else branch never stores, so the clear is
+        // load-bearing" hazard that came with it).
         let mut i = n;
         while i > 0 {
-            if take[i] {
+            let include = applicability_weight(group[i - 1].applicability) + w[p[i - 1] as usize];
+            if include > w[i - 1] {
                 scratch.idx.push((i - 1) as u32);
                 i = p[i - 1] as usize;
             } else {
@@ -452,7 +546,7 @@ impl<'src> FixSet<'src> {
         {
             let selected_weight: u32 = out[start..]
                 .iter()
-                .map(|e| applicability_weight(e.applicability) as u32)
+                .map(|e| applicability_weight(e.applicability))
                 .sum();
             debug_assert_eq!(
                 selected_weight, w[n],
@@ -476,6 +570,15 @@ impl<'src> FixSet<'src> {
     /// Iterate over the retained edits in source order.
     pub fn iter(&self) -> impl Iterator<Item = &FixEdit<'src>> + '_ {
         self.edits.iter()
+    }
+
+    /// The edits as a slice, in documented `(file, start, end)` order.
+    ///
+    /// `iter()` is already `ExactSize + DoubleEnded`, but a caller that needs to
+    /// index, binary-search or hand the slice to another API had to collect it.
+    #[must_use]
+    pub fn as_slice(&self) -> &[FixEdit<'src>] {
+        &self.edits
     }
 
     /// Apply the edits to `source`, returning the rewritten text.
@@ -575,16 +678,22 @@ impl<'src> FixSet<'src> {
         // Pre-sum how much the replacements outgrow the text they replace, so the
         // single allocation is the right size: `source.len()` alone is
         // undersized for rewrite-heavy batches and reallocs mid-pass.
-        let excess: usize = edits
+        // Signed per-edit delta, not `saturating_sub` per edit: a batch that both
+        // shrinks and grows (`"abc" -> ""` plus `"x" -> "long replacement"`) had
+        // every shrink counted as zero, so the reservation over-estimated and the
+        // shrink savings were lost.  Only the *sum* can be negative, and that just
+        // means "no growth beyond `source.len()`".
+        let delta: i64 = edits
             .iter()
             .map(|e| {
-                e.replacement.len().saturating_sub(
-                    e.span
+                e.replacement.len() as i64
+                    - e.span
                         .end_as_usize()
-                        .saturating_sub(e.span.start_as_usize()),
-                )
+                        .saturating_sub(e.span.start_as_usize()) as i64
             })
             .sum();
+        let excess: usize = delta.max(0) as usize;
+        let ascii_source = source.is_ascii();
         let mut out: Option<String> = None;
         let mut last = 0usize;
         for edit in edits {
@@ -604,13 +713,18 @@ impl<'src> FixSet<'src> {
             if start > end || end > source.len() {
                 continue;
             }
-            if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+            // ASCII sources have a boundary at every offset, so the two checks
+            // are provably no-ops there — and `is_ascii()` is a SIMD-fast scan,
+            // while `is_char_boundary` is two loads and a shift each, per edit.
+            if !ascii_source && (!source.is_char_boundary(start) || !source.is_char_boundary(end)) {
                 continue;
             }
-            // `collect` already guarantees non-overlapping, in-order spans
-            // within a file, so `start >= last` holds there.  This guard is a
-            // cross-file safety net for a caller that mixes files into one
-            // buffer by offset; it is not the conflict-resolution policy.
+            // `collect` already guarantees non-overlapping, in-order spans within
+            // a file, so `start >= last` holds there.  This guard is therefore a
+            // **corrupted-set backstop**, not a conflict-resolution policy: no
+            // public path can mix files into one buffer (`edits` is private and
+            // `apply_for_file*` filters by `FileId`), so a trigger here means the
+            // set invariant was broken upstream.
             if start < last {
                 continue;
             }
@@ -749,11 +863,15 @@ mod tests {
             seed >> 33
         };
         for _ in 0..300 {
-            let n = 2 + (next() % 5) as usize; // 2..=6
+            // `n <= 9`, offsets `< 16`: the closed-point interactions (a point at
+            // an interval boundary vs. strictly inside it) need offset room to
+            // occur; at `n <= 6`, offsets `< 10` the fuzzer mostly generated
+            // non-interacting intervals.  300 cases still run in milliseconds.
+            let n = 2 + (next() % 8) as usize; // 2..=9
             let mut spans: Vec<(u32, u32)> = Vec::with_capacity(n);
             let mut diags: Vec<Diagnostic<'static>> = Vec::with_capacity(n);
             for _ in 0..n {
-                let start = (next() % 10) as u32;
+                let start = (next() % 16) as u32;
                 let len = (next() % 4) as u32; // 0 => a zero-length insertion
                 let app = match next() % 3 {
                     0 => Applicability::MachineApplicable,
@@ -767,7 +885,7 @@ mod tests {
                     app,
                 ));
             }
-            let weights: Vec<u64> = diags
+            let weights: Vec<u32> = diags
                 .iter()
                 .map(|d| {
                     let app = d.suggestions()[0].applicability;
@@ -789,11 +907,11 @@ mod tests {
             };
 
             let set = FixSet::collect(&diags, FixHints::All);
-            let got: u64 = set
+            let got: u32 = set
                 .iter()
                 .map(|e| applicability_weight(e.applicability))
                 .sum();
-            let mut want = 0u64;
+            let mut want = 0u32;
             for mask in 0u32..(1 << n) {
                 let chosen: Vec<usize> = (0..n).filter(|i| mask >> i & 1 == 1).collect();
                 let disjoint = chosen.iter().enumerate().all(|(k, &i)| {
@@ -806,6 +924,178 @@ mod tests {
                 }
             }
             assert_eq!(got, want, "not maximum-weight for spans {spans:?}");
+        }
+    }
+
+    /// Non-ASCII sources: a span is only applicable if both ends are char
+    /// boundaries, and the forward pass splices by *byte* offsets.  Generate spans
+    /// on real boundaries of a multi-byte source and compare against an
+    /// independent reverse-splice reference — the fuzzer's byte-span `"R"`
+    /// replacements never exercise this.
+    #[test]
+    fn multi_byte_sources_apply_matches_reverse_splice() {
+        let mut seed: u64 = 0x0b1e_c7a5_5eed_0001;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for _ in 0..200 {
+            // Characters of 1, 2 (é), 3 (你) and 4 (😀) bytes, so boundary
+            // arithmetic is genuinely non-uniform.
+            let n_chars = 3 + (next() % 6) as usize;
+            let mut src = String::new();
+            for _ in 0..n_chars {
+                src.push(match next() % 4 {
+                    0 => 'a',
+                    1 => 'é',
+                    2 => '你',
+                    _ => '😀',
+                });
+            }
+            // Boundary offsets only, so every generated edit is applicable.
+            let bounds: Vec<u32> = src
+                .char_indices()
+                .map(|(i, _)| i as u32)
+                .chain(std::iter::once(src.len() as u32))
+                .collect();
+            let mut edits: Vec<(u32, u32, &'static str)> = Vec::new();
+            for _ in 0..(1 + next() % 3) {
+                let a = bounds[(next() as usize) % bounds.len()];
+                let b = bounds[(next() as usize) % bounds.len()];
+                let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                edits.push((start, end, "R"));
+            }
+            let diags: Vec<Diagnostic<'static>> = edits
+                .iter()
+                .map(|&(start, end, rep)| {
+                    diag_with_fix(
+                        Span::new(FileId::DUMMY, start, end),
+                        rep,
+                        Applicability::MachineApplicable,
+                    )
+                })
+                .collect();
+            let set = FixSet::collect(&diags, FixHints::Auto);
+            // Reference: splice the *collected* edits back-to-front (they are
+            // disjoint, so order of application cannot matter, which is the point).
+            let mut expected = src.clone();
+            for e in set.as_slice().iter().rev() {
+                expected.replace_range(
+                    e.span.start_as_usize()..e.span.end_as_usize(),
+                    &e.replacement,
+                );
+            }
+            let (out, applied) = set.apply_for_file_counted(&src, FileId::DUMMY);
+            assert_eq!(
+                applied,
+                set.len(),
+                "all edits are boundary-aligned: {src:?}"
+            );
+            assert_eq!(&*out.as_ref(), expected.as_str(), "source {src:?}");
+        }
+    }
+
+    /// The same optimality oracle, but **across files**, and through the DP branch
+    /// (the previous fuzzer used `FileId::DUMMY` for everything, so `resolve_file`
+    /// ran once, `scratch.idx` was empty at the backtrack, and the leak could
+    /// not manifest). The objective decomposes per file, so per-file brute force is a
+    /// strict generalization of the single-file check.
+    #[test]
+    fn collect_is_optimal_and_disjoint_across_file_groups() {
+        let mut seed: u64 = 0xdead_beef_1234_5678;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let conflicts = |a: (u32, u32), b: (u32, u32)| -> bool {
+            let (sa, ea) = a;
+            let (sb, eb) = b;
+            match (sa == ea, sb == eb) {
+                (true, true) => sa == sb,
+                (true, false) => sb < sa && sa < eb,
+                (false, true) => sa < sb && sb < ea,
+                (false, false) => sa < eb && sb < ea,
+            }
+        };
+        for _ in 0..400 {
+            let n = 2 + (next() % 6) as usize; // 2..=7
+            let mut spans: Vec<(u32, (u32, u32))> = Vec::with_capacity(n);
+            let mut diags: Vec<Diagnostic<'static>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let file = FileId::from_raw(1 + (next() % 3) as u32);
+                let start = (next() % 12) as u32;
+                let len = (next() % 4) as u32; // 0 => zero-length insertion
+                let app = match next() % 3 {
+                    0 => Applicability::MachineApplicable,
+                    1 => Applicability::MaybeIncorrect,
+                    _ => Applicability::HasPlaceholders,
+                };
+                spans.push((file.as_u32(), (start, start + len)));
+                diags.push(diag_with_fix(Span::new(file, start, start + len), "R", app));
+            }
+            let set = FixSet::collect(&diags, FixHints::All);
+
+            // Per file: the collected weight must equal that file's brute-force
+            // optimum, and the kept edits must be pairwise disjoint.  A leaked
+            // backtrack index shows up as either an inflated weight or an overlap.
+            for file_id in 1..=3u32 {
+                let members: Vec<usize> = (0..n).filter(|&i| spans[i].0 == file_id).collect();
+                let got: u32 = set
+                    .iter()
+                    .filter(|e| e.span.file.as_u32() == file_id)
+                    .map(|e| applicability_weight(e.applicability))
+                    .sum();
+                let mut want = 0u32;
+                for mask in 0u32..(1u32 << members.len()) {
+                    let chosen: Vec<usize> = members
+                        .iter()
+                        .enumerate()
+                        .filter(|(k, _)| mask >> k & 1 == 1)
+                        .map(|(_, &i)| i)
+                        .collect();
+                    let disjoint = chosen.iter().enumerate().all(|(k, &i)| {
+                        chosen[k + 1..]
+                            .iter()
+                            .all(|&j| !conflicts(spans[i].1, spans[j].1))
+                    });
+                    if disjoint {
+                        let w: u32 = chosen
+                            .iter()
+                            .map(|&i| applicability_weight(diags[i].suggestions()[0].applicability))
+                            .sum();
+                        want = want.max(w);
+                    }
+                }
+                assert_eq!(
+                    got,
+                    want,
+                    "file {file_id}: not maximum-weight for {:?}",
+                    members.iter().map(|&i| spans[i].1).collect::<Vec<_>>()
+                );
+                // Disjointness inside the file, under the closed-point model.
+                let kept: Vec<(u32, u32)> = set
+                    .iter()
+                    .filter(|e| e.span.file.as_u32() == file_id)
+                    .map(|e| (e.span.start_as_usize() as u32, e.span.end_as_usize() as u32))
+                    .collect();
+                for (k, a) in kept.iter().enumerate() {
+                    for b in &kept[k + 1..] {
+                        assert!(!conflicts(*a, *b), "file {file_id}: {a:?} overlaps {b:?}");
+                    }
+                }
+            }
+            // Global order the type documents, and cross-file independence: the
+            // set must be (file, start)-sorted with no interleaving.
+            assert!(
+                set.iter()
+                    .zip(set.iter().skip(1))
+                    .all(|(a, b)| (a.span.file, a.span.start) <= (b.span.file, b.span.start)),
+                "set must stay (file, start)-ordered"
+            );
         }
     }
 
@@ -978,6 +1268,50 @@ mod tests {
         let _ = set.apply("x");
     }
 
+    /// Regression: `ResolveScratch::idx` is reused across file groups, and it
+    /// was never cleared, so file 1's backtrack indices sat behind file 2's after
+    /// the `reverse()`. A stale index that happened to match an enumeration index
+    /// pushed an edit file 2's DP had **rejected** (leaving an overlapping set),
+    /// while the `next == len` canary still passed. Two files, each on the DP
+    /// branch (unequal weights) — the minimal trace that reproduces the leak.
+    #[test]
+    fn backtrack_indices_do_not_leak_across_file_groups() {
+        let f1 = FileId::from_raw(1);
+        let f2 = FileId::from_raw(2);
+        // File 1: [0,2) weight 2 vs [1,5) weight 4 -> the DP keeps [1,5).
+        let a1 = diag_with_fix(Span::new(f1, 0, 2), "A", Applicability::MaybeIncorrect);
+        let b1 = diag_with_fix(Span::new(f1, 1, 5), "B", Applicability::MachineApplicable);
+        // File 2: [1,2) weight 4 vs [0,3) weight 2 -> the DP keeps [1,2) only.
+        let c2 = diag_with_fix(Span::new(f2, 1, 2), "C", Applicability::MachineApplicable);
+        let d2 = diag_with_fix(Span::new(f2, 0, 3), "D", Applicability::MaybeIncorrect);
+
+        let set = FixSet::collect(&[a1, b1, c2, d2], FixHints::Auto);
+        assert_eq!(
+            set.iter().filter(|e| e.span.file == f1).count(),
+            1,
+            "file 1 must keep exactly the MachineApplicable edit: {:?}",
+            set.iter()
+                .map(|e| (e.span, &*e.replacement))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            set.iter().filter(|e| e.span.file == f2).count(),
+            1,
+            "file 2 must keep exactly one edit — a leaked backtrack index added a \
+             rejected one: {:?}",
+            set.iter()
+                .map(|e| (e.span, &*e.replacement))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !set.iter().any(|e| &*e.replacement == "D"),
+            "the rejected MaybeIncorrect edit must not survive"
+        );
+        // Per-file application, which is how a batch driver uses the set.
+        assert_eq!(set.apply_for_file("x---y", f1), "xB");
+        assert_eq!(set.apply_for_file("--z", f2), "-Cz");
+    }
+
     #[test]
     fn insertion_inside_replacement_wins_as_shorter_interval() {
         let src = "abcdef";
@@ -1069,6 +1403,137 @@ mod tests {
         let set = FixSet::collect(&[light_point, heavy_interval], FixHints::All);
         assert_eq!(set.len(), 1, "the interval is retained");
         assert_eq!(set.apply(src), "aYYYf");
+    }
+
+    /// The "keep the heaviest" rule for duplicate insertions at one point, which
+    /// the equal-weight test next door could not distinguish from "keep the first".
+    #[test]
+    fn zero_length_dedup_keeps_the_heaviest_applicability() {
+        let span = Span::new(FileId::DUMMY, 3, 3);
+        let weak = diag_with_fix(span, "W", Applicability::Unspecified);
+        let strong = diag_with_fix(span, "S", Applicability::MachineApplicable);
+        // Both orders: the winner must not depend on diagnostic order.
+        for diags in [
+            vec![weak.clone(), strong.clone()],
+            vec![strong.clone(), weak.clone()],
+        ] {
+            let set = FixSet::collect(&diags, FixHints::All);
+            assert_eq!(set.len(), 1, "duplicate insertions must collapse");
+            assert_eq!(&*set.as_slice()[0].replacement, "S");
+            assert_eq!(set.apply("abcdef"), "abcSdef");
+        }
+    }
+
+    /// Equal weight: the *first* diagnostic's replacement wins.  The tier is
+    /// `strict >` on weight plus a stable sort, so this is deliberate ordering
+    /// policy — pin it rather than letting a `>=` change it silently.
+    #[test]
+    fn equal_weight_duplicate_insertion_keeps_the_first_diagnostic() {
+        let span = Span::new(FileId::DUMMY, 2, 2);
+        let first = diag_with_fix(span, "1", Applicability::MachineApplicable);
+        let second = diag_with_fix(span, "2", Applicability::MachineApplicable);
+        let set = FixSet::collect(&[first, second], FixHints::Auto);
+        assert_eq!(set.len(), 1);
+        assert_eq!(&*set.as_slice()[0].replacement, "1");
+    }
+
+    /// `HideCodeInline` shows the replacement inline in the message, so it is
+    /// user-visible and must participate in `--fix`.  Nothing pinned that policy;
+    /// flipping the arm to "hidden" would change `--fix` output with no test
+    /// failing.
+    #[test]
+    fn hide_code_inline_suggestions_are_user_visible_and_collected() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        use crate::diagnostics::Suggestion;
+        let diag = Diagnostic::error("m").with_suggestions(vec![Suggestion {
+            message: "replace".into(),
+            applicability: Applicability::MachineApplicable,
+            style: SuggestionStyle::HideCodeInline,
+            span: Some(span),
+            replacement: Some("Z".into()),
+        }]);
+        let set = FixSet::collect(&[diag], FixHints::Auto);
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.apply("abc"), "Zbc");
+    }
+
+    /// `apply_for_file_counted` is what a driver reports as "N fixes applied";
+    /// apply-time filters (char boundary, past end) can make it *less* than
+    /// `len()`, and that relationship deserves a direct assertion.
+    #[test]
+    fn apply_for_file_counted_reports_fewer_than_len_when_a_filter_fires() {
+        // A span that is not a char boundary in the source: `é` occupies 1..3.
+        let bad = diag_with_fix(
+            Span::new(FileId::DUMMY, 2, 3),
+            "X",
+            Applicability::MachineApplicable,
+        );
+        let good = diag_with_fix(
+            Span::new(FileId::DUMMY, 4, 5),
+            "Y",
+            Applicability::MachineApplicable,
+        );
+        let set = FixSet::collect(&[bad, good], FixHints::Auto);
+        assert_eq!(
+            set.len(),
+            2,
+            "collect keeps both: validity is an apply concern"
+        );
+        let (out, applied) = set.apply_for_file_counted("aébcd", FileId::DUMMY);
+        assert_eq!(applied, 1, "only the boundary-aligned edit may splice");
+        assert_eq!(&*out.as_ref(), "aébYd");
+    }
+
+    /// Deletion edits (`replacement == ""`) at an interior offset and at EOF:
+    /// the forward pass must not read past `last` or drop the tail.
+    #[test]
+    fn deletion_edits_apply_interior_and_at_eof() {
+        let interior = diag_with_fix(
+            Span::new(FileId::DUMMY, 1, 3),
+            "",
+            Applicability::MachineApplicable,
+        );
+        let set = FixSet::collect(&[interior], FixHints::Auto);
+        assert_eq!(set.apply("abcde"), "ade");
+
+        let eof = diag_with_fix(
+            Span::new(FileId::DUMMY, 3, 5),
+            "",
+            Applicability::MachineApplicable,
+        );
+        let set = FixSet::collect(&[eof], FixHints::Auto);
+        assert_eq!(set.apply("abcde"), "abc");
+
+        // Both at once, non-adjacent, to exercise the forward cursor twice.
+        let a = diag_with_fix(
+            Span::new(FileId::DUMMY, 1, 2),
+            "",
+            Applicability::MachineApplicable,
+        );
+        let b = diag_with_fix(
+            Span::new(FileId::DUMMY, 4, 5),
+            "",
+            Applicability::MachineApplicable,
+        );
+        let set = FixSet::collect(&[a, b], FixHints::Auto);
+        // "abcde" minus [1,2)='b' minus [4,5)='e'.
+        assert_eq!(set.apply("abcde"), "acd");
+    }
+
+    /// The `HasPlaceholders` acceptance matrix was only pinned against `All`;
+    /// the arms are enumerated deliberately, so pin all four hints levels.
+    #[test]
+    fn has_placeholders_acceptance_matrix() {
+        let diag = diag_with_fix(
+            Span::new(FileId::DUMMY, 0, 1),
+            "P",
+            Applicability::HasPlaceholders,
+        );
+        assert!(FixSet::collect(std::slice::from_ref(&diag), FixHints::All).len() == 1);
+        assert!(FixSet::collect(std::slice::from_ref(&diag), FixHints::Review).len() == 0);
+        assert!(FixSet::collect(std::slice::from_ref(&diag), FixHints::Auto).len() == 0);
+        // `Auto` and `Review` reject placeholders; `All` accepts everything.
+        assert!(FixSet::collect(std::slice::from_ref(&diag), FixHints::All).len() == 1);
     }
 
     #[test]

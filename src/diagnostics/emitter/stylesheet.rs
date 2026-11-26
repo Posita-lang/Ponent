@@ -52,78 +52,10 @@ pub struct Stylesheet {
     pub toggle_bg: &'static str,
 }
 
-impl Stylesheet {
-    /// Dark theme (Catppuccin Mocha) — the default.
-    pub const fn dark() -> Self {
-        Stylesheet {
-            bg: "#1e1e2e",
-            fg: "#cdd6f4",
-            diag_bg: "#181825",
-            border: "#45475a",
-            error_border: "#f38ba8",
-            error_bg: "#2a1e1e",
-            warning_border: "#f9e2af",
-            warning_bg: "#2a2a1e",
-            help_border: "#94e2d5",
-            help_bg: "#1e2a2a",
-            accent: "#89b4fa",
-            muted: "#6c7086",
-            source_fg: "#a6adc8",
-            suggestion: "#a6e3a1",
-            help_text: "#94e2d5",
-            highlight_bg: "#f38ba833",
-            underline: "#f38ba8",
-            explain_fg: "#bac2de",
-            toggle_bg: "#45475a",
-        }
-    }
-
-    /// Light theme (clean white / Material Design inspired).
-    pub const fn light() -> Self {
-        Stylesheet {
-            bg: "#ffffff",
-            fg: "#1e1e2e",
-            diag_bg: "#f5f5f5",
-            border: "#d0d0d0",
-            error_border: "#d32f2f",
-            error_bg: "#fce4e4",
-            warning_border: "#f57c00",
-            warning_bg: "#fff3e0",
-            help_border: "#00796b",
-            help_bg: "#e0f2f1",
-            accent: "#1565c0",
-            muted: "#757575",
-            source_fg: "#424242",
-            suggestion: "#2e7d32",
-            help_text: "#00796b",
-            highlight_bg: "#ffcdd266",
-            underline: "#d32f2f",
-            explain_fg: "#616161",
-            toggle_bg: "#e0e0e0",
-        }
-    }
-}
-
 impl Default for Stylesheet {
     fn default() -> Self {
         Self::dark()
     }
-}
-
-/// Const string equality — used by the palette/CSS drift assert below.
-const fn str_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
 }
 
 /// Generate the served CSS **at compile time** from one literal list.
@@ -142,42 +74,56 @@ const fn str_eq(a: &str, b: &str) -> bool {
 macro_rules! theme_css {
     ($($name:literal => $field:ident => $dark:literal => $light:literal),+ $(,)?) => {
         /// Dark theme with the `.light` override — the HTML renderer's stylesheet.
+        ///
+        /// `color-scheme` is fixed per block, not `dark light`: the palette is
+        /// fixed, so `dark light` only told the UA "either is fine", which painted
+        /// light scrollbars/form controls on the dark page (and dark ones on the
+        /// `.light` page).  Re-declaring the same value in the override made the
+        /// toggle a no-op for native controls as well.
         pub const DARK_HTML_CSS: &str = concat!(
-            ":root{color-scheme:dark light;", $($name, ":", $dark, ";",)+ "}",
-            "html.light{color-scheme:dark light;", $($name, ":", $light, ";",)+ "}",
+            ":root{color-scheme:dark;", $($name, ":", $dark, ";",)+ "}",
+            "html.light{color-scheme:light;", $($name, ":", $light, ";",)+ "}",
         );
 
         /// Light theme, `:root` only.
         pub const LIGHT_HTML_CSS: &str = concat!(
-            ":root{color-scheme:dark light;", $($name, ":", $light, ";",)+ "}",
+            ":root{color-scheme:light;", $($name, ":", $light, ";",)+ "}",
         );
 
         /// Every CSS variable this palette defines, in declaration order.
         pub const THEME_VARS: &[&str] = &[$($name),+];
 
+        // The two constructors are **generated from the palette above**, so the
+        // palette has exactly one home.  They used to be hand-written literals
+        // duplicated against these lines, with a bidirectional const assert as the
+        // only thing keeping them equal — 38 literals with a build-time guard instead
+        // of a single source.  Model: one edit per colour, and the drift assert below
+        // reduces to the *completeness* direction.
+        impl Stylesheet {
+            /// Dark theme (Catppuccin Mocha) — the default.
+            pub const fn dark() -> Self {
+                Stylesheet { $($field: $dark,)+ }
+            }
+
+            /// Light theme (clean white / Material Design inspired).
+            pub const fn light() -> Self {
+                Stylesheet { $($field: $light,)+ }
+            }
+        }
+
         const _: () = {
-            // Completeness AND value agreement, both at compile time.
+            // Completeness, at compile time: the literals are built *from the
+            // palette*, so a `Stylesheet` field with no palette line leaves this
+            // initializer incomplete and is a hard compile error (E0063).  That was
+            // previously the pairing check — a field without a palette entry was
+            // silently unstyled (its `var(--x)` consumers just lost the property) with
+            // no build or test signal.
             //
-            // The literals below are built *from the palette*, so a `Stylesheet`
-            // field that has no palette line leaves the literal incomplete and
-            // is a hard compile error (E0063) — previously such a field was
-            // silently unstyled (its `var(--x)` consumers just lost the
-            // property) with no build or test signal.  Comparing them against the
-            // hand-written constructors then pins the *values* in both
-            // directions, so neither home can drift.
-            let dark = Stylesheet { $($field: $dark,)+ };
-            let light = Stylesheet { $($field: $light,)+ };
-            // The comparison must be *between* the two homes, not between the
-            // literal and itself: `dark.$field` IS `$dark`, so the earlier form
-            // asserted `x == x` and the drift guard this macro exists for did not
-            // exist.  `Stylesheet::dark()` / `light()` are the hand-written
-            // constructors the renderers read, so pin those against the palette.
-            let handwritten_dark = Stylesheet::dark();
-            let handwritten_light = Stylesheet::light();
-            $(
-                assert!(str_eq(dark.$field, handwritten_dark.$field));
-                assert!(str_eq(light.$field, handwritten_light.$field));
-            )+
+            // The *value* direction no longer needs an assert: `Stylesheet::dark()` /
+            // `light()` are generated from the same `$dark`/`$light` literals (see the
+            // impl above), so there is one home to drift from.
+            let _dark = Stylesheet { $($field: $dark,)+ };
+            let _light = Stylesheet { $($field: $light,)+ };
         };
     };
 }
@@ -240,6 +186,18 @@ mod tests {
             19,
             "palette size changed — update the pin"
         );
+        // The count pins are substring counts, so a future variable whose name
+        // contains another variable's name plus `:` (`--x--bg:` matching `--bg:`)
+        // would silently corrupt them.  Cheap pairwise guard.
+        for var in THEME_VARS {
+            for other in THEME_VARS {
+                assert!(
+                    var == other || !var.contains(&format!("{other}:")),
+                    "{var} contains `{other}:` — the substring counts below become \
+                     ambiguous; rename one of them"
+                );
+            }
+        }
         for var in THEME_VARS {
             let needle = format!("{var}:");
             assert_eq!(

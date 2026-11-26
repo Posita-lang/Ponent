@@ -30,6 +30,24 @@ pub struct Label<'a> {
 }
 
 impl<'a> Label<'a> {
+    /// Identity used when merging label sets (`Diagnostic::augment`).
+    ///
+    /// Deliberately **excludes** `kind`: two labels on the same span with the same
+    /// text are the same annotation even if one is primary and one secondary, and
+    /// that is the rule the merge always applied.  Spelled as a named method
+    /// rather than a derived `PartialEq` (which would include `kind`) so "label
+    /// identity" has exactly one definition instead of being re-derived in the
+    /// scan and the keyed-set paths.
+    #[must_use]
+    pub fn dedup_key(&self) -> (crate::ast::FileId, u32, u32, &str) {
+        (
+            self.span.file,
+            self.span.start,
+            self.span.end,
+            &self.message,
+        )
+    }
+
     #[must_use]
     pub fn new(span: Span, message: impl Into<Cow<'a, str>>) -> Self {
         Label {
@@ -257,11 +275,13 @@ mod tests {
             line: 0,
             col: byte_col,
         };
-        assert_eq!(pos.to_string(), "1:2", "col is the byte offset");
-        // The *display* column of `x` is 5 (the tab advances to the next
-        // 4-column stop); a renderer that printed display columns would emit
-        // "1:5", so this guards the documented byte-column contract.
-        assert_ne!(pos.col + 1, 5, "col must not be the display column");
+        // The *display* column of `x` is 5 (the tab advances to the next 4-column stop),
+        // so "1:2" is the guard: a `Display` that printed display columns would emit
+        // "1:5".  (An `assert_ne!(pos.col + 1, 5)` used to sit here — it tested the
+        // literal this test constructs, the `x == x` tautology `stylesheet.rs` records as
+        // a past bug — and deleting it left the body with no assertion at all, which is
+        // why this pins the actual `Display` output.)
+        assert_eq!(pos.to_string(), "1:2");
     }
 
     /// The glyph table is consumed by every renderer; swapping `~`/`-` must be a

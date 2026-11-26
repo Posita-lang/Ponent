@@ -94,7 +94,8 @@ impl<'a> ChainSuffix<'a> {
             } => {
                 if let Some(url) = url {
                     // `render_into` already rejected URLs containing ESC or
-                    // the ST terminator (an unconditional check, see C1);
+                    // the ST terminator (an unconditional check, not a
+                    // debug-only assert);
                     // this writer only emits a validated URL.
                     out.push_str(": \x1b]8;;");
                     out.push_str(url);
@@ -491,6 +492,14 @@ impl std::fmt::Debug for DebugMessage<'_> {
 fn percent_encode_high_bytes(s: &str) -> String {
     // `super::HEX_UPPER`, not a private copy: the same table already lives in
     // `diagnostics` and a second home is exactly how the two drift.
+    // Fast path: an already-ASCII payload needs no encoding *and* no per-byte
+    // loop.  This is the common case by construction — `path_to_file_url` encodes
+    // non-ASCII path bytes itself, so only a custom `RenderCtx::file_url` reaches
+    // the slow path.  Reuse the module's SIMD-accelerated high-byte scan instead of
+    // a hand-rolled `filter().count()`.
+    if super::ascii::next_non_ascii_byte(s.as_bytes()) == usize::MAX {
+        return s.to_owned();
+    }
     // Exact capacity: every byte >= 0x80 becomes three bytes (`%XX`).  The
     // sibling `encode_url_path_segment` uses the same worst-case reasoning;
     // reserving `len + 8` reallocated ~log2(n) times on a fully non-ASCII URL.
@@ -629,6 +638,19 @@ impl<'src> CallChain<'src> {
             // newlines are counted exactly (memchr is SIMD); wrapped rows are
             // estimated from message length at ~64 bytes/row, which is
             // render-parameter independent (a memo precondition) and monotone.
+            //
+            // Bound, stated because it is a decision: the wrapped-row term is
+            // `len / 64`, i.e. it books **one indent per 64 bytes**, while the real
+            // row count is `ceil(display_width / avail)`.  On a narrow measure
+            // (`max_width = 30, indent = 4` ⇒ 26 columns) a 64-byte message really
+            // wraps to three rows while this books one extra, so the estimate
+            // under-reserves ≤ 1 indent per entry (≤ ~64k × 260 ≈ 16 MB of
+            // reallocation on a hostile narrow-terminal wide chain, less the
+            // `entry_count * 64` slack in the reserve).  A divisor of 16 would halve
+            // that gap at the cost of over-reserving on wide terminals — memory, not
+            // correctness.  64 stays because over-reserving is paid on *every*
+            // render while under-reserving is paid only at the cap, and the render
+            // is a no-op once capacity suffices.
             let newlines = memchr::memchr_iter(b'\n', entry.message.as_bytes()).count();
             let extra_rows = newlines.saturating_add(entry.message.len() / 64);
             if extra_rows > 0 {
@@ -894,6 +916,14 @@ impl<'src> CallChain<'src> {
         // hyperlink-capable terminal used to lose every clickable location
         // because the click target was gated on the palette.  Capability probing
         // is `supports_hyperlinks()`; colour is a separate question.
+        //
+        // Not unit-testable at this level, stated rather than hidden: reaching this
+        // gate needs `anchor: Some(file)`, which the public `render` never passes, and
+        // `supports_hyperlinks()` is a process-global capability probe with no test
+        // override.  Adding a "force capability" hook is the only way to pin it, and
+        // that hook would be a second source of truth for the probe — the decision is
+        // therefore pinned by construction (colour does not appear in this predicate)
+        // rather than by a test.
         let hyperlink_enabled = source.is_some()
             && super::term::supports_hyperlinks()
             && super::is_real_file_name(file_name)
@@ -903,7 +933,7 @@ impl<'src> CallChain<'src> {
                 Some(cx) => cx.file_url(file_name),
                 None => path_to_file_url(std::path::Path::new(file_name)),
             };
-            // C1: enforce the OSC 8 invariant unconditionally (not with a
+            // Enforce the OSC 8 invariant unconditionally (not with a
             // debug_assert that disappears in release).  ESC and the ST
             // terminator would close the hyperlink early, but BEL (0x07) is
             // also widely accepted as an OSC terminator and any other C0/DEL
@@ -1147,7 +1177,7 @@ impl<'src> CallChain<'src> {
             // line's budget is `avail_full - suffix_cols` while every other
             // line keeps the full measure; the wrap below is the minimal-line
             // single pass (`research/locator-wrap/`, solution.md §2.3).
-            // C3: dominant-case fast path — a short printable-ASCII message
+            // Dominant-case fast path — a short printable-ASCII message
             // that fits on one line needs no `wrap_optimal` and no `Vec`.
             // `PrintableOrTab` extends the same path to tab-indented single
             // lines; tabs are measured from the real indent column.
@@ -1215,12 +1245,12 @@ impl<'src> CallChain<'src> {
                 // dropped row here.
                 //
                 // Infeasible entries — `suffix_cols >= avail_full`, or a last
-                // word wider than the narrowed budget — take policy P1 of
+                // word wider than the narrowed budget — take the policy of
                 // solution.md §4: wrap at the full measure and let the locator
                 // overflow that row.  It is the minimum-row-count policy.
-                // Carrying the suffix on its own continuation row (P2) doubles
+                // Carrying the suffix on its own continuation row doubles
                 // the row count of a deep chain, the cascade the row budget
-                // rejects; truncating it (P3) would break the click target and
+                // rejects; truncating it would break the click target and
                 // flicker as the line/column digits change.  The width invariant
                 // therefore holds for every entry whose
                 // `suffix_cols < avail_full`, which is the regime the contract
@@ -1281,7 +1311,7 @@ mod tests {
         RENDERED.with(|c| c.replace(0))
     }
 
-    /// 1.2's pin: a wrap segment never carries a hard newline, which is what the
+    /// Pin: a wrap segment never carries a hard newline, which is what the
     /// indent-once push, the SGR wrapping and the tab pre-expansion all assume.
     /// `Clone` is reachable through the public `with_children`, so a hostile deep
     /// chain must clone without touching the stack — the same reason `Drop` and
@@ -1365,7 +1395,26 @@ mod tests {
         }
     }
 
-    /// 1.3's pin: the capped-width scan and the tab expander implement one
+    /// `percent_encode_high_bytes`' fast path must be byte-identical to the slow
+    /// path on ASCII input, and the slow path must still escape every high byte.
+    #[test]
+    fn percent_encode_high_bytes_fast_path_matches() {
+        // ASCII: untouched, and it returns early (the loop would have copied it).
+        assert_eq!(
+            percent_encode_high_bytes("file:///tmp/a.rs"),
+            "file:///tmp/a.rs"
+        );
+        // Non-ASCII: every high byte becomes `%XX`, mixed with plain ASCII.
+        assert_eq!(
+            percent_encode_high_bytes("file:///tmp/café.rs"),
+            "file:///tmp/caf%C3%A9.rs"
+        );
+        // A non-ASCII byte in the *first* sixteen bytes must also take the slow
+        // path (the fast-path scan has a short-input arm for `< 16`).
+        assert_eq!(percent_encode_high_bytes("é/x"), "%C3%A9/x");
+    }
+
+    /// Pin: the capped-width scan and the tab expander implement one
     /// tab-stop rule in two places; this is the differential that keeps them one.
     #[test]
     fn tab_width_formula_matches_the_expander() {
@@ -1500,7 +1549,7 @@ mod tests {
         assert!(out.contains("called from here"), "out: {out}");
     }
 
-    /// C6: a span from a different file is not an offset into the anchor
+    /// A span from a different file is not an offset into the anchor
     /// source; it must render its kind label, never the anchor's coordinates.
     #[test]
     fn foreign_file_span_falls_back_to_kind_label() {
@@ -1577,22 +1626,28 @@ mod tests {
         // hyperlink open/ST/close/ST (4 ESC) appears only when the terminal
         // advertises support, so the total tracks `supports_hyperlinks()`
         // rather than assuming a fixed count.
-        let out = chain.render(true, Some("def main() {}"), "f\x1b]8;;y\x07.ps");
+        // Pinned **on**: the OSC 8 wrapper is exactly the coverage this test exists for,
+        // and it used to be a conditional on the host terminal advertising hyperlinks —
+        // so the assertion silently weakened to "no links were emitted" wherever the
+        // probe said no.  The plain (links-off) byte count stays pinned below.
+        let out = crate::diagnostics::term::with_hyperlinks_override(true, || {
+            chain.render(true, Some("def main() {}"), "f\x1b]8;;y\x07.ps")
+        });
         assert!(!out.contains('\x07'), "BEL leaked: {out:?}");
         assert!(
             out.contains('\u{FFFD}'),
             "control char not replaced: {out:?}"
         );
-        let hyperlink_esc = if crate::diagnostics::term::supports_hyperlinks() {
-            4
-        } else {
-            0
-        };
-        assert_eq!(
-            out.matches('\x1b').count(),
-            4 + hyperlink_esc,
-            "extra ESC in {out:?}"
-        );
+        // Header open/close + message colour open/close + OSC 8 open/ST/close/ST.
+        assert_eq!(out.matches('\x1b').count(), 8, "extra ESC in {out:?}");
+
+        // The same render with the capability pinned off: exactly the four SGR escapes,
+        // no OSC 8.  Pinning both directions is what makes the capability a *test input*
+        // instead of an ambient property of the machine.
+        let plain = crate::diagnostics::term::with_hyperlinks_override(false, || {
+            chain.render(true, Some("def main() {}"), "f\x1b]8;;y\x07.ps")
+        });
+        assert_eq!(plain.matches('\x1b').count(), 4, "extra ESC in {plain:?}");
 
         // Kind-label branch (no source) must sanitize as well.
         let out = chain.render(true, None, "");
@@ -1706,6 +1761,34 @@ mod tests {
         let out = chain.render(false, None, "");
         assert_eq!(out.matches("...").count(), 1, "one truncation marker");
         assert!(out.len() < (8 << 20), "bounded output, got {}", out.len());
+
+        // The marker row must respect the measure.  The depth marker was clamped
+        // and the entry-cap marker was not: it pushed `indent_cols` raw, i.e. up to
+        // ~264 columns of spaces before `...` on a 40-column terminal, and the
+        // whole-output size assertion above could not see it.  Render narrow and
+        // check every row.
+        for max_width in [40usize, 80] {
+            let narrow = chain.render_with_index(
+                false,
+                None,
+                "",
+                None,
+                max_width,
+                crate::diagnostics::glyph::DEFAULT_TAB_WIDTH,
+            );
+            for line in narrow.lines() {
+                assert!(
+                    line.chars().count() <= max_width,
+                    "row exceeds the {max_width}-column measure: {:?}",
+                    line
+                );
+            }
+            assert_eq!(
+                narrow.matches("...").count(),
+                1,
+                "exactly one truncation marker at {max_width} columns"
+            );
+        }
     }
 
     /// The reserve estimate (`compute_facts`) and the renderer walk the tree
@@ -1916,7 +1999,7 @@ mod tests {
         );
     }
 
-    /// C7: the width formula (`cols`) and the writer (`write_into`) are
+    /// The width formula (`cols`) and the writer (`write_into`) are
     /// hand-synchronised duplicates; pin them together so a future edit to
     /// one cannot silently desynchronise wrapping from rendering.
     #[test]

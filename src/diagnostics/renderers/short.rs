@@ -130,6 +130,83 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
 /// *original* bytes; a U+FFFD replacement before that offset shifted the
 /// sanitized string and made `push_flattened` start mid-character.  This
 /// derives both decisions from the same character stream.
+/// Could these bytes require a sanitize/flatten change at all?
+///
+/// Exact for everything the two rules care about:
+///
+/// * `< 0x20` — the C0 controls, which includes the three breaks (`\n`, `\r`, `\t`);
+/// * `0x7F` — DEL;
+/// * `0xC2` — the lead byte of every C1 control (`U+0080..=U+009F`), the only
+///   controls outside C0/DEL;
+/// * `0xE2` — the lead byte of U+200E/U+200F, U+2028/U+2029 (the Unicode line
+///   separators) and the whole bidi override/isolate block, which is every
+///   non-ASCII break or direction character this renderer touches.
+///
+/// False positives (an en dash, NBSP, any other U+2xxx) merely take the slow path,
+/// so the predicate is *conservative-complete*: no byte that could change is
+/// skipped.  That is what makes "no such byte ⇒ output is byte-identical to the
+/// input" a proof rather than a hope, and it is the same argument `ascii.rs` proves
+/// for its `has_e2` gate.
+#[inline]
+fn needs_flatten_or_sanitize(s: &[u8]) -> bool {
+    // SWAR form of `b < 0x20 || b == 0x7F || b == 0xC2 || b == 0xE2`: this predicate
+    // gates the dominant per-message fast path (message, file name, code — three
+    // scans per diagnostic), and the scalar `iter().any()` runs four comparisons per
+    // byte.
+    //
+    // Every mask is per-lane exact, using the "OR the high bit in, then subtract"
+    // trick so no borrow crosses lanes:
+    //   * `below20` is masked with `!x` so only high-bit-clear lanes can be flagged —
+    //     without that, bytes 0x80..0x9F (UTF-8 continuation) would look like
+    //     controls and send every non-ASCII message down the slow path;
+    //   * the three equality masks are exact for any byte value.
+    // A false *positive* would only be slower, but a false negative would leak a
+    // break/control/bidi character into the "one physical line" output, so the
+    // differential test below asserts equality with the scalar predicate over all
+    // 256 bytes and a random corpus.
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    #[inline]
+    fn rep(b: u8) -> u64 {
+        u64::from(b) * ONES
+    }
+    /// High bit set in exactly the lanes equal to `k` **given every lane < 0x80**.
+    ///
+    /// Exact for 7-bit lanes: `(d | 0x80) - 1` keeps the high bit iff `d != 0`, and
+    /// OR-ing `0x80` in first is what stops borrows from crossing lanes.
+    #[inline]
+    fn eq7(x: u64, k: u8) -> u64 {
+        let d = (x & LOW7) ^ rep(k & 0x7F);
+        !((d | HI).wrapping_sub(ONES)) & HI
+    }
+    /// High bit set in exactly the lanes below `0x20` (high-bit-clear lanes only).
+    #[inline]
+    fn below_20(x: u64) -> u64 {
+        !((x | HI).wrapping_sub(rep(0x20))) & !x & HI
+    }
+    let mut i = 0usize;
+    while i + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[i..i + 8].try_into().expect("8 bytes"));
+        let high = x & HI;
+        // 0x7F and the two UTF-8 lead bytes are matched on the low 7 bits *plus* the
+        // high bit, which is exact: 0x7F has it clear while 0xC2/0xE2 have it set, and
+        // no other byte shares those low-7 patterns with that high bit.  (Matching them
+        // on all 8 bits was the bug: `x ^ 0xC2` can produce a lane of 0x80, whose
+        // `(d|0x80)-1` of 0x7F looked exactly like a zero lane.)
+        let del = eq7(x, 0x7F) & !high;
+        let c2 = eq7(x, 0x42) & high; // 0xC2 & 0x7F == 0x42
+        let e2 = eq7(x, 0x62) & high; // 0xE2 & 0x7F == 0x62
+        if (below_20(x) | del | c2 | e2) != 0 {
+            return true;
+        }
+        i += 8;
+    }
+    s[i..]
+        .iter()
+        .any(|&b| b < 0x20 || b == 0x7F || b == 0xC2 || b == 0xE2)
+}
+
 fn push_sanitized_flattened(out: &mut String, msg: &str) {
     // Sanitize and flatten in one pass, byte-identical to `push_flattened`'s
     // split/trim/join rule: segment edges abut a break, so a space there belongs
@@ -141,6 +218,15 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
     // Suppressing the joiner alone is not enough: spaces pushed before the break
     // are already in the buffer.  `"a  \tb"` used to emit `"a  b"` where the
     // reference emits `"a b"`, and `" \ta"` emitted `" a"` vs. `"a"`.
+    // Clean fast path.  Without a break, control or bidi byte, `pending_break` can
+    // never be set, so no space run is truncated, no joiner is emitted and no char is
+    // replaced: the output is byte-identical to the input.  The dominant case *is* a
+    // clean ASCII sentence, and it now costs one scan plus one `push_str` instead of
+    // a per-char state machine.
+    if !needs_flatten_or_sanitize(msg.as_bytes()) {
+        out.push_str(msg);
+        return;
+    }
     let mut emitted = false; // a non-space char survives the truncation
     let mut pending_break = false;
     let mut space_run: Option<usize> = None; // where the trailing space run began
@@ -171,13 +257,50 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
         *space_run = None;
         *emitted = true;
     };
-    for (i, c) in msg.char_indices() {
+    // `peekable`, not `for`, because a space run is consumed here: a long
+    // interior run (`"a    b"`, tables, ASCII art) used to pay one `push` —
+    // with its capacity check — per space.  The run is all spaces, so it cannot
+    // touch the break state machine, and the differential flatten tests
+    // (`merged_render_matches_three_walk_pipeline`) pin the bytes.
+    let mut chars = msg.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
         if !matches!(c, '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' | ' ')
             && !c.is_control()
             && !crate::diagnostics::is_bidi_override(c)
         {
             if run_start.is_none() {
                 run_start = Some(i);
+            }
+            // Extend the run by *bytes*, not by decoding one char per iteration:
+            // finding the run's end was the last per-byte cost left on the
+            // dominant path (a long ASCII sentence).  The scan is a tight,
+            // autovectorized `position` over the printable-ASCII set, and every
+            // byte it admits is single-byte, so the char iterator can be advanced
+            // by index.  A non-ASCII starter is left to the per-char path (its
+            // continuation bytes would make byte-index advancement land
+            // mid-character).
+            if c.is_ascii() {
+                let bytes = msg.as_bytes();
+                let mut end = i + 1;
+                // `first_byte_outside_range` instead of a `position` closure: the
+                // short-circuiting `find` shape does not vectorize, while this walks 8
+                // bytes per iteration with per-lane-exact SWAR masks (differentially
+                // pinned against this same predicate in `ascii.rs`).  This is the
+                // dominant per-message byte cost — a long ASCII sentence is one run.
+                let rest =
+                    crate::diagnostics::ascii::first_byte_outside_range(&bytes[end..], 0x21, 0x7E);
+                end += if rest == usize::MAX {
+                    bytes.len() - end
+                } else {
+                    rest
+                };
+                while let Some(&(j, _)) = chars.peek() {
+                    if j < end {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
             }
             continue;
         }
@@ -224,10 +347,19 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
                 // non-space char or at the start of the buffer.
                 space_run = Some(out.len());
             }
-        } else {
-            space_run = None;
-            emitted = true;
+            // Consume the whole run and store it with one `push_str`.  `c` is
+            // one byte, so the run starts at `i` and each following space is one
+            // byte too.
+            let mut end = i + 1;
+            while let Some(&(j, ' ')) = chars.peek() {
+                chars.next();
+                end = j + 1;
+            }
+            out.push_str(&msg[i..end]);
+            continue;
         }
+        space_run = None;
+        emitted = true;
         out.push(c);
     }
     flush_run(
@@ -252,12 +384,11 @@ fn push_sanitized_flattened(out: &mut String, msg: &str) {
 /// (`push_sanitized_flattened`) instead of being implied by the sanitizer's
 /// break semantics.
 fn flatten_component(s: &str) -> Cow<'_, str> {
-    let dirty = s.chars().any(|c| {
-        matches!(c, '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}')
-            || c.is_control()
-            || crate::diagnostics::is_bidi_override(c)
-    });
-    if !dirty {
+    // The same byte predicate the message fast path uses, instead of a char-decode
+    // pass: `needs_flatten_or_sanitize` is a superset of the old conditions (C0/DEL,
+    // C1 via `0xC2`, U+2028/U+2029 and the bidi block via `0xE2`), so borrowing on
+    // "no such byte" stays sound and the scan becomes SWAR-vectorizable.
+    if !needs_flatten_or_sanitize(s.as_bytes()) {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
@@ -267,6 +398,16 @@ fn flatten_component(s: &str) -> Cow<'_, str> {
 
 impl Renderer for ShortRenderer {
     fn render_into(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>, out: &mut String) {
+        // The contract `json.rs` states explicitly instead of relying on an
+        // undocumented convention: the caller hands in an empty buffer.  A non-empty
+        // one would concatenate two "greppable one-liners" into one, and the emitters'
+        // panic-containment path (placeholder → clear → refill) is exactly the
+        // machinery whose future regression this guards.
+        debug_assert!(
+            out.is_empty(),
+            "short renderer expects an empty buffer, got {} bytes",
+            out.len()
+        );
         let file_raw = diag.file_name();
         // File names are untrusted (`set_file_name` / `with_file_name` are
         // public) and so are unknown codes, so both go through the same
@@ -302,7 +443,13 @@ impl Renderer for ShortRenderer {
         // Resolve the location *before* allocating: the 1-based line/col
         // digit widths feed the capacity computation, and every accessor
         // (`spans()`, `source()`, `message()`) is called once.
-        let span = diag.spans().first();
+        // `primary_ref()`, like `json.rs` and the emitter's batch path: `spans()`
+        // is the full collection in insertion order, so a secondary registered first
+        // would print *its* coordinates as THE location while the machine JSON
+        // printed the primary's.  The `Cow` is bound first: `.first()` on a
+        // temporary does not outlive the statement.
+        let primaries = diag.spans.primary_ref();
+        let span = primaries.first();
         // Hoisted: the renderer's contract is one accessor call each, and the
         // comment claimed that while calling `source()` three times.
         let src = diag.source();
@@ -323,13 +470,23 @@ impl Renderer for ShortRenderer {
 
         // ---- Size the reservation to a lower bound -----------------------
         //   location + tag + ": " + message + "\n"
-        let mut len = raw_msg.len() + 2 /* ": " */ + 1 /* "\n" */;
+        // Every term saturates: this feeds `reserve`, so for an absurd diagnostic the
+        // right answer is "huge", not a debug-build overflow panic (`json.rs::estimate_cap`
+        // documents the same rule for the same reason).
+        let mut len = raw_msg
+            .len()
+            .saturating_add(2 /* ": " */)
+            .saturating_add(1 /* "\n" */);
         match (linecol, span) {
             (Some((line, col)), _) => {
                 if !file.is_empty() {
-                    len += file.len() + 1; // "file:"
+                    len = len.saturating_add(file.len()).saturating_add(1); // "file:"
                 }
-                len += fmt::dec_digits(line as u64) + 1 + fmt::dec_digits(col as u64) + 2; // "line:col: "
+                len = len
+                    .saturating_add(fmt::dec_digits(line as u64))
+                    .saturating_add(1)
+                    .saturating_add(fmt::dec_digits(col as u64))
+                    .saturating_add(2); // "line:col: "
             }
             // Byte-range fallback: two `push_uint` calls (start, end) need at
             // most 20 digits each plus the `..`, i.e. 44 bytes — reserved here so
@@ -337,25 +494,25 @@ impl Renderer for ShortRenderer {
             // bound for `Span`'s `Display`, which this branch never calls.)
             (None, Some(_)) => {
                 if !file.is_empty() {
-                    len += file.len() + 1;
+                    len = len.saturating_add(file.len()).saturating_add(1);
                 }
-                len += 48; // "start..end: " upper bound
+                len = len.saturating_add(48); // "start..end: " upper bound
             }
             (None, None) => {
                 if src.is_some() && !file.is_empty() {
-                    len += file.len() + 2; // "file: "
+                    len = len.saturating_add(file.len()).saturating_add(2); // "file: "
                 }
             }
         }
         if self.use_color {
-            len += 4 + level.len() + 4; // "\x1b[1m" level "\x1b[0m"
+            len = len.saturating_add(4 + level.len() + 4); // "\x1b[1m" level "\x1b[0m"
             if let Some(code) = code_display.as_deref() {
-                len += 5 + code.len() + 5; // "\x1b[2m[" code "]\x1b[0m"
+                len = len.saturating_add(5 + code.len() + 5); // "\x1b[2m[" code "]\x1b[0m"
             }
         } else {
-            len += level.len();
+            len = len.saturating_add(level.len());
             if let Some(code) = code_display.as_deref() {
-                len += code.len() + 2; // "[code]"
+                len = len.saturating_add(code.len()).saturating_add(2); // "[code]"
             }
         }
         out.reserve(len);
@@ -378,6 +535,10 @@ impl Renderer for ShortRenderer {
                     out.push_str(file);
                     out.push(':');
                 }
+                // `push_uint(.. as u64)`, not `push_u32(.. as u32)`: the
+                // `usize → u32` cast silently truncates if an offset ever
+                // exceeds 4 GiB, and this renderer's whole purpose is printing
+                // the range faithfully.
                 fmt::push_uint(out, span.start_as_usize() as u64);
                 out.push_str("..");
                 fmt::push_uint(out, span.end_as_usize() as u64);
@@ -429,12 +590,6 @@ impl Renderer for ShortRenderer {
         out.push('\n');
     }
 
-    fn render(&self, diag: &Diagnostic<'_>, cx: &RenderCtx<'_>) -> String {
-        let mut out = String::new();
-        self.render_into(diag, cx, &mut out);
-        out
-    }
-
     // Machine formats do not carry a summary trailer — a parser reading
     // `:make` output would treat it as a bogus diagnostic.
     fn render_summary(&self, _errors: usize, _warnings: usize) -> String {
@@ -448,7 +603,7 @@ impl Renderer for ShortRenderer {
         ""
     }
 
-    /// F1: `render_summary_full` defaults to `render_summary`, and this format
+    /// `render_summary_full` defaults to `render_summary`, and this format
     /// overrides that to `""` — pin it, because a batch rendered with
     /// `--summary-full` must not gain a prose trailer in a machine format.
     fn render_summary_full(&self, _errors: usize, _warnings: usize, _files: usize) -> String {
@@ -676,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    /// F1/F2 pins: a machine format must never grow a prose trailer, and a
+    /// Pins: a machine format must never grow a prose trailer, and a
     /// contained render panic must still produce a greppable, newline-terminated
     /// row (the default marker was prose with neither).
     fn machine_format_rows_and_summary_stay_machine_shaped() {
@@ -701,6 +856,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn separator_is_empty() {
         // A non-empty separator would double-space the output and break the
         // one-line contract the summary/suppressed hooks were given.
@@ -711,6 +867,199 @@ mod tests {
     /// the default `<input>` name): a real file name is still omitted when there
     /// is neither a span nor a source, because a name alone cannot place the
     /// message.
+    /// The SWAR gate must equal the scalar predicate for every byte and every length
+    /// across the 8-byte boundary.
+    ///
+    /// A false negative would let a control/break/bidi character reach the "one
+    /// physical line" output unchanged, so this is an equivalence check, not a
+    /// spot-check: every single byte 0..=255 alone, and every byte inside an otherwise
+    /// clean 8-, 9- and 16-byte row.
+    #[test]
+    fn swar_gate_matches_the_scalar_predicate() {
+        fn scalar(s: &[u8]) -> bool {
+            s.iter()
+                .any(|&b| b < 0x20 || b == 0x7F || b == 0xC2 || b == 0xE2)
+        }
+        for b in 0u8..=255 {
+            for len in [1usize, 8, 9, 16] {
+                for pos in 0..len {
+                    let mut row = vec![b'a'; len];
+                    row[pos] = b;
+                    assert_eq!(
+                        needs_flatten_or_sanitize(&row),
+                        scalar(&row),
+                        "byte {b:#04x} at {pos} of a {len}-byte row"
+                    );
+                }
+            }
+        }
+        // Clean rows of every length past the chunk size stay clean (no false
+        // positive from the `!x` masking of the low-control mask).
+        for len in 0..=24 {
+            let row = vec![b'x'; len];
+            assert!(!needs_flatten_or_sanitize(&row), "len {len}");
+            let cjk = "中文".repeat(len / 2 + 1);
+            let bytes = cjk.as_bytes();
+            assert!(
+                !needs_flatten_or_sanitize(bytes),
+                "CJK text must not trip the gate (len {} bytes)",
+                bytes.len()
+            );
+        }
+    }
+
+    /// Clean input must reach the identity fast path, and dirty input must not.
+    ///
+    /// The predicate is conservative-complete (`< 0x20`, DEL, `0xC2`, `0xE2`), so
+    /// "no such byte ⇒ output == input" is a proof rather than a hope: nothing else
+    /// can be a break, a control or a bidi character. Both directions are pinned — a
+    /// predicate that flagged too much would merely be slow, while one that flagged
+    /// too little is a correctness bug.
+    #[test]
+    fn clean_messages_take_the_identity_path_and_dirty_ones_do_not() {
+        for clean in [
+            "",
+            "plain ascii sentence",
+            "  leading and trailing spaces  ",
+            "a   b     c",
+            "中文 注释 with ascii",
+            "тип: тип",
+            "café résumé",
+        ] {
+            assert!(
+                !needs_flatten_or_sanitize(clean.as_bytes()),
+                "predicate flagged a clean string: {clean:?}"
+            );
+            let mut out = String::new();
+            push_sanitized_flattened(&mut out, clean);
+            assert_eq!(out, clean, "clean input must be byte-identical");
+        }
+        for dirty in [
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\u{202E}b",
+            "del\u{7f}",
+            "nul\u{0}",
+        ] {
+            assert!(
+                needs_flatten_or_sanitize(dirty.as_bytes()),
+                "predicate missed a dirty string: {dirty:?}"
+            );
+        }
+        // Predicate *false positives* still produce identity output: U+2014 (en dash)
+        // and U+00A0 (NBSP) trip the `0xE2`/`0xC2` gates, so they take the state
+        // machine — which changes nothing, because neither is a break, a control or a
+        // bidi character.  That is what "conservative" buys: a wider scan, never a
+        // wrong byte.
+        for (flagged, text) in [
+            (true, "en dash \u{2014} here"),
+            (true, "nbsp\u{a0}here"),
+            (false, "plain café"),
+        ] {
+            assert_eq!(
+                needs_flatten_or_sanitize(text.as_bytes()),
+                flagged,
+                "{text:?}"
+            );
+            let mut out = String::new();
+            push_sanitized_flattened(&mut out, text);
+            assert_eq!(
+                out, text,
+                "false positives must still be identity: {text:?}"
+            );
+        }
+        // `flatten_component` borrows exactly when the predicate says clean.
+        for clean in ["plain", "  spaced  ", "中文"] {
+            assert!(matches!(flatten_component(clean), Cow::Borrowed(_)));
+        }
+        for dirty in ["a\nb", "a\u{202E}b"] {
+            assert!(matches!(flatten_component(dirty), Cow::Owned(_)));
+        }
+    }
+
+    /// A span starting inside a multi-byte codepoint must floor to the char
+    /// boundary, not emit a column that does not exist.
+    ///
+    /// `json.rs` pins the same invariant for its coordinates
+    /// (`span_start_inside_a_multibyte_char_lands_on_the_boundary`); `short.rs`
+    /// consumes the *same* `LineIndex` but had no equivalent test, so the floor
+    /// behaviour was claimed in one renderer and merely inherited in the other.
+    #[test]
+    fn span_start_inside_a_multibyte_char_floors_to_the_boundary() {
+        use super::Renderer as _;
+        let opts = crate::diagnostics::DiagOpts::default();
+        let cx = crate::diagnostics::render::RenderCtx::new(&opts, None);
+        // (source, byte offset, expected column) — 1-based columns, char-based.
+        let cases = [
+            ("éa\n", 1usize, 1usize), // inside `é` (2 bytes) -> floors to byte 0
+            ("雪a\n", 2, 1),          // inside `雪` (3 bytes) -> floors to byte 0
+            ("雪a\n", 1, 1),          // also inside `雪`
+            ("a雪b\n", 2, 2),         // inside `雪` -> floors to the `雪` boundary
+        ];
+        for (src, start, want_col) in cases {
+            let span = Span::new(FileId::DUMMY, start as u32, start as u32 + 1);
+            let diag = Diagnostic::error("boom")
+                .with_span(span)
+                .with_source(src)
+                .with_file_name("x.pn");
+            let mut out = String::new();
+            super::ShortRenderer::default().render_into(&diag, &cx, &mut out);
+            assert!(
+                out.contains(&format!(":1:{want_col}:")),
+                "start {start} of {src:?} must report column {want_col}: {out:?}"
+            );
+        }
+    }
+
+    /// The location must come from the **primary** span, not from insertion order.
+    ///
+    /// `with_span` + `with_additional_span` leaves `spans()` in insertion order
+    /// (here: the later-positioned span first) while `primary_ref()` sorts, so
+    /// reading `spans().first()` printed the additional span's coordinates as THE
+    /// location while `json.rs` printed the primary's — two renderers disagreeing
+    /// about where the same diagnostic is.
+    #[test]
+    fn location_comes_from_the_primary_span_not_insertion_order() {
+        use super::Renderer as _;
+        let opts = crate::diagnostics::DiagOpts::default();
+        let cx = crate::diagnostics::render::RenderCtx::new(&opts, None);
+        let src = "aaa\nbbb\n";
+        let later = Span::new(FileId::DUMMY, 4, 7); // line 2, pushed first
+        let earlier = Span::new(FileId::DUMMY, 0, 3); // line 1
+        let diag = Diagnostic::error("boom")
+            .with_span(later)
+            .with_additional_span(earlier)
+            .with_source(src)
+            .with_file_name("x.pn");
+
+        // Both accessors agree, and both are sorted: `MultiSpan` holds only primary
+        // spans and every read goes through the dedup'd sorted view, so the
+        // "secondary registered first" hazard cannot arise in
+        // this model.  The alignment on `primary_ref()` is therefore consistency, not
+        // repair — and this pins the equivalence so a future accessor split cannot
+        // reintroduce the divergence silently.
+        assert_eq!(diag.spans.primary_ref().first(), Some(&earlier));
+        assert_eq!(
+            diag.spans().first(),
+            Some(earlier),
+            "spans() must be the same sorted view as primary_ref()"
+        );
+
+        let mut out = String::new();
+        super::ShortRenderer::default().render_into(&diag, &cx, &mut out);
+        assert!(
+            out.contains("1:1"),
+            "the primary span's location is expected: {out:?}"
+        );
+        assert!(
+            !out.contains("2:1"),
+            "the additional span leaked into the location: {out:?}"
+        );
+    }
+
     #[test]
     fn no_source_no_span_omits_the_file_name() {
         let diag = Diagnostic::error("boom")

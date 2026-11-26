@@ -470,9 +470,31 @@ pub fn generate_fluent_functions(dir: &Path) -> String {
         rs.push_str(
             "pub(crate) fn zero_arg_slug_at(slug: &str, lang_idx: usize) -> Option<&'static str> {\n",
         );
-        rs.push_str("    let idx = match slug {\n");
+        // Bucket by byte length first: a flat `match slug { "a" => … }` chain compares
+        // every entry (Rust lowers `&str` arms to length checks plus byte compares, but
+        // it still walks the arms), and this lookup runs on **every** zero-argument
+        // render — every level label, chain kind and note.  Grouping by length means
+        // only same-length candidates are ever compared, which is a strict reduction in
+        // comparisons with no change in behaviour.
+        rs.push_str("    let idx = match slug.len() {\n");
+        let mut by_len: std::collections::BTreeMap<usize, Vec<(usize, &str)>> =
+            std::collections::BTreeMap::new();
         for (i, s) in zero_arg.iter().enumerate() {
-            let _ = std::fmt::Write::write_fmt(&mut rs, format_args!("        {s:?} => {i},\n"));
+            by_len.entry(s.len()).or_default().push((i, s));
+        }
+        for (len, group) in &by_len {
+            let _ = std::fmt::Write::write_fmt(
+                &mut rs,
+                format_args!("        {len} => match slug {{\n"),
+            );
+            for (i, s) in group {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut rs,
+                    format_args!("            {s:?} => {i},\n"),
+                );
+            }
+            rs.push_str("            _ => return None,\n");
+            rs.push_str("        },\n");
         }
         rs.push_str("        _ => return None,\n");
         rs.push_str("    };\n");
@@ -504,6 +526,67 @@ pub fn generate_fluent_functions(dir: &Path) -> String {
              }\n\n",
         );
     }
+
+    // Closed-set slug index for the primary-pattern cache.  The render hot path used
+    // `RwLock` + `FxHashMap` for this, once per parameterized render; the slug set comes
+    // from `en.ftl`, so it is known at build time and an index plus a `OnceLock` slot
+    // replaces both the lock acquire and the hash probe.  Bucketed by byte length like
+    // `zero_arg_slug_at`, so only same-length candidates are compared.
+    let all_slugs: Vec<&str> = msgs
+        .iter()
+        .map(|(s, _)| *s)
+        .filter(|s| !s.starts_with('-'))
+        .collect();
+    let _ = std::fmt::Write::write_fmt(
+        &mut rs,
+        format_args!("pub(crate) const N_SLUGS: usize = {};\n\n", all_slugs.len()),
+    );
+    // Slug names and their declared variables, so the differential test can drive
+    // **every** slug in **every** language instead of a hand-picked corpus — the direct
+    // writer's whole risk is a pattern it classifies as simple but Fluent renders
+    // differently, and only an exhaustive sweep bounds that.
+    rs.push_str("pub(crate) const SLUG_NAMES: &[&str] = &[\n");
+    for s in &all_slugs {
+        let _ = std::fmt::Write::write_fmt(&mut rs, format_args!("    {s:?},\n"));
+    }
+    rs.push_str("];\n\n");
+    rs.push_str("pub(crate) const SLUG_ARGS: &[&[&str]] = &[\n");
+    for slug in &all_slugs {
+        let vars = msgs.get(slug).map(Vec::as_slice).unwrap_or(&[]);
+        rs.push_str("    &[");
+        for v in vars {
+            let _ = std::fmt::Write::write_fmt(&mut rs, format_args!("{v:?}, "));
+        }
+        rs.push_str("],\n");
+    }
+    rs.push_str("];\n\n");
+    rs.push_str(
+        "/// Index of a public `en.ftl` slug, or `None` for a dynamically-shaped\n\
+         /// spelling the generated set cannot know (tests, legacy keys).\n\
+         pub(crate) fn slug_index(slug: &str) -> Option<usize> {\n\
+         \x20   match slug.len() {\n",
+    );
+    {
+        let mut by_len: std::collections::BTreeMap<usize, Vec<(usize, &str)>> =
+            std::collections::BTreeMap::new();
+        for (i, s) in all_slugs.iter().enumerate() {
+            by_len.entry(s.len()).or_default().push((i, s));
+        }
+        for (len, group) in &by_len {
+            let _ = std::fmt::Write::write_fmt(
+                &mut rs,
+                format_args!("        {len} => match slug {{\n"),
+            );
+            for (i, s) in group {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut rs,
+                    format_args!("            {s:?} => Some({i}),\n"),
+                );
+            }
+            rs.push_str("            _ => None,\n        },\n");
+        }
+    }
+    rs.push_str("        _ => None,\n    }\n}\n\n");
 
     for (slug, vars) in &msgs {
         let fn_name = slug.replace('-', "_");

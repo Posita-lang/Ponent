@@ -1,57 +1,39 @@
-//! Shared integer/space formatting primitives — straight div-mod loops instead
-//! of `core::fmt`, and no allocation.
+//! Shared integer/space formatting primitives — no `core::fmt`, no allocation.
 //!
-//! "No `core::fmt`" is a property of the *algorithms* here, not of the sink
-//! bounds: the writers take `std::fmt::Write`, so the guarantee holds because
-//! `String::write_str`/`push_str` are `#[inline]` in practice.  It would not hold
-//! for a `dyn Write`, and is unverified for `CompactString` — see the F20 note in
-//! the review backlog about a `JsonSink` trait if that ever matters.
+//! Decimal formatting is `itoa` (two-digit table + one reciprocal multiply per
+//! pair, and it hands back a `&str`, so no `from_utf8_unchecked`); hex is a
+//! 512-byte pair table; spaces are a slice push.  `core::fmt` for integers would
+//! drag in the width/precision/flags machinery and an indirect call through
+//! `Formatter` for every digit.
 //!
-//! `core::fmt` for integers drags in the width/precision/flags machinery and
-//! an indirect call through `Formatter`; these are straight div-mod loops
-//! into stack buffers plus one `push` per ASCII digit, shared by the JSON,
-//! HTML, and short renderers.
-
-/// Const-built table of the two ASCII digits for every `u8` value `0..100`,
-/// laid out as `[d0(0), d1(0), d0(1), d1(1), …]`.  Lets `push_uint` emit two
-/// digits per div-mod and one `push_str` instead of one `push` per digit.
-const fn build_digit_pairs() -> [u8; 200] {
-    let mut t = [0u8; 200];
-    let mut i = 0;
-    while i < 100 {
-        t[2 * i] = b'0' + (i / 10) as u8;
-        t[2 * i + 1] = b'0' + (i % 10) as u8;
-        i += 1;
-    }
-    t
-}
-static DIGITS: [u8; 200] = build_digit_pairs();
+//! The sinks are `&mut String`, deliberately: the earlier `impl fmt::Write` bound
+//! advertised a fallible writer whose errors every call site discarded with
+//! `let _ =`, which is the one way these helpers could have silently truncated a
+//! number.  (`json.rs` narrowed its own string writers for the same reason; the
+//! two now agree.)  The `no core::fmt` guarantee rests on the `String`-specific
+//! fast paths of `write_str`/`push_str`, so it is unverified for any other
+//! sink: a `dyn Write`-style or `CompactString`-backed sink would need its own
+//! verification before this module could be reused there (a `JsonSink` trait is
+//! one candidate shape; not pursued).  Shared by the JSON, HTML and short
+//! renderers.
 
 /// Append a decimal `u64` without `core::fmt`'s number machinery and without
 /// allocating.
 ///
-/// Generic over the sink so the no-`core::fmt` contract actually holds at every
-/// call site: `String` and `ArrayString` both implement `fmt::Write`, and
-/// `String::write_str` delegates to `push_str` (std marks it `#[inline]`), so
-/// monomorphization leaves existing call sites' codegen unchanged.
+/// Backed by `itoa`: the fastest known integer formatter (two-digit table plus
+/// one reciprocal multiply per pair), returning a `&str` so no
+/// `from_utf8_unchecked` is needed.  Bytes are pinned by
+/// `push_uint_matches_display`, so a formatter swap cannot change output
+/// silently.
 ///
-/// Two digits per iteration (halving the div-mod count for `n ≥ 100`) and a
-/// single write of a stack buffer instead of one capacity-checked `push` per
-/// digit.  20 digits covers every 64-bit value (`2^64 - 1` has 20).
-///
-/// Backed by `itoa` rather than a hand-rolled div-mod ladder: `itoa` is the
-/// fastest known integer formatter (two-digit table + one reciprocal multiply
-/// per pair), and — the part that matters here — it returns a `&str`, which
-/// deletes the `from_utf8_unchecked` this function used to need.  The bytes are
-/// pinned by `push_uint_matches_display` and `push_u32_matches_push_uint`, so a
-/// formatter swap cannot change output silently.
+/// Takes `&mut String` rather than `impl fmt::Write`: every caller passes a
+/// `String`, and the generic bound used to be paired with `let _ = write_str(..)`,
+/// i.e. it advertised fallibility the code discarded.  A non-`String` sink that
+/// ever needs this should call `.as_str()` and append itself.
 #[inline]
-pub fn push_uint<W: std::fmt::Write + ?Sized>(out: &mut W, n: u64) {
+pub fn push_uint(out: &mut String, n: u64) {
     let mut buf = itoa::Buffer::new();
-    // The `write_str` result is discarded deliberately: these sinks are
-    // infallible in practice (`String`, `ArrayString`), and an error would mean
-    // the sink is broken, not that the number is unrepresentable.
-    let _ = out.write_str(buf.format(n));
+    out.push_str(buf.format(n));
 }
 
 /// `push_uint` for the u32 values this module is almost always given (span
@@ -61,9 +43,9 @@ pub fn push_uint<W: std::fmt::Write + ?Sized>(out: &mut W, n: u64) {
 /// used to be the only way in; `itoa` has a dedicated `u32` path, so the call
 /// site and the formatter agree on the width.
 #[inline]
-pub fn push_u32<W: std::fmt::Write + ?Sized>(out: &mut W, n: u32) {
+pub fn push_u32(out: &mut String, n: u32) {
     let mut buf = itoa::Buffer::new();
-    let _ = out.write_str(buf.format(n));
+    out.push_str(buf.format(n));
 }
 
 /// Const-built table mapping each `u8` to its two lowercase hex digits,
@@ -89,7 +71,16 @@ static HEX_PAIRS: [u8; 512] = build_hex_pairs();
 /// ids comparable as byte strings without parsing.  One `push_str` of a
 /// 16-byte stack buffer instead of sixteen `push`es.
 #[inline]
-pub fn push_hex64<W: std::fmt::Write + ?Sized>(out: &mut W, mut n: u64) {
+/// Write `n` as exactly 16 lowercase hex digits.
+///
+/// The digits are built in a 16-byte stack buffer and copied in with one `push_str`.
+/// Writing straight into `out`'s spare capacity would remove that 16-byte copy, but it
+/// needs a **second** `unsafe` block (raw `set_len`) in the JSON writer's hottest helper
+/// for a copy the optimiser usually folds away — the container here is
+/// `String`, not a `Vec<u8>` sink, so `spare_capacity_mut` + `from_utf8_unchecked` would
+/// have to be re-argued at every call site.  The existing `unsafe` below is bounded to
+/// this one stack buffer, which is the contract worth keeping.
+pub fn push_hex64(out: &mut String, mut n: u64) {
     let mut buf = [0u8; 16];
     let mut i = 16;
     while i > 0 {
@@ -102,13 +93,15 @@ pub fn push_hex64<W: std::fmt::Write + ?Sized>(out: &mut W, mut n: u64) {
     // SAFETY: `buf` holds only ASCII hex digit bytes from `HEX_PAIRS`
     // (const-built from `HEX_LOWER` = `b"0123456789abcdef"`), all in
     // `0x30..=0x39 | 0x61..=0x66`.
-    let _ = out.write_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
 }
 
-/// Append `n` space characters without per-iteration overhead.
+/// Append `n` space characters with one fill.
 ///
-/// Large counts are pushed in 64-byte chunks; the common source-rendering
-/// counts (line-number widths, label indentation) are a single sliced push.
+/// One `reserve` + one `write_bytes` (libc's SIMD memset), not the chunked
+/// `push_str` loop the previous doc described and the code no longer contained:
+/// every `push_str` of a 64-byte literal re-checks capacity and copies, so wide
+/// indents on a table-heavy render paid `n / 64` capacity checks.
 #[inline]
 pub fn push_spaces(out: &mut String, n: usize) {
     if n == 0 {
@@ -128,19 +121,6 @@ pub fn push_spaces(out: &mut String, n: usize) {
         std::ptr::write_bytes(v.as_mut_ptr().add(len), b' ', n);
         v.set_len(len + n);
     }
-}
-
-/// Compile-time check that a `&str` is all spaces.
-const fn all_spaces(s: &str) -> bool {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b' ' {
-            return false;
-        }
-        i += 1;
-    }
-    true
 }
 
 /// Append `n` right-justified to `width` columns (left-padded with spaces).
@@ -173,11 +153,45 @@ pub fn push_fold_marker(out: &mut String, gap: usize) {
 
 /// Decimal digit count of `n` (≥ 1).
 ///
-/// `u64::ilog10` is constant-time on modern rustc (LLVM emits the tables);
-/// the loop it replaces is up to 20 divisions.  Still `const fn`.
+/// Branch-light estimate plus one correction, instead of `u64::ilog10`.  The previous
+/// doc claimed "`ilog10` is constant-time on modern rustc (LLVM emits the tables)";
+/// std's `ilog10` is a *division loop* — strength-reduced, but variable-trip — so the
+/// claim was doing load-bearing work it does not support.  `(bits · 1233) >> 12` is the
+/// standard log10-from-bits bound (within one), and the single comparison against the
+/// power-of-ten table settles the off-by-one.  `dec_digits_boundaries` pins this
+/// exhaustively against `to_string().len()`.
 #[inline]
 pub const fn dec_digits(n: u64) -> usize {
-    if n == 0 { 1 } else { n.ilog10() as usize + 1 }
+    const POW10: [u64; 20] = [
+        1,
+        10,
+        100,
+        1_000,
+        10_000,
+        100_000,
+        1_000_000,
+        10_000_000,
+        100_000_000,
+        1_000_000_000,
+        10_000_000_000,
+        100_000_000_000,
+        1_000_000_000_000,
+        10_000_000_000_000,
+        100_000_000_000_000,
+        1_000_000_000_000_000,
+        10_000_000_000_000_000,
+        100_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+    ];
+    if n == 0 {
+        return 1;
+    }
+    let bits = 64 - n.leading_zeros() as usize;
+    // `<= 19` for every `u64`, so `POW10[t]` and `POW10[t + 1]` stay in range.
+    let t = ((bits * 1233) >> 12) as usize;
+    let t = if n < POW10[t] { t - 1 } else { t };
+    t + 1
 }
 
 #[cfg(test)]
@@ -215,6 +229,21 @@ mod tests {
     }
 
     #[test]
+    /// `push_hex64` against the formatter over a randomized corpus.
+    fn push_hex64_matches_the_formatter_on_xorshift_corpus() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..2048 {
+            // xorshift64: exercises every bit position without a rng dependency.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut out = String::new();
+            push_hex64(&mut out, state);
+            assert_eq!(out, format!("{state:016x}"));
+        }
+    }
+
+    #[test]
     fn push_hex64_is_fixed_width_lowercase() {
         for (n, want) in [
             (0u64, "0000000000000000"),
@@ -239,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn push_spaces_covers_chunk_and_tail_paths() {
+    fn push_spaces_fills_zero_and_wide_counts() {
         for n in [0usize, 1, 63, 64, 65, 127, 128, 1000] {
             let mut out = String::from("|");
             push_spaces(&mut out, n);
@@ -264,7 +293,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// `push_u32` must be byte-identical to `push_uint` on every value the
     /// formatters actually pass it — otherwise the JSON `start`/`end`/`fileId`
     /// fields would silently diverge from the `line`/`column` ones.
@@ -272,6 +300,13 @@ mod tests {
     fn push_u32_matches_push_uint() {
         let mut x = 0x2545_F491u32;
         for extra in [0u32, 1, 9, 10, 99, 100, 999, 1_000, u32::MAX - 1, u32::MAX] {
+            // The boundary values are checked once, not 500 times: the random sweep
+            // exists for `x`.
+            let mut a = String::new();
+            let mut b = String::new();
+            push_u32(&mut a, extra);
+            push_uint(&mut b, extra as u64);
+            assert_eq!(a, b, "push_u32({extra})");
             for _ in 0..500 {
                 x ^= x << 13;
                 x ^= x >> 17;
@@ -281,15 +316,11 @@ mod tests {
                 push_u32(&mut a, x);
                 push_uint(&mut b, x as u64);
                 assert_eq!(a, b, "push_u32({x})");
-                let mut a = String::new();
-                let mut b = String::new();
-                push_u32(&mut a, extra);
-                push_uint(&mut b, extra as u64);
-                assert_eq!(a, b, "push_u32({extra})");
             }
         }
     }
 
+    #[test]
     fn dec_digits_boundaries() {
         for (n, want) in [
             (0u64, 1usize),
