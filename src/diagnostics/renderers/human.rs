@@ -97,7 +97,13 @@ impl Renderer for HumanRenderer {
         // below both need it, and every other accessor in this file is bound once for the
         // same reason ("the renderer's contract is one accessor call each").
         let call_chain = diag.call_chain();
-        let needs_index = diag.spans.primary_ref().first().is_some()
+        // One `primary_ref()` per diagnostic: the `needs_index` gate and the chain anchor below
+        // both need the first primary span, and `primary_ref()` may materialize a sorted copy and
+        // cache it — two calls were two probes for one answer, against this file's "one accessor
+        // call each" contract (which the `call_chain` binding above already follows).
+        let primaries = diag.spans.primary_ref();
+        let first_primary = primaries.first();
+        let needs_index = first_primary.is_some()
             || !diag.labels().is_empty()
             || call_chain.is_some_and(|c| !c.is_empty())
             || diag.related_errors.iter().any(|r| r.span.is_some());
@@ -124,7 +130,7 @@ impl Renderer for HumanRenderer {
                     // Anchors foreign-file span detection to the diagnostic's
                     // own file, so a chain entry from another file is rendered as
                     // its kind label instead of bogus coordinates.
-                    anchor: diag.spans.primary_ref().first().map(|s| s.file),
+                    anchor: first_primary.map(|s| s.file),
                 },
                 out,
             );

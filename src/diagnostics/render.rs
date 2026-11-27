@@ -468,6 +468,42 @@ impl<'a> RenderCtx<'a> {
     ///
     /// The returned index borrows only `source`, so callers can hold it for
     /// the duration of a render without borrowing the ctx.
+    /// The per-ctx LRU lookup, with its debug ABA tripwire and MRU promotion.
+    ///
+    /// Extracted so [`Self::line_index`] can consult it *first* and the other tiers can share
+    /// one implementation: the inline copy that lived after tier 0 was both unreachable for
+    /// prebuilt sources and a second place for the tripwire to drift.
+    fn lru_tables(&self, source: &str) -> Option<SharedSourceTables> {
+        let ptr = source.as_ptr() as usize;
+        let len = source.len();
+        let mut cache = self.source_index.borrow_mut();
+        let pos = cache.iter().position(|c| c.ptr == ptr && c.len == len)?;
+        // Debug ABA tripwire: a hit means the same `(ptr, len)`, but if the cached table
+        // belonged to a *different* source that reused the allocation, every line number would
+        // be silently wrong.  `0` is the "unknown" sentinel `preload` sets for tables built
+        // without source text; it is refused at every insertion site (`preload_line_index`,
+        // `from_entries`, and the content-verified tier-0 backfill), so a `0` here means the
+        // invariant was violated rather than "unverifiable".
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            cache[pos].fingerprint,
+            source_fingerprint(source),
+            "(ptr,len) collision — cached line table belongs to a different source"
+        );
+        // LRU: promote the hit to MRU so it survives eviction longest.  N ≤ 4, so the shifts
+        // are a handful of pointer moves.
+        if pos > 0 {
+            let entry = cache.remove(pos);
+            cache.insert(0, entry);
+        }
+        Some(SharedSourceTables::from_cache(
+            Arc::clone(&cache[0].starts),
+            cache[0].ascii,
+            cache[0].char_prefixes.clone(),
+            cache[0].generation,
+        ))
+    }
+
     pub(crate) fn line_index<'s>(&self, source: &'s str) -> LineIndex<'s> {
         let ptr = source.as_ptr() as usize;
         let len = source.len();
@@ -501,9 +537,27 @@ impl<'a> RenderCtx<'a> {
                 .all(|w| (w[0].ptr, w[0].len) <= (w[1].ptr, w[1].len))),
             "prebuilt must be sorted by (ptr, len) for the tier-0 binary search"
         );
+        // The per-ctx LRU is consulted **first**, and that ordering is the point: tier 0
+        // intercepts on *every* call for a prebuilt source, so with tier 0 ahead of it the LRU
+        // hit path was unreachable for exactly those sources — the tier-0 backfill below ran per
+        // render and could never produce a hit, each render re-paid the binary search + the
+        // release-mode fingerprint + two `Arc` clones, and the worker preload's slots for prebuilt
+        // sources were shadowed and never read.  The backfill's own comment states this design
+        // ("an LRU hit is an O(4) scan with no fingerprint at all"); the code did the opposite.
+        //
+        // Trusting the LRU here extends the same batch-scoped-liveness argument every other
+        // backfill already relies on (shared/stable/rebuild entries), and tier 0's fingerprint
+        // still runs on the first render of each batch — the LRU-cold moment where a stale
+        // cross-batch pointer is possible.
+        if let Some(tables) = self.lru_tables(source) {
+            return LineIndex::from_shared(source, tables);
+        }
         if let Some(prebuilt) = self.prebuilt
             && let Ok(pos) = prebuilt.binary_search_by_key(&(ptr, len), |e| (e.ptr, e.len))
-            && let Some(e) = prebuilt.get(pos)
+            // `Ok(pos)` implies `pos < prebuilt.len()` — that is the `binary_search` contract — so
+            // index directly.  The `get(pos)` form implied an out-of-bounds outcome that cannot
+            // exist and mis-taught the contract to anyone reading this chain.
+            && let e = &prebuilt[pos]
             && e.fingerprint != 0
             && e.fingerprint == source_fingerprint(source)
         {
@@ -542,41 +596,8 @@ impl<'a> RenderCtx<'a> {
                 ),
             );
         }
-        {
-            let mut cache = self.source_index.borrow_mut();
-            if let Some(pos) = cache.iter().position(|c| c.ptr == ptr && c.len == len) {
-                // Debug ABA tripwire: a hit means the same `(ptr, len)`, but if
-                // the cached table belonged to a *different* source that
-                // reused the allocation, every line number would be silently
-                // wrong.  `0` is the "unknown" sentinel set by `preload`
-                // (which has no source text).
-                // Unconditional: sentinels are refused at every insertion site
-                // (`preload_line_index`, `from_entries`, and the content-verified
-                // tier-0 backfill), so a `0` here means the invariant was violated,
-                // not "unverifiable".
-                #[cfg(debug_assertions)]
-                debug_assert_eq!(
-                    cache[pos].fingerprint,
-                    source_fingerprint(source),
-                    "(ptr,len) collision — cached line table belongs to a different source"
-                );
-                // LRU: promote the hit to MRU so it survives eviction longest.
-                // N ≤ 4, so the shifts are a handful of pointer moves.
-                if pos > 0 {
-                    let entry = cache.remove(pos);
-                    cache.insert(0, entry);
-                }
-                return LineIndex::from_shared(
-                    source,
-                    SharedSourceTables::from_cache(
-                        Arc::clone(&cache[0].starts),
-                        cache[0].ascii,
-                        cache[0].char_prefixes.clone(),
-                        cache[0].generation,
-                    ),
-                );
-            }
-        }
+        // (The per-ctx LRU was consulted at the top of this function; reaching here means it
+        // missed, so there is nothing left to check.)
         // Cross-worker share: a hit means some other worker (or the main
         // thread's prebuild) already paid the O(source_len) scan.  Backfill
         // the local LRU with the shared entry, so subsequent renders of the
@@ -611,8 +632,11 @@ impl<'a> RenderCtx<'a> {
                 if cache.len() >= CACHE_SLOTS {
                     cache.pop();
                 }
-                // Insert first, then build the returned index from the cached
-                // entry, so the hit path clones two `Arc`s instead of four.
+                // Insert first, then build the returned index from the cached entry.  Counting
+                // both orderings shows the same two `Arc` + two `char_prefixes` clones, so the
+                // old "clones two `Arc`s instead of four" claim here was simply wrong; the
+                // ordering is kept because building from the cache entry keeps the borrow scope
+                // in one place.
                 cache.insert(
                     0,
                     CachedSourceIndex {
@@ -638,9 +662,14 @@ impl<'a> RenderCtx<'a> {
                 );
             }
         }
-        if len <= STABLE_CACHE_MAX_SOURCE {
+        // One fingerprint for the whole cold path: the stable-tier check below and the rebuild's
+        // stable-cache insert both need it, and computing it at each site contradicted this
+        // module's own "one content, one fingerprint" note.  Gated on the tier actually being
+        // enabled so a cache-less ctx pays nothing.
+        let cold_fingerprint = (self.line_cache.is_some() && len <= STABLE_CACHE_MAX_SOURCE)
+            .then(|| source_fingerprint(source));
+        if let Some(fingerprint) = cold_fingerprint {
             if let Some(cache_ref) = self.line_cache {
-                let fingerprint = source_fingerprint(source);
                 let mut cache = cache_ref.borrow_mut();
                 if let Some(pos) = cache.iter().position(|entry| {
                     entry.fingerprint == fingerprint
@@ -761,7 +790,10 @@ impl<'a> RenderCtx<'a> {
                     0,
                     StableSourceIndex {
                         text: source.to_owned(),
-                        fingerprint: source_fingerprint(source),
+                        // Reused from `cold_fingerprint` above: this block is inside
+                        // `len <= STABLE_CACHE_MAX_SOURCE`, so the value is already computed.
+                        fingerprint: cold_fingerprint
+                            .expect("stable tier enabled on this path computes the fingerprint"),
                         starts: Arc::clone(&shared_entry.0),
                         ascii: shared_entry.1,
                         char_prefixes: shared_entry.2.clone(),
@@ -908,9 +940,21 @@ impl<'a> RenderCtx<'a> {
             Some(slot) => slot,
             None => {
                 let mut map = self.file_urls.write().unwrap_or_else(|e| e.into_inner());
-                // Re-check under the write lock: a racing worker may have
-                // inserted the slot between the read-lock miss and here, and in
-                // that case the `to_string()` key would be built and dropped.
+                // Double-checked locking: a racing worker may have inserted the slot between
+                // the read-lock miss and here, and this re-check is what keeps the miss path
+                // from building and dropping a key `String` for a slot that now exists — the
+                // `else` branch below is the only place that allocates one.
+                //
+                // The map is keyed by the *verbatim* spelling and entries are never evicted, so
+                // a producer that mints a distinct spelling per diagnostic grows it for the
+                // process lifetime.  The `FileUrlMap` doc promises this tripwire turns that into
+                // a loud debug failure instead of silent unbounded growth; it was never written.
+                debug_assert!(
+                    map.len() < 100_000,
+                    "file_url map grew past a sane session bound ({} entries): a producer is \
+                     minting distinct path spellings per render",
+                    map.len()
+                );
                 if let Some(slot) = map.get(name) {
                     Arc::clone(slot)
                 } else {
@@ -1241,6 +1285,7 @@ pub trait Renderer: Send + Sync {
     /// array produces output no consumer can parse, which is strictly worse than
     /// omitting the item — the batch would fail at the parser instead of
     /// surfacing one broken diagnostic.
+    ///
     /// Whether this renderer emits a *machine-parsed* format.
     ///
     /// The placeholder below is flat text: correct for every human format and
@@ -1282,6 +1327,23 @@ pub trait Renderer: Send + Sync {
     fn render_summary_full(&self, errors: usize, warnings: usize, files: usize) -> String {
         let _ = files;
         self.render_summary(errors, warnings)
+    }
+
+    /// [`render_summary_full`](Self::render_summary_full) into an existing buffer.
+    ///
+    /// The emitter renders the summary once per batch into its reused scratch, so the
+    /// `String`-returning form allocated a buffer purely to hand it over — the same treatment
+    /// `render_suppressed_note_into` got, for the same reason.  The default keeps working for
+    /// renderers whose summary is built by another `String`-returning layer; a renderer that can
+    /// write directly overrides it.
+    fn render_summary_full_into(
+        &self,
+        errors: usize,
+        warnings: usize,
+        files: usize,
+        out: &mut String,
+    ) {
+        out.push_str(&self.render_summary_full(errors, warnings, files));
     }
 
     /// Render the "N errors suppressed" trailer when `max_errors` cut the

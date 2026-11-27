@@ -212,10 +212,6 @@ fn x86_level_init() -> u8 {
 ///   path).  Free in principle, but aarch64 code cannot be compiled or run on the x86 dev
 ///   host, so it would ship unverified vector code — the one thing this module's test
 ///   discipline forbids.  Do it inside the `check-aarch64` / `test-aarch64` (qemu) loop.
-/// * **`classify_swar_wide` tail: mirror the entry's two-overlapping-word trick** for the
-///   9..15-byte remainder (a second `classify_word8` over `&s[len-8..]` instead of a scalar
-///   walk).  Measured-cheap micro whose benefit depends on how many rows end 9..15 bytes
-///   into a chunk; needs a bench row before it is worth the extra branch.
 /// * **Wide-band gate on AVX2-less hosts** (serve `len >= 128` boolean predicates from
 ///   `gate_sse2` instead of the fused classify path): the honest answer is the measure-then-
 ///   decide the doc already asks for — A/B `gate_sse2` against `classify_ascii_avx2` at
@@ -716,6 +712,23 @@ pub(crate) fn first_byte_outside_range(s: &[u8], lo: u8, hi: u8) -> usize {
         }
         i += 16;
     }
+    // A 9..=15-byte remainder takes two **overlapping** words (at `i` and `len - 8`) with one
+    // branch each, where the sequential loop paid a branch per 8 bytes and then a scalar walk for
+    // the last 1..=7 — the same trick [`classify_swar_wide`]'s entry path uses, and the caller
+    // (`char_col`'s plain-run scan) is per message run.  Overlap is idempotent: both words compute
+    // the same per-lane masks, and the first offender wins by position.
+    if s.len() - i >= 9 {
+        for at in [i, s.len() - 8] {
+            let word = load_word8(&s[at..]);
+            let bad = (word & HI64)
+                | (!((word | HI64).wrapping_sub(lo_rep)) & HI64)
+                | (((word | HI64).wrapping_sub(hi_rep)) & HI64);
+            if bad != 0 {
+                return at + (bad.trailing_zeros() / 8) as usize;
+            }
+        }
+        return usize::MAX;
+    }
     while i + 8 <= s.len() {
         let word = load_word8(&s[i..]);
         let bad = (word & HI64)
@@ -807,9 +820,12 @@ fn classify_ascii_bounded(s: &[u8], stop_at: AsciiClass) -> AsciiClass {
     // back many times over.  The old "`16..127` never touches the level" wording dated from
     // a floor of 128.
     #[cfg(target_arch = "x86_64")]
-    // `!swar_forced()` is redundant *today* — `x86_level()` reads the forced flag
-    // first and returns 0 — but it is the only thing making this arm safe on its
-    // own, and the forced-SWAR tier exists to run the SWAR body.
+    // `!swar_forced()` is redundant: `x86_level()` reads the forced flag first and returns 0,
+    // so `x86_level() >= 3` already implies it.  It is kept as defence in depth — if the level
+    // query ever stops consulting the override, this arm still honours the forced-SWAR tier —
+    // but it is *not* the load-bearing guard (an earlier wording said it was "the only thing
+    // making this arm safe on its own"; the NNA arms below omit the conjunct and are safe for
+    // exactly that reason).
     if !swar_forced() && s.len() >= CLASSIFY_AVX512_MIN_LEN && x86_level() >= 3 {
         // SAFETY: `level >= 3` iff `is_x86_feature_detected!("avx512bw")`
         // succeeded inside `x86_level_init`; `avx512f` is implied by
@@ -891,7 +907,17 @@ fn classify_ascii_bounded(s: &[u8], stop_at: AsciiClass) -> AsciiClass {
 ///
 /// Split out of [`classify_ascii_bounded`] (its only caller) so the hot
 /// dispatcher does not carry its ~40-60 instructions at every inlined call site.
-#[cold]
+// Cold **only where a vector backend shadows it**: on riscv/loongarch/etc. this *is* the
+// production body for every row, and `#[cold]` there costs placement and prediction for the
+// hottest path in the file.
+#[cfg_attr(
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "wasm32"
+    ),
+    cold
+)]
 #[inline(never)]
 fn classify_swar_wide(s: &[u8], stop_at: AsciiClass) -> AsciiClass {
     const HI: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
@@ -920,11 +946,19 @@ fn classify_swar_wide(s: &[u8], stop_at: AsciiClass) -> AsciiClass {
             }
             saw_tab |= tab != 0;
             saw_newline |= nl != 0;
+            // Only this branch can change the flags, so it is the only place the monotone answer
+            // can change: on a chunk with no `< 0x20` lane the previous iteration already derived
+            // the same value (or the entry path did), so re-asking re-derived a constant — one
+            // always-executed compare+branch per clean 16-byte chunk, which is the common case.
+            // `Other` never needs the question at all: the full-classification entry cannot stop
+            // early.
+            if stop_at != AsciiClass::Other
+                && let Some(done) = reached(saw_tab, saw_newline, stop_at)
+            {
+                return done;
+            }
         }
         i += 16;
-        if let Some(done) = reached(saw_tab, saw_newline, stop_at) {
-            return done;
-        }
     }
     // One implementation of the byte-set rule for the tail: `classify_scalar`
     // early-returns `Other` and is `#[inline]`, and `compose_classify_tail` is
@@ -994,6 +1028,29 @@ fn tail_overlap_16(len: usize, i: usize) -> Option<(usize, usize)> {
     let skip = i - base; // 1..=15
     debug_assert!((1..16).contains(&skip), "tail skip out of range: {skip}");
     Some((base, skip))
+}
+
+/// Lane index of the lowest set bit of a **per-lane** bitmask, or `None`.
+///
+/// The distinction this function exists to make impossible to get wrong: a SWAR `u64` word
+/// carries **8 bits per byte lane**, so its `trailing_zeros() / 8` is a byte offset; a
+/// `u8x16_bitmask` / `_mm_movemask_epi8` result carries **one bit per lane**, so
+/// `trailing_zeros()` is *already* the lane index.  Mixing the two domains shipped a real bug:
+/// the wasm `next_non_ascii_byte` tail divided by 8, so for any length that is not a multiple of
+/// 16 with a high byte in the last 1..=15 bytes it returned an already-scanned ASCII offset —
+/// wrong character columns on wasm32, with nothing to assert against.
+///
+/// Extracted and host-tested because the wasm backend cannot execute in CI: this is precisely the
+/// conversion that failed silently there, so it must be verifiable on x86.
+///
+/// `skip` is the count of already-scanned lanes to mask off, per [`tail_overlap_16`]'s contract
+/// (`1..=15`).
+#[inline]
+#[must_use]
+pub(crate) fn first_lane_masked(bits: u16, skip: u16) -> Option<usize> {
+    debug_assert!(skip < 16, "skip out of the per-lane domain: {skip}");
+    let bits = bits & !((1u16 << skip) - 1);
+    (bits != 0).then(|| bits.trailing_zeros() as usize)
 }
 
 /// Byte offset of the first byte ≥ 0x80 in `s`, or `usize::MAX` if `s` is
@@ -1135,18 +1192,15 @@ pub(crate) fn next_non_ascii(s: &[u8]) -> Option<usize> {
 ///   bytes that is the SWAR body's `u64` step and then `classify_scalar`).  The
 ///   SWAR lane proofs therefore stay the single source of truth below the vector
 ///   width even though a kernel does not call SWAR directly.
-/// * `next_non_ascii_byte_avx2` / `_avx512` carry an SSE2 step and an earlier
-///   16-byte overlap that the **current** thresholds make unreachable (a `>= 32`
-///   AVX2 chunk always leaves `i < len` handleable by the 32-byte overlap; a
-///   `>= 64` AVX-512 chunk likewise).  They are kept deliberately as the
-///   documented safety net for a *lowered* threshold rather than deleted: the
-///   `const _` canaries above make re-entering the dispatcher at the same length a
-///   build error, so the net cannot silently become the live path.  The historical
-///   measurement that motivated this shape stands: re-entering the dispatcher for
-///   a 1..15-byte remainder measured ~3× the cost of the neighbouring length.
-///   `next_non_ascii_byte_sse2` is the tier where the overlap tail is *live* (see
-///   its masked-load block), and the NEON/wasm backends still re-enter the
-///   dispatcher for a short remainder — that asymmetry is real and stated.
+/// * **No kernel re-enters the dispatcher for its own remainder.**  Every backend covers
+///   `i..len` with a masked overlap tail ([`tail_overlap_16`] on the 16-byte backends, the
+///   32/64-byte forms in the AVX2/AVX-512 kernels, the SSE2 masked load in `gate_sse2`), and
+///   each ends in a `debug_assert_eq!(i, s.len())` plus a trivial terminal value.  This
+///   paragraph used to claim the opposite for AVX2/AVX-512 ("kept deliberately as the
+///   documented safety net") while those kernels' own comments said the re-dispatch had been
+///   *deleted as a trap*, and it also claimed NEON/wasm still re-entered — they stopped when
+///   their masked tails landed.  The kernels are the truth; do not restore a re-dispatch on
+///   the strength of an older revision of this doc.
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use std::arch::x86_64::*;
@@ -1875,7 +1929,9 @@ mod wasm {
 
     #[inline]
     unsafe fn any(v: v128) -> bool {
-        unsafe { u8x16_bitmask(v) != 0 }
+        // `v128_any_true` is the single-instruction form of "any lane nonzero";
+        // `u8x16_bitmask(v) != 0` was a bitmask extract plus a compare for the same answer.
+        unsafe { core::arch::wasm32::v128_any_true(v) }
     }
 
     #[target_feature(enable = "simd128")]
@@ -2019,15 +2075,14 @@ mod wasm {
             // --target wasm32-unknown-unknown` (and the aarch64 check) now exist for
             // exactly this class of bug.
             let v = unsafe { v128_load(s.as_ptr().add(base).cast()) };
-            let bits = unsafe { u8x16_bitmask(v) } & !((1u16 << skip) - 1);
-            return if bits == 0 {
-                usize::MAX
-            } else {
-                // `trailing_zeros` counts bits and a lane is 8 bits, so `/ 8` is the
-                // lane index of the first high byte — the same relation the 32/64-byte
-                // loops above rely on.
-                base + (bits.trailing_zeros() / 8) as usize
-            };
+            // Domain check: `u8x16_bitmask` yields **one bit per lane**, so the masked
+            // `trailing_zeros()` *is* the lane index.  This block used to divide by 8, copying
+            // the SWAR `u64` domain (8 bits per byte lane) into a per-lane bitmask — which
+            // returned an already-scanned ASCII offset for every non-multiple-of-16 length with
+            // a high byte in the tail.  `first_lane_masked` now owns that conversion and is
+            // host-tested, because wasm cannot execute in CI.
+            return super::first_lane_masked(unsafe { u8x16_bitmask(v) }, skip as u16)
+                .map_or(usize::MAX, |lane| base + lane);
         }
         // Exact-multiple lengths (32/64/128/256/512 — the sizes a
         // benchmark and a 64-column diagnose row both hit) leave nothing
@@ -2313,6 +2368,24 @@ mod tests {
                 *del.last_mut().unwrap() = 0x7F;
             }
             payloads.push(del);
+            // High bytes, without which the `next_non_ascii_byte` assertion below would be
+            // vacuous (`usize::MAX` for every payload) and the per-tier coverage the sweep
+            // exists for would not exist.
+            let mut hi_end = vec![b'a'; len];
+            if len > 0 {
+                *hi_end.last_mut().unwrap() = 0x80;
+            }
+            payloads.push(hi_end);
+            let mut hi_mid = vec![b'a'; len];
+            if len > 1 {
+                hi_mid[len / 2] = 0xE4; // CJK lead byte
+            }
+            payloads.push(hi_mid);
+            let mut hi_first = vec![b'a'; len];
+            if len > 0 {
+                hi_first[0] = 0x80;
+            }
+            payloads.push(hi_first);
         }
         for level in [0u8, 1, 2, 3] {
             let _level = LevelOverrideGuard::new(level);
@@ -2343,6 +2416,15 @@ mod tests {
                         super::is_printable_ascii_multiline(p),
                         want != super::AsciiClass::Other,
                         "is_printable_ascii_multiline: {ctx}"
+                    );
+                    // `next_non_ascii_byte` was absent from this sweep, so its SSE2/AVX2
+                    // kernels were covered only by a handful of incidental fixed lengths while
+                    // the NEON/wasm tails were already shipped with a silent offset bug (see
+                    // `first_lane_masked`).  Same per-tier oracle as the predicates above.
+                    assert_eq!(
+                        super::next_non_ascii_byte(p),
+                        p.iter().position(|&b| b >= 0x80).unwrap_or(usize::MAX),
+                        "next_non_ascii_byte: {ctx}"
                     );
                 }
             }
@@ -2911,6 +2993,37 @@ mod tests {
     /// non-multiple-of-16 input shipped without a single failing test.  The
     /// masks are re-derived here from the same `skip`, so a sign/direction slip
     /// in either formula fails on x86 too.
+    /// The per-lane bitmask → lane-index conversion, exhaustively.
+    ///
+    /// This is the conversion the wasm `next_non_ascii_byte` tail got wrong: it divided by 8,
+    /// copying the SWAR `u64` domain (8 bits per byte lane) onto a `u8x16_bitmask` result (one
+    /// bit per lane), so every non-multiple-of-16 length with a high byte in the tail returned
+    /// an already-scanned ASCII offset.  wasm cannot execute in CI, so the conversion lives in a
+    /// portable helper and is pinned here, on the host.
+    #[test]
+    fn first_lane_masked_is_the_lane_index_not_a_bit_offset_over_eight() {
+        for lane in 0..16u16 {
+            for skip in 1..16u16 {
+                let want = (lane >= skip).then_some(lane as usize);
+                assert_eq!(
+                    super::first_lane_masked(1u16 << lane, skip),
+                    want,
+                    "lane {lane} skip {skip}"
+                );
+            }
+        }
+        assert_eq!(super::first_lane_masked(0, 1), None);
+        // Scanned lanes are masked off even when they are set: only lane 15 survives skip 3.
+        assert_eq!(super::first_lane_masked((1u16 << 15) | 0b111, 3), Some(15));
+        // The concrete regression: `len = 20`, high byte at byte 18 is lane 14 of the tail
+        // (base 4, skip 12) and must map to offset 18 — the old `/8` produced `base + 1`.
+        assert_eq!(
+            super::first_lane_masked(1u16 << 14, 12).map(|lane| 4 + lane),
+            Some(18),
+            "a tail high byte at byte 18 must map to 18, not to base + 14/8"
+        );
+    }
+
     #[test]
     fn tail_overlap_16_and_its_masks_cover_every_remainder() {
         for len in 16..=300usize {

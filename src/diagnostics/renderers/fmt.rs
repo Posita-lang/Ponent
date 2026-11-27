@@ -70,13 +70,23 @@ static HEX_PAIRS: [u8; 512] = build_hex_pairs();
 /// Used for the stable diagnostic id (`"0x{:016x}"`); the fixed width makes ids comparable
 /// as byte strings without parsing.
 ///
-/// The digits are built in a 16-byte stack buffer and copied in with one `push_str`.
-/// Writing straight into `out`'s spare capacity would remove that 16-byte copy, but it
-/// needs a **second** `unsafe` block (raw `set_len`) in the JSON writer's hottest helper
-/// for a copy the optimiser usually folds away — the container here is
-/// `String`, not a `Vec<u8>` sink, so `spare_capacity_mut` + `from_utf8_unchecked` would
-/// have to be re-argued at every call site.  The existing `unsafe` below is bounded to
-/// this one stack buffer, which is the contract worth keeping.
+/// Writes the 16 digits **directly into `out`'s reserved tail** and extends the length with
+/// `set_len` — no stack buffer, no second `push_str` copy.  This is the JSON writer's hottest
+/// helper (one call per diagnostic's `"id"`), so that copy was pure overhead.
+///
+/// # Safety
+///
+/// The contract of the `unsafe` block below, stated where an auditor of it will look: `reserve(16)`
+/// guarantees at least 16 spare bytes (`start + 16 <= capacity`); all 16 are written **before**
+/// `set_len`, from `HEX_PAIRS`, which is const-built from `HEX_LOWER = b"0123456789abcdef"` so
+/// every byte is ASCII hex and the result is valid UTF-8; `set_len` extends by exactly the bytes
+/// written; and `&mut String` is exclusive, so no reader can observe the buffer mid-write.
+///
+/// (This doc used to describe a 16-byte stack buffer plus `push_str`, and located the safety
+/// envelope *in that stack buffer*.  Both were one revision behind the code: the block touches
+/// `out.as_mut_vec()`, not a stack buffer, so a reader auditing from the doc verified the wrong
+/// invariant — the exact defect class this project treats a comment as.)
+#[inline]
 pub fn push_hex64(out: &mut String, mut n: u64) {
     out.reserve(16);
     // Writing straight into the reserved tail instead of building a 16-byte stack buffer
@@ -120,6 +130,16 @@ pub fn push_spaces(out: &mut String, n: usize) {
     if n == 0 {
         return;
     }
+    // `String::reserve` **aborts** on capacity overflow (`capacity_overflow`), it does not panic,
+    // so an absurd `n` from an unclamped `--width` would take the process down rather than produce
+    // a bad layout.  `sink.rs` clamps every capacity entry point against `MAX_SINK_CAPACITY` for
+    // this reason; the trust contract here is that `n` comes from clamped layout options
+    // (`DiagOpts::max_width` is `caps.width.max(1)` on the detected path), so the bound is a
+    // tripwire rather than a clamp — a caller that hands over a raw user width must clamp first.
+    debug_assert!(
+        n <= 1 << 20,
+        "push_spaces called with {n} spaces — a width was not clamped by its producer"
+    );
     out.reserve(n);
     // One `memset` (libc's SIMD fill) instead of `n / 64` `push_str` calls, each
     // re-checking capacity and copying a 64-byte literal.  Indents are wide

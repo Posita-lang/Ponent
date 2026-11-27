@@ -212,11 +212,18 @@ impl Renderer for HtmlRenderer {
         s
     }
 
-    fn render_summary_full(&self, errors: usize, warnings: usize, files: usize) -> String {
-        let mut s = String::from("<div class='summary' role='status'>");
-        summary_inner(&mut s, errors, warnings, (files > 1).then_some(files));
-        s.push_str("</div>\n");
-        s
+    /// Writes the markup straight into the emitter's reused buffer; the `String`-returning form
+    /// is the trait default's business.
+    fn render_summary_full_into(
+        &self,
+        errors: usize,
+        warnings: usize,
+        files: usize,
+        out: &mut String,
+    ) {
+        out.push_str("<div class='summary' role='status'>");
+        summary_inner(out, errors, warnings, (files > 1).then_some(files));
+        out.push_str("</div>\n");
     }
 
     fn end(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {

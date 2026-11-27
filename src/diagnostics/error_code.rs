@@ -848,7 +848,12 @@ struct OtherCode {
     /// `&self` for the call's duration, exactly like `sanitized`.  A slot-less
     /// spelling (`E999`, junk CLI input) therefore re-ran a per-byte encode scan plus
     /// an allocation on every render; now it pays that once.
-    encoded: std::sync::OnceLock<Box<str>>,
+    ///
+    /// `None` records "the encoder left the spelling unchanged", i.e. the encoded segment *is*
+    /// [`Self::render_text`]: `encode_url_path_segment` returns `Cow::Borrowed` exactly then, and
+    /// the old `into_owned()` allocated a copy of bytes this value already owns — the same
+    /// borrow/own split [`Self::sanitized`] documents.
+    encoded: std::sync::OnceLock<Option<Box<str>>>,
     // NOTE: a payload-level memo of the doc URL was tried and reverted.  The
     // public `url()`/`url_ansi()` contract is `Cow<'static, str>`, and a
     // `OnceLock<Box<str>>` inside an `Arc<OtherCode>` can only lend a `&self`
@@ -909,11 +914,16 @@ impl OtherCode {
 
     /// The percent-encoded spelling, memoized in the payload (see `encoded`).
     fn encoded_segment(&self) -> &str {
-        self.encoded.get_or_init(|| {
-            encode_url_path_segment(self.render_text())
-                .into_owned()
-                .into_boxed_str()
-        })
+        match self.encoded.get_or_init(|| {
+            match encode_url_path_segment(self.render_text()) {
+                // Identity transform: borrow `render_text()` instead of boxing a copy.
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(owned) => Some(owned.into_boxed_str()),
+            }
+        }) {
+            Some(encoded) => encoded,
+            None => self.render_text(),
+        }
     }
 }
 
@@ -956,12 +966,16 @@ impl PartialEq for ErrCode {
         // duplicates are rejected at build time, so pointer equality can never
         // conflate two distinct codes.
         //
-        // `std::ptr::eq` on a wide pointer compares the address *and* the
-        // metadata, so a same-address/different-length pair is already unequal
-        // and no explicit length check is needed.  What makes the fast path
-        // sound is the shape of `canonical()`: it returns whole allocations (an
-        // entire `'static` literal or an entire `Arc<OtherCode>` payload), never
-        // a derived slice, so equal addresses can only mean equal codes.
+        // `std::ptr::eq` on a wide pointer compares the **data address only** and ignores the
+        // metadata (the length), so a same-address/different-length pair would compare *equal*
+        // — the opposite of what an earlier revision of this comment claimed.  No length check is
+        // needed because of a property of `canonical()`, not of `ptr::eq`: it returns whole
+        // allocations (an entire `'static` literal, or an entire `Arc<OtherCode>` payload), never
+        // a derived slice, so equal addresses can only mean the same allocation and therefore the
+        // same code.  `ptr_eq_fast_path_never_conflates_distinct_codes` pins that invariant over
+        // the whole registry — the argument lives in prose otherwise, and a future `canonical()`
+        // that returned a trimmed slice would let two distinct codes compare equal and collapse in
+        // a `HashSet`, silently suppressing a diagnostic.
         // The `|| a == b` fallback is load-bearing, not vestigial: junk codes are
         // **not** interned, so two `unknown("junk1")` values are two distinct
         // `Arc<OtherCode>` allocations that must compare by bytes.  (An earlier
@@ -1047,7 +1061,7 @@ impl std::hash::Hash for ErrCode {
         //   `canonical()` strings, while the stored value came from whichever
         //   spelling happened to build the payload; nothing forced the two to agree
         //   once the stored value and the compared string diverged, and
-        //   `seeded_hash_is_consistent_across_representations` catches exactly that
+        //   `hash_is_consistent_across_representations` catches exactly that
         //   disagreement (a pinned test, not a hypothesis).
         // * **Flooding.**  A fixed inner `u64` bypasses the outer hasher's per-map
         //   keying — the standard defence — because a collision in our value is
@@ -1483,13 +1497,13 @@ impl ErrCode {
     /// Uncached core of [`url_ansi`](Self::url_ansi): build the OSC 8 hyperlink
     /// from the (uncached) [`url`](Self::url) and the sanitized code.  Separated
     /// so the cache path can `set` without holding a borrow across the build.
-    /// Write this code's OSC 8 hyperlink into `out` without an intermediate buffer.
     ///
-    /// `url_ansi` returns a `Cow<'static, str>` and therefore has to own a `String`
-    /// for every *uncacheable* spelling (a non-canonical `unknown("e030")`, junk
-    /// shapes).  The per-diagnostic terminal path only concatenates the escape into an
-    /// existing buffer, so the owned wrapper was pure copying: this writes the same
-    /// bytes straight through.  `url_ansi` stays as the compat form.
+    /// (A streaming-contract paragraph about writing "into `out` without an intermediate buffer"
+    /// used to sit here, stacked above [`Self::visible_text`] — it describes
+    /// [`Self::write_ansi_hyperlink`], where it now lives.  rustdoc attributed a write-into-sink
+    /// contract to two `&str`-returning items, the failure mode the i18n module already
+    /// documented.)
+    ///
     /// The text shown inside a hyperlink (or after the level prefix).
     ///
     /// One definition: `url_ansi_build` and `write_ansi_hyperlink` each carried an
@@ -1502,6 +1516,13 @@ impl ErrCode {
         }
     }
 
+    /// Write this code's OSC 8 hyperlink into `out` without an intermediate buffer.
+    ///
+    /// [`url_ansi`](Self::url_ansi) returns a `Cow<'static, str>` and therefore has to own a
+    /// `String` for every *uncacheable* spelling (a non-canonical `unknown("e030")`, junk
+    /// shapes).  The per-diagnostic terminal path only concatenates the escape into an existing
+    /// buffer, so that owned wrapper was pure copying: this writes the same bytes straight
+    /// through.  `url_ansi` stays as the compat form.
     pub fn write_ansi_hyperlink<W: std::fmt::Write>(&self, out: &mut W) -> std::fmt::Result {
         // The URL is `Cow`: borrowed for registry/cached spellings (no copy at all),
         // owned only when a slot-less spelling had to be assembled.
@@ -2027,6 +2048,36 @@ mod tests {
         assert_ne!(doc, local, "the two quadrants must differ");
     }
 
+    /// `ptr::eq` ignores fat-pointer metadata, so the `PartialEq` fast path is sound **only**
+    /// because `canonical()` returns whole allocations.
+    ///
+    /// If two distinct canonical spellings ever shared a data address — a `canonical()` that
+    /// returned a trimmed slice, an interning scheme, a shared arena — they would compare equal
+    /// and collapse in a `HashSet<ErrCode>`, silently suppressing a diagnostic.  The argument was
+    /// prose only; this is the mechanical form, over the whole registry.
+    #[test]
+    fn ptr_eq_fast_path_never_conflates_distinct_codes() {
+        let canon: Vec<&'static str> = super::CODE_INNER.iter().map(|e| e.canonical).collect();
+        // Magnitude only guards against a misbound/empty table; the pairwise scan below is the
+        // real assertion (the registry is generated, so its size is not this test's business).
+        assert!(
+            !canon.is_empty(),
+            "registry corpus is empty — `CODE_INNER` is misbound"
+        );
+        for i in 0..canon.len() {
+            for j in (i + 1)..canon.len() {
+                if std::ptr::eq(canon[i], canon[j]) {
+                    assert_eq!(
+                        canon[i], canon[j],
+                        "the ptr::eq fast path conflated two distinct registry codes"
+                    );
+                }
+            }
+        }
+        // The intended `ptr::eq == true` case: two spellings of one registry code.
+        assert_eq!(ErrCode::unknown("E030"), ErrCode::new("E030"));
+    }
+
     #[test]
     fn set_explain_port_reports_second_set() {
         let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2038,6 +2089,19 @@ mod tests {
         );
         assert_eq!(set_explain_port(54321), Err(0));
         assert!(is_explain_server_running(), "the first port keeps winning");
+        // The *rendered* consequence of accepting 0 is a deliberate trade, so pin it: the URL a
+        // hyperlink shows is `http://127.0.0.1:0/<code>`, i.e. a link to nothing.  Rejecting 0
+        // here would need a second error channel without preventing a bad URL, so the choice is
+        // "accept verbatim and let the binder validate" — but a future "helpful" change treating
+        // 0 as the documentation quadrant would silently rewrite every link, and this assertion is
+        // what would fail first.
+        assert_eq!(
+            ErrCode::new("E030")
+                .url_for_slot_with_port(Some(0))
+                .as_ref(),
+            "http://127.0.0.1:0/E030",
+            "port 0 must render verbatim, not fall back to the docs host"
+        );
     }
 
     /// `unknown` is the untrusted-input path; an ESC in the code must reach
@@ -2737,7 +2801,17 @@ mod tests {
                 // Skipping them here keeps the extraction faithful to what can
                 // actually compile — a future bytes-taking callee would otherwise
                 // inherit the false positives.
-                b'b' | b'c' if i + 1 < bytes.len() && bytes[i + 1] == b'"' => {
+                // `opener_boundary_ok`, like every other literal-opener arm: an identifier
+                // ending in `b`/`c` immediately followed by a quote (`my_cb"E030"`) is not a
+                // byte-string opener.  That adjacency is impossible in valid Rust, so no real
+                // call site changes behaviour — but this was the one arm where the "three
+                // scanners agree" rule held by maintenance alone, which the file documents twice
+                // as the shape that drifts.
+                b'b' | b'c'
+                    if i + 1 < bytes.len()
+                        && bytes[i + 1] == b'"'
+                        && opener_boundary_ok(bytes, i) =>
+                {
                     i = skip_string_literal(bytes, i + 1);
                 }
                 b'"' => {
@@ -3129,6 +3203,11 @@ mod tests {
     #[test]
     #[ignore = "measurement only"]
     fn slot_cache_hit_path_cost() {
+        // Serialized against the port-flipping test: `set_explain_port(0)` is process-global, and
+        // a flip between this benchmark's warm-up and its timed loop would move the measurement to
+        // a cold quadrant and trip the sanity floor spuriously — the same comparability argument
+        // the `ascii_dispatch` baselines apply.
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let code = ErrCode::new("E030");
         // Warm the slot so the timed loop measures the hit path only.
         let _ = code.url_ansi();

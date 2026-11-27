@@ -1857,6 +1857,57 @@ impl<'src> Subdiag<'src> {
     }
 }
 
+/// Humanize a slice in parallel above a shared threshold.
+///
+/// `keep` selects which diagnostics are humanized — the emitter's `&mut` entry points pass their
+/// `DiagFilter`, the collector passes `|_| true`.  Both sites used to carry their own copy of the
+/// threshold, the chunking formula and a cached `available_parallelism`, which is exactly the
+/// drift this helper removes.
+///
+/// Sound for the reasons the collector documents: `Lang` is a process-global atomic, the chunks
+/// are disjoint `&mut`, every per-diagnostic cache is diagnostic-local, and each `humanize` goes
+/// through [`Diagnostic::humanize_contained`], so one broken diagnostic costs a placeholder
+/// instead of the batch.  Output is order-independent by construction — each call touches only
+/// its own diagnostic — so the split cannot change a byte.
+pub(crate) fn humanize_slice_parallel<F>(diags: &mut [Diagnostic<'_>], keep: F)
+where
+    F: Fn(&Diagnostic<'_>) -> bool + Sync,
+{
+    /// A spawn costs ~50 µs, so chunking pays only once the unit count is well past it.
+    const PARALLEL_HUMANIZE_MIN: usize = 64;
+    // `available_parallelism` is a `sched_getaffinity` syscall on Linux and a process's
+    // affinity mask does not change under it, so the answer is cached.
+    static AVAILABLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = if diags.len() >= PARALLEL_HUMANIZE_MIN {
+        (*AVAILABLE.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get())))
+            .min(diags.len() / PARALLEL_HUMANIZE_MIN)
+            .max(1)
+    } else {
+        1
+    };
+    if threads > 1 {
+        let chunk = diags.len().div_ceil(threads);
+        let keep = &keep;
+        std::thread::scope(|scope| {
+            for slice in diags.chunks_mut(chunk) {
+                scope.spawn(move || {
+                    for diag in slice {
+                        if keep(diag) {
+                            diag.humanize_contained();
+                        }
+                    }
+                });
+            }
+        });
+    } else {
+        for diag in diags.iter_mut() {
+            if keep(diag) {
+                diag.humanize_contained();
+            }
+        }
+    }
+}
+
 impl<'src> Diagnostic<'src> {
     // ── Constructors ───────────────────────────────────────────────
 

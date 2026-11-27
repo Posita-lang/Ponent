@@ -146,9 +146,13 @@ impl Renderer for JsonRenderer {
             INDENTS[BATCH_LEVEL],
             self.pretty,
         );
-        // Same field set and order as a normal element: a consumer that reads
-        // `id` unconditionally must not meet an element without one, and the
-        // placeholder is exactly the element it most wants to identify.
+        // The same *shapes* and relative order as a normal element, **not** the same field set:
+        // `id` is always present and hex-shaped (a consumer that reads it unconditionally must not
+        // meet an element without one — the placeholder is exactly the element it most wants to
+        // identify), `level`/`message` are spelled exactly as a real element spells them, and
+        // everything else is omitted per the absent-optional contract.  The old wording claimed
+        // "same field set", which is false (a real element emits ~14 fields) and would invite a
+        // reader to add fields that do not belong here.
         obj.key("id");
         obj.u64_hex(INTERNAL_ERROR_ID);
         obj.key("level");
@@ -203,12 +207,17 @@ impl JsonRenderer {
         // SWAR scan per 8-byte chunk finds each escape site, and the runs between
         // them are bulk-copied.  The clean case (no control byte, `"`, or `\\`) is
         // one scan that finds nothing plus one `push_str(s)`.
-        // One reserve covers the quotes and the (common) unescaped body, so the
-        // pushes below do not each re-check capacity.  An escaped body can still
-        // grow past it; that is one amortized extension, not the norm.
-        out.reserve(s.len() + 2);
+        // Exact for the **whole quoted scalar**, not just the body.  The old shape reserved
+        // `len + 2` here and let the body reserve `len + extra` *at length 1*, so whenever the
+        // growth landed on its bound — control-dense strings, where `extra > len` — the
+        // **closing quote** was the one byte past the guarantee.  The body was exact; the
+        // composition was off by one.  `extra` is computed once and passed down, so neither path
+        // re-scans.  Pinned by
+        // `a_quoted_scalar_needs_no_reallocation_when_reserved_exactly`.
+        let extra = escaped_extra(s.as_bytes());
+        out.reserve(s.len().saturating_add(extra).saturating_add(2));
         out.push('"');
-        push_json_escaped_str(out, s);
+        push_json_escaped_body(out, s, extra);
         out.push('"');
     }
 
@@ -374,7 +383,18 @@ impl JsonRenderer {
         cap.saturating_add(
             diag.call_chain
                 .as_ref()
-                .map_or(0, |c| c.entries().len().saturating_mul(80)),
+                // Per-entry estimate, folded like `related_extra`/the label terms: a chain entry
+                // carries its escaped message and a `location` with the escaped file name
+                // (`flat_location` reserves `2*file + 44`), so a flat 80 under-reserved exactly the
+                // long-identifier chains this estimate exists for.
+                .map_or(0, |c| {
+                    c.entries().len().saturating_mul(96).saturating_add(
+                        c.entries()
+                            .iter()
+                            .map(|e| e.message.len().saturating_mul(2))
+                            .sum::<usize>(),
+                    )
+                }),
         )
     }
 
@@ -495,7 +515,12 @@ impl JsonRenderer {
         // assert and keeps direct access.
         obj.string(&diag.display_message());
 
-        if let Some(code) = &diag.code {
+        // An empty code counts as absent, matching `relatedErrors` below (and `short.rs`): emitting
+        // `"code": ""` would contradict the header contract "code is absent, not null, when a
+        // diagnostic has no code at all".  `unknown("")` is the reachable shape.
+        if let Some(code) = &diag.code
+            && !code.code().is_empty()
+        {
             obj.key("code");
             obj.string(code.code());
             if let Some(entry) = code.entry() {
@@ -1509,9 +1534,6 @@ fn needs_json_escape(s: &str) -> bool {
     next_json_escape_byte(s.as_bytes()).is_some()
 }
 
-/// Append `s` to `out` with JSON string escaping (no surrounding quotes).
-/// Bulk-copies the runs between escape sites instead of a per-byte branch
-/// loop; the clean case (no escapes) is a single `write_str`.
 /// Bytes [`push_json_escaped_str`] adds on top of `bytes.len()`.
 ///
 /// Walks 8 bytes at a time with the same [`escape_mask`] the scanner uses, so the count
@@ -1554,7 +1576,19 @@ fn escaped_extra(bytes: &[u8]) -> usize {
     extra
 }
 
+/// Append `s` to `out` with JSON string escaping (no surrounding quotes).
+///
+/// Bulk-copies the runs between escape sites instead of a per-byte branch loop; the clean case
+/// (no escapes) is a single `write_str`.  Exact reservation is the caller's business only when it
+/// composes (see `push_json_str`, which adds the quotes to the same reservation).
 fn push_json_escaped_str(out: &mut String, s: &str) {
+    let extra = escaped_extra(s.as_bytes());
+    push_json_escaped_body(out, s, extra);
+}
+
+/// [`push_json_escaped_str`] with the escape cost already known, for a caller that sized the
+/// buffer itself (`push_json_str` adds the quotes to the same reservation).
+fn push_json_escaped_body(out: &mut String, s: &str, extra: usize) {
     let bytes = s.as_bytes();
     // One scanner, one pass.  This used to fork: the fused SWAR scan at `<= SHORT_FUSED_MAX`
     // and, above it, a **merged** `memchr2` + `CtrlIter` loop.  The merge never shortened
@@ -1569,7 +1603,7 @@ fn push_json_escaped_str(out: &mut String, s: &str) {
     // class (`"`/`\\`, +1 each) is subtracted from the C0 class (`\\u00XX`, +5 each).  The long
     // path previously relied on `push_json_str`'s `len + 2` and reallocated mid-copy on every
     // escaped long string.
-    out.reserve(bytes.len().saturating_add(escaped_extra(bytes)));
+    out.reserve(bytes.len().saturating_add(extra));
     let mut start = 0usize;
     for at in EscapeIter::new(bytes) {
         if start < at {
@@ -1592,11 +1626,11 @@ fn push_json_escaped_str(out: &mut String, s: &str) {
 /// before this table is consulted, so their slots are unreachable.
 /// Pretty-print indentation, two spaces per level.
 ///
-/// At module scope (not inside `indent`) so `write_diagnostic::<LVL>` can index
-/// it with a compile-time constant, which folds the bounds check and the load
-/// away entirely; the runtime accessor is the fallback for callers that cannot
-/// name a level.
 /// One indentation step per nesting level.
+///
+/// At module scope (not inside `indent`) so `write_diagnostic::<LVL>` can index it with a
+/// compile-time constant, which folds the bounds check and the load away entirely; the runtime
+/// accessor is the fallback for callers that cannot name a level.
 ///
 /// An array, not a slice: the length is part of the type, and — the point of the
 /// change — the `LVL` bound can then be asserted in a `const` block inside the
@@ -2261,6 +2295,36 @@ mod tests {
                 "probe {probe:#04x} must be selected"
             );
         }
+    }
+
+    /// A quoted, control-dense scalar reserved exactly must not reallocate.
+    ///
+    /// `push_json_str` reserved `len + 2` and let the body reserve `len + extra` at length 1, so the
+    /// closing quote was one byte past the guarantee exactly when `extra > len` — the case this
+    /// corpus builds.  The body's own capacity-identity pin could not see it; only the composed
+    /// write can.
+    #[test]
+    fn a_quoted_scalar_needs_no_reallocation_when_reserved_exactly() {
+        let s = "\u{1}\u{1}\u{1}a\u{2}"; // 4 C0 bytes (5 extra each) + 1 byte
+        let extra = super::escaped_extra(s.as_bytes());
+        assert!(
+            extra > s.len(),
+            "the corpus must out-grow its input: {extra}"
+        );
+        let mut out = String::with_capacity(s.len() + extra + 2);
+        super::JsonRenderer::push_json_str(&mut out, s);
+        assert_eq!(
+            out.capacity(),
+            s.len() + extra + 2,
+            "the quoted scalar grew"
+        );
+        assert_eq!(
+            out.len(),
+            s.len() + extra + 2,
+            "length must match the reserve"
+        );
+        // `\u0001` here is six ASCII bytes; the Rust-escaped form is `"\\u0001"`.
+        assert_eq!(out, "\"\\u0001\\u0001\\u0001a\\u0002\"");
     }
 
     /// An exactly-reserved hex id write must not reallocate.

@@ -141,8 +141,6 @@ fn push_flattened(out: &mut String, msg: &str, first: Option<usize>) {
 /// Sanitize + flatten in one pass over the original message.  The old
 /// `sanitize_for_terminal_flatten_with_break` returned a break offset into the
 /// *original* bytes; a U+FFFD replacement before that offset shifted the
-/// sanitized string and made `push_flattened` start mid-character.  This
-/// derives both decisions from the same character stream.
 /// Could these bytes require a sanitize/flatten change at all?
 ///
 /// Exact for everything the two rules care about:

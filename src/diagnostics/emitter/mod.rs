@@ -676,6 +676,17 @@ struct BatchShared<'a, 'src, R: Renderer> {
 ///   batch — real, but unmeasured, and the rewrite would have to preserve the
 ///   first-appearance order the cache merge depends on.  Reopen with a `benches/` row on a
 ///   two-source batch.
+/// Bumped per [`Emitter::new`]: identifies which *filter instance* the collector's
+/// `emit_seen_len` drop-cache was computed under.
+///
+/// `DiagCtxt::humanize_pending_for` caches "this prefix has been processed for emit", which
+/// includes diagnostics the filter **dropped**.  That cache is only valid for the filter that
+/// produced it: emitting with emitter A (drops X, frontier latches past X) and then with emitter
+/// B (keeps X) used to early-return and hand Phase 1 an un-humanized diagnostic — a debug panic,
+/// and in release an unmaterialized diagnostic reaching the renderers.  Alternating emitters
+/// (stderr + LSP publish) is a plausible shape, and `emit` is documented as retry-safe.
+static FILTER_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const POOL_SMALL_CAP: usize = 64 * 1024;
 /// Largest *oversize* buffer the pool keeps at all: one per pool, so a single
 /// huge diagnostic cannot evict its size class permanently while worst-case
@@ -930,6 +941,9 @@ pub struct Emitter<R, M> {
     /// are alive, which a batch ctx guarantees by being dropped with the
     /// batch; a hoisted key could alias a reused allocation in a later call.
     shared: SharedRenderState,
+    /// Identity of this emitter's filter instance (see [`FILTER_EPOCH`]); the collector
+    /// compares it against the epoch its drop-cache was built under.
+    filter_epoch: u64,
     /// Host parallelism, resolved once in [`Emitter::new`].  `available_parallelism`
     /// is a syscall and host affinity effectively does not change over a
     /// compiler process's lifetime, so a per-batch query is pure overhead.
@@ -976,6 +990,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             make_sink,
             opts,
             filter,
+            filter_epoch: FILTER_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             shared: SharedRenderState::new(),
             parallelism,
             pool: std::sync::OnceLock::new(),
@@ -992,6 +1007,14 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             },
             file_index_cache: std::cell::RefCell::new(crate::smallvec::SmallVec::new()),
         }
+    }
+
+    /// Identity of this emitter's filter instance.
+    ///
+    /// `DiagCtxt` caches which diagnostics an emit already processed (including the ones the
+    /// filter dropped), and that cache is filter-specific — see [`FILTER_EPOCH`].
+    pub(crate) fn filter_epoch(&self) -> u64 {
+        self.filter_epoch
     }
 
     /// Force a worker count (the test-reachable shape of the `available_parallelism`
@@ -1023,6 +1046,25 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// from *this* call's source, because the downstream lookups match prebuilt
     /// tables by address.
     fn prebuilt_for_single(
+        &self,
+        src: &str,
+        file_id: Option<crate::ast::FileId>,
+    ) -> SmallVec<[PreloadedSource; 1]> {
+        // Contained for the same reason the batch path wraps its prebuild in
+        // `build_prebuilt_contained`: `scan_line_starts_and_ascii_capped` has a **release**
+        // `assert!(len <= u32::MAX)`, and this path let that panic escape `emit` and take the
+        // whole LSP process with it.  Degrading to an empty prebuilt is safe rather than a
+        // silent wrong answer — the render path rebuilds the table inside its own
+        // `catch_unwind`, which is the documented "a fallback for the fallback must be total"
+        // policy; the only cost is an O(source) rebuild.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.prebuilt_for_single_inner(src, file_id)
+        }))
+        .unwrap_or_default()
+    }
+
+    /// [`Self::prebuilt_for_single`]'s body, split out so the caller can contain a panic.
+    fn prebuilt_for_single_inner(
         &self,
         src: &str,
         file_id: Option<crate::ast::FileId>,
@@ -1151,10 +1193,14 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// cross-call limit, so an LSP-style loop must track its own if it needs
     /// one.  A filtered-out diagnostic returns before `begin`/`end`; batch
     /// paths always run them, so an empty-document renderer must use a batch
-    /// API when it needs the header/footer for an empty set.  A panic during
-    /// `humanize` **or** `render_into` becomes the renderer's internal-error
-    /// placeholder (see [`Renderer::render_internal_error`]) — the same policy
-    /// as the batch paths, so one broken diagnostic never aborts an LSP batch.
+    /// API when it needs the header/footer for an empty set.
+    ///
+    /// Panic policy, identical to the batch paths: a panic in `humanize` **poisons** the
+    /// diagnostic ([`Diagnostic::poison_for_render`] — placeholder message, derived state
+    /// cleared, latch set) and it renders as a normal diagnostic, so the caller is never left
+    /// with half-derived state; a panic in `render_into` becomes the renderer's
+    /// internal-error placeholder (see [`Renderer::render_internal_error`]).  Either way one
+    /// broken diagnostic never aborts an LSP batch.
     pub fn emit(&mut self, diag: &mut Diagnostic<'_>) -> io::Result<()> {
         if !self.filter.matches(diag) {
             return Ok(());
@@ -1167,6 +1213,15 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // caller on the LSP path.
         let mut humanized = true;
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| diag.humanize())).is_err() {
+            // `humanize` mutates before it can fail — it `mem::take`s the message and drains
+            // the labels — so the diagnostic is left half-derived.  Poison it: the repair is
+            // total and pinned (`poison_for_render_overwrites_every_half_derived_field`), the
+            // latch stops a retry, and the placeholder text then renders through the *real*
+            // renderer, so a JSON consumer sees a structured record instead of
+            // `fill_internal_error`'s flat fallback.  Every batch path has always done this;
+            // this doc claimed the same policy while `emit` only set a local flag, leaving the
+            // caller's diagnostic in the undefined state the batch paths had already fixed.
+            diag.poison_for_render();
             humanized = false;
         }
         let mut sink = self.make_sink.make();
@@ -1209,14 +1264,16 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // allocation/free in the documented LSP re-emit loop.
         let mut buf = self.shared.render_buf.borrow_mut();
         buf.clear();
-        let rendered = humanized
-            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Idempotent on the already-humanized path (the latch makes it a
-                // `u8` compare); kept so the render closure is self-contained.
-                diag.humanize();
-                self.renderer.render_into(diag, &cx, &mut buf);
-            }))
-            .is_ok();
+        // Rendered in **both** outcomes now: a humanize failure is repaired by
+        // `poison_for_render`, so the diagnostic is still renderable (its placeholder message is
+        // the visible signal) and only a *renderer* panic falls back to the flat placeholder.
+        // The `humanize()` call stays idempotent for the already-humanized path and is a latch
+        // hit after a poison, so it cannot overwrite the placeholder.
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            diag.humanize();
+            self.renderer.render_into(diag, &cx, &mut buf);
+        }))
+        .is_ok();
         if !rendered {
             fill_internal_error(&self.renderer, &mut buf);
         }
@@ -1320,37 +1377,11 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// diagnostic costs one placeholder, and `catch_unwind` per diagnostic also keeps a worker
     /// from taking the whole scope down.
     fn humanize_kept(diags: &mut [Diagnostic<'_>], filter: &DiagFilter) {
-        const PARALLEL_HUMANIZE_MIN: usize = 64;
-        // `available_parallelism` is a `sched_getaffinity` syscall on Linux; a process's
-        // affinity mask does not change under it, so the answer is cached like the collector's.
-        static AVAILABLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let threads = if diags.len() >= PARALLEL_HUMANIZE_MIN {
-            (*AVAILABLE.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get())))
-                .min(diags.len() / PARALLEL_HUMANIZE_MIN)
-                .max(1)
-        } else {
-            1
-        };
-        if threads > 1 {
-            let chunk = diags.len().div_ceil(threads);
-            std::thread::scope(|scope| {
-                for slice in diags.chunks_mut(chunk) {
-                    scope.spawn(move || {
-                        for diag in slice {
-                            if filter.matches(diag) {
-                                diag.humanize_contained();
-                            }
-                        }
-                    });
-                }
-            });
-        } else {
-            for diag in diags.iter_mut() {
-                if filter.matches(diag) {
-                    diag.humanize_contained();
-                }
-            }
-        }
+        // One implementation, shared with `DiagCtxt::humanize_pending`: the threshold and the
+        // chunking formula used to exist twice with a copy of the cached `available_parallelism`
+        // in each.  The emitter's extra job is the filter, which is exactly what the predicate
+        // parameter is for.
+        crate::diagnostics::humanize_slice_parallel(diags, |d| filter.matches(d));
     }
 
     pub fn emit_all_streaming_to<S: DiagnosticSink>(
@@ -1621,11 +1652,13 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             sink.write_str(&note)?;
         }
         if !self.opts.quiet && (errors > 0 || warnings > 0) {
-            sink.write_str(
-                &self
-                    .renderer
-                    .render_summary_full(errors, warnings, files.len()),
-            )?;
+            // Same reused buffer as the suppressed note: one `String` per batch was a pure
+            // allocation/free in the documented LSP re-emit loop.
+            let mut summary = self.shared.render_buf.borrow_mut();
+            summary.clear();
+            self.renderer
+                .render_summary_full_into(errors, warnings, files.len(), &mut summary);
+            sink.write_str(&summary)?;
         }
 
         self.renderer.end(sink)?;
@@ -1647,6 +1680,10 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // batch.  `render_sequential` takes `&self`, so the hoisted buffer is
         // borrowable; the renderer never re-enters the emitter, so there is
         // no nested borrow.
+        // One borrow for the whole batch: the per-diagnostic `borrow_mut()`/drop pair on the
+        // serial path — which every small batch takes — was pure `RefCell` traffic, and the
+        // renderer never re-enters the emitter, so no nested borrow can exist.
+        let mut buf = self.shared.render_buf.borrow_mut();
         let mut first = true;
         for diag in filtered.iter() {
             // Render boundary: materialize `kind` only for diagnostics we
@@ -1660,7 +1697,6 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // exactly the dynamic renderer's stitcher semantics
             // (the two paths are byte-identical for every `Renderer`, not
             // just the built-ins).
-            let mut buf = self.shared.render_buf.borrow_mut();
             buf.clear();
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // No `humanize()` here: the batch entry points take
@@ -1889,9 +1925,20 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 cache.insert(0, (id, hash, entry.len, entry));
             }
         }
-        out.sort_by_key(|entry| {
+        // Only `[0, PRELOAD_SLOTS)` ever reaches the workers' preload (`prebuild_sources` takes
+        // that prefix and then re-sorts the whole list by `(ptr, len)` for the tier-0 search), so
+        // a full weight sort computed an O(n log n) arrangement for an O(1)-sized answer.
+        // `select_nth_unstable_by_key` partitions the k heaviest into the prefix in O(n); only
+        // that prefix needs the weight order.
+        let weight_key = |entry: &Prebuilt| {
             std::cmp::Reverse(*source_weight.get(&(entry.ptr, entry.len)).unwrap_or(&0))
-        });
+        };
+        if out.len() > PRELOAD_SLOTS {
+            out.select_nth_unstable_by_key(PRELOAD_SLOTS, weight_key);
+            out[..PRELOAD_SLOTS].sort_by_key(weight_key);
+        } else {
+            out.sort_by_key(weight_key);
+        }
         out
     }
 
@@ -2020,18 +2067,11 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // gates the parallel path (`emit_batch_iter`); only the O(n log n) reordering was
         // vestigial work here — it did not even improve locality, since `order` is read
         // once per claim from a cold slice.
-        let mut slots = std::mem::take(&mut scratch.slots);
-        slots.resize_with(n, || Padded(std::sync::Mutex::new(None)));
-        for slot in &mut slots[..n] {
-            debug_assert!(
-                slot.0
-                    .get_mut()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_none(),
-                "a claim slot survived its batch — the stitch missed it"
-            );
-            *slot.0.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
-        }
+        // Borrow the slots in place: `mem::take` + re-assign was pure complexity, and
+        // `render_streaming` already proves the in-place form works.  `prepare_slots` owns the
+        // resize + the survived-a-claim tripwire, so this site cannot drift from it.
+        scratch.prepare_slots(n);
+        let slots = &mut scratch.slots;
         let pool = self.pool.get_or_init(|| {
             let (pool, token) = crate::pool::WorkerPool::new(self.parallelism);
             *self.pool_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
@@ -2067,7 +2107,15 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             let finished = pool.submit(token, jobs).wait();
             permit.token = Some(finished);
         }
+        // Stitch.  A sink error must not cost the batch its buffers: the previous `?` in this
+        // loop returned before `scratch.slots = slots`, so the slot vector (up to n × 64 B,
+        // per the pool measurement) was dropped *and* every already-filled slot's buffer went
+        // to the allocator instead of its owner pool, forcing the next batch to re-allocate —
+        // the exact disconnect `render_streaming`'s post-error drain already fixes on the
+        // streaming path.  Now the first error is recorded, every slot is still recycled, and
+        // the error is reported once the pool and the scratch are intact.
         let mut first = true;
+        let mut write_err: Option<io::Error> = None;
         for slot in &mut slots[..n] {
             let (mut buf, owner) = slot
                 .0
@@ -2079,40 +2127,42 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // evicted half the pool on an every-other-empty workload, forcing a
             // fresh allocation on the next pop — the churn the pool exists to
             // remove.  A cleared buffer is worth exactly as much as before.
-            if buf.is_empty() {
-                let mut pool = self.string_pools[owner]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                return_buffer_to_pool(&mut pool, buf);
-                continue;
+            if !buf.is_empty() {
+                if first {
+                    first = false;
+                } else if !separator.is_empty()
+                    && write_err.is_none()
+                    && let Err(e) = sink.write_str(separator)
+                {
+                    // Write the separator on its own instead of splicing it into
+                    // the buffer: `insert_str(0, ..)` memmoves the whole rendered
+                    // diagnostic (up to a 64 KiB pooled buffer) per emission, and
+                    // may reallocate when capacity == len.  A sink is a
+                    // concatenation of `write_str` calls, so the bytes are
+                    // identical.
+                    write_err = Some(e);
+                }
+                if write_err.is_none()
+                    && let Err(e) = sink.write_str(&buf)
+                {
+                    write_err = Some(e);
+                }
             }
-            if first {
-                first = false;
-            } else if !separator.is_empty() {
-                // Write the separator on its own instead of splicing it into
-                // the buffer: `insert_str(0, ..)` memmoves the whole rendered
-                // diagnostic (up to a 64 KiB pooled buffer) per emission, and
-                // may reallocate when capacity == len.  A sink is a
-                // concatenation of `write_str` calls, so the bytes are
-                // identical.
-                sink.write_str(separator)?;
-            }
-            sink.write_str(&buf)?;
             // Keep one oversize buffer per pool (bounded by
             // `POOL_OVERSIZE_CAP`): a single huge diagnostic used to evict its
             // size class from the pool permanently, so every later batch
             // re-allocated.
-            {
-                let mut pool = self.string_pools[owner]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                buf.clear();
-                return_buffer_to_pool(&mut pool, buf);
-            }
+            let mut pool = self.string_pools[owner]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            buf.clear();
+            return_buffer_to_pool(&mut pool, buf);
         }
-        // Hand the (now all-empty) slot vector back to the scratch; its allocation is
-        // what the next batch reuses.
-        scratch.slots = slots;
+        // The slot vector lives in the scratch itself now (borrowed in place), so there is
+        // nothing to hand back — and nothing an early `?` can drop.  See the note above.
+        if let Some(e) = write_err {
+            return Err(e);
+        }
         Ok(())
     }
 

@@ -78,6 +78,17 @@ pub struct DiagCtxt<'src> {
     /// for a long-lived context with a persistent `--only-*` filter, the same quadratic
     /// shape the `humanized_len` frontier was introduced to remove.
     emit_seen_len: usize,
+    /// Which filter instance [`Self::emit_seen_len`] was computed under
+    /// ([`crate::diagnostics::emitter::Emitter::filter_epoch`]).
+    ///
+    /// The frontier records diagnostics the filter *dropped*, so it is valid only for that
+    /// filter.  Emitting the same context through a different emitter (stderr + LSP publish, or
+    /// a retry with other options) used to reuse it and hand an un-humanized diagnostic to the
+    /// batch path — a `debug_assert` in Phase 1, and in release an unmaterialized diagnostic
+    /// reaching a renderer.  On a mismatch the frontier resets to `humanized_len`, which
+    /// re-filters the previously dropped suffix at predicate cost only (the humanized latch
+    /// skips the work), while same-emitter retries keep the O(1) path.
+    emit_filter_epoch: u64,
     /// Debug only: the length at which [`Self::recount_derived_state`] last ran.
     ///
     /// The power-of-two sample assumes each emit *grows* the vector.  It does not
@@ -175,6 +186,10 @@ impl<'src> DiagCtxt<'src> {
             reported_len: 0,
             humanized_len: 0,
             emit_seen_len: 0,
+            // `u64::MAX` cannot equal a real epoch (the counter starts at 0 and only
+            // increments), so the first emit always takes the reset path — which is exactly
+            // right: no frontier has been computed yet.
+            emit_filter_epoch: u64::MAX,
             #[cfg(debug_assertions)]
             last_recounted_len: 0,
             may_have_unsourced_prefix: false,
@@ -547,35 +562,10 @@ impl<'src> DiagCtxt<'src> {
         // chunking pays only once the unit count is well past it.  Output is
         // order-independent by construction (each `humanize` touches one diagnostic), so
         // the split cannot change a byte of rendered output.
-        const PARALLEL_HUMANIZE_MIN: usize = 64;
-        // `available_parallelism` resolves to a `sched_getaffinity` syscall on Linux and
-        // this runs once per module emit, so the answer is cached: a process's affinity
-        // mask does not change under it.  `PARALLEL_HUMANIZE_MIN` is a nonzero const, so
-        // the old `.max(1)` on the divisor was dead.
-        static AVAILABLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let threads = if pending.len() >= PARALLEL_HUMANIZE_MIN {
-            (*AVAILABLE.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get())))
-                .min(pending.len() / PARALLEL_HUMANIZE_MIN)
-                .max(1)
-        } else {
-            1
-        };
-        if threads > 1 {
-            let chunk = pending.len().div_ceil(threads);
-            std::thread::scope(|scope| {
-                for slice in pending.chunks_mut(chunk) {
-                    scope.spawn(move || {
-                        for diag in slice {
-                            diag.humanize_contained();
-                        }
-                    });
-                }
-            });
-        } else {
-            for diag in pending {
-                diag.humanize_contained();
-            }
-        }
+        // One implementation, shared with the emitter's `&mut` entry points: the threshold, the
+        // chunking formula and the cached `available_parallelism` used to exist twice.  The
+        // collector keeps every diagnostic, hence the trivial predicate.
+        super::humanize_slice_parallel(pending, |_| true);
         self.humanized_len = self.diags.len();
         // Everything is humanized, so it is also processed for emit.
         self.emit_seen_len = self.diags.len();
@@ -747,6 +737,13 @@ impl<'src> DiagCtxt<'src> {
         // `scan_derived` pair that existed only to detect such a change, and the
         // `HumanizeOnly` wrapper that tried to restrict it, are both gone.  In
         // release the guarantee used to be "trust"; now it is the borrow checker.
+        // Bind the drop-cache to the filter instance that produced it (see
+        // `emit_filter_epoch`): a different emitter means a different predicate, and a frontier
+        // that latched past a diagnostic *this* filter keeps would skip humanizing it.
+        if self.emit_filter_epoch != emitter.filter_epoch() {
+            self.emit_seen_len = self.humanized_len;
+            self.emit_filter_epoch = emitter.filter_epoch();
+        }
         // Filter first, then humanize: the emitter drops diagnostics the filter rejects,
         // and humanizing those was the largest avoidable cost in this path.
         self.humanize_pending_for(|d| emitter.filter().matches(d));
@@ -1456,6 +1453,7 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
             // frontier starts at zero and the first `humanize_pending` covers them.
             humanized_len: 0,
             emit_seen_len: 0,
+            emit_filter_epoch: u64::MAX,
             #[cfg(debug_assertions)]
             last_recounted_len: 0,
             can_emit_warnings: true,

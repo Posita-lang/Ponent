@@ -1304,8 +1304,12 @@ fn try_fluent_owned_into<'msg, 'src>(
     // `debug_assertions`, so an ungated call here made *release* builds fail to
     // compile (`cannot find function tripwire_unformatted`) while `cargo test`
     // (debug) stayed green.  This is the owned render path `humanize` uses.
+    //
+    // `Owned`, not `Borrowed`: this function *is* the owned path, so a tripwire failure here
+    // reported the borrowed one — the most important render path mislabelled itself, and the
+    // `Owned` variant was never constructed anywhere (dead code).
     #[cfg(debug_assertions)]
-    tripwire_unformatted(msg, en, formatted, UnformattedPath::Borrowed);
+    tripwire_unformatted(msg, en, formatted, UnformattedPath::Owned);
     formatted
 }
 

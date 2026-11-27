@@ -177,11 +177,14 @@ impl<W: Write> DiagnosticSink for W {
         /// keeps 16 of them inline.  The heap path only serves a caller that
         /// passes a larger part list in one call.
         const INLINE_PARTS: usize = 16;
+        // One buffer for every chunk: the old shape built a fresh `SmallVec` per
+        // `MAX_IOV`-part chunk, so a 5 000-part call paid five heap allocations of ~16 KiB for a
+        // slice list that is rebuilt each time anyway.
+        let mut slices: smallvec::SmallVec<[io::IoSlice<'_>; INLINE_PARTS]> =
+            smallvec::SmallVec::new();
         for chunk in parts.chunks(MAX_IOV) {
-            let mut slices: smallvec::SmallVec<[io::IoSlice<'_>; INLINE_PARTS]> = chunk
-                .iter()
-                .map(|p| io::IoSlice::new(p.as_bytes()))
-                .collect();
+            slices.clear();
+            slices.extend(chunk.iter().map(|p| io::IoSlice::new(p.as_bytes())));
             // An empty slice carries no progress and would make `advance_slices`
             // a no-op; drop them so the loop can never stall on one.
             slices.retain(|s| !s.is_empty());
@@ -468,19 +471,10 @@ impl<S: DiagnosticSink> Drop for CoalescingSink<S> {
         let Some(pool) = self.pool else {
             return;
         };
-        // A capacity-0 shell appears when `with_pool` popped an empty pool; pushing
-        // it back would fill a bounded pool with buffers that "reuse" nothing, so
-        // every later batch would pop a shell and re-grow from zero while
-        // `pool.len()` looked healthy.  `PooledStringSink::drop` guards the same
-        // way, and this divergence is what let the bug live here.
-        if self.buf.capacity() == 0 {
-            return;
-        }
-        // Only recycle a buffer that is within the documented bound; a runaway
-        // render must not park a huge allocation in the pool forever.
-        if self.buf.capacity() > MAX_RECYCLED_CAPACITY {
-            return;
-        }
+        // No local guards: `BufferPool::recycle` owns the shell (`capacity() == 0`) and oversized
+        // (`capacity() > MAX_RECYCLED_CAPACITY`) rules, and duplicating them here is exactly the
+        // drift that centralization was written to end — the only effect was skipping a free
+        // `mem::take`.
         let mut buf = std::mem::take(&mut self.buf);
         // `drain` already cleared it on every path; keeping the clear makes the
         // recycled-buffer invariant ("empty, with capacity") independent of that.
@@ -745,6 +739,13 @@ impl DiagnosticSink for ChannelSink {
             return Ok(());
         }
         let total: usize = parts.iter().map(|p| p.len()).sum();
+        // The sequential default performs zero sends for an all-empty part list (`write_all(&[])`
+        // is a no-op), so matching it costs one compare and avoids an empty frame at the receiver.
+        // Per-`write_str` framing is explicitly not a contract, but "no bytes in, no frame out" is
+        // the shape a consumer can reason about.
+        if total == 0 {
+            return Ok(());
+        }
         let mut payload = String::with_capacity(total);
         for p in parts {
             payload.push_str(p);
@@ -815,6 +816,15 @@ pub fn channel(tx: crossbeam_channel::Sender<String>) -> impl MakeSink<Sink = Ch
 /// replacement buffer: one allocation per batch, not per flush.  Removing the
 /// per-flush allocation would need a copy-free payload (`Arc<str>`/`Bytes`),
 /// which the zero-copy verdict above already rules out.
+///
+/// **Precondition: one `flush` per `make`/drop cycle.**  Every flush takes a fresh resident buffer
+/// from the pool and hands the old one to the channel, which owns it and never returns it; only
+/// `Drop` recycles one.  That balances at the emitter's documented "flush at the end of each
+/// batch" contract.  A sink flushed more often than it is made (a future per-diagnostic flush, a
+/// user-driven mid-batch flush) drains the pool after `MAX_POOLED_BUFFERS` flushes and then
+/// allocates on every flush while `pool.len()` reads 0 — i.e. the pooled variant degrades to the
+/// unpooled one plus pool churn.  Stated here so a flush-frequency change is forced to revisit
+/// this claim instead of silently invalidating it.
 pub struct BufferedChannelSink {
     tx: crossbeam_channel::Sender<String>,
     buf: String,
@@ -1007,9 +1017,15 @@ const MAX_POOLED_BUFFERS: usize = 8;
 /// Capacity ceiling for a recycled buffer.
 ///
 /// `MAX_POOLED_BUFFERS` bounds the *count*; without a byte bound a single 1 MB
-/// batch buffer entered the (LIFO) pool and was popped first by every later
-/// small batch — pinned forever and charged to each of them, exactly the
-/// "must not pin the huge allocation" failure the pool's doc claims to prevent.
+/// batch buffer stays resident for the pool's lifetime and is handed to later small batches on
+/// the queue's round-robin — pinned for good and charged to each of them, exactly the "must not
+/// pin the huge allocation" failure the pool's doc claims to prevent.
+///
+/// (This said the buffer "entered the (LIFO) pool and was popped first".  `crossbeam_queue::
+/// ArrayQueue` is a bounded **FIFO queue**: `push` appends at the tail and `pop` takes the head,
+/// so `take` returns the *oldest* recycled buffer.  The bound is required under either
+/// discipline; only the warmth story differs, and LIFO would need either a lock (the lock-free
+/// queue is what lets the parallel emitter share one pool) or unsafe tagging.)
 const MAX_RECYCLED_CAPACITY: usize = 64 * 1024;
 
 /// Pop-with-fallback and guarded recycle, shared by every pooled sink.
@@ -1025,8 +1041,9 @@ const MAX_RECYCLED_CAPACITY: usize = 64 * 1024;
 /// shared across the parallel emitter's worker threads.  A full or empty pool is
 /// never an error: `recycle` drops the buffer, `take` allocates.
 pub struct BufferPool {
-    /// Bounded MPMC stack. `push` fails when full, `pop` fails when empty →
-    /// allocate fresh; a lock-free queue means a pool can be shared by the
+    /// Bounded MPMC **FIFO queue** (not a stack — `ArrayQueue` appends at the tail and pops from
+    /// the head, so `take` returns the oldest recycled buffer).  `push` fails when full, `pop`
+    /// fails when empty → allocate fresh; a lock-free queue means a pool can be shared by the
     /// parallel emitter's worker threads with no contention on the fast path.
     ///
     /// Eager rather than `LazyLock`: `LazyLock<T>`'s `F` defaults to `fn() -> T`,
@@ -1040,6 +1057,11 @@ impl BufferPool {
     ///
     /// `slots` bounds the *count*; [`MAX_RECYCLED_CAPACITY`] bounds the bytes of
     /// each recycled buffer.
+    ///
+    /// `slots` is clamped to at least 1: `ArrayQueue::new(0)` is legal (every push fails, every
+    /// take allocates), but a zero-slot pool is always a caller mistake and the clamp keeps
+    /// `pool.len()` meaningful for the residency assertions.  Stated rather than implicit —
+    /// the same reason [`MIN_POOL_BUFFER`]'s doc needed a correction.
     #[must_use]
     pub fn new(slots: usize) -> Self {
         BufferPool {
