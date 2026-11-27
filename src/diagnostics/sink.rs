@@ -40,6 +40,44 @@
 //!
 //! Callers that need all-or-nothing output must render into a
 //! [`StringSink`] (or a local `String`) and publish it in one operation.
+//!
+//! ## Measured allocation counts
+//!
+//! The claims above are about allocation counts, so they are counted:
+//! `cargo bench --bench alloc_counts` wraps `GlobalAlloc` and reports requests per
+//! one 64-piece batch (10 B pieces, one warmup batch first, so the pooled rows are
+//! steady state).  Recorded on the 4-core WSL2 dev box:
+//!
+//! | case | allocs / batch |
+//! |------|----------------|
+//! | `string` — a fresh `StringSink` and nothing else | 7 |
+//! | `channel`, 64 × `write_str` | 66 |
+//! | `channel`, 8 × `write_parts` of 8 pieces | 9 |
+//! | `buffered_channel_with_capacity` | 2 |
+//! | `buffered_channel_pooled_with_capacity` | 1 |
+//! | pooled `CoalescingSink` over a channel | 1 |
+//!
+//! Both documented wins are visible in that table: `write_parts` turns per-piece
+//! framing into per-group framing (66 → 9), and pooling removes the resident
+//! replacement buffer (2 → 1).  The payload allocation survives pooling by design —
+//! it *is* the channel message — which is the "what pooling can and cannot save"
+//! note on [`BufferedChannelSink`].  The `string` row is not zero because that
+//! factory hands out a fresh `String` per batch; it is the growth cost of the
+//! 640-byte batch itself, i.e. the floor every other row sits on top of.
+//!
+//! ## Ordering under reentrancy
+//!
+//! Every **per-batch buffered** factory — [`stderr_buffered`],
+//! [`CoalescingSink`], [`BufferedChannelSink`] — shares one hazard, stated here
+//! once instead of per factory: each `make()` returns a *fresh* sink, so a nested
+//! emit on the same thread (a `Display` impl that emits another diagnostic, a
+//! panic hook) flushes **its** buffer while the outer batch's bytes are still
+//! buffered.  The observed order becomes `inner, outer-prefix, outer-suffix`
+//! rather than emission order.
+//!
+//! Only the *unbuffered* sinks are immune: [`stderr`] (one syscall per write) and
+//! [`ChannelSink`] (one message per write).  A renderer that can re-enter must use
+//! one of those.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -134,8 +172,13 @@ impl<W: Write> DiagnosticSink for W {
         // write must advance across slices, and a zero-progress write is an
         // error rather than a spin.
         const MAX_IOV: usize = 1024;
+        /// Renderers emit a bounded number of parts per logical unit, so the
+        /// common case must not allocate: `IoSlice<'_>` is `Copy`, and `SmallVec`
+        /// keeps 16 of them inline.  The heap path only serves a caller that
+        /// passes a larger part list in one call.
+        const INLINE_PARTS: usize = 16;
         for chunk in parts.chunks(MAX_IOV) {
-            let mut slices: Vec<io::IoSlice<'_>> = chunk
+            let mut slices: smallvec::SmallVec<[io::IoSlice<'_>; INLINE_PARTS]> = chunk
                 .iter()
                 .map(|p| io::IoSlice::new(p.as_bytes()))
                 .collect();
@@ -146,7 +189,18 @@ impl<W: Write> DiagnosticSink for W {
             while !pending.is_empty() {
                 match self.write_vectored(pending) {
                     Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-                    Ok(n) => io::IoSlice::advance_slices(&mut pending, n),
+                    Ok(n) => {
+                        // A `Write` that reports more than it was handed would make
+                        // `advance_slices` empty `pending` and return success for
+                        // bytes nobody wrote.  std's own loops share the exposure;
+                        // this is the cheap tripwire (debug-only: the sum is not
+                        // worth paying per iteration in release).
+                        debug_assert!(
+                            n <= pending.iter().map(|s| s.len()).sum::<usize>(),
+                            "write_vectored over-reported {n} bytes"
+                        );
+                        io::IoSlice::advance_slices(&mut pending, n);
+                    }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(e) => return Err(e),
                 }
@@ -258,6 +312,25 @@ impl DiagnosticSink for StringSink {
 /// whose state is genuinely process-global (a channel sender) should wrap the
 /// shared handle in a cheap per-batch value rather than asking the emitter to
 /// reuse anything.
+///
+/// **This trait is sealed by coherence, not by a private supertrait.**  The
+/// blanket `impl<F: Fn() -> S>` below means a downstream *type* can never
+/// implement it: the compiler must assume the upstream crate may add `Fn` for
+/// that type in a future version (E0119, "the upstream crate may add a new impl
+/// of trait `Fn` for type …").  In-crate named types are unaffected — coherence
+/// sees every local impl — which is why the restriction does not show up in this
+/// repository.
+///
+/// What to do instead: put the configuration in a captured closure, which *is* a
+/// `Fn() -> S`.  Every factory here already does exactly that
+/// (`buffered_channel_with_capacity`, `stderr_buffered_with`,
+/// `pooled_string_with_capacity`), so the pattern is proven rather than
+/// theoretical:
+///
+/// ```ignore
+/// // NOT `impl MakeSink for MyFactory` (E0119), but:
+/// let make = move || CoalescingSink::new(my_configured_sink(cfg));
+/// ```
 pub trait MakeSink {
     type Sink: DiagnosticSink;
 
@@ -290,6 +363,23 @@ where
 /// A single piece at least as large as the buffer bypasses it (topping up and
 /// flushing immediately would copy it twice), matching `BufWriter`'s own
 /// behaviour.
+///
+/// # Dropping without `flush`
+///
+/// `Drop` drains best-effort, mirroring `BufWriter` and `BufferedChannelSink`:
+/// bytes still in the buffer reach the inner sink instead of being discarded.
+/// Without it a panic that emits a diagnostic through this wrapper (a panic hook
+/// is the canonical case) lost the entire coalesced prefix, and an early `?`
+/// return between two `write_str` calls silently truncated the batch — the
+/// "silent partial write with no error reported" hazard this module's header
+/// forbids.
+///
+/// The price is the exposure `BufferedChannelSink`'s ordinary drop path already
+/// accepts: `inner.write_str` may block, and during unwinding a blocked sink can
+/// hang. That trade is deliberate — losing the bytes is strictly worse, and a
+/// generic wrapper cannot tell a blocking inner sink from a non-blocking one. A
+/// sink that must never block while unwinding should use
+/// [`BufferedChannelSink`], whose panicking drop uses `try_send`.
 pub struct CoalescingSink<S: DiagnosticSink> {
     inner: S,
     buf: String,
@@ -297,7 +387,12 @@ pub struct CoalescingSink<S: DiagnosticSink> {
     /// When set, the buffer is taken from (and returned to) this pool on
     /// creation/drop, so a per-batch sink does not allocate its buffer every
     /// batch.  `None` keeps the plain owning behaviour.
-    pool: Option<&'static crossbeam_queue::ArrayQueue<String>>,
+    ///
+    /// `&'static` rather than `Arc`: pooling is a process-wide contract (a pool
+    /// built per factory call is populated by the sink that dropped into it and
+    /// then discarded, so nothing is ever reused), and a `static` is the cheapest
+    /// way to express that without an atomic on every take/recycle.
+    pool: Option<&'static BufferPool>,
 }
 
 impl<S: DiagnosticSink> sealed::Sealed for CoalescingSink<S> {}
@@ -318,7 +413,7 @@ impl<S: DiagnosticSink> CoalescingSink<S> {
             // Same clamping rationale as `stderr_buffered_with`: 0 would make
             // every write flush twice, and an absurd value could abort in
             // `String` growth.
-            capacity: capacity.clamp(1024, MAX_SINK_CAPACITY),
+            capacity: clamp_io_capacity(capacity),
             pool: None,
         }
     }
@@ -329,16 +424,21 @@ impl<S: DiagnosticSink> CoalescingSink<S> {
     /// `Vec`, so a batch-per-`make()` factory allocated a fresh 16 KiB buffer for
     /// every batch.  The pool degrades to "allocate fresh" when empty, exactly
     /// like [`PooledStringSink`].
+    ///
+    /// The pool must be `'static` because pooling is a *process-wide* contract:
+    /// a pool built per factory call is populated by the sink that dropped into
+    /// it and then discarded, so nothing is ever reused.  That is why the
+    /// lifetime is part of the signature rather than an incidental detail of
+    /// `ArrayQueue`.
+    ///
+    /// The popped buffer's capacity is unrelated to `capacity`: a smaller one
+    /// simply flushes earlier than configured, a larger one is bounded on return
+    /// by [`MAX_RECYCLED_CAPACITY`].  Only a `capacity() == 0` shell (an empty
+    /// pool) is worth growing, and the drop path refuses to recycle it.
     #[must_use]
-    pub fn with_pool(
-        inner: S,
-        capacity: usize,
-        pool: &'static crossbeam_queue::ArrayQueue<String>,
-    ) -> Self {
-        let mut buf = pool.pop().unwrap_or_default();
-        buf.clear();
+    pub fn with_pool(inner: S, capacity: usize, pool: &'static BufferPool) -> Self {
         let mut sink = Self::with_capacity(inner, capacity);
-        sink.buf = buf;
+        sink.buf = pool.take(sink.capacity);
         sink.pool = Some(pool);
         sink
     }
@@ -359,17 +459,35 @@ impl<S: DiagnosticSink> CoalescingSink<S> {
 
 impl<S: DiagnosticSink> Drop for CoalescingSink<S> {
     fn drop(&mut self) {
+        // Best-effort drain FIRST, pool return second: a recycled buffer is
+        // emptied anyway, so delivering its contents cannot depend on the pool
+        // (and the non-pooled case — the default — used to return here and throw
+        // the bytes away).  The aliasing with panic-time emission and the
+        // blocking trade are argued on the struct's "Dropping without `flush`".
+        let _ = self.drain();
         let Some(pool) = self.pool else {
             return;
         };
+        // A capacity-0 shell appears when `with_pool` popped an empty pool; pushing
+        // it back would fill a bounded pool with buffers that "reuse" nothing, so
+        // every later batch would pop a shell and re-grow from zero while
+        // `pool.len()` looked healthy.  `PooledStringSink::drop` guards the same
+        // way, and this divergence is what let the bug live here.
+        if self.buf.capacity() == 0 {
+            return;
+        }
         // Only recycle a buffer that is within the documented bound; a runaway
         // render must not park a huge allocation in the pool forever.
         if self.buf.capacity() > MAX_RECYCLED_CAPACITY {
             return;
         }
-        let buf = std::mem::take(&mut self.buf);
-        // A full pool drops the buffer (the documented degradation).
-        let _ = pool.push(buf);
+        let mut buf = std::mem::take(&mut self.buf);
+        // `drain` already cleared it on every path; keeping the clear makes the
+        // recycled-buffer invariant ("empty, with capacity") independent of that.
+        buf.clear();
+        // The pool's own guards (shell, oversized) live in `BufferPool::recycle`,
+        // so this sink and `PooledStringSink` cannot drift apart again.
+        pool.recycle(buf);
     }
 }
 
@@ -388,6 +506,18 @@ impl<S: DiagnosticSink> DiagnosticSink for CoalescingSink<S> {
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
         use fmt::Write as _;
+        // Route a bare literal through `write_str`.  Gutters, headers and newlines
+        // are the highest-frequency fragments the renderer emits, and this wrapper
+        // is what every hot write passes through — yet it was the one sink without
+        // the fast path.  Delegating also removes two real asymmetries the old
+        // branch had: it drained at `buf.len() >= capacity` *after* formatting (so
+        // an exactly-capacity piece flushed via `write_fmt` but not via
+        // `write_str`, which tests `len + piece > capacity` first), and it had no
+        // oversized bypass (a literal larger than the buffer was formatted into
+        // `buf`, growing it past capacity, then copied out — two copies).
+        if let Some(s) = args.as_str() {
+            return self.write_str(s);
+        }
         // Format into the buffer, not into the inner sink: one flush per batch
         // instead of one boundary crossing per formatted fragment.
         if fmt::write(&mut self.buf, args).is_err() {
@@ -421,6 +551,23 @@ pub fn stderr() -> impl MakeSink<Sink = io::StderrLock<'static>> {
     || io::stderr().lock()
 }
 
+/// [`stderr`] with a pooled 16 KiB coalescing buffer instead of `BufWriter`.
+///
+/// `BufWriter` allocates its 16 KiB `Vec` in every `make()`, so a per-batch
+/// factory pays one allocation per batch forever.  This reuses the buffer through
+/// a process-wide [`BufferPool`], and its flush policy is slightly better than
+/// `BufWriter`'s for an oversized piece: `CoalescingSink` hands a piece at least
+/// as large as the buffer straight to the sink (one `write(2)`), where `BufWriter`
+/// fills the remainder of its buffer, flushes, then writes the rest (two).
+///
+/// The reentrancy caveat is the module-level one ("Ordering under reentrancy").
+#[must_use]
+pub fn stderr_pooled() -> impl MakeSink<Sink = CoalescingSink<io::StderrLock<'static>>> {
+    static POOL: std::sync::LazyLock<BufferPool> =
+        std::sync::LazyLock::new(|| BufferPool::new(MAX_POOLED_BUFFERS));
+    || CoalescingSink::with_pool(io::stderr().lock(), 16 * 1024, &POOL)
+}
+
 /// Like [`stderr`], but batches small writes through a [`BufWriter`].
 ///
 /// `io::stderr()` is unbuffered in Rust: every `write_str` is a `write(2)`
@@ -435,13 +582,10 @@ pub fn stderr() -> impl MakeSink<Sink = io::StderrLock<'static>> {
 /// direct `write(2)` — correct, just not batched; use [`stderr_buffered_with`]
 /// to raise the capacity for unusually large renders.
 ///
-/// **Ordering under reentrancy.**  Each `make()` returns a fresh `BufWriter`, so
-/// a nested emit on the same thread (a `Display` impl that emits another
-/// diagnostic, a panic hook) flushes *its* buffer to stderr while the outer
-/// batch's bytes are still buffered: the observed order becomes
-/// `inner, outer-prefix, outer-suffix` rather than emission order.  The
-/// unbuffered [`stderr`] does not have this hazard.  Use it when the renderer
-/// can re-enter; the buffered factory trades that guarantee for fewer syscalls.
+/// **Ordering under reentrancy.**  See the module-level "Ordering under
+/// reentrancy" section: a fresh `BufWriter` per `make()` flushes a nested emit's
+/// bytes ahead of the outer batch's still-buffered prefix.  The unbuffered
+/// [`stderr`] does not have this hazard.
 #[must_use]
 pub fn stderr_buffered() -> impl MakeSink<Sink = io::BufWriter<io::StderrLock<'static>>> {
     stderr_buffered_with(16 * 1024)
@@ -460,25 +604,45 @@ pub fn stderr_buffered_with(
     // Clamped at both ends now: the minimum keeps it a real buffer, the maximum
     // stops one annotated-but-fat-fingered value from aborting the process in
     // `Vec::with_capacity`.
-    let capacity = capacity.clamp(1024, MAX_SINK_CAPACITY);
+    let capacity = clamp_io_capacity(capacity);
     move || io::BufWriter::with_capacity(capacity, io::stderr().lock())
 }
 
 /// Upper bound any sink capacity may request.
 ///
 /// A caller passing `usize::MAX` (or a fat-fingered huge value) previously
-/// reached `Vec::with_capacity` and **aborted the process**; a zero capacity made
-/// `pooled_string_with_capacity(0)` a silently dead pool (the seed buffer had
-/// capacity 0, so `Drop`'s `capacity() == 0` guard rejected every returned
-/// buffer and pooling was disabled with no diagnostic).  One helper keeps all
-/// four factories consistent in both directions.
+/// reached `Vec::with_capacity` and **aborted the process**.  Every
+/// capacity-taking entry point clamps against this.
 const MAX_SINK_CAPACITY: usize = 16 * 1024 * 1024;
-/// Floor for a *pooled/buffered* capacity: below this the buffer is a shell and
-/// the pool would refuse it back (see above).
-const MIN_SINK_CAPACITY: usize = 16;
 
+/// Floor for a *syscall-amortising* buffer: `stderr_buffered_with`,
+/// `CoalescingSink::with_capacity`.
+///
+/// Below this the extra `write(2)` per small piece costs more than the memory
+/// saved, and `BufWriter::with_capacity(0)` is pathological — effectively
+/// unbuffered *plus* a flush attempt per write, strictly worse than plain
+/// `stderr()`.
+const MIN_IO_BUFFER: usize = 1024;
+
+/// Floor for a *recyclable* buffer: `pooled_string_with_capacity`,
+/// `buffered_channel_with_capacity`.
+///
+/// The pool's only hard rejection is `capacity() == 0` (see
+/// `PooledStringSink::drop`); this floor is a *seeding* guideline, not a pool
+/// requirement: a buffer smaller than this regrows on the first push, so seeding
+/// one is pure waste.  (An earlier comment claimed the pool refuses anything
+/// below this — it does not.)
+const MIN_POOL_BUFFER: usize = 16;
+
+// Not `const`: `usize::clamp` is `Ord::clamp`, which is `const fn` only under
+// the unstable `const_cmp` feature (E0658 on this toolchain). These are called
+// once per factory, so the missing `const` costs nothing.
 fn clamp_capacity(capacity: usize) -> usize {
-    capacity.clamp(MIN_SINK_CAPACITY, MAX_SINK_CAPACITY)
+    capacity.clamp(MIN_POOL_BUFFER, MAX_SINK_CAPACITY)
+}
+
+fn clamp_io_capacity(capacity: usize) -> usize {
+    capacity.clamp(MIN_IO_BUFFER, MAX_SINK_CAPACITY)
 }
 
 /// Test sink factory: produce a fresh [`StringSink`] per batch.
@@ -488,6 +652,11 @@ pub fn string() -> impl MakeSink<Sink = StringSink> {
 }
 
 /// Like [`string`], with the batch buffer pre-sized.
+///
+/// This is the one capacity entry point with **no floor**: a `StringSink` has no
+/// pool to poison, so `string_with_capacity(0)` is well-defined and documented —
+/// it means "no pre-sizing at all" (a `String::with_capacity(0)` never
+/// allocates; the first push grows it).  The ceiling still applies.
 #[must_use]
 pub fn string_with_capacity(capacity: usize) -> impl MakeSink<Sink = StringSink> {
     let capacity = capacity.min(MAX_SINK_CAPACITY);
@@ -559,6 +728,29 @@ impl DiagnosticSink for ChannelSink {
         // Exactly one allocation: the formatted string sent over the channel.
         self.send_owned(args.to_string())
     }
+
+    fn write_parts(&mut self, parts: &[&str]) -> io::Result<()> {
+        if self.disconnected {
+            return Err(broken_pipe());
+        }
+        // One payload, one send: a per-`write_str` frame is explicitly not a
+        // contract here (`BufferedChannelSink` already coalesces a whole batch into
+        // one message), so the default loop's N allocations and N channel
+        // operations buy nothing.  `with_capacity(total)` also makes this the
+        // exact-size allocation the single-part path already pays.
+        if parts.len() < 2 {
+            for p in parts {
+                self.write_str(p)?;
+            }
+            return Ok(());
+        }
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mut payload = String::with_capacity(total);
+        for p in parts {
+            payload.push_str(p);
+        }
+        self.send_owned(payload)
+    }
 }
 
 /// LSP sink factory: clone the sender for each batch.
@@ -605,15 +797,49 @@ pub fn channel(tx: crossbeam_channel::Sender<String>) -> impl MakeSink<Sink = Ch
 /// live-progress UI) must keep using [`channel`].  A panic mid-batch would
 /// otherwise lose the buffered text, so `Drop` flushes best-effort (ignoring the
 /// error, like `BufWriter`'s drop).
+///
+/// # Memory bound
+///
+/// The buffer grows to the size of one batch and is then sent as one message:
+/// **the batch size is the memory ceiling**, and this sink has none of its own
+/// (unlike [`CoalescingSink`], which flushes at a fixed capacity).  A
+/// pathological batch therefore builds one arbitrarily large `String` and then
+/// one arbitrarily large channel message.  If that must be bounded, wrap this
+/// sink in [`CoalescingSink`] — coalescing composes: the receiver then gets one
+/// message per capacity window instead of one per batch.
+///
+/// # What pooling can and cannot save
+///
+/// Each flushed payload owns its buffer (it is the channel message), so
+/// `buffered_channel_pooled_with_capacity` recycles only the sink's *resident*
+/// replacement buffer: one allocation per batch, not per flush.  Removing the
+/// per-flush allocation would need a copy-free payload (`Arc<str>`/`Bytes`),
+/// which the zero-copy verdict above already rules out.
 pub struct BufferedChannelSink {
     tx: crossbeam_channel::Sender<String>,
     buf: String,
     /// Capacity every replacement buffer is seeded with (see `send_buffered`).
     capacity: usize,
+    /// When set, the resident replacement buffer comes from this pool and is
+    /// returned to it on drop.  Only the *resident* buffer can be recycled — see
+    /// the struct's "What pooling can and cannot save".
+    pool: Option<&'static BufferPool>,
     disconnected: bool,
 }
 
 impl BufferedChannelSink {
+    /// The buffer that replaces `buf` after a flush.
+    ///
+    /// Pooled sinks take it from the pool (one allocation saved per batch);
+    /// unpooled ones allocate at the configured capacity, which is why
+    /// `mem::take` — a capacity-0 shell — was the wrong primitive here.
+    fn fresh_buffer(&self) -> String {
+        match self.pool {
+            Some(pool) => pool.take(self.capacity),
+            None => String::with_capacity(self.capacity),
+        }
+    }
+
     /// Frame and send the buffered text, clearing it for the next batch.
     fn send_buffered(&mut self) -> io::Result<()> {
         // Sticky, like `write_str`/`write_fmt`: once the channel is gone every
@@ -630,7 +856,11 @@ impl BufferedChannelSink {
         // a capacity-0 shell, so the *second* diagnostic of a batch (and all
         // later ones) regrew through the doubling chain — exactly the cost
         // `buffered_channel_with_capacity` exists to avoid.
-        let payload = std::mem::replace(&mut self.buf, String::with_capacity(self.capacity));
+        // Two steps, not one: `mem::replace(&mut self.buf, self.fresh_buffer())`
+        // borrows `self` both mutably and immutably (E0502) — `fresh_buffer`
+        // reads `self.pool`/`self.capacity` while `self.buf` is mutably borrowed.
+        let replacement = self.fresh_buffer();
+        let payload = std::mem::replace(&mut self.buf, replacement);
         match self.tx.send(payload) {
             Ok(()) => Ok(()),
             Err(_) => {
@@ -655,7 +885,11 @@ impl BufferedChannelSink {
         if self.buf.is_empty() {
             return Ok(());
         }
-        let payload = std::mem::replace(&mut self.buf, String::with_capacity(self.capacity));
+        // Two steps, not one: `mem::replace(&mut self.buf, self.fresh_buffer())`
+        // borrows `self` both mutably and immutably (E0502) — `fresh_buffer`
+        // reads `self.pool`/`self.capacity` while `self.buf` is mutably borrowed.
+        let replacement = self.fresh_buffer();
+        let payload = std::mem::replace(&mut self.buf, replacement);
         match self.tx.try_send(payload) {
             Ok(()) => Ok(()),
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
@@ -682,6 +916,12 @@ impl Drop for BufferedChannelSink {
         } else {
             self.send_buffered()
         };
+        // The payload that was flushed owns its buffer; what comes back to the pool
+        // is the resident replacement buffer (see "What pooling can and cannot
+        // save").  Unpooled sinks have nothing to do.
+        if let Some(pool) = self.pool {
+            pool.recycle(std::mem::take(&mut self.buf));
+        }
     }
 }
 
@@ -735,6 +975,28 @@ pub fn buffered_channel_with_capacity(
         tx: tx.clone(),
         buf: String::with_capacity(capacity),
         capacity,
+        pool: None,
+        disconnected: false,
+    }
+}
+
+/// [`buffered_channel_with_capacity`] whose resident buffer comes from `pool`.
+///
+/// Pooling saves **one allocation per batch**, not one per flush: each flushed
+/// payload owns its buffer because it *is* the channel message.  See the sink's
+/// "What pooling can and cannot save".
+#[must_use]
+pub fn buffered_channel_pooled_with_capacity(
+    tx: crossbeam_channel::Sender<String>,
+    capacity: usize,
+    pool: &'static BufferPool,
+) -> impl MakeSink<Sink = BufferedChannelSink> {
+    let capacity = clamp_capacity(capacity);
+    move || BufferedChannelSink {
+        tx: tx.clone(),
+        buf: pool.take(capacity),
+        capacity,
+        pool: Some(pool),
         disconnected: false,
     }
 }
@@ -750,6 +1012,149 @@ const MAX_POOLED_BUFFERS: usize = 8;
 /// "must not pin the huge allocation" failure the pool's doc claims to prevent.
 const MAX_RECYCLED_CAPACITY: usize = 64 * 1024;
 
+/// Pop-with-fallback and guarded recycle, shared by every pooled sink.
+///
+/// The policy used to be copy-pasted per sink and had already drifted:
+/// `PooledStringSink::drop` cleared the buffer and rejected shells and oversized
+/// allocations, `CoalescingSink::drop` did none of the three — so a flush-only
+/// batch could fill a bounded pool with capacity-0 shells and every later batch
+/// re-grew from zero while `pool.len()` looked healthy.  One type owns the rules
+/// now; a new pooled sink gets them by construction.
+///
+/// All operations are lock-free (`crossbeam_queue::ArrayQueue`), so a pool can be
+/// shared across the parallel emitter's worker threads.  A full or empty pool is
+/// never an error: `recycle` drops the buffer, `take` allocates.
+pub struct BufferPool {
+    /// Bounded MPMC stack. `push` fails when full, `pop` fails when empty →
+    /// allocate fresh; a lock-free queue means a pool can be shared by the
+    /// parallel emitter's worker threads with no contention on the fast path.
+    ///
+    /// Eager rather than `LazyLock`: `LazyLock<T>`'s `F` defaults to `fn() -> T`,
+    /// so a *capturing* closure (the `slots` parameter) would not coerce — and a
+    /// pool is constructed once per factory, not on a hot path.
+    queue: crossbeam_queue::ArrayQueue<String>,
+}
+
+impl BufferPool {
+    /// A pool holding at most `slots` idle buffers.
+    ///
+    /// `slots` bounds the *count*; [`MAX_RECYCLED_CAPACITY`] bounds the bytes of
+    /// each recycled buffer.
+    #[must_use]
+    pub fn new(slots: usize) -> Self {
+        BufferPool {
+            queue: crossbeam_queue::ArrayQueue::new(slots.max(1)),
+        }
+    }
+
+    /// Pop a cleared buffer, allocating one with `capacity` when the pool is
+    /// empty.
+    ///
+    /// The popped buffer's capacity is unrelated to `capacity`: a smaller one
+    /// simply means the caller's buffer flushes earlier than configured, a larger
+    /// one is bounded on return by [`MAX_RECYCLED_CAPACITY`].  Only seeding should
+    /// assume they match.
+    #[must_use]
+    pub fn take(&self, capacity: usize) -> String {
+        let mut buf = self
+            .queue
+            .pop()
+            .unwrap_or_else(|| String::with_capacity(capacity));
+        // A recycled buffer is already empty; the clear keeps the invariant
+        // independent of the recycle path.
+        buf.clear();
+        buf
+    }
+
+    /// Return `buf` for reuse, unless recycling it would poison the pool.
+    ///
+    /// Two rejections, both of them real bugs before they were centralised:
+    ///
+    /// * `capacity() == 0` — a shell (e.g. after `into_string`), which would
+    ///   "reuse" nothing and force the next batch to re-grow from zero;
+    /// * `capacity() > MAX_RECYCLED_CAPACITY` — a runaway render must not pin a
+    ///   huge allocation for the pool's lifetime, where LIFO would hand it to
+    ///   every later small batch.
+    ///
+    /// The buffer is cleared first so a recycled buffer never carries one batch's
+    /// bytes into the next.
+    pub fn recycle(&self, mut buf: String) {
+        buf.clear();
+        if buf.capacity() == 0 || buf.capacity() > MAX_RECYCLED_CAPACITY {
+            return;
+        }
+        // Fails (and drops `buf`) when the pool is full — the queue's capacity is
+        // the count bound, so there is no separate length check to drift.
+        let _ = self.queue.push(buf);
+    }
+
+    /// Number of idle buffers (for reuse assertions).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Whether the pool currently holds no idle buffer.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+impl std::fmt::Debug for BufferPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Count only: dumping the buffers would print every batch's bytes.
+        f.debug_struct("BufferPool")
+            .field("idle", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+// `Debug` impls that report sizes, not contents.  Without them `{:?}` on a sink
+// would not compile, which tempts a future `#[derive(Debug)]` on a sink holding a
+// multi-KiB batch buffer — a derive that dumps kilobytes into a panic message.
+// Each of these prints the shape a reader actually wants.
+
+impl std::fmt::Debug for StringSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StringSink")
+            .field("len", &self.buf.len())
+            .field("capacity", &self.buf.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ChannelSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelSink")
+            .field("disconnected", &self.disconnected)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for BufferedChannelSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferedChannelSink")
+            .field("len", &self.buf.len())
+            .field("capacity", &self.capacity)
+            .field("disconnected", &self.disconnected)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: DiagnosticSink> std::fmt::Debug for CoalescingSink<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The inner sink is deliberately not formatted: it may itself be a
+        // buffered sink, and nesting the dump is how kilobytes leak into a panic
+        // message.
+        f.debug_struct("CoalescingSink")
+            .field("len", &self.buf.len())
+            .field("capacity", &self.capacity)
+            .field("pooled", &self.pool.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// [`StringSink`] whose buffer is returned to a shared pool on drop.
 ///
 /// The emitter makes one sink per batch, so a long-lived emitter paid one
@@ -763,13 +1168,10 @@ const MAX_RECYCLED_CAPACITY: usize = 64 * 1024;
 /// error.
 pub struct PooledStringSink {
     buf: String,
-    /// Bounded MPMC stack.  The pool's semantics were always exactly that
-    /// (`push` fails when full, `pop` fails when empty → allocate fresh), so the
-    /// `Mutex<Vec<_>>` only added an acquire/release per batch and made the cap an
-    /// `if` instead of a capacity.  `ArrayQueue` is lock-free and its capacity *is*
-    /// `MAX_POOLED_BUFFERS`; a poisoned pool cannot exist, so "pool unavailable →
-    /// allocate" is simply `pop() == None`.
-    pool: std::sync::Arc<crossbeam_queue::ArrayQueue<String>>,
+    /// Bounded MPMC stack, shared by every pooled sink.  Its capacity is
+    /// `MAX_POOLED_BUFFERS` and the recycle guards live in [`BufferPool`], so
+    /// `CoalescingSink::with_pool` and this sink cannot drift apart again.
+    pool: std::sync::Arc<BufferPool>,
 }
 
 impl PooledStringSink {
@@ -797,24 +1199,10 @@ impl PooledStringSink {
 
 impl Drop for PooledStringSink {
     fn drop(&mut self) {
-        let mut buf = std::mem::take(&mut self.buf);
-        buf.clear();
-        // A capacity-0 shell means `into_string` handed the allocation away; do
-        // not push it, or the next batch would "reuse" nothing and re-grow from
-        // zero (which is exactly what `pooled_string_reuses_its_buffer_across_batches`
-        // caught).
-        if buf.capacity() == 0 {
-            return;
-        }
-        // Oversized buffers are not recycled (see `MAX_RECYCLED_CAPACITY`):
-        // dropping the allocation is cheaper than pinning a megabyte for the
-        // lifetime of the pool, and LIFO would hand it to every small batch.
-        if buf.capacity() > MAX_RECYCLED_CAPACITY {
-            return;
-        }
-        // Fails (and drops `buf`) when the pool is full — the bound is the
-        // queue's capacity now, so there is no separate length check to drift.
-        let _ = self.pool.push(buf);
+        // `recycle` owns all three guards (shell, oversized, clear) — this sink
+        // used to carry its own copy, which is exactly how `CoalescingSink` came
+        // to be missing them.
+        self.pool.recycle(std::mem::take(&mut self.buf));
     }
 }
 
@@ -861,17 +1249,13 @@ pub fn pooled_string() -> impl MakeSink<Sink = PooledStringSink> {
 #[must_use]
 pub fn pooled_string_with_capacity(capacity: usize) -> impl MakeSink<Sink = PooledStringSink> {
     let capacity = clamp_capacity(capacity);
-    let pool: std::sync::Arc<crossbeam_queue::ArrayQueue<String>> =
-        std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(MAX_POOLED_BUFFERS));
-    let _ = pool.push(String::with_capacity(capacity));
-    move || {
-        let buf = pool
-            .pop()
-            .unwrap_or_else(|| String::with_capacity(capacity));
-        PooledStringSink {
-            buf,
-            pool: std::sync::Arc::clone(&pool),
-        }
+    let pool = std::sync::Arc::new(BufferPool::new(MAX_POOLED_BUFFERS));
+    // Seed one buffer so the very first batch does not allocate; `recycle` applies
+    // the same guards as every later return, so a mis-seeded pool cannot happen.
+    pool.recycle(String::with_capacity(capacity));
+    move || PooledStringSink {
+        buf: pool.take(capacity),
+        pool: std::sync::Arc::clone(&pool),
     }
 }
 
@@ -941,14 +1325,238 @@ mod coalescing_probe_tests {
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
+    /// Records what actually reached the sink, so "was this delivered?" is
+    /// observable *after* the wrapper has been dropped.
+    struct Shared(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl io::Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared sink poisoned")
+                .push_str(std::str::from_utf8(buf).expect("utf-8 pieces only"));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn coalescing_pool_returns_the_buffer_on_drop() {
         // `ArrayQueue::new` is not a const fn, so the pool lives behind a
         // `LazyLock` (the production pools do the same).
-        static POOL: std::sync::LazyLock<crossbeam_queue::ArrayQueue<String>> =
-            std::sync::LazyLock::new(|| crossbeam_queue::ArrayQueue::new(4));
-        drop(CoalescingSink::with_pool(Vec::<u8>::new(), 1024, &POOL));
+        static POOL: std::sync::LazyLock<BufferPool> =
+            std::sync::LazyLock::new(|| BufferPool::new(4));
+        // Seed a *real* buffer: the old version popped an empty pool, wrote
+        // nothing, and asserted that the resulting capacity-0 shell came back —
+        // enshrining the bug that filled a bounded pool with shells that reuse
+        // nothing.
+        POOL.recycle(String::with_capacity(1024));
+        {
+            let mut sink = CoalescingSink::with_pool(Vec::<u8>::new(), 1024, &POOL);
+            sink.write_str("x").expect("write");
+        }
         assert_eq!(POOL.len(), 1, "the buffer must be recycled on drop");
+        let recycled = POOL.take(0);
+        assert_eq!(recycled.capacity(), 1024, "the allocation is reused");
+        assert!(recycled.is_empty(), "a recycled buffer is always empty");
+    }
+
+    /// The shell case, which the test above used to *be*.
+    ///
+    /// `with_pool` no longer *hands out* shells — `BufferPool::take` allocates at
+    /// the requested capacity when the pool is empty — so the guard is asserted
+    /// where it now lives: `recycle` refuses a capacity-0 buffer.  `into_string`
+    /// (which leaves exactly such a shell behind) is the production path that
+    /// depends on it.
+    #[test]
+    fn buffer_pool_refuses_to_recycle_a_shell() {
+        let pool = BufferPool::new(4);
+        pool.recycle(String::new());
+        assert_eq!(pool.len(), 0, "a capacity-0 shell must not be recycled");
+        // A cold `take` allocates at the requested capacity, so the pool can never
+        // be *repopulated* with a shell through this path either.
+        let cold = pool.take(1024);
+        assert_eq!(cold.capacity(), 1024, "cold take pre-sizes");
+        assert!(cold.is_empty());
+    }
+
+    /// The oversized guard, on the same centralised path: a runaway render must
+    /// not pin a huge allocation in a bounded pool.
+    #[test]
+    fn buffer_pool_refuses_to_recycle_an_oversized_buffer() {
+        let pool = BufferPool::new(4);
+        pool.recycle(String::with_capacity(MAX_RECYCLED_CAPACITY + 1));
+        assert_eq!(pool.len(), 0, "oversized buffers are dropped, not pooled");
+        pool.recycle(String::with_capacity(MAX_RECYCLED_CAPACITY));
+        assert_eq!(pool.len(), 1, "the bound itself is recyclable");
+    }
+
+    /// The measurable claim behind pooling, made checkable without a counting
+    /// allocator: the second batch writes into the *same* allocation as the first.
+    /// (`as_str().as_ptr()` is the buffer's data pointer; a re-allocation would
+    /// move it.)  The module's allocation arguments were unmeasured before this.
+    #[test]
+    fn pooled_batches_reuse_the_same_allocation() {
+        let make = pooled_string_with_capacity(1024);
+        let first = {
+            let mut sink = make.make();
+            sink.write_str("batch one").expect("write");
+            sink.as_str().as_ptr()
+        };
+        let second = {
+            let mut sink = make.make();
+            assert_eq!(sink.capacity(), 1024, "the pooled buffer came back");
+            sink.write_str("batch two").expect("write");
+            sink.as_str().as_ptr()
+        };
+        assert_eq!(
+            first, second,
+            "no allocation between batches: the pool handed back the same buffer"
+        );
+    }
+
+    /// ...and the coalescing wrapper gets the same guarantee through `with_pool`.
+    #[test]
+    fn coalescing_pooled_sink_reuses_the_buffer() {
+        static POOL: std::sync::LazyLock<BufferPool> =
+            std::sync::LazyLock::new(|| BufferPool::new(4));
+        let drained = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let first_ptr = {
+            let mut sink =
+                CoalescingSink::with_pool(Shared(std::sync::Arc::clone(&drained)), 1024, &POOL);
+            sink.write_str("first").expect("write");
+            let p = sink.buf.as_ptr().cast::<u8>();
+            drop(sink);
+            p
+        };
+        let second_ptr = {
+            let mut sink =
+                CoalescingSink::with_pool(Shared(std::sync::Arc::clone(&drained)), 1024, &POOL);
+            sink.write_str("second").expect("write");
+            sink.buf.as_ptr().cast::<u8>()
+        };
+        assert_eq!(
+            first_ptr, second_ptr,
+            "the coalescing pool handed back the same allocation"
+        );
+    }
+
+    /// Dropping without an explicit `flush` must still deliver the coalesced
+    /// prefix. `BufWriter` and `BufferedChannelSink` both do this; the wrapper
+    /// used to discard the bytes entirely, which is how a panic hook emitting a
+    /// diagnostic lost its whole message.
+    #[test]
+    fn coalescing_drop_delivers_buffered_bytes() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        {
+            let mut sink = CoalescingSink::new(Shared(std::sync::Arc::clone(&seen)));
+            sink.write_str("first ").expect("write");
+            sink.write_fmt(format_args!("second {}", 2)).expect("fmt");
+            // No `flush()`: the drop is the point of the test.
+        }
+        assert_eq!(seen.lock().unwrap().as_str(), "first second 2");
+    }
+
+    /// ...and the oversized-write bypass path is covered too, because it hands the
+    /// piece straight to the inner sink: a `Drop` that only drained the buffer
+    /// would look correct here while losing the rest.
+    #[test]
+    fn coalescing_drop_delivers_after_an_oversized_bypass() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let big = "y".repeat(2048);
+        {
+            let mut sink =
+                CoalescingSink::with_capacity(Shared(std::sync::Arc::clone(&seen)), 1024);
+            sink.write_str("head").expect("write");
+            sink.write_str(&big).expect("oversized");
+            sink.write_str("tail").expect("write");
+        }
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 4 + big.len() + 4);
+        assert!(got.starts_with("head"));
+        assert!(got.ends_with("tail"));
+    }
+
+    /// The `write_fmt` twin of `string_sink_write_fmt_keeps_the_prefix_and_errors`:
+    /// a `Display` impl that fails *after* writing must leave the prefix in the
+    /// buffer and surface the error (the coalescing path had no such test, so a
+    /// future `write_fmt` rewrite could silently drop the prefix).
+    #[test]
+    fn coalescing_write_fmt_keeps_the_prefix_and_errors() {
+        struct HalfBroken;
+        impl fmt::Display for HalfBroken {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("prefix")?;
+                Err(fmt::Error)
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut sink = CoalescingSink::new(Shared(std::sync::Arc::clone(&seen)));
+        let err = sink
+            .write_fmt(format_args!("{}", HalfBroken))
+            .expect_err("a formatter error must surface as io::Error");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        // The prefix is still *in the buffer* (not yet handed to the inner sink),
+        // and the drop delivers it — both halves of the partial-prefix invariant.
+        drop(sink);
+        assert_eq!(seen.lock().unwrap().as_str(), "prefix");
+    }
+
+    /// A bare literal and the same text through `write_str` must be byte- and
+    /// boundary-identical: `write_fmt` now delegates for literals, so the
+    /// drain-at-threshold rule cannot differ between the two entry points.
+    #[test]
+    fn coalescing_write_fmt_literal_matches_write_str() {
+        let cross = |write_str: bool| {
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bytes = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let mut sink = CoalescingSink::with_capacity(
+                CountingAndRecording(
+                    std::sync::Arc::clone(&counter),
+                    std::sync::Arc::clone(&bytes),
+                ),
+                1024,
+            );
+            for _ in 0..600 {
+                if write_str {
+                    sink.write_str("literal").expect("write");
+                } else {
+                    sink.write_fmt(format_args!("literal")).expect("fmt");
+                }
+            }
+            sink.flush().expect("flush");
+            (
+                counter.load(std::sync::atomic::Ordering::Relaxed),
+                bytes.lock().unwrap().clone(),
+            )
+        };
+        let via_str = cross(true);
+        let via_fmt = cross(false);
+        assert_eq!(via_str.1, via_fmt.1, "same bytes");
+        assert_eq!(via_str.0, via_fmt.0, "same boundary-crossing count");
+    }
+
+    /// Counts crossings *and* records the payload, for the parity test above.
+    struct CountingAndRecording(
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<String>>,
+    );
+
+    impl io::Write for CountingAndRecording {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.1
+                .lock()
+                .expect("recorder poisoned")
+                .push_str(std::str::from_utf8(buf).expect("utf-8 pieces only"));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -1153,6 +1761,59 @@ mod tests {
         sink.write_str("b").unwrap();
         assert_eq!(rx.recv().unwrap(), "a");
         assert_eq!(rx.recv().unwrap(), "b");
+    }
+
+    /// `ChannelSink::write_parts` coalesces into one message: N-1 fewer
+    /// allocations and N-1 fewer channel operations for a multi-part emit.  The
+    /// framing change is sanctioned by `BufferedChannelSink`, which already sends
+    /// one message per batch — per-`write_str` framing is not a contract.
+    #[test]
+    fn channel_sink_write_parts_sends_one_message() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let make = channel(tx);
+        let mut sink = make.make();
+        sink.write_parts(&["head", " ^^^^", "tail"]).expect("parts");
+        assert_eq!(rx.recv().unwrap(), "head ^^^^tail");
+        assert!(
+            rx.try_recv().is_err(),
+            "multi-part writes must not fragment the message"
+        );
+        // The single-part path keeps `write_str`'s semantics.
+        sink.write_parts(&["solo"]).expect("one part");
+        assert_eq!(rx.recv().unwrap(), "solo");
+    }
+
+    /// Pooling the buffered channel sink saves the *resident* buffer's allocation
+    /// per batch — the flushed payload owns its buffer by design, so this is the
+    /// one allocation pooling can remove.  Pointer identity is the proof: a second
+    /// batch reuses the same allocation.
+    #[test]
+    fn buffered_channel_pooled_reuses_the_resident_buffer() {
+        static POOL: std::sync::LazyLock<BufferPool> =
+            std::sync::LazyLock::new(|| BufferPool::new(4));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let make = buffered_channel_pooled_with_capacity(tx, 1024, &POOL);
+        let first = {
+            let mut sink = make.make();
+            sink.write_str("first").expect("write");
+            // The flush hands the *payload* buffer over and swaps in the resident
+            // one; that replacement is what the pool sees at drop.
+            sink.flush().expect("flush");
+            let resident = sink.buf.as_ptr();
+            assert_eq!(rx.recv().expect("payload"), "first");
+            drop(sink);
+            resident
+        };
+        assert_eq!(POOL.len(), 1, "the resident buffer was recycled");
+        let mut second = make.make();
+        assert_eq!(
+            second.buf.as_ptr(),
+            first,
+            "the next batch reused that allocation"
+        );
+        second.write_str("second").expect("write");
+        second.flush().expect("flush");
+        assert_eq!(rx.recv().expect("payload"), "second");
     }
 
     /// `BufWriter<W>` and `W` produce identical bytes for the same write

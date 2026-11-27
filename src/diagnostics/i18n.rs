@@ -196,6 +196,13 @@ fn bundles() -> &'static [Bundle; N_LANGS] {
     })
 }
 
+/// Note on the release stance of `make_bundle`: a locale whose Fluent source fails to parse
+/// degrades **silently to English** in release builds (the parse error is a debug assertion
+/// only).  That is deliberate — a compiler must not refuse to emit diagnostics because a
+/// translation is broken — but it is a decision, so `validate_locales` (CI) asserts that
+/// every locale parses and that its slug set equals `en`'s; drift is caught at build time
+/// rather than as a mixed-language diagnostic at run time.
+
 fn make_bundle(lang: LanguageIdentifier, src: &'static str) -> Bundle {
     // Locales are validated by `validate_locales` at build time, so a parse
     // error here means the validator and the runtime disagree (version drift,
@@ -214,11 +221,22 @@ fn make_bundle(lang: LanguageIdentifier, src: &'static str) -> Bundle {
         lang
     );
     let res: &'static FluentResource = Box::leak(Box::new(res));
-    let mut bundle = fluent_bundle::concurrent::FluentBundle::new_concurrent(vec![lang]);
+    let mut bundle = fluent_bundle::concurrent::FluentBundle::new_concurrent(vec![lang.clone()]);
     bundle.set_use_isolating(false);
-    bundle
-        .add_resource(res)
-        .expect("conflicting Fluent message ids");
+    if let Err(err) = bundle.add_resource(res) {
+        // Conflicting message ids inside one `.ftl`.  Same class as a parse error
+        // above, and this module's stated stance is that a compiler must not refuse to
+        // emit diagnostics because a translation is broken: Fluent adds every
+        // non-conflicting message and reports the clash, so the recovered bundle keeps
+        // working and a slug it lacks falls back to English.  Panicking here aborted the
+        // process at first `bundles()` init — in release, over a locale problem, which
+        // is the worst possible trade for a diagnostic system.  `validate_locales`
+        // rejects duplicates at build time, so this is the runtime-only last resort.
+        debug_assert!(
+            false,
+            "locale {lang}: conflicting Fluent message ids that `validate_locales` missed: {err:?}"
+        );
+    }
     bundle
 }
 
@@ -304,12 +322,38 @@ where
 /// is actively wrong for the release case.
 #[cfg(debug_assertions)]
 #[cold]
-fn tripwire_unformatted(msg: &str, en: &Bundle, formatted: bool) {
+fn tripwire_unformatted(msg: &str, en: &Bundle, formatted: bool, path: UnformattedPath) {
     debug_assert!(
         formatted || en.get_message(msg).is_none(),
-        "slug {msg:?} exists but formatting failed on every bundle — \
-         missing or misspelled argument?"
+        "slug {msg:?} exists but formatting failed on the {} path — \
+         missing or misspelled argument?",
+        path.describe()
     );
+}
+
+/// Which call shape observed an unformatted slug.
+///
+/// One predicate with a mode, not three predicates with three texts: the texts drifted
+/// once already (the owned zero-argument branch checked *every* bundle while the borrowed
+/// one checked `en`), and a per-shape `debug_assert!` message is exactly the kind of copy
+/// this module keeps collapsing.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+enum UnformattedPath {
+    Borrowed,
+    Owned,
+    ZeroArg,
+}
+
+#[cfg(debug_assertions)]
+impl UnformattedPath {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Borrowed => "borrowed",
+            Self::Owned => "owned",
+            Self::ZeroArg => "zero-argument",
+        }
+    }
 }
 
 /// Zero-argument variant of [`tripwire_unformatted`], sharing its message so the
@@ -320,14 +364,13 @@ fn tripwire_unformatted(msg: &str, en: &Bundle, formatted: bool) {
 /// because the locale-coverage test pins equal slug sets, but two predicates for
 /// one invariant is exactly the drift shape this module keeps removing; `en` is
 /// the reference locale by construction.
+/// Zero-argument call shape: same predicate, `ZeroArg` mode (see
+/// [`tripwire_unformatted`]).  Kept as a named wrapper so the call sites read as what they
+/// are, not as a mode constant at each of them.
 #[cfg(debug_assertions)]
 #[cold]
 fn tripwire_unformatted_zero_arg(msg: &str, en: &Bundle, formatted: bool) {
-    debug_assert!(
-        formatted || en.get_message(msg).is_none(),
-        "slug {msg:?} exists but formatting failed on the zero-argument path — \
-         missing or misspelled argument?"
-    );
+    tripwire_unformatted(msg, en, formatted, UnformattedPath::ZeroArg);
 }
 
 fn format_slug_in_into(
@@ -455,27 +498,43 @@ fn write_simple_pairs_into(
     };
     // Validate *and* size in one pass, then write: a partial write followed by a fallback
     // would duplicate text, and an exact reserve keeps this path allocation-free.
+    //
+    // The validation pass also records each variable's value, so the write pass does
+    // not rescan `pairs` per variable.  `parts`/`pairs` are tiny today, so this is not
+    // a measured win — it removes the "linear scan inside a linear pass" shape the
+    // module's hot paths deliberately avoid, and the recorded order is checked against
+    // the write order so the two passes cannot drift.
     let mut reserve = 0usize;
-    for part in parts {
+    let mut values: smallvec::SmallVec<[(usize, &str); 4]> = smallvec::SmallVec::new();
+    for (i, part) in parts.iter().enumerate() {
         match part {
             SimplePart::Text(text) => reserve += text.len(),
             SimplePart::Var(name) => {
                 let mut hits = pairs.iter().filter(|(k, _)| k == name);
                 match (hits.next(), hits.next()) {
-                    (Some((_, value)), None) => reserve += value.len(),
+                    (Some((_, value)), None) => {
+                        reserve += value.len();
+                        values.push((i, value.as_ref()));
+                    }
                     _ => return false,
                 }
             }
         }
     }
     out.reserve(reserve);
-    for part in parts {
+    let mut next_value = values.iter();
+    for (i, part) in parts.iter().enumerate() {
         match part {
             SimplePart::Text(text) => out.push_str(text),
-            SimplePart::Var(name) => {
-                if let Some((_, value)) = pairs.iter().find(|(k, _)| k == name) {
-                    out.push_str(value.as_ref());
-                }
+            SimplePart::Var(_) => {
+                let Some((at, value)) = next_value.next() else {
+                    return false;
+                };
+                debug_assert_eq!(
+                    *at, i,
+                    "the value index must follow the write order it was built in"
+                );
+                out.push_str(value);
             }
         }
     }
@@ -511,12 +570,23 @@ fn write_simple_into(
             return false;
         }
     }
+    // Exact reserve, mirroring the hot-path twin `write_simple_pairs_into`: a fixed guess
+    // per variable (8 bytes) under-reserved for every parameterized label — a type name
+    // reaches `MAX_PAYLOAD_CHARS` (512) after `capped_payload` — so `label_expected(Int<32>)`
+    // reallocated mid-write on the per-label render path.  Both writers now compute the
+    // same number from the same pieces; the reserve was the last behavioural asymmetry
+    // between them (`simple_writer_matches_fluent_byte_for_byte` pins the bytes, not this).
     out.reserve(
         parts
             .iter()
             .map(|p| match p {
                 SimplePart::Text(t) => t.len(),
-                SimplePart::Var(_) => 8,
+                SimplePart::Var(name) => match args.get(*name) {
+                    Some(FluentValue::String(value)) => value.len(),
+                    // Unreachable (validated above), but a wrong guess here only
+                    // over-reserves; never write 0.
+                    _ => 8,
+                },
             })
             .sum::<usize>(),
     );
@@ -711,33 +781,46 @@ fn detect_from_str(env: &str) -> Lang {
 /// The fallback path borrows `msg` directly (`Cow::Borrowed`), so unknown
 /// slugs and legacy keys never allocate — the caller's output buffer is the
 /// only copy. Only the Fluent-resolved branch returns `Cow::Owned`.
+/// The zero-argument prelude every entry point used to repeat.
+///
+/// `Some(cached)` means the slug has a build-time cached rendering for the current
+/// language (borrowed; no allocation after the first call per `(slug, lang)`); `None` means
+/// "format it".  A non-empty argument list on a zero-arg slug is a caller bug — the
+/// generator classifies a slug as zero-arg from `en.ftl`, so the arguments would be silently
+/// dropped, the worst kind of defect in a diagnostics engine.  The assert is `#[cfg]`-gated
+/// so release builds keep zero generated-table lookups here (a bare `debug_assert!` would
+/// leave the lookup in release and rely on DCE, and "usually" is not a contract).
+fn zero_arg_cached<'m>(slug: &'m str, arg_count: usize) -> Option<Cow<'m, str>> {
+    if arg_count == 0 {
+        return fluent::zero_arg_slug(slug);
+    }
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        fluent::zero_arg_slug(slug).is_none(),
+        "slug {slug:?} is zero-arg but was passed {arg_count} argument(s)"
+    );
+    None
+}
+
+/// [`zero_arg_cached`] for the into-buffer entry points: pushes the cached rendering and
+/// reports whether the caller is done.
+fn push_zero_arg_cached(out: &mut String, slug: &str, arg_count: usize) -> bool {
+    match zero_arg_cached(slug, arg_count) {
+        Some(cached) => {
+            out.push_str(&cached);
+            true
+        }
+        None => false,
+    }
+}
+
 pub fn render<'msg, 'src>(
     msg: &'msg str,
     pairs: &[(&'static str, Cow<'src, str>)],
 ) -> Cow<'msg, str> {
     if is_ftl_slug(msg) {
-        if pairs.is_empty() {
-            // Zero-arg slug: build-time cached, returns borrowed — no formatting
-            // and no allocation after the first call per (slug, lang).
-            if let Some(c) = fluent::zero_arg_slug(msg) {
-                return c;
-            }
-        } else {
-            // The generator classifies a slug as zero-arg from `en.ftl`; a
-            // caller passing arguments to it would be silently ignored — the
-            // worst kind of bug in a diagnostics engine (plausible but wrong
-            // text).  Fail loudly in debug builds.
-            //
-            // In release this assertion (and the generated-table lookup that
-            // feeds it) is compiled away: a parameterized render used to perform
-            // that lookup *only to fail*, on every call.  `#[cfg]` makes that
-            // removal syntactic instead of an optimizer expectation.
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                fluent::zero_arg_slug(msg).is_none(),
-                "slug {msg:?} is zero-arg but was passed {} argument(s)",
-                pairs.len()
-            );
+        if let Some(cached) = zero_arg_cached(msg, pairs.len()) {
+            return cached;
         }
         if let Some(s) = try_fluent(msg, pairs) {
             return Cow::Owned(s);
@@ -758,17 +841,8 @@ pub fn render_slug<'msg, 'src>(
     slug: &'msg str,
     pairs: &[(&'static str, Cow<'src, str>)],
 ) -> Cow<'msg, str> {
-    if pairs.is_empty() {
-        if let Some(c) = fluent::zero_arg_slug(slug) {
-            return c;
-        }
-    } else {
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            fluent::zero_arg_slug(slug).is_none(),
-            "slug {slug:?} is zero-arg but was passed {} argument(s)",
-            pairs.len()
-        );
+    if let Some(cached) = zero_arg_cached(slug, pairs.len()) {
+        return cached;
     }
     match try_fluent(slug, pairs) {
         Some(s) => Cow::Owned(s),
@@ -783,21 +857,8 @@ pub fn render_into<'msg, 'src>(
     out: &mut String,
 ) {
     if is_ftl_slug(msg) {
-        if pairs.is_empty() {
-            if let Some(c) = fluent::zero_arg_slug(msg) {
-                out.push_str(&c);
-                return;
-            }
-        } else {
-            // Debug-only tripwire; see `render` for why release skips the lookup.
-            // Gated syntactically: `debug_assert!` alone keeps the lookup in
-            // release and relies on DCE, and "usually" is not a contract.
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                fluent::zero_arg_slug(msg).is_none(),
-                "slug {msg:?} is zero-arg but was passed {} argument(s)",
-                pairs.len()
-            );
+        if push_zero_arg_cached(out, msg, pairs.len()) {
+            return;
         }
         if try_fluent_into(msg, pairs, out) {
             return;
@@ -872,7 +933,7 @@ pub fn render_into_count(msg: &str, key: &'static str, n: u64, out: &mut String)
         // fails to format here (a missing or misspelled argument) used to fall
         // through to the raw slug with no assert at all.
         #[cfg(debug_assertions)]
-        tripwire_unformatted(msg, en, formatted);
+        tripwire_unformatted(msg, en, formatted, UnformattedPath::Borrowed);
         if formatted {
             // `walk_chain` already pushed the rendered value.  Without this the
             // function fell through and appended the *raw slug* after the text
@@ -958,19 +1019,8 @@ pub fn render_into_slug_ref<'msg, 'src>(
     pairs: &[(&'static str, Cow<'src, str>)],
     out: &mut String,
 ) {
-    if pairs.is_empty() {
-        if let Some(c) = fluent::zero_arg_slug(msg) {
-            out.push_str(&c);
-            return;
-        }
-    } else {
-        // Debug-only tripwire, gated syntactically (see `render`).
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            fluent::zero_arg_slug(msg).is_none(),
-            "slug {msg:?} is zero-arg but was passed {} argument(s) (borrowed path)",
-            pairs.len()
-        );
+    if push_zero_arg_cached(out, msg, pairs.len()) {
+        return;
     }
     if try_fluent_into(msg, pairs, out) {
         return;
@@ -1130,7 +1180,7 @@ fn try_fluent_into<'msg, 'src>(
         }
     });
     #[cfg(debug_assertions)]
-    tripwire_unformatted(msg, en, formatted);
+    tripwire_unformatted(msg, en, formatted, UnformattedPath::Borrowed);
     formatted
 }
 
@@ -1146,21 +1196,8 @@ pub fn render_into_owned<'msg, 'src>(
     out: &mut String,
 ) {
     if is_ftl_slug(msg) {
-        if pairs.is_empty() {
-            if let Some(c) = fluent::zero_arg_slug(msg) {
-                out.push_str(&c);
-                return;
-            }
-        } else {
-            // Debug-only tripwire; see `render` for why release skips the lookup.
-            // Gated syntactically: `debug_assert!` alone keeps the lookup in
-            // release and relies on DCE, and "usually" is not a contract.
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                fluent::zero_arg_slug(msg).is_none(),
-                "slug {msg:?} is zero-arg but was passed {} argument(s)",
-                pairs.len()
-            );
+        if push_zero_arg_cached(out, msg, pairs.len()) {
+            return;
         }
         if try_fluent_owned_into(msg, pairs, out) {
             return;
@@ -1176,21 +1213,8 @@ pub fn render_into_slug<'msg, 'src>(
     pairs: SmallVec<[(&'static str, Cow<'src, str>); 4]>,
     out: &mut String,
 ) {
-    if pairs.is_empty() {
-        if let Some(c) = fluent::zero_arg_slug(msg) {
-            out.push_str(&c);
-            return;
-        }
-    } else {
-        // Debug-only tripwire (see `render`): the caller already knows this is a
-        // slug, so release must not pay the generated-table lookup for it — gated
-        // syntactically so that removal does not depend on the optimizer.
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            fluent::zero_arg_slug(msg).is_none(),
-            "slug {msg:?} is zero-arg but was passed {} argument(s) (owned path)",
-            pairs.len()
-        );
+    if push_zero_arg_cached(out, msg, pairs.len()) {
+        return;
     }
     if try_fluent_owned_into(msg, pairs, out) {
         return;
@@ -1281,7 +1305,7 @@ fn try_fluent_owned_into<'msg, 'src>(
     // compile (`cannot find function tripwire_unformatted`) while `cargo test`
     // (debug) stayed green.  This is the owned render path `humanize` uses.
     #[cfg(debug_assertions)]
-    tripwire_unformatted(msg, en, formatted);
+    tripwire_unformatted(msg, en, formatted, UnformattedPath::Borrowed);
     formatted
 }
 

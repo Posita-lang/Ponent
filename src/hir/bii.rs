@@ -1755,7 +1755,12 @@ fn build_refine_query_skeleton(
     // Bound constants for the witness template A' (the existential part).
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        swrite!(prefix, "(declare-const l_{r} {})\n(declare-const u_{r} {})\n", sort(ebw), sort(ebw));
+        swrite!(
+            prefix,
+            "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
+            sort(ebw),
+            sort(ebw)
+        );
     }
 
     // The inductiveness formula ∀X,X'.P(A',X,X') with A'(X) = ⋀_r l_r ≤
@@ -1900,7 +1905,17 @@ fn build_refine_query_skeleton(
     // justification as `var_range_conds` on the BiiLoopProblem path);
     // BV mode emits `true`. Inductiveness:
     // A'(X) ∧ G(X) ∧ T(X,X') → A'(X').
-    swrite!(smt, "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n", pre, loop_var_range_conds(n, bws, signed, bv), a_x, a_x, guard, trans, a_xp);
+    swrite!(
+        smt,
+        "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n",
+        pre,
+        loop_var_range_conds(n, bws, signed, bv),
+        a_x,
+        a_x,
+        guard,
+        trans,
+        a_xp
+    );
     smt.push_str("))\n");
     smt.push_str("(check-sat)\n");
     if get_model {
@@ -2004,7 +2019,14 @@ fn emit_candidate_disjunction(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
-        swrite!(smt, "  ({} l_{r} {}) ({} u_{r} {})\n", rge, render_bound(&row.lb, ebw, &off, bv), rle, render_bound(&row.ub, ebw, &off, bv));
+        swrite!(
+            smt,
+            "  ({} l_{r} {}) ({} u_{r} {})\n",
+            rge,
+            render_bound(&row.lb, ebw, &off, bv),
+            rle,
+            render_bound(&row.ub, ebw, &off, bv)
+        );
     }
     // Shared well-formedness: A' is never empty (l_r ≤ u_r) — hoisted out
     // of the former per-candidate repetition; also gives the solver a
@@ -2020,7 +2042,16 @@ fn emit_candidate_disjunction(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
-        swrite!(smt, "    (and ({} l_{} {}) ({} u_{} {}))\n", rge, c.row_idx, render_bound(&c.new_lb, ebw, &off, bv), rle, c.row_idx, render_bound(&c.new_ub, ebw, &off, bv));
+        swrite!(
+            smt,
+            "    (and ({} l_{} {}) ({} u_{} {}))\n",
+            rge,
+            c.row_idx,
+            render_bound(&c.new_lb, ebw, &off, bv),
+            rle,
+            c.row_idx,
+            render_bound(&c.new_ub, ebw, &off, bv)
+        );
     }
     // Close: the (or ...), the enclosing (and ...), and the (assert ...).
     smt.push_str("  )))\n");
@@ -2655,7 +2686,12 @@ fn build_refine_query_problem_skeleton(
     }
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        swrite!(prefix, "(declare-const l_{r} {})\n(declare-const u_{r} {})\n", sort(ebw), sort(ebw));
+        swrite!(
+            prefix,
+            "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
+            sort(ebw),
+            sort(ebw)
+        );
     }
 
     let mut smt = String::with_capacity(8192);
@@ -2683,7 +2719,14 @@ fn build_refine_query_problem_skeleton(
     for (j, p) in problem.params.iter().enumerate() {
         swrite!(smt, "(n_{j} {}) ", sort(p.bw as u32));
     }
-    swrite!(smt, ") (=> (and {} {} {}) {})))\n", init_cond, param_range_conds(&problem.params, bv), var_range_conds(&problem.vars, bv), a_x_init);
+    swrite!(
+        smt,
+        ") (=> (and {} {} {}) {})))\n",
+        init_cond,
+        param_range_conds(&problem.params, bv),
+        var_range_conds(&problem.vars, bv),
+        a_x_init
+    );
 
     // One ∀ implication per back edge (x/xp loop variables, n read-only params).
     for edge in &problem.back_edges {
@@ -2715,7 +2758,14 @@ fn build_refine_query_problem_skeleton(
         for (j, p) in problem.params.iter().enumerate() {
             swrite!(smt, "(n_{j} {}) ", sort(p.bw as u32));
         }
-        swrite!(smt, ") (=> (and {} {} (not {})) {})))\n", a_x, var_range_conds(&problem.vars, bv), g_s, post_s);
+        swrite!(
+            smt,
+            ") (=> (and {} {} (not {})) {})))\n",
+            a_x,
+            var_range_conds(&problem.vars, bv),
+            g_s,
+            post_s
+        );
     }
 
     smt.push_str("(check-sat)\n");
@@ -2780,7 +2830,12 @@ fn build_bounded_leap_query_problem(
     }
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        swrite!(smt, "(declare-const l_{r} {})\n(declare-const u_{r} {})\n", sort(ebw), sort(ebw));
+        swrite!(
+            smt,
+            "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
+            sort(ebw),
+            sort(ebw)
+        );
     }
     // B ⊑ A′ ⊏ A (Algorithm 5). `limits == None` relaxes the `B ⊑ A′`
     // half (the optimality query's "B is still ⊥" case).
@@ -2789,9 +2844,23 @@ fn build_bounded_leap_query_problem(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
-        swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rge, lit(&row.lb, ebw, &off), rle, lit(&row.ub, ebw, &off));
+        swrite!(
+            smt,
+            " ({} l_{r} {}) ({} u_{r} {})",
+            rge,
+            lit(&row.lb, ebw, &off),
+            rle,
+            lit(&row.ub, ebw, &off)
+        );
         if let Some(limits) = limits {
-            swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rle, lit(&limits.lb[r], ebw, &off), rge, lit(&limits.ub[r], ebw, &off));
+            swrite!(
+                smt,
+                " ({} l_{r} {}) ({} u_{r} {})",
+                rle,
+                lit(&limits.lb[r], ebw, &off),
+                rge,
+                lit(&limits.ub[r], ebw, &off)
+            );
         }
         swrite!(smt, " ({} l_{r} u_{r})", rle);
     }
@@ -2803,7 +2872,14 @@ fn build_bounded_leap_query_problem(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rgt, rlt) = row_gt_lt(row, bv);
-        swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rgt, lit(&row.lb, ebw, &off), rlt, lit(&row.ub, ebw, &off));
+        swrite!(
+            smt,
+            " ({} l_{r} {}) ({} u_{r} {})",
+            rgt,
+            lit(&row.lb, ebw, &off),
+            rlt,
+            lit(&row.ub, ebw, &off)
+        );
     }
     smt.push_str("))\n");
 
@@ -2866,7 +2942,14 @@ fn build_bounded_leap_query_problem(
         for (j, p) in problem.params.iter().enumerate() {
             swrite!(smt, "(n_{j} {}) ", sort(p.bw as u32));
         }
-        swrite!(smt, ") (=> (and {} {} (not {})) {})))\n", a_x, var_range_conds(&problem.vars, bv), g_s, post_s);
+        swrite!(
+            smt,
+            ") (=> (and {} {} (not {})) {})))\n",
+            a_x,
+            var_range_conds(&problem.vars, bv),
+            g_s,
+            post_s
+        );
     }
 
     smt.push_str("(check-sat)\n");
@@ -4317,7 +4400,12 @@ fn build_bounded_leap_query(
     }
     for (r, row) in rows.iter().enumerate() {
         let ebw = row.enc_bw();
-        swrite!(smt, "(declare-const l_{r} {})\n(declare-const u_{r} {})\n", sort(ebw), sort(ebw));
+        swrite!(
+            smt,
+            "(declare-const l_{r} {})\n(declare-const u_{r} {})\n",
+            sort(ebw),
+            sort(ebw)
+        );
     }
 
     // B ⊑ A′ ⊏ A in bound terms (ENCODED domain, Diff rows offset):
@@ -4329,9 +4417,23 @@ fn build_bounded_leap_query(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rge, rle) = row_ge_le(row, bv);
-        swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rge, lit(&row.lb, ebw, &off), rle, lit(&row.ub, ebw, &off));
+        swrite!(
+            smt,
+            " ({} l_{r} {}) ({} u_{r} {})",
+            rge,
+            lit(&row.lb, ebw, &off),
+            rle,
+            lit(&row.ub, ebw, &off)
+        );
         if let Some(limits) = limits {
-            swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rle, lit(&limits.lb[r], ebw, &off), rge, lit(&limits.ub[r], ebw, &off));
+            swrite!(
+                smt,
+                " ({} l_{r} {}) ({} u_{r} {})",
+                rle,
+                lit(&limits.lb[r], ebw, &off),
+                rge,
+                lit(&limits.ub[r], ebw, &off)
+            );
         }
         swrite!(smt, " ({} l_{r} u_{r})", rle);
     }
@@ -4345,7 +4447,14 @@ fn build_bounded_leap_query(
         let ebw = row.enc_bw();
         let off = row.offset();
         let (rgt, rlt) = row_gt_lt(row, bv);
-        swrite!(smt, " ({} l_{r} {}) ({} u_{r} {})", rgt, lit(&row.lb, ebw, &off), rlt, lit(&row.ub, ebw, &off));
+        swrite!(
+            smt,
+            " ({} l_{r} {}) ({} u_{r} {})",
+            rgt,
+            lit(&row.lb, ebw, &off),
+            rlt,
+            lit(&row.ub, ebw, &off)
+        );
     }
     smt.push_str("))\n");
 
@@ -4472,7 +4581,17 @@ fn build_bounded_leap_query(
     };
 
     // Init: Pre(X) ∧ ranges(X) → A'(X) — see `build_refine_query_skeleton`.
-    swrite!(smt, "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n", pre, loop_var_range_conds(n, bws, signed, bv), a_x, a_x, guard, trans, a_xp);
+    swrite!(
+        smt,
+        "  (and (=> (and {} {}) {}) (=> (and {} {} {}) {}))\n",
+        pre,
+        loop_var_range_conds(n, bws, signed, bv),
+        a_x,
+        a_x,
+        guard,
+        trans,
+        a_xp
+    );
     smt.push_str("))\n");
     smt.push_str("(check-sat)\n");
     if get_model {

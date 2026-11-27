@@ -1,0 +1,43 @@
+name: Toolchain bump
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync lean-toolchain + lake update
+        id: sync
+        run: |
+          set -euo pipefail
+          cd research/underline-lanes/lean
+          before="$(cat lean-toolchain)"
+          # Track release tags: mathlib master's lean-toolchain points to the latest release.
+          curl -fsSL https://raw.githubusercontent.com/leanprover-community/mathlib4/master/lean-toolchain -o lean-toolchain
+          after="$(cat lean-toolchain)"
+          lake update mathlib || true
+          lake exe cache get || true
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$after"   >> "$GITHUB_OUTPUT"
+          if [ "$before" = "$after" ]; then echo "changed=false" >> "$GITHUB_OUTPUT"; else echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Open PR if the toolchain moved
+        if: steps.sync.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(lean): track mathlib toolchain ${{ steps.sync.outputs.after }}"
+          title: "chore(lean): track mathlib toolchain ${{ steps.sync.outputs.after }}"
+          body: |
+            Automated bump: `${{ steps.sync.outputs.before }}` → `${{ steps.sync.outputs.after }}`.
+
+            Follow upstream mathlib release. Confirm the Lean job (hard gate) is green before merging.
+          branch: toolchain-bump
+          delete-branch: true
+          labels: dependencies

@@ -107,6 +107,88 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
 
+  # `cross-aarch64` only *compiles* the NEON tier.  The overlap-tail bug in
+  # `next_non_ascii_byte` (NEON and wasm never had the masked tail the x86
+  # kernels do — their tail was the re-dispatch that the x86 cleanup deleted) was
+  # a silent wrong answer, not a build error: no amount of type-checking would
+  # have caught it.  So the aarch64 leg also *executes* the ascii tests under
+  # qemu, which is the only way the NEON kernels run in CI at all.
+  #
+  # Scope is deliberately the `ascii` tests only.  They are the only suite whose
+  # behaviour is architecture-selected (`#[cfg(target_arch)]` + `#[target_feature]`
+  # tiers); the rest is arch-agnostic and already runs on x86.  Running all ~2.5k
+  # tests under qemu would multiply the job's wall clock for no extra coverage.
+  #
+  # wasm32 still cannot run here: `z3 = { features = ["vendored"] }` needs a C++
+  # toolchain for the target and none exists for `wasm32-unknown-unknown`
+  # (documented at `cross-platform` above).  The wasm tail arithmetic and its
+  # `bitmask & !((1 << skip) - 1)` mask are therefore covered on x86 by
+  # `ascii::tests::tail_overlap_16_and_its_masks_cover_every_remainder`, which
+  # re-derives both backends' masks from the same `skip`.
+  test-aarch64:
+    name: Test (aarch64, qemu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-test
+      - run: sudo apt-get update && sudo -A apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user-static
+      - run: cargo test --bin ponent --locked --target aarch64-unknown-linux-gnu -- ascii
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          # `-L` supplies the aarch64 loader and libc for the dynamically linked
+          # test binary; without it qemu exits with ENOENT on the interpreter.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+
+  # Target *checks* for the backends an x86 runner cannot see.
+  #
+  # Every backend in `diagnostics/ascii.rs` is `#[cfg(target_arch = ...)]`, so an x86
+  # job compiles none of them.  The wasm `next_non_ascii_byte` tail once shipped
+  # containing aarch64 intrinsics (`vld1q_u8`, `LANE_IDX`, `first_high_lane`) — the
+  # wasm backend had never compiled and nothing said so.  `cargo check` does not link,
+  # so each of these costs seconds.
+  #
+  # aarch64 is blocking: the target's libs come from rustup and no C/C++ toolchain is
+  # needed for `check`.
+  check-aarch64:
+    name: Check (aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-check
+      - run: cargo check --bin ponent --locked --target aarch64-unknown-linux-gnu
+
+  # wasm32 is **advisory** until the `z3 = { features = ["vendored"] }` C++ blocker
+  # below is resolved: the dependency graph cannot be built for the target at all, so
+  # a failing check says nothing about this crate's wasm code.  `continue-on-error`
+  # keeps the job informative (it prints the blocker) without gating PRs on a
+  # dependency we cannot cross-build; when that lands, delete the flag and the
+  # `ascii.rs` wasm backend is covered from that day on.
+  check-wasm32:
+    name: Check (wasm32, advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-check
+      - run: cargo check --bin ponent --locked --target wasm32-unknown-unknown
+
   msrv:
     name: MSRV (rust-version)
     runs-on: ubuntu-latest
@@ -139,17 +221,38 @@ jobs:
 
   lean:
     name: Lean (UnderlineLanes)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8core
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # The Lean witnesses live with the research note; lean-action reads the
-      # toolchain file and lakefile from that package directory and runs
-      # `lake build` (including the mathlib cache).
+
+      - name: Add swap
+        run: |
+          sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288 status=none
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Guard toolchain alignment
+        run: |
+          set -euo pipefail
+          cd research/underline-lanes/lean
+          want="$(cat lean-toolchain)"
+          echo "project lean-toolchain : $want"
+          case "$want" in
+            *:v4.36.0) echo "toolchain pinned to release v4.36.0 OK" ;;
+            *) echo "::error::unexpected lean-toolchain $want, expected release v4.36.0"; exit 1 ;;
+          esac
+
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: research/underline-lanes/lean
           use-github-cache: true
           use-mathlib-cache: true
+          build-args: "--quiet"
+        env:
+          LEAN_NUM_THREADS: "2"
 
   benchmark:
     name: Benchmarks (measurement data)

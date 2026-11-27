@@ -223,15 +223,21 @@ impl Renderer for HtmlRenderer {
         out.write_str("</body>\n</html>")
     }
 
-    fn render_suppressed_note(&self, count: usize) -> String {
-        let mut s = String::from("<div class='summary' role='status'>");
+    /// HTML's trailer is markup, not the terminal `= note:` line.
+    ///
+    /// Overrides **`_into`**, which is the single hook: the default
+    /// `render_suppressed_note` already routes through it, so overriding the `String`-returning
+    /// form (as this did) left the `_into` path — the one the emitter calls to reuse its buffer
+    /// — falling back to the terminal text.  Two overridable hooks for one behaviour is exactly
+    /// the drift this file's contract discipline forbids.
+    fn render_suppressed_note_into(&self, count: usize, out: &mut String) {
+        out.push_str("<div class='summary' role='status'>");
         crate::diagnostics::i18n::render_into(
             "suppressed-note",
             &[("count", Cow::Owned(count.to_string()))],
-            &mut s,
+            out,
         );
-        s.push_str("</div>\n");
-        s
+        out.push_str("</div>\n");
     }
 }
 
@@ -295,7 +301,11 @@ impl HtmlRenderer {
         // Route through the accessors so a kind-built diagnostic that was
         // never humanized fails the same debug assert as the JSON renderer
         // instead of silently rendering an empty message.
-        let msg_esc = self.escape(diag.message());
+        // Bound, not inlined: `display_message` may return an owned fallback, and the
+        // escaped text outlives the temporary the inline form would drop at the end
+        // of the statement (E0716).
+        let message = diag.display_message();
+        let msg_esc = self.escape(&message);
         html.push_str("<summary><span class='code'>");
         html.push_str(level_label);
         html.push_str("</span>: <span class='message'>");

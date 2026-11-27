@@ -6,13 +6,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use swrite::{SWrite, swrite, swriteln};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Duration;
+use swrite::{SWrite, swrite, swriteln};
 
 #[derive(Debug, Clone)]
 enum Z3Availability {
@@ -514,7 +514,8 @@ impl SmtSolver {
             swriteln!(
                 smt,
                 "(push 1)\n(assert (= (shape-of iv_{}) {}))\n(check-sat)\n(pop 1)",
-                var_id, name
+                var_id,
+                name
             );
         }
 

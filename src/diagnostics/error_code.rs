@@ -1,3 +1,55 @@
+//! Registry codes, untrusted spellings, and the two rendered URL forms.
+//!
+//! ## Rejected / measurement-gated designs
+//!
+//! Recorded with their blockers so they are not re-derived (the same ledger style
+//! `render.rs` and the emitter use):
+//!
+//! * **SWAR `encode_url_path_segment`.** Rejected unless a profile asks. The
+//!   function is memoized per shape-valid spelling (`OtherCode::encoded`) and capped
+//!   at `MAX_CODE_CHARS` for junk (≤512 B), so it is sub-µs end-to-end; a multi-lane
+//!   classifier would also need the per-lane `(b − 0x30) | (0x39 − b)` form, because a
+//!   single `0x30303030`-subtract comparison is wrong across lanes (cross-lane
+//!   borrows).
+//! * **`CODE_INDEX` as `Option<NonZeroU32>` indices instead of pointers.** Would save
+//!   8 KB of `.data.rel.ro` and ~2,000 relocations, but adds a `lea` plus an index
+//!   read on *every* construction path — the opposite trade from the change that put
+//!   the pointer there (documented on the item). Measure binary size and relocations
+//!   before reopening.
+//! * **`AtomicPtr<Box<str>>` slot caches for the four `OnceLock` tables.** 24 B → 8 B
+//!   per slot (128 KB of *virtual* BSS), but re-implements `OnceLock`'s
+//!   park-the-loser protocol to save pages that are lazily committed anyway, and the
+//!   hit path is unchanged. Rejected: pay complexity only where the hit path changes.
+//! * **Precomputing doc URLs for every shape-valid slot into the generated table.**
+//!   ~100–120 KB of *resident* `.rodata` for ~1,800 slots that mostly never render;
+//!   the lazy per-slot cache commits page by page and is strictly better.
+//! * **Tagged-pointer `ErrCode` (8 B, `NonZero<usize>` with a bit-0 tag).** The one
+//!   genuinely large structural win (`ErrCode` 16 → 8 B, `Option<ErrCode>` 16 → 8 B,
+//!   and the `Option` niche contract stops mattering), but it is `unsafe` pointer
+//!   tagging and raw-pointer reconstruction for a struct-layout win on a path measured
+//!   at single-digit nanoseconds. Revisit only if `Diagnostic` size ever appears in a
+//!   profile, and only if the crate relaxes its no-unsafe rule.
+//! * **Single-pass scanner in `literal_codes_are_all_in_code_table`.** Test-only, ~3×
+//!   on that test; listed for completeness, not worth the rewrite on its own.
+//! * **One `parts()` helper fusing the three enum dispatches** (`url_ansi`'s
+//!   `ansi_cacheable` + `slot`, `url_for_slot_with_port`'s `slot` + `inner` +
+//!   `canonical`, `visible_text`'s match).  Would save ~2-4 predictable branches per
+//!   rendered diagnostic, but it is a pure refactor of correct code on the hot path;
+//!   the standing risk ("three call sites of one operation drift") is already handled by
+//!   the docs at each site.  Not done here because it needs its own before/after
+//!   measurement to justify touching the header path, not because it is hard.
+//! * **Streaming `write_url`** (a writer core so an uncacheable spelling stops
+//!   allocating a `String` per render).  Real win, moderate refactor: it also
+//!   consolidates the OSC framing that `write_ansi_hyperlink` and `url_ansi_build`
+//!   currently duplicate.  Precondition is measurement on a profile that shows
+//!   uncacheable spellings rendering repeatedly — today only junk shapes and
+//!   non-canonical `unknown("e030")` do.
+//! * **One `Memo` struct instead of three `OnceLock<Option<Box<str>>>`** in `OtherCode`
+//!   (~24-32 B per unknown code, plus two lock round-trips).  Deferred with the C1
+//!   `sanitized()` fix in place: merging the memos changes the invariant that fix
+//!   documents ("`None` ⇒ borrow `render_text()`"), so it wants one deliberate edit
+//!   rather than a drive-by while fixing the cap bypass.
+
 use compact_str::CompactString;
 use std::borrow::Cow;
 use std::fmt;
@@ -83,7 +135,10 @@ const SLOT_CACHE_SLOTS: usize = 2048;
 /// storing the pointer removes a bounds-checked `CODE_TABLE[idx]` read and the
 /// `u16::MAX` sentinel from the hottest construction path, and makes
 /// `ErrCode::slot()` a field read.  `Option<&T>` occupies the niche, so the
-/// table stays 8 bytes per slot (16 KB BSS, committed page by page like any).
+/// table stays 8 bytes per slot.  The slots hold relocations, so the table is
+/// **not** lazily-committed BSS: it lives in `.data.rel.ro` and is fully resident
+/// (16 KB).  This is the distinction `SlotCache`'s doc exists to keep straight — a
+/// resident-size audit that assumed BSS would be wrong by the whole table.
 static CODE_INDEX: [Option<&'static ErrCodeInner>; CODE_INDEX_SLOTS] = build_code_index(CODE_INNER);
 /// The registry must stay indexable by a `u16` *slot* (see `slot()`): fail the
 /// build, not a lookup, if it ever outgrows that.  (This was documented as "the
@@ -271,9 +326,51 @@ pub fn set_explain_port(port: u16) -> Result<(), u16> {
 }
 
 /// Whether the explain server is running (its port has been set).
+/// Whether an explain server is running, as the *effective* port sees it.
+///
+/// Routed through [`explain_port`] rather than reading `EXPLAIN_PORT` directly: under
+/// `cfg(test)` the per-thread override shadows the process global, and reading the
+/// global made the two disagree ("port 41234 is effective" but "server not running").
+/// Production behaviour is identical — `explain_port` falls through to the global.
 pub fn is_explain_server_running() -> bool {
-    EXPLAIN_PORT.get().is_some()
+    explain_port().is_some()
 }
+
+/// Every `ErrorCategory`, in one place: the const block below pins `index()` as a dense
+/// bijection onto `0..COUNT` at **compile** time.
+///
+/// The runtime test alone left a release build free to ship a duplicate or out-of-range
+/// index (`label()`'s slug array is ordered by `index()`, so a duplicate silently
+/// permutes localized labels).  This file's policy is "fail the build, not a lookup".
+const ALL_CATEGORIES: [ErrorCategory; ErrorCategory::COUNT] = [
+    ErrorCategory::Parse,
+    ErrorCategory::Resolution,
+    ErrorCategory::Type,
+    ErrorCategory::Contract,
+    ErrorCategory::Trait,
+    ErrorCategory::Inference,
+    ErrorCategory::Internal,
+    ErrorCategory::Generic,
+];
+const _: () = {
+    let mut seen = [false; ErrorCategory::COUNT];
+    let mut i = 0;
+    while i < ALL_CATEGORIES.len() {
+        let idx = ALL_CATEGORIES[i].index();
+        assert!(
+            idx < ErrorCategory::COUNT,
+            "an ErrorCategory index is out of range"
+        );
+        assert!(!seen[idx], "two ErrorCategory variants share an index");
+        seen[idx] = true;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < ErrorCategory::COUNT {
+        assert!(seen[j], "ErrorCategory::index is not dense");
+        j += 1;
+    }
+};
 
 /// Build the explanation URL for a code, given an explicit port.
 ///
@@ -617,6 +714,25 @@ const _: () = {
 /// `code()` echoes `"e030"` for the unresolved form.  `code()` is the stored
 /// spelling, **not** the identity — keying a `HashSet<ErrCode>` on it would
 /// split one code into two entries.
+///
+/// # Why `Option<ErrCode>` is 16 bytes, and what would break it
+///
+/// `ErrCode` is two words.  The niche that lets `Option<ErrCode>` stay two words comes
+/// from the `Known` variant's `&'static ErrCodeInner` — a reference can never be null,
+/// and rustc descends through this newtype and the tagged enum to find it, so no extra
+/// discriminant is needed.  Two consequences worth stating:
+///
+/// * This is **compiler layout behaviour**, not a language guarantee.  A rustc change,
+///   or a third variant without a niche, flips `Option<ErrCode>` to 32 bytes.
+///   `err_code_stays_two_words` is the guard: if it fails, the fallback cost is one
+///   extra word on every `Option<ErrCode>` (e.g. `Diagnostic::code`), nothing worse.
+/// * `url()`'s `DOC_URL_CACHE` arm deliberately omits the `cacheable` guard that
+///   `url_ansi` has.  That is *structurally* sound, not an oversight: the arm is
+///   reached only when `inner()` is `None`, and a slot-ful code always has an inner, so
+///   the spelling is canonical by construction (`other_repr` is the only constructor
+///   that stores no slot).  A future caller of `other_repr` that passed a registry
+///   payload with no slot would invalidate it — which is why the argument lives here
+///   and not in a comment at the call site.
 #[derive(Clone)]
 pub struct ErrCode(ErrCodeRepr);
 
@@ -779,7 +895,15 @@ impl OtherCode {
             }
         }) {
             Some(clean) => clean,
-            None => &self.raw,
+            // `None` means "nothing needed replacing", so borrow the **rendered**
+            // (capped) text — never `raw`: an over-cap spelling with no control
+            // bytes took this arm and bypassed `MAX_CODE_CHARS` on every visible
+            // surface, while the URL *segment* (`encoded_segment`) stayed capped.
+            // A 100 KB junk spelling therefore rendered as a 100 KB label over a
+            // 128-byte hyperlink, in `Display`, `visible_text()` and both ANSI
+            // wrappers.  Both locks are independent (`capped` never calls
+            // `sanitized`), so the nesting cannot deadlock.
+            None => self.render_text(),
         }
     }
 
@@ -861,44 +985,16 @@ impl Eq for ErrCode {}
 /// I-cache tight — the same treatment `ascii.rs::x86_level_init` gets.  `raw`
 /// keeps the caller's verbatim spelling; `canonical` is the resolved entry when
 /// a differently-cased spelling hit the table.
-/// FNV-1a over `s` — *recorded*, not used by `Hash`.
+/// No precomputed hash exists, deliberately.
 ///
-/// `Hash` hashes `canonical()`'s bytes through the caller's hasher (see the impl:
-/// the precomputed value was inconsistent with `Eq` and bypassed the map's own
-/// keying, so it could not protect a `HashMap<ErrCode, _>` from spellings an
-/// attacker mints through `ErrCode::unknown`).  This value stays as a *generation
-/// canary*, not a hashing path: the const block's
-/// `code_inner_hashes_match_code_hash` assert re-derives it for every canonical
-/// spelling and compares it with the value the generator emitted into `CODE_INNER`,
-/// so a generator/registry mismatch fails the build instead of a test.  (No runtime
-/// code calls it; `code_inner_agrees_with_the_runtime_payload` compares spellings.)
-const fn code_hash(s: &str) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let bytes = s.as_bytes();
-    let mut h = OFFSET;
-    let mut i = 0;
-    while i < bytes.len() {
-        h ^= bytes[i] as u64;
-        h = h.wrapping_mul(PRIME);
-        i += 1;
-    }
-    h
-}
-
-/// FNV-1a over the canonical spelling.
-///
-/// The hash must be **identical across representations**: a registry code and a
-/// spelling of it that resolved through `Other` compare equal (see
-/// `PartialEq`/`Hash`), so they must hash equal too.  It is precomputed because
-/// `Hash` for an `ErrCode` is one indexed load plus `write_u64`.
-///
-/// The value **is** seeded (`hash_seed`) despite that: an earlier note claimed the
-/// inputs were "compiler source and diagnostic strings, not attacker-chosen keys",
-/// which is false — `ErrCode::unknown` takes CLI arguments, `Diagnostic::with_code_str`
-/// values and LSP-supplied text, so a fixed hash function made a
-/// `HashMap<ErrCode, _>` a flooding target (the outer `Hasher`'s SipHash keying
-/// cannot help: the collision would already be in the `u64` handed to it).
+/// `Hash for ErrCode` derives from `canonical()` through the caller's hasher, so it
+/// agrees with `PartialEq` *structurally* rather than by keeping two stored values in
+/// agreement — the old precomputed FNV value was inconsistent with `Eq` and bypassed
+/// the map's own SipHash keying, which is exactly how a `HashMap<ErrCode, _>` became a
+/// flooding target (see the `Hash` impl).  A generation canary was tried on top of it
+/// and then deleted: the `canonical == entry.code` comparison in
+/// `code_inner_agrees_with_the_runtime_payload` already subsumes it, and it cost 8
+/// bytes in every registry entry's `.rodata`.
 /// Wrap `url` in an OSC 8 hyperlink around `visible`.
 /// Payload for a registry entry.
 ///
@@ -1255,14 +1351,18 @@ impl ErrCode {
                     // A slot-less spelling has no per-slot cache; its encoding is
                     // memoized in the payload instead, so this branch is one memo read
                     // plus the URL assembly.
-                    let encoded = match &self.0 {
-                        ErrCodeRepr::Other(o) => Some(o.encoded_segment()),
-                        ErrCodeRepr::Known(_) => None,
+                    //
+                    // This arm is reachable only with `slot == None`, and a slot-less
+                    // code is always an `Other` payload (`other_repr` is the only
+                    // constructor that stores no slot, and every registry code carries a
+                    // generator slot).  The `Known => None` case that used to sit here was
+                    // therefore dead — and had it ever been reached it would have built
+                    // the URL from the *uncapped* `canonical()`, the same
+                    // `MAX_CODE_CHARS` bypass `sanitized()` just had.
+                    let ErrCodeRepr::Other(other) = &self.0 else {
+                        unreachable!("a slot-less code is always an `Other` payload")
                     };
-                    std::borrow::Cow::Owned(match encoded {
-                        Some(segment) => doc_url_from_encoded(segment),
-                        None => explain_url_with_port(self.canonical(), None),
-                    })
+                    std::borrow::Cow::Owned(doc_url_from_encoded(other.encoded_segment()))
                 }
                 Some(slot) => {
                     static DOC_URL_CACHE: SlotCache = new_slot_cache();
@@ -1872,16 +1972,9 @@ mod tests {
     /// `CODE_INDEX`'s build-time assertions rely on the same discipline.
     #[test]
     fn category_index_is_dense_and_unique() {
-        let all = [
-            ErrorCategory::Parse,
-            ErrorCategory::Resolution,
-            ErrorCategory::Type,
-            ErrorCategory::Contract,
-            ErrorCategory::Trait,
-            ErrorCategory::Inference,
-            ErrorCategory::Internal,
-            ErrorCategory::Generic,
-        ];
+        // The *same* list the `const _` block above pins, so the compile-time check and
+        // the runtime test cannot drift (the test used to build its own copy).
+        let all = ALL_CATEGORIES;
         let mut seen = [false; ErrorCategory::COUNT];
         for cat in all {
             let i = cat.index();
@@ -2152,7 +2245,10 @@ mod tests {
             ">", "&", "?", "#", "[", "]",
         ];
         for _ in 0..2_000 {
-            let n = (next() % 8) as usize;
+            // Up to 200 *components*, so spellings well past `MAX_CODE_CHARS` (128) are
+            // generated: the previous `% 8` corpus never left the under-cap path, which
+            // is exactly how the clean-over-cap arm of `sanitized()` went unnoticed.
+            let n = (next() % 200) as usize;
             let mut spelling = String::new();
             for _ in 0..n {
                 spelling.push_str(alphabet[(next() % alphabet.len() as u64) as usize]);
@@ -2213,6 +2309,39 @@ mod tests {
                 assert!(prefix || c != '/', "raw path separator in {url:?}");
             }
         }
+    }
+
+    /// `MAX_CODE_CHARS` must hold on the **clean** over-cap path too.
+    ///
+    /// `sanitized()`'s `None` arm means "nothing needed replacing", and it used to
+    /// borrow `raw` — so an over-cap spelling with no control bytes (the common shape
+    /// for junk input) flowed uncapped into `Display`, `visible_text()` and the ANSI
+    /// link text, while the URL *segment* stayed capped: a 256-char label over a
+    /// 128-char link.  The fuzz corpus never caught it because it generated at most
+    /// seven characters.
+    #[test]
+    fn render_surfaces_cap_over_cap_clean_spellings() {
+        let raw = "junk".repeat(64); // 256 chars, zero control bytes
+        assert!(raw.chars().count() > MAX_CODE_CHARS);
+        let code = super::ErrCode::unknown(raw.as_str());
+
+        let shown = format!("{code}");
+        assert_eq!(
+            shown.chars().count(),
+            MAX_CODE_CHARS + 1,
+            "Display must cap at MAX_CODE_CHARS plus the ellipsis"
+        );
+        assert!(shown.ends_with('…'), "{shown:?}");
+        assert_eq!(code.visible_text(), shown);
+
+        // The hyperlink's *label* goes through the same surface; the segment inside
+        // the OSC opener is capped independently by `encoded_segment`.
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ansi = code.url_ansi();
+        assert!(
+            ansi.ends_with("…\x1b]8;;\x1b\\"),
+            "the hyperlink label must be capped too: {ansi:?}"
+        );
     }
 
     #[test]
@@ -2681,7 +2810,17 @@ mod tests {
             // `raw_string_opener`'s guard above.
             let str_quote = if bytes[i] == b'"' {
                 opener_boundary_ok(bytes, i).then_some(i)
-            } else if bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+            } else if (bytes[i] == b'b' || bytes[i] == b'c')
+                && i + 1 < bytes.len()
+                && bytes[i + 1] == b'"'
+            {
+                // `c"…"` is a plain C string literal and `code_literals` already
+                // skips it; this blanking pass did not, so a callee name inside one
+                // (`c"see ErrCode::new(\"E999\")"`) survived as "code" and made
+                // `literal_codes_are_all_in_code_table` demand registration of a
+                // spelling that is pure data.  `cr#"…"#` is handled by
+                // `raw_string_opener` above; `c'…'` needs nothing (the char arm
+                // blanks the content and a lone `c` cannot form a callee).
                 opener_boundary_ok(bytes, i).then_some(i + 1)
             } else {
                 None
@@ -3080,6 +3219,27 @@ mod tests {
         // strings, and char literals are blanked.
         assert_eq!(stripped.matches("with_code_str").count(), 1);
         assert_eq!(stripped.matches("ErrCode::new").count(), 0);
+    }
+
+    /// `c"…"` is a plain C-string literal; blanking it keeps a callee name inside it
+    /// from looking like a call site.
+    ///
+    /// `code_literals` already skipped `c"…"` and `raw_string_opener` covers
+    /// `cr#"…"#`, but this pass's opener test only accepted `"` and `b"` — so
+    /// `c"ErrCode::new(\"E999\")"` survived as "code" and
+    /// `literal_codes_are_all_in_code_table` demanded registration of a spelling that
+    /// is pure data.  The three scanners disagreeing is exactly the silent drift
+    /// their docs warn about.
+    #[test]
+    fn strip_non_code_blanks_c_string_literals() {
+        let src = r#"let s = c"ErrCode::new(\"E999\")"; let real = ErrCode::new("E030");"#;
+        let stripped = strip_non_code(src);
+        assert_eq!(stripped.len(), src.len(), "offsets must be preserved");
+        assert_eq!(
+            stripped.matches("ErrCode::new").count(),
+            1,
+            "only the real call site may survive: {stripped:?}"
+        );
     }
 
     /// Inner-doc comments (`//!`) are item-level only, and are the one comment

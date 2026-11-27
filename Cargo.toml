@@ -134,6 +134,7 @@ swrite = "0.1.0"
 itoa = "1"
 iota = "0.2.3"
 duplicate = "2.0.1"
+exitcode = "1.1.2"
 
 # The AUTHORITATIVE Polonius R1-R8 engine (rustc's own), used as a
 # differential oracle in tests: our `evaluate_rules` must agree with it
@@ -225,4 +226,13 @@ harness = false
 # SWAR tier and compare it against the vector paths in the same binary.
 [[bench]]
 name = "ascii_dispatch"
+harness = false
+
+# Allocation counts per sink batch (`src/diagnostics/sink.rs`): the "measure the
+# allocation claims" harness those docs ask for. `harness = false` because it
+# installs a counting `GlobalAlloc` and prints a table — a `criterion` harness
+# would time the allocator instead of counting it, and a unit test cannot own a
+# process-wide allocator without perturbing the rest of the suite.
+[[bench]]
+name = "alloc_counts"
 harness = false

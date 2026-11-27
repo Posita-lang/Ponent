@@ -312,20 +312,12 @@ pub fn load_registry(dir: &Path) -> Registry {
 /// constant; `doc_url_prefix_matches` pins the agreement).
 const DOC_URL_PREFIX: &str = "https://doc.posita-lang.org/error_codes/";
 
-/// FNV-1a over the canonical spelling.
-///
-/// Must equal `error_code::code_hash` — the runtime precomputes the same value
-/// for interned spellings, and `code_inner_hashes_match_code_hash` pins it.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = OFFSET;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
-}
+// The generator used to emit a per-entry FNV-1a canary (`fnv1a` here, mirrored by
+// `error_code::code_hash`) for a const assert to re-derive.  Both were deleted: the
+// spelling-equality check in `code_inner_agrees_with_the_runtime_payload` subsumes
+// the property, and the canary cost 8 bytes in every registry entry's `.rodata`.
+// Do not reintroduce one without deleting that comparison — two homes for one
+// invariant is how they drift.
 
 fn generate_table(entries: &[RegistryEntry]) -> String {
     let mut rs = String::from(

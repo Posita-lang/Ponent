@@ -478,7 +478,7 @@ impl<'src> DiagCtxt<'src> {
                 continue;
             }
             if !diag.is_humanized() {
-                diag.humanize();
+                diag.humanize_contained();
             }
         }
         self.emit_seen_len = self.diags.len();
@@ -503,6 +503,15 @@ impl<'src> DiagCtxt<'src> {
     /// contract: the `#[test]`-wiring guard in `mod.rs` has no equivalent for docs, so
     /// the load-bearing half — the inspection-path warning and the "never called by
     /// `push`" rule — was documented on the wrong function and this one had none.)
+    ///
+    /// # `Lang::set` must not run during an in-flight emit
+    ///
+    /// `Lang` is a process-global atomic and the parallel path below resolves labels in
+    /// several threads at once, so a concurrent `Lang::set` yields **per-diagnostic** mixed
+    /// languages inside a single emit — strictly worse than the documented "freeze at
+    /// humanize time" window.  The emit side therefore has exactly one rule: set the language
+    /// *between* emits, never during one.  Deliberately not snapshotted and restored around
+    /// the batch, because that would silently revert an intentional mid-batch switch.
     pub fn humanize_pending(&mut self) {
         // Loud instead of silent: a frontier past the end panics on the slice below,
         // but the *other* shape of a stale frontier (it claims a prefix that was never
@@ -557,14 +566,14 @@ impl<'src> DiagCtxt<'src> {
                 for slice in pending.chunks_mut(chunk) {
                     scope.spawn(move || {
                         for diag in slice {
-                            diag.humanize();
+                            diag.humanize_contained();
                         }
                     });
                 }
             });
         } else {
             for diag in pending {
-                diag.humanize();
+                diag.humanize_contained();
             }
         }
         self.humanized_len = self.diags.len();
@@ -1773,6 +1782,49 @@ mod tests {
     /// `diags[1..]` on an empty vector) and a silent one: a `push` after the drain
     /// landed at index 0 behind a frontier claiming `0..1` was humanized, so that
     /// diagnostic was never humanized and the renderer emitted an empty message.
+    /// `emit` humanizes only the diagnostics the filter keeps.
+    ///
+    /// The lazy-humanization contract ("filtered-out diagnostics pay nothing") was hollow
+    /// while `emit` humanized the whole unreported suffix and the emitter filtered
+    /// afterwards: a build with `--only-files`/`--allow` paid a full Fluent render — message,
+    /// labels, help, suggestions — for every rejected diagnostic, then dropped it.  `emit`
+    /// now humanizes through the emitter's own filter, and a filtered diagnostic stays
+    /// latched-unhumanized (it is never rendered; `unhumanized_fallback` covers a breach).
+    #[test]
+    fn emit_humanizes_only_the_diagnostics_the_filter_keeps() {
+        use crate::ast::{FileId, Span};
+        use crate::diagnostics::kind::DiagnosticKind;
+
+        let named = |i: u32, file: &'static str| {
+            Diagnostic::error_kind(DiagnosticKind::NameNotFound {
+                name: format!("n{i}").into(),
+                span: Span::new(FileId::DUMMY, i, i + 1),
+                suggestions: crate::smallvec::SmallVec::new(),
+            })
+            .with_file_name(file)
+        };
+        let mut opts = crate::diagnostics::DiagOpts::default();
+        opts.only_files = vec![compact_str::CompactString::from("keep.pn")];
+        let mut emitter = Emitter::new(
+            crate::diagnostics::JsonRenderer::new(false),
+            crate::diagnostics::sink::string(),
+            opts,
+        );
+        let mut c = DiagCtxt::new();
+        c.push(named(0, "keep.pn"));
+        c.push(named(1, "drop.pn"));
+        c.emit(&mut emitter).unwrap();
+
+        assert!(
+            c.iter().next().expect("kept").is_humanized(),
+            "the diagnostic the filter keeps must be humanized"
+        );
+        assert!(
+            !c.iter().nth(1).expect("filtered").is_humanized(),
+            "a filtered diagnostic must never be humanized — that was the whole cost"
+        );
+    }
+
     /// A filtered emit humanizes only the survivors, leaves the dropped ones raw, and
     /// still records that every index has been *processed* — the contract
     /// `humanize_pending_for` documents and the reason the second (`emit_seen_len`)

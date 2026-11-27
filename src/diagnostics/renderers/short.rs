@@ -25,6 +25,19 @@ use std::borrow::Cow;
 /// `file:start..end: …` (byte range) or `level[code]: …` (no source at all),
 /// so the shape stays greppable even for malformed input.
 ///
+/// # Sanitizer scope, stated (invisible characters are deliberately kept)
+///
+/// U+200B (ZWSP), U+200C (ZWNJ), U+200D (ZWJ), U+2060 (word joiner) and U+FEFF (BOM/ZWNBSP) pass
+/// through unchanged.  They are neither line breaks, C0/C1 controls, nor bidi overrides, so the
+/// documented scope of this sanitizer does not cover them.  They are all `0xE2`/`0xEF` lead bytes,
+/// so the fast-path gate already routes such a message to the state machine — dropping them would
+/// therefore cost the clean path **nothing**.
+///
+/// Not adopted, because it is a product decision rather than a correctness fix: the risk is that
+/// zero-width characters can spoof a `file:line:col` stream in CI logs.  Trigger for reopening: a
+/// product call to make the one-line format "greppable and unspoofable"; the edit is one line in
+/// the drop set plus per-codepoint pins for both the file-name and message paths.
+///
 /// Colour, when enabled, is applied only to the `level[code]` tag — the
 /// location and message stay uncoloured so a pipeline that strips ANSI
 /// still sees a clean `file:line:col: message` line.
@@ -391,6 +404,10 @@ fn flatten_component(s: &str) -> Cow<'_, str> {
     if !needs_flatten_or_sanitize(s.as_bytes()) {
         return Cow::Borrowed(s);
     }
+    // `s.len()` is a **lower** bound: each flattened control becomes a 3-byte U+FFFD, so a
+    // control-dense message grows once (amortized, never per character).  Same statement the
+    // message path makes; documented here so the asymmetry with the exact reservations in
+    // `json.rs` reads as contract rather than oversight.
     let mut out = String::with_capacity(s.len());
     push_sanitized_flattened(&mut out, s);
     Cow::Owned(out)
@@ -466,7 +483,7 @@ impl Renderer for ShortRenderer {
         // One fused pass handles bidi removal, control replacement and break
         // collapsing.  `raw_msg.len()` is only a lower bound: U+FFFD growth is
         // rare, and `String` grows amortized rather than paying a pre-scan.
-        let raw_msg = diag.message();
+        let raw_msg = diag.display_message();
 
         // ---- Size the reservation to a lower bound -----------------------
         //   location + tag + ": " + message + "\n"
@@ -493,6 +510,10 @@ impl Renderer for ShortRenderer {
             // the two writes cannot grow the buffer.  (The old comment claimed a
             // bound for `Span`'s `Display`, which this branch never calls.)
             (None, Some(_)) => {
+                // A corrupt span with `start > end` is printed in the order given.  This branch
+                // is a backstop for malformed input, and echoing the values unchanged is the
+                // honest diagnostic (normalising would hide a producer bug behind plausible
+                // output); the greppable shape is preserved either way.
                 if !file.is_empty() {
                     len = len.saturating_add(file.len()).saturating_add(1);
                 }
@@ -586,7 +607,7 @@ impl Renderer for ShortRenderer {
         // ---- Message, sanitized and flattened in a single pass ----------
         // A multi-line message would break the one-line format, and a stray
         // `\r` would make a terminal redraw the line.
-        push_sanitized_flattened(out, raw_msg);
+        push_sanitized_flattened(out, &raw_msg);
         out.push('\n');
     }
 
@@ -618,9 +639,11 @@ impl Renderer for ShortRenderer {
         out.push_str("error[internal]: diagnostic rendering panicked\n");
     }
 
-    fn render_suppressed_note(&self, _count: usize) -> String {
-        String::new()
-    }
+    /// Machine-consumed formats emit no trailer: a `= note:` line (or any markup) would corrupt
+    /// the document.  Overrides `_into`, the single hook the default `render_suppressed_note`
+    /// routes through — overriding only the `String` form left the emitter's buffer-reusing call
+    /// writing the terminal note into a JSON/LSP payload.
+    fn render_suppressed_note_into(&self, _count: usize, _out: &mut String) {}
 }
 
 #[cfg(test)]

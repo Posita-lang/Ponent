@@ -62,23 +62,32 @@ pub enum FixHints {
 impl FixHints {
     #[inline]
     fn accepts(self, app: Applicability) -> bool {
+        // `matches!` is a boolean expression, not an exhaustive `match`: a new
+        // `Applicability` variant compiled cleanly and silently made `Auto`/`Review`/`All`
+        // reject it, i.e. the exact opposite of the "a conscious `--fix-hints=all`
+        // decision" contract.  `All` routes through [`every_applicability`], whose match
+        // lists every variant, so adding one fails the build here — the same guarantee
+        // `applicability_weight` (already an exhaustive `match`) provides.
         match self {
-            FixHints::Auto => matches!(app, Applicability::MachineApplicable),
-            FixHints::Review => matches!(
-                app,
-                Applicability::MachineApplicable | Applicability::MaybeIncorrect
-            ),
-            // Enumerated rather than `true`: a future `Applicability` variant
-            // must be a *conscious* `--fix-hints=all` decision here, matching the
-            // explicit `SuggestionStyle` arms in `collect`.
-            FixHints::All => matches!(
-                app,
-                Applicability::MachineApplicable
-                    | Applicability::MaybeIncorrect
-                    | Applicability::HasPlaceholders
-                    | Applicability::Unspecified
-            ),
+            FixHints::Auto => app == Applicability::MachineApplicable,
+            FixHints::Review => {
+                app == Applicability::MachineApplicable || app == Applicability::MaybeIncorrect
+            }
+            FixHints::All => every_applicability(app),
         }
+    }
+}
+
+/// True for every `Applicability`; the match exists to be **exhaustive**.
+///
+/// A wildcard here would defeat the purpose: the point is that adding a variant is a
+/// compile error at the one place the `--fix-hints=all` policy is decided.
+fn every_applicability(app: Applicability) -> bool {
+    match app {
+        Applicability::MachineApplicable
+        | Applicability::MaybeIncorrect
+        | Applicability::HasPlaceholders
+        | Applicability::Unspecified => true,
     }
 }
 
@@ -205,10 +214,16 @@ impl<'src> FixSet<'src> {
             .iter()
             .flat_map(|d| d.suggestions())
             .filter(|sug| {
-                !matches!(
-                    sug.style,
-                    SuggestionStyle::HideCodeAlways | SuggestionStyle::CompletelyHidden
-                ) && hints.accepts(sug.applicability)
+                // Exact, not approximate: the fill loop additionally requires a span and a
+                // replacement (a text-only suggestion never becomes an edit), so counting
+                // it here over-reserved — and this comment claims exactness.
+                sug.span.is_some()
+                    && sug.replacement.is_some()
+                    && !matches!(
+                        sug.style,
+                        SuggestionStyle::HideCodeAlways | SuggestionStyle::CompletelyHidden
+                    )
+                    && hints.accepts(sug.applicability)
             })
             .count();
         let mut candidates: Vec<FixEdit<'src>> = Vec::with_capacity(eligible);
@@ -341,12 +356,21 @@ impl<'src> FixSet<'src> {
         // "suggestions rarely overlap" case — needs neither the per-file grouping
         // nor the DP/greedy.  One linear scan decides it.
         //
-        // Consecutive checks suffice under `(file, end, start)` order: if `a`
-        // conflicts with some later `b`, then the immediate successor `c` of `a`
-        // has `c.start <= b.start < a.end` for interval/interval and
-        // interval/point, and for point/point the same offset is already deduped;
-        // a point is emitted before an interval containing it (smaller `end`), so
-        // the pair is consecutive there too.
+        // Consecutive checks suffice under `(file, end, start)` order, by this invariant:
+        // **if `a` conflicts with some later `b`, then either `a`'s immediate successor
+        // `c` conflicts with `a`, or `c` conflicts with `b`.**
+        //
+        // (The earlier prose claimed `c.start <= b.start < a.end`; that is false.  With
+        // `a = [0,10)`, `c = [10,11)`, `b = [5,12)` the order is `a, c, b` and `c.start =
+        // 10 >= a.end`, so `c` does *not* conflict with `a` — the pair that fires is
+        // `c`/`b`.  A reader trusting the old sentence could "simplify" this into a
+        // single `a`/`b` comparison and silently lose conflicts.)
+        //
+        // Proof of the invariant: `c` is disjoint from `a` only if `c.start > a.end`,
+        // because the end order guarantees `c.end >= a.end >= a.start`.  `a` conflicts
+        // with `b` gives `b.start <= a.end` (closed-point semantics), so
+        // `b.start <= a.end < c.start`, and `c.end <= b.end` (order), hence
+        // `b.start <= c.end` and `c.start <= c.end <= b.end` — `c` and `b` conflict.
         {
             let mut disjoint = true;
             let mut prev: Option<(FileId, usize)> = None;
@@ -641,9 +665,16 @@ impl<'src> FixSet<'src> {
     #[must_use = "apply_single_file returns the rewritten source and count"]
     pub fn apply_single_file<'s>(&self, source: &'s str) -> (Cow<'s, str>, usize) {
         let anchor = self.edits.first().map(|e| e.span.file);
-        debug_assert!(
+        // A hard assert, not `debug_assert!`.  In release the check was compiled out and
+        // `apply` routed to `apply_for_file_counted(source, first_file)`, so a per-file
+        // loop over a multi-file set spliced the *first* file's edits into every other
+        // file by raw byte offset — silent cross-file corruption.  The foreign-offset
+        // filter inside the pass only prevents the opposite mistake (another file's edits
+        // leaking in), so nothing else catches this.  Cost is one linear scan over an
+        // already-sorted, already-disjoint set, once per `apply`.
+        assert!(
             anchor.is_none_or(|f| self.edits.iter().all(|e| e.span.file == f)),
-            "FixSet::apply_single_file called on a multi-file set; use apply_for_file_counted",
+            "FixSet::apply called on a multi-file set; use apply_for_file/apply_for_file_counted",
         );
         match anchor {
             Some(file) => self.apply_for_file_counted(source, file),
@@ -671,6 +702,13 @@ impl<'src> FixSet<'src> {
         edits: &[FixEdit<'src>],
     ) -> (Cow<'s, str>, usize) {
         let mut applied = 0usize;
+        // `apply_for_file_counted` calls this with an empty slice for every file that has
+        // no fixes, and the prepass below used to run an O(source) `is_ascii` scan for
+        // zero edits — the documented "collect once, apply per file" driver paid that for
+        // most files.
+        if edits.is_empty() {
+            return (Cow::Borrowed(source), 0);
+        }
         // Two passes: an O(n) excess pre-pass sizes the single allocation, and
         // the write pass is the authoritative "did anything apply" test (so the
         // borrowed source is returned when nothing applies).  The old shape
@@ -683,8 +721,12 @@ impl<'src> FixSet<'src> {
         // every shrink counted as zero, so the reservation over-estimated and the
         // shrink savings were lost.  Only the *sum* can be negative, and that just
         // means "no growth beyond `source.len()`".
+        // Reversed spans are skipped here too, not just at apply time: counting them as
+        // a zero-length span made the reservation add the whole replacement, i.e. it
+        // over-reserved exactly on the corrupt input this path claims to tolerate.
         let delta: i64 = edits
             .iter()
+            .filter(|e| e.span.start_as_usize() <= e.span.end_as_usize())
             .map(|e| {
                 e.replacement.len() as i64
                     - e.span
@@ -693,7 +735,13 @@ impl<'src> FixSet<'src> {
             })
             .sum();
         let excess: usize = delta.max(0) as usize;
-        let ascii_source = source.is_ascii();
+        // Density-gated ASCII probe.  The scan buys the per-edit `is_char_boundary`
+        // checks, which are a bounds check plus a sign test each; for the common "a
+        // handful of fixes in a 1 MB file" a full SIMD scan was ~1000x the cost of the
+        // handful it replaces, and in a per-file loop it fired for every file. 32 is
+        // roughly two SIMD widths of checks per scanned byte, so the gate admits exactly
+        // the dense case the optimization was written for.
+        let ascii_source = edits.len().saturating_mul(32) >= source.len() && source.is_ascii();
         let mut out: Option<String> = None;
         let mut last = 0usize;
         for edit in edits {
@@ -924,6 +972,67 @@ mod tests {
                 }
             }
             assert_eq!(got, want, "not maximum-weight for spans {spans:?}");
+        }
+    }
+
+    /// The equal-weight greedy fast path, against the same brute-force oracle.
+    ///
+    /// `resolve_file` forks: all-equal weights take a greedy branch, mixed weights take
+    /// the DP.  The fuzzer above assigns three applicability tiers at random, so an
+    /// all-equal configuration occurs with probability `(1/3)^(n-1)` — invisible at
+    /// `n = 9`.  That greedy branch is the fork most exposed to the **closed-point**
+    /// semantics (this is not a standard interval graph: a point at an interval boundary
+    /// composes with it), so it gets its own corpus rather than riding on the DP's.
+    #[test]
+    fn equal_weight_batches_take_the_greedy_path_optimally() {
+        let mut seed: u64 = 0x9e11_0347_5eed_0007;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let conflicts = |a: (u32, u32), b: (u32, u32)| -> bool {
+            let (sa, ea) = a;
+            let (sb, eb) = b;
+            match (sa == ea, sb == eb) {
+                (true, true) => sa == sb,
+                (true, false) => sb < sa && sa < eb,
+                (false, true) => sa < sb && sb < ea,
+                (false, false) => sa < eb && sb < ea,
+            }
+        };
+        for _ in 0..300 {
+            // Same shape as the weighted fuzzer: `n <= 9`, offsets `< 16`, so boundary
+            // and strictly-interior points both occur.
+            let n = 2 + (next() % 8) as usize;
+            let mut spans: Vec<(u32, u32)> = Vec::with_capacity(n);
+            let mut diags: Vec<Diagnostic<'static>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let start = (next() % 16) as u32;
+                let len = (next() % 4) as u32; // 0 => a zero-length insertion
+                spans.push((start, start + len));
+                // One tier for every edit => identical weights => the greedy branch.
+                diags.push(diag_with_fix(
+                    Span::new(FileId::DUMMY, start, start + len),
+                    "R",
+                    Applicability::MachineApplicable,
+                ));
+            }
+            let got = FixSet::collect(&diags, FixHints::Auto).len();
+            let mut want = 0usize;
+            for mask in 0u32..(1 << n) {
+                let chosen: Vec<usize> = (0..n).filter(|i| mask >> i & 1 == 1).collect();
+                let disjoint = chosen.iter().enumerate().all(|(k, &i)| {
+                    chosen[k + 1..]
+                        .iter()
+                        .all(|&j| !conflicts(spans[i], spans[j]))
+                });
+                if disjoint {
+                    want = want.max(chosen.len());
+                }
+            }
+            assert_eq!(got, want, "greedy lost optimality for spans {spans:?}");
         }
     }
 

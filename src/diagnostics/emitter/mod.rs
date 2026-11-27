@@ -132,6 +132,13 @@ struct FilesSeen {
 /// Inline capacity of [`FilesSeenInner::Small`].  Used in both the array type
 /// and the spill check below so the two cannot silently drift apart (changing
 /// one without the other would move the spill point).
+///
+/// **Measurement-gated, deliberately not raised.**  A 5-file batch pays the
+/// `IndexSet` spill, and the common batch is 1–2 files, so 4 is tighter than ideal;
+/// 8 costs ~500 B of stack per `FilesSeen` and only wins for batches of 5–8.  The
+/// decision needs a benchmark over batch shapes (1/2/4/8/16 distinct files), not an
+/// argument — raising it also changes `FilesSeen`'s size, which the emitter holds per
+/// batch.
 const INLINE_FILES: usize = 4;
 
 enum FilesSeenInner {
@@ -163,10 +170,15 @@ struct NameIndex {
     id_names: rustc_hash::FxHashMap<crate::ast::FileId, SmallVec<[CompactString; 2]>>,
 }
 
-/// Test-only count of `last_pair` buffer allocations.
+/// Test-only count of `last_pair` buffer allocations, per thread.
+///
+/// Thread-local, not a process-global atomic: the assertion is an exact count, and any
+/// other test emitting from another thread would have bumped a shared counter (it did —
+/// this became order-dependent the moment two emitter tests ran in parallel).
 #[cfg(test)]
-pub(crate) static LAST_PAIR_ALLOCS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub(crate) static LAST_PAIR_ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 impl FilesSeen {
     fn new() -> Self {
@@ -420,7 +432,7 @@ impl FilesSeen {
                 // Test-only: makes "the one-entry memo reuses its buffer" measurable
                 // instead of a claim in a comment.
                 #[cfg(test)]
-                LAST_PAIR_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                LAST_PAIR_ALLOCS.with(|c| c.set(c.get() + 1));
                 self.last_pair = Some((id, CompactString::from(name)));
             }
         }
@@ -496,6 +508,35 @@ impl NameIndex {
 struct BatchScratch {
     weights: Vec<usize>,
     order: Vec<usize>,
+    /// Reused claim slots.
+    ///
+    /// Every parallel batch used to allocate `n * 64 B` of `Padded<Mutex<_>>` and free
+    /// it again (256 KB at n=4096).  Hoisting it is safe because a batch provably ends
+    /// with every slot empty — the batch stitch takes each one, and the streaming error
+    /// path drains the rest after the workers are joined — which the `debug_assert` in
+    /// `prepare_slots` checks.  The stitch reads them through `&mut` (`get_mut`), so
+    /// hoisting is a pure win rather than trading an allocation for `n` locks.
+    slots: Vec<Padded<std::sync::Mutex<Option<(String, usize)>>>>,
+}
+
+impl BatchScratch {
+    /// Size and clear the claim slots for a batch of `n`.
+    fn prepare_slots(&mut self, n: usize) {
+        self.slots
+            .resize_with(n, || Padded(std::sync::Mutex::new(None)));
+        for slot in &mut self.slots[..n] {
+            // A slot that survived its batch means the stitch or the error drain
+            // missed it; clearing is correct, but the tripwire is worth having.
+            debug_assert!(
+                slot.0
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none(),
+                "a claim slot survived its batch — the stitch or the stream drain missed it"
+            );
+            *slot.0.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
 }
 
 /// Prebuilt line-table entry shared by all workers.
@@ -575,11 +616,16 @@ struct BatchShared<'a, 'src, R: Renderer> {
     /// way to mutate a diagnostic"), so no synchronization is needed at all; the
     /// slice borrow is what makes that a compile-time fact.
     cells: &'a [&'a Diagnostic<'src>],
-    slots: Vec<Padded<std::sync::Mutex<Option<(String, usize)>>>>,
+    /// The batch's claim slots, borrowed from `BatchScratch` (see its field doc).
+    slots: &'a [Padded<std::sync::Mutex<Option<(String, usize)>>>],
     slot_cv: std::sync::Condvar,
     renderer: &'a R,
     opts: &'a DiagOpts,
     prebuilt: &'a [Prebuilt],
+    /// The worker LRU seed, heaviest-first — deliberately **not** a slice of
+    /// `prebuilt`, which is sorted by `(ptr, len)` for the tier-0 binary search (a
+    /// prefix of that would be four arbitrary sources, not the four heaviest).
+    preload: &'a [Prebuilt],
     /// One buffer pool per resident worker.  A buffer is returned to the pool
     /// of the worker that produced it, so the hot path has no shared mutex.
     string_pools: &'a [std::sync::Mutex<StringPool>],
@@ -587,6 +633,49 @@ struct BatchShared<'a, 'src, R: Renderer> {
 }
 
 /// Largest buffer the pool keeps unconditionally.
+/// Rejected / measured-gated designs for the parallel path.
+///
+/// Recorded rather than re-derived — the same discipline `render.rs`'s "Decision
+/// record" block established.  Each entry names the blocker or the number.
+///
+/// * **Phase 1 (filter + weight + files) parallelization.** Not done.  The
+///   order-dependent `max_errors` gate needs chunk-prefix arithmetic plus a
+///   `FilesSeen` union that preserves the distinct-file count and the suppressed
+///   tally *bit-identically*, and the payoff only starts around 10^4 diagnostics.  No
+///   workload here reaches that; reopen with a rustc-scale batch as an explicit target,
+///   and differential-test the merged Phase 1 against the serial one exactly as
+///   `human_parallel_matches_serial` does for rendering.
+/// * **Folding the prebuild phase into the resident pool.** Not done.  It needs a
+///   two-phase `submit` (prebuild jobs, latch, render jobs) under one `BatchToken`,
+///   with `BatchPermit` retired across the whole window.  The scoped spawns are now
+///   chunked and byte-gated (`prebuild_chunk_len`), so a batch pays `min(P, files)`
+///   spawns; reopen only if a profile shows that cost for a frequently-parallel batch
+///   (an LSP re-publish loop), not for CLI one-shots.
+/// * **One process-wide pool serving humanize + prebuild + render.** Not done.  The
+///   blocker is plumbing, not concept: `DiagCtxt` holds no emitter reference, and a
+///   global pool needs shutdown semantics for tests.  Worth it only if LSP-style
+///   long-lived processes are a first-class target — a product decision.
+/// * **Lock-free per-worker string pool.** Rejected with numbers.  The two
+///   uncontended lock/unlock pairs cost ~40 ns per diagnostic.  True disjoint
+///   ownership is blocked by the borrow checker, not by preference: jobs are
+///   `SendJob<'a>` closures handed to a pool that outlives the batch borrow, so
+///   `split_at_mut`-style `&mut StringPool` handles cannot be proven across the job
+///   indirection.  The sound alternatives (worker-local storage inside the pool's
+///   thread lifecycle, or an intrusive freelist) are high effort for that 40 ns.
+/// * **A "pre-filtered" flag threaded into `emit_ordered`** (skipping the Phase-1
+///   `filter.matches` re-check for the two `&mut` entry points that already filtered).
+///   Not done.  The win is one match per diagnostic and only materialises with
+///   finder-heavy filters (`--only-files` `memmem` scans) on 10^4-diagnostic batches,
+///   while the failure mode of a stale flag is the worst one this subsystem has:
+///   *rendering a dropped diagnostic*.  A one-bit invariant guarding the filter contract
+///   needs a measurement putting the double check on the critical path; reopen with that
+///   bench row, and keep the flag `pub(crate)` set in exactly two places.
+/// * **An inlined small-batch source table in `prebuild_entries`** (linear `SmallVec` up
+///   to 4 sources, spilling to the hash structures).  Not done.  The common batch has 1-2
+///   distinct sources, so the saving is one `FxHashSet` + `FxHashMap` construction per
+///   batch — real, but unmeasured, and the rewrite would have to preserve the
+///   first-appearance order the cache merge depends on.  Reopen with a `benches/` row on a
+///   two-source batch.
 const POOL_SMALL_CAP: usize = 64 * 1024;
 /// Largest *oversize* buffer the pool keeps at all: one per pool, so a single
 /// huge diagnostic cannot evict its size class permanently while worst-case
@@ -603,10 +692,38 @@ const POOL_OVERSIZE_CAP: usize = 1024 * 1024;
 const POOL_BYTE_BUDGET: usize = 512 * 1024;
 
 /// Floor for a single pool's budget after dividing `POOL_BYTE_BUDGET` by the
-/// worker count.  Below ~32 typical 2 KiB render buffers the pool stops amortising
-/// allocations at all, so the division must not drive it to zero on many-core
-/// hosts.
-const POOL_BYTE_BUDGET_MIN: usize = 64 * 1024;
+/// worker count.
+///
+/// The floor exists because a pool with a few hundred bytes of budget retains
+/// nothing worth reusing: reaching a 2 KiB buffer costs the doubling chain (~4
+/// allocations), so the budget has to cover at least a few typical buffers.
+///
+/// **The floor is what makes the aggregate arithmetic exact rather than aspirational.**
+/// With `per_pool = max(512 KiB / P, 8 KiB)` the aggregate is
+///
+/// ```text
+/// P <= 64:  512 KiB            (the documented target, exactly)
+/// P >  64:  8 KiB * P          (1 MiB at 128 workers)
+/// ```
+///
+/// It used to be 64 KiB, which made the aggregate 4 MiB at 64 workers — 8x the
+/// target the surrounding comment claimed, because `max()` hides the multiplication.
+/// 8 KiB still retains four typical 2 KiB render buffers, so the reuse the pool exists
+/// for survives; only the idle ceiling changes.  `const _` below pins the crossover so
+/// a future bump cannot silently reintroduce the 8x.
+const POOL_BYTE_BUDGET_MIN: usize = 8 * 1024;
+const _: () = assert!(POOL_BYTE_BUDGET % POOL_BYTE_BUDGET_MIN == 0);
+const _: () = assert!(POOL_BYTE_BUDGET / POOL_BYTE_BUDGET_MIN == 64);
+
+/// Below this much total source, prebuilding serially beats fanning out.
+///
+/// A scoped thread costs ~50 µs to spawn and join; a line table for a few hundred
+/// bytes is built in ~1 µs.  The gate matters most for the pathological batch: a
+/// 1,000-file lint run of small files used to spawn 1,000 threads (and hold 1,000
+/// line tables at once) before the render weight gate then chose the serial path
+/// anyway.  `prebuild_chunk_len` additionally caps the worker count at
+/// `available_parallelism`, so a large batch chunks instead of storming.
+const PREBUILD_MIN_TOTAL_BYTES: usize = 64 * 1024;
 
 /// Return `buf` to `pool` under the retained-bytes budget.
 ///
@@ -696,7 +813,8 @@ fn worker_render_dynamic<R: Renderer>(
             None,
             sources,
             urls,
-            &shared.prebuilt[..shared.prebuilt.len().min(PRELOAD_SLOTS)],
+            shared.preload,
+            shared.prebuilt,
         )
     }))
     .ok();
@@ -916,27 +1034,43 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // cache holds something to compare against; computing it unconditionally
         // put a full pass over the source on the single-emit (LSP) path for
         // diagnostics that could never hit.
-        // The length is already part of the cache key and costs nothing to
-        // compare, while `source_content_hash` is a full O(n) pass over the
-        // source.  Nearly every real edit changes the length, so hash only when a
-        // same-length entry for this file exists; otherwise the lookup below
-        // cannot match anyway and the hash was pure overhead on the LSP path.
-        let len_matches = match file_id {
-            Some(id) => self
-                .file_index_cache
-                .borrow()
-                .iter()
-                .any(|(f, _, n, _)| *f == id && *n == len),
-            None => false,
-        };
-        let content_hash = len_matches.then(|| source_content_hash(src));
-        let cached = match (file_id, content_hash) {
-            (Some(id), Some(h)) => self
-                .file_index_cache
-                .borrow()
-                .iter()
-                .find_map(|(f, ch, n, p)| (*f == id && *ch == h && *n == len).then(|| p.clone())),
-            _ => None,
+        //
+        // One scan, not two: the same-`(file, len)` entries are collected as the
+        // candidates, and that single borrow answers both "is hashing worth it" and
+        // "which entry matches".  The length is part of the cache key and costs
+        // nothing to compare, while `source_content_hash` is a full O(n) pass; nearly
+        // every real edit changes the length, so the hash is computed only when a
+        // same-length candidate exists.  (`PreloadedSource` is `Arc`-backed, so the
+        // clones are refcount bumps.)
+        let mut candidates: SmallVec<[(usize, u64, PreloadedSource); 2]> = SmallVec::new();
+        if let Some(id) = file_id {
+            for (idx, (f, ch, n, p)) in self.file_index_cache.borrow().iter().enumerate() {
+                if *f == id && *n == len {
+                    candidates.push((idx, *ch, p.clone()));
+                }
+            }
+        }
+        let mut hash: Option<u64> = None;
+        let cached = if candidates.is_empty() {
+            None
+        } else {
+            let h = source_content_hash(src);
+            hash = Some(h);
+            match candidates.into_iter().find(|(_, ch, _)| *ch == h) {
+                Some((idx, _, p)) => {
+                    // Promote the hit to the front.  The window is documented as "recent
+                    // files", but a FIFO never reordered on a hit, so an LSP session touching
+                    // more than 8 files evicted the very file it re-emits on every keystroke —
+                    // and the miss costs a full `LineIndex::new` scan of that source.
+                    let mut cache = self.file_index_cache.borrow_mut();
+                    if idx < cache.len() {
+                        let hit = cache.remove(idx);
+                        cache.insert(0, hit);
+                    }
+                    Some(p)
+                }
+                None => None,
+            }
         };
         let entry = match cached {
             // Carried from the cached entry **explicitly**: `starts`/`ascii`/
@@ -959,7 +1093,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 // Fuse the line table and the cache key into one pass, exactly as
                 // the batch path already does: a cold single emit used to scan the
                 // source twice (`LineIndex::new` + `source_content_hash`).
-                let (idx, computed) = match (file_id, content_hash) {
+                let (idx, computed) = match (file_id, hash) {
                     (Some(_), None) => {
                         let (idx, h) = LineIndex::new_hashed(src);
                         (idx, Some(h))
@@ -984,7 +1118,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                     if cache.len() >= 8 {
                         cache.pop();
                     }
-                    let h = content_hash
+                    let h = hash
                         .or(computed)
                         .unwrap_or_else(|| source_content_hash(src));
                     cache.insert(0, (id, h, len, entry.clone()));
@@ -1169,15 +1303,68 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
 
     /// Streaming emit to a caller-provided sink, mirroring
     /// [`Self::emit_all_to`] but consuming slots as they complete.
+    /// Humanize the filter-kept diagnostics, in parallel above the collector's threshold.
+    ///
+    /// Humanization is the last **serial** stage in front of the parallel renderer: at 10^4
+    /// diagnostics × ~1-5 µs (Fluent rendering, label derivation, suggestion mapping) that is
+    /// 10-50 ms of serial work, the same Amdahl term `DiagCtxt::humanize_pending` already
+    /// removes for the collector path.  These entry points took `&mut [Diagnostic]` and
+    /// therefore bypassed it.
+    ///
+    /// Sound for the same reasons the collector documents: `Lang` is a process-global atomic,
+    /// the chunks are disjoint `&mut`, every per-diagnostic cache is diagnostic-local, and
+    /// `DiagFilter` is `Sync` (a bitset, an `FxHashSet` and `memmem::Finder`s).  Output is
+    /// untouched because each `humanize` writes only its own diagnostic.
+    ///
+    /// The containment from `humanize_contained` is what makes the fan-out safe: a panicking
+    /// diagnostic costs one placeholder, and `catch_unwind` per diagnostic also keeps a worker
+    /// from taking the whole scope down.
+    fn humanize_kept(diags: &mut [Diagnostic<'_>], filter: &DiagFilter) {
+        const PARALLEL_HUMANIZE_MIN: usize = 64;
+        // `available_parallelism` is a `sched_getaffinity` syscall on Linux; a process's
+        // affinity mask does not change under it, so the answer is cached like the collector's.
+        static AVAILABLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let threads = if diags.len() >= PARALLEL_HUMANIZE_MIN {
+            (*AVAILABLE.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get())))
+                .min(diags.len() / PARALLEL_HUMANIZE_MIN)
+                .max(1)
+        } else {
+            1
+        };
+        if threads > 1 {
+            let chunk = diags.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                for slice in diags.chunks_mut(chunk) {
+                    scope.spawn(move || {
+                        for diag in slice {
+                            if filter.matches(diag) {
+                                diag.humanize_contained();
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            for diag in diags.iter_mut() {
+                if filter.matches(diag) {
+                    diag.humanize_contained();
+                }
+            }
+        }
+    }
+
     pub fn emit_all_streaming_to<S: DiagnosticSink>(
         &mut self,
         diags: &mut [Diagnostic<'_>],
         sink: &mut S,
     ) -> io::Result<()> {
         // Same contract and same reason as `emit_all_to`.
-        for diag in diags.iter_mut() {
-            diag.humanize();
-        }
+        // Humanize only what the filter keeps.  The filter reads pre-humanize data
+        // (the Phase-1 invariant), so this cannot change which diagnostics survive —
+        // it stops the dropped ones paying Fluent rendering, label derivation and
+        // their allocations.  Same policy as `DiagCtxt::humanize_pending_for`, which
+        // this path bypassed because it takes `&mut [Diagnostic]` directly.
+        Self::humanize_kept(diags, &self.filter);
         self.emit_ordered(diags.iter(), sink, true)
     }
 
@@ -1194,9 +1381,12 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // *not* using it made a contract violation silently render pre-materialization
         // spans and an empty message.  Idempotent — the latch makes this a `bool`
         // compare for already-humanized input.
-        for diag in diags.iter_mut() {
-            diag.humanize();
-        }
+        // Humanize only what the filter keeps.  The filter reads pre-humanize data
+        // (the Phase-1 invariant), so this cannot change which diagnostics survive —
+        // it stops the dropped ones paying Fluent rendering, label derivation and
+        // their allocations.  Same policy as `DiagCtxt::humanize_pending_for`, which
+        // this path bypassed because it takes `&mut [Diagnostic]` directly.
+        Self::humanize_kept(diags, &self.filter);
         self.emit_ordered(diags.iter(), sink, false)
     }
 
@@ -1297,13 +1487,19 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // attribution, wrong line numbers, possibly an empty message, with no
             // signal at all.  Debug builds abort here instead; release behaviour is
             // unchanged (and the `&mut` entry points make it moot for the common path).
-            debug_assert!(
-                diag.is_humanized(),
-                "batch entry points require humanized diagnostics — run                  `DiagCtxt::humanize_pending` first (the `&mut` variants do it for you)"
-            );
+            // The check applies to **survivors only**: a diagnostic the filter rejects is
+            // never rendered, so requiring it to be humanized was a precondition with no
+            // purpose — and it became a hard failure once `DiagCtxt::emit` started
+            // humanizing only what the filter keeps (which is the whole point of that
+            // change: a `--only-files` run must not pay a Fluent render per rejected
+            // diagnostic).
             if !self.filter.matches(diag) {
                 continue;
             }
+            debug_assert!(
+                diag.is_humanized(),
+                "batch entry points require humanized diagnostics — run `DiagCtxt::humanize_pending` first (the `&mut` variants do it for you)"
+            );
             let is_warning = diag.is_warning();
             let is_error = diag.is_error();
             // `warn_is_error` promotes warnings into the error budget: they
@@ -1414,7 +1610,15 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // is gated on `quiet`, which `HumanRenderer`'s note would otherwise
         // leak through (machine renderers return "" here anyway).
         if suppressed > 0 && !self.opts.quiet {
-            sink.write_str(&self.renderer.render_suppressed_note(suppressed))?;
+            // Into the batch's reused render buffer: the note is copied into the sink and
+            // dropped, so a fresh `String` per batch was a pure allocation/free in the
+            // documented LSP re-emit loop.  `render_suppressed_note_into` already existed; this
+            // path just never called it.
+            let mut note = self.shared.render_buf.borrow_mut();
+            note.clear();
+            self.renderer
+                .render_suppressed_note_into(suppressed, &mut note);
+            sink.write_str(&note)?;
         }
         if !self.opts.quiet && (errors > 0 || warnings > 0) {
             sink.write_str(
@@ -1565,6 +1769,47 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// used to be serial too, so a cold multi-file batch paid Σ O(source) (a hash plus a
     /// line-start scan per file; ~20 ms for 100 × 100 KB) *before* any worker was
     /// dispatched — the parallelism the batch path exists for, minus its prologue.
+    /// One prebuild job, with the emitter's containment policy applied.
+    ///
+    /// The rest of this module degrades a failing diagnostic to a placeholder and
+    /// never aborts the emit ("a fallback for the fallback must be total"), but the
+    /// prebuild phase used to `join().expect(...)`: a panic in
+    /// `LineIndex::new_hashed` (its >4 GiB `assert!` is release-enforced) took the
+    /// whole batch down.  Dropping the entry instead leaves the render path building
+    /// the index per query — correct, just slower — and no `(hash, entry)` pair is
+    /// produced, so nothing half-built can reach `file_index_cache`.
+    fn build_prebuilt_contained(
+        snapshot: &[(crate::ast::FileId, u64, usize, Prebuilt)],
+        id: Option<crate::ast::FileId>,
+        key: (usize, usize),
+        src: &str,
+    ) -> Option<(Option<crate::ast::FileId>, (usize, usize), u64, Prebuilt)> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (hash, entry) = Self::build_prebuilt(snapshot, id, key, src);
+            (id, key, hash, entry)
+        }))
+        .ok()
+    }
+
+    /// How many entries one prebuild worker takes, or `None` for the serial path.
+    ///
+    /// The render path caps its workers and gates on total weight; the prebuild path
+    /// used to spawn **one scoped thread per distinct source**, unbounded — a
+    /// 1,000-file batch that then failed the render weight gate still paid 1,000
+    /// spawn/join pairs and held 1,000 line tables at once.  Same policy as the
+    /// render gate: gate on bytes, then chunk to the machine's parallelism.
+    fn prebuild_chunk_len(len: usize, total_bytes: usize) -> Option<usize> {
+        // A thread per file is worse than useless when each file is a few hundred
+        // bytes: ~50 µs of spawn buys a table built in ~1 µs.
+        if len < 2 || total_bytes < PREBUILD_MIN_TOTAL_BYTES {
+            return None;
+        }
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(len);
+        Some(len.div_ceil(workers))
+    }
+
     fn prebuild_entries(&self, filtered: &[&Diagnostic<'_>], weights: &[usize]) -> Vec<Prebuilt> {
         let mut seen: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
         let mut source_weight: rustc_hash::FxHashMap<(usize, usize), usize> =
@@ -1595,33 +1840,42 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // phase needs a plain `Vec` it can share with scoped threads.
         let snapshot: Vec<(crate::ast::FileId, u64, usize, Prebuilt)> =
             self.file_index_cache.borrow().iter().cloned().collect();
+        let total_bytes: usize = pending.iter().map(|(_, _, src)| src.len()).sum();
         let built: Vec<(Option<crate::ast::FileId>, (usize, usize), u64, Prebuilt)> =
-            if pending.len() >= 2 {
-                std::thread::scope(|scope| {
+            match Self::prebuild_chunk_len(pending.len(), total_bytes) {
+                Some(chunk_len) => std::thread::scope(|scope| {
+                    // One task per *chunk*, in order; `flat_map` over the joined
+                    // handles keeps the merge below in first-appearance order, which
+                    // is the order the cache and the prebuilt slice must have.
                     let handles: Vec<_> = pending
-                        .iter()
-                        .map(|(key, id, src)| {
+                        .chunks(chunk_len)
+                        .map(|chunk| {
                             let snapshot = snapshot.as_slice();
                             scope.spawn(move || {
-                                let (hash, entry) = Self::build_prebuilt(snapshot, *id, *key, src);
-                                (*id, *key, hash, entry)
+                                let mut part: Vec<_> = Vec::with_capacity(chunk.len());
+                                for (key, id, src) in chunk {
+                                    part.extend(Self::build_prebuilt_contained(
+                                        snapshot, *id, *key, src,
+                                    ));
+                                }
+                                part
                             })
                         })
                         .collect();
                     handles
                         .into_iter()
-                        .map(|h| h.join().expect("prebuild worker panicked"))
+                        // A worker panic can only come from outside the contained job
+                        // body, so treat it as "this chunk produced nothing" rather
+                        // than aborting the batch.
+                        .flat_map(|h| h.join().unwrap_or_default())
                         .collect()
-                })
-            } else {
-                pending
+                }),
+                None => pending
                     .iter()
-                    .map(|(key, id, src)| {
-                        let (hash, entry) =
-                            Self::build_prebuilt(snapshot.as_slice(), *id, *key, src);
-                        (*id, *key, hash, entry)
+                    .filter_map(|(key, id, src)| {
+                        Self::build_prebuilt_contained(snapshot.as_slice(), *id, *key, src)
                     })
-                    .collect()
+                    .collect(),
             };
 
         let mut out: Vec<Prebuilt> = Vec::with_capacity(built.len());
@@ -1643,14 +1897,36 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
 
     /// [`Self::prebuild_entries`] plus the `Arc<SharedSources>` the parallel path
     /// shares across workers.
+    ///
+    /// **Two consumers, two orders, and they are different.**  `RenderCtx::line_index`'s
+    /// tier-0 lookup is a `binary_search_by_key((ptr, len))`, so the list it searches
+    /// must be sorted by that key; the worker LRU preload wants the batch's *heaviest*
+    /// sources first.  `prebuild_entries` produces the weight order, so this captures
+    /// its prefix for the preload and then sorts the list for the search.
+    ///
+    /// Before this split the weight order went straight to the workers, whose binary
+    /// search then missed every entry it did not happen to find by luck.  That was
+    /// *correct* — `binary_search` returning `Err` just rebuilds the table, and the
+    /// fingerprint check covers a false `Ok` — but it silently turned the prebuild into
+    /// dead weight, i.e. exactly the "silent, not loud" failure this cache stack exists
+    /// to exclude.
     fn prebuild_sources(
         &self,
         filtered: &[&Diagnostic<'_>],
         weights: &[usize],
-    ) -> (Vec<Prebuilt>, std::sync::Arc<SharedSources>) {
-        let out = self.prebuild_entries(filtered, weights);
+    ) -> (
+        Vec<Prebuilt>,
+        smallvec::SmallVec<[Prebuilt; PRELOAD_SLOTS]>,
+        std::sync::Arc<SharedSources>,
+    ) {
+        let mut out = self.prebuild_entries(filtered, weights);
+        let preload: smallvec::SmallVec<[Prebuilt; PRELOAD_SLOTS]> =
+            out.iter().take(PRELOAD_SLOTS).cloned().collect();
+        // Same key the tier-0 `binary_search` below uses; `sort_unstable` because
+        // duplicate keys (one pointer, one length) are indistinguishable to it.
+        out.sort_unstable_by_key(|e| (e.ptr, e.len));
         let shared = SharedSources::from_entries(&out);
-        (out, shared)
+        (out, preload, shared)
     }
 
     /// The per-batch shared state both parallel renderers hand to their workers.
@@ -1665,7 +1941,8 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         cells: &'a [&'a Diagnostic<'src>],
         order: &'a [usize],
         prebuilt: &'a [Prebuilt],
-        n: usize,
+        preload: &'a [Prebuilt],
+        slots: &'a [Padded<std::sync::Mutex<Option<(String, usize)>>>],
         streaming: bool,
     ) -> BatchShared<'a, 'src, R> {
         BatchShared {
@@ -1674,13 +1951,12 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             cancelled: std::sync::atomic::AtomicBool::new(false),
             order,
             cells,
-            slots: (0..n)
-                .map(|_| Padded(std::sync::Mutex::new(None)))
-                .collect(),
+            slots,
             slot_cv: std::sync::Condvar::new(),
             renderer: &self.renderer,
             opts: &self.opts,
             prebuilt,
+            preload,
             string_pools: &self.string_pools,
             streaming,
         }
@@ -1733,16 +2009,29 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         #[cfg(test)]
         PARALLEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let separator = self.renderer.render_separator();
-        let (prebuilt, shared_sources) = self.prebuild_sources(filtered, &scratch.weights);
+        let (prebuilt, preload, shared_sources) = self.prebuild_sources(filtered, &scratch.weights);
         let shared_urls = std::sync::Arc::clone(&self.shared.file_urls);
         let n = filtered.len();
         scratch.order.clear();
         scratch.order.extend(0..n);
-        let weights = &scratch.weights;
-        scratch
-            .order
-            .sort_unstable_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
-        let shared = self.make_batch_shared(filtered, &scratch.order, &prebuilt, n, false);
+        // No claim-order sort.  Claims are atomic (`next.fetch_add`), so which worker
+        // renders which diagnostic is invisible: the stitch is by slot index, which is
+        // why `render_streaming` has always used identity order.  The weight *sum* still
+        // gates the parallel path (`emit_batch_iter`); only the O(n log n) reordering was
+        // vestigial work here — it did not even improve locality, since `order` is read
+        // once per claim from a cold slice.
+        let mut slots = std::mem::take(&mut scratch.slots);
+        slots.resize_with(n, || Padded(std::sync::Mutex::new(None)));
+        for slot in &mut slots[..n] {
+            debug_assert!(
+                slot.0
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none(),
+                "a claim slot survived its batch — the stitch missed it"
+            );
+            *slot.0.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         let pool = self.pool.get_or_init(|| {
             let (pool, token) = crate::pool::WorkerPool::new(self.parallelism);
             *self.pool_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
@@ -1753,32 +2042,45 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             .token
             .take()
             .expect("batch token is absent only while a batch is in flight");
+        // Scoped so the shared borrow of `slots` ends before the stitch, which reads
+        // them through `&mut` (`get_mut`, no per-slot lock).  That is what makes reusing
+        // the scratch's slot vector a win instead of trading one allocation for `n`
+        // mutex round-trips.
         let _shared_wrap = crate::diagnostics::wrap::enter_shared_wrap();
         let pool_count = self.string_pools.len();
-        let jobs = Self::worker_jobs(
-            &shared,
-            &shared_sources,
-            &shared_urls,
-            num_workers,
-            pool_count,
-        );
-        let token = pool.submit(token, jobs).wait();
-        permit.token = Some(token);
-        let string_pools = shared.string_pools;
-        let BatchShared { slots, .. } = shared;
+        {
+            let shared = self.make_batch_shared(
+                filtered,
+                &scratch.order,
+                &prebuilt,
+                &preload,
+                &slots[..n],
+                false,
+            );
+            let jobs = Self::worker_jobs(
+                &shared,
+                &shared_sources,
+                &shared_urls,
+                num_workers,
+                pool_count,
+            );
+            let finished = pool.submit(token, jobs).wait();
+            permit.token = Some(finished);
+        }
         let mut first = true;
-        for slot in slots {
+        for slot in &mut slots[..n] {
             let (mut buf, owner) = slot
                 .0
-                .into_inner()
+                .get_mut()
                 .unwrap_or_else(|e| e.into_inner())
+                .take()
                 .expect("every claimed render slot must be filled before stitch");
             // Return the buffer even when the render was empty: dropping it here
             // evicted half the pool on an every-other-empty workload, forcing a
             // fresh allocation on the next pop — the churn the pool exists to
             // remove.  A cleared buffer is worth exactly as much as before.
             if buf.is_empty() {
-                let mut pool = string_pools[owner]
+                let mut pool = self.string_pools[owner]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 return_buffer_to_pool(&mut pool, buf);
@@ -1801,13 +2103,16 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // size class from the pool permanently, so every later batch
             // re-allocated.
             {
-                let mut pool = string_pools[owner]
+                let mut pool = self.string_pools[owner]
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 buf.clear();
                 return_buffer_to_pool(&mut pool, buf);
             }
         }
+        // Hand the (now all-empty) slot vector back to the scratch; its allocation is
+        // what the next batch reuses.
+        scratch.slots = slots;
         Ok(())
     }
 
@@ -1824,12 +2129,20 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         #[cfg(test)]
         PARALLEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let separator = self.renderer.render_separator();
-        let (prebuilt, shared_sources) = self.prebuild_sources(filtered, &scratch.weights);
+        let (prebuilt, preload, shared_sources) = self.prebuild_sources(filtered, &scratch.weights);
         let shared_urls = std::sync::Arc::clone(&self.shared.file_urls);
         let n = filtered.len();
         scratch.order.clear();
         scratch.order.extend(0..n);
-        let shared = self.make_batch_shared(filtered, &scratch.order, &prebuilt, n, true);
+        scratch.prepare_slots(n);
+        let shared = self.make_batch_shared(
+            filtered,
+            &scratch.order,
+            &prebuilt,
+            &preload,
+            &scratch.slots[..n],
+            true,
+        );
         let pool = self.pool.get_or_init(|| {
             let (pool, token) = crate::pool::WorkerPool::new(self.parallelism);
             *self.pool_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
@@ -1861,11 +2174,18 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 // Published *under the slot mutex, before the wait*: that ordering is what
                 // lets a worker that filled this slot see the matching value after its own
                 // acquire and wake us (see `next_needed`).
-                shared
-                    .next_needed
-                    .store(cursor, std::sync::atomic::Ordering::Relaxed);
-                while slot.is_none() {
-                    slot = shared.slot_cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+                // Published *under the slot mutex, before the wait*: that ordering is what
+                // lets a worker that filled this slot see the matching value after its own
+                // acquire and wake us (see `next_needed`).  Skip the store when the slot is
+                // already filled — a fast consumer drains slots faster than workers fill
+                // them, and a filled slot has no waiter to publish to.
+                if slot.is_none() {
+                    shared
+                        .next_needed
+                        .store(cursor, std::sync::atomic::Ordering::Relaxed);
+                    while slot.is_none() {
+                        slot = shared.slot_cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+                    }
                 }
                 slot.take().expect("slot filled")
             };
@@ -1923,6 +2243,27 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         }
         let token = wait.wait();
         permit.token = Some(token);
+        // After a sink error the remaining slots still hold rendered buffers — including
+        // the ones workers filled while the consumer was unwinding out of the loop
+        // (`cancelled` is checked before a *claim*, not during a render).  They used to
+        // drop with `shared`, handing the pool's warm buffers to the allocator at the
+        // one moment a re-publish (an LSP client that reconnects) wants them back.
+        //
+        // Only after `wait.wait()`: the workers are joined, so nothing can fill a slot
+        // underneath us.  Guarded on `result.is_err()` because the success path leaves
+        // every slot empty and this loop is `n` uncontended lock/unlock pairs.
+        if result.is_err() {
+            for slot in shared.slots {
+                let Some((buf, owner)) = slot.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+                else {
+                    continue;
+                };
+                let mut pool = shared.string_pools[owner]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                return_buffer_to_pool(&mut pool, buf);
+            }
+        }
         result
     }
 }
@@ -1933,6 +2274,45 @@ mod tests {
     use crate::ast::{FileId, Span};
     use crate::diagnostics::JsonRenderer;
     use crate::diagnostics::sink::{StringSink, string};
+
+    /// The parallel prebuild feeds two consumers with **different** orders: the tier-0
+    /// `binary_search_by_key((ptr, len))` in `RenderCtx::line_index`, and the worker LRU
+    /// seed (heaviest source first).  The weight order used to go to both, so the binary
+    /// search missed every entry it did not find by luck — correct (a miss just rebuilds)
+    /// but silently pointless, which is the failure mode this cache stack exists to
+    /// exclude.
+    #[test]
+    fn parallel_prebuild_sorts_for_the_search_and_keeps_weight_for_the_preload() {
+        let id = FileId::DUMMY;
+        let light = "a\nb\nc";
+        let heavy = "a\nb\nc\nd\ne\nf\ng";
+        let mut emitter = Emitter::new(JsonRenderer::new(false), string(), DiagOpts::default());
+        let diags = vec![
+            warn_diag()
+                .with_span(Span::new(id, 1, 2))
+                .with_source(light),
+            warn_diag()
+                .with_span(Span::new(id, 1, 2))
+                .with_source(heavy),
+        ];
+        let refs: Vec<&Diagnostic<'_>> = diags.iter().collect();
+
+        // Weight the second diagnostic so weight order and pointer order cannot
+        // coincide by accident (whichever way the allocator ordered the two strings).
+        let (prebuilt, preload, _shared) = emitter.prebuild_sources(&refs, &[1, 9]);
+
+        let keys: Vec<(usize, usize)> = prebuilt.iter().map(|e| (e.ptr, e.len)).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "the tier-0 binary search needs (ptr, len) order, got {keys:?}"
+        );
+        assert_eq!(preload.len(), 2, "every buildable source fits the seed");
+        assert_eq!(
+            preload[0].len,
+            heavy.len(),
+            "the preload prefix is chosen by weight, not by pointer order"
+        );
+    }
 
     fn warn_diag() -> Diagnostic<'static> {
         Diagnostic::warning("boom")
@@ -1957,13 +2337,13 @@ mod tests {
     /// buffer (`clear` + `push_str`), which this counts.
     #[test]
     fn alternating_file_names_reuse_the_last_pair_buffer() {
-        LAST_PAIR_ALLOCS.store(0, std::sync::atomic::Ordering::Relaxed);
+        LAST_PAIR_ALLOCS.with(|c| c.set(0));
         let mut seen = FilesSeen::new();
         for i in 0..64 {
             seen.add_id_name(FileId::DUMMY, if i % 2 == 0 { "a.pn" } else { "b.pn" });
         }
         assert_eq!(
-            LAST_PAIR_ALLOCS.load(std::sync::atomic::Ordering::Relaxed),
+            LAST_PAIR_ALLOCS.with(std::cell::Cell::get),
             1,
             "the one-entry memo must reuse its buffer, not rebuild it per diagnostic"
         );

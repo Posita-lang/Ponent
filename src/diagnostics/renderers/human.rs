@@ -84,6 +84,15 @@ impl Renderer for HumanRenderer {
         // only related errors would otherwise render unplaceable.  Children and
         // suggestions are message-and-diff only — no coordinates, so they stay
         // out.
+        //
+        // Recorded, not adopted: a review proposed narrowing this disjunct to related spans in
+        // the *anchor* file (`Some(s.file) == diag.spans.first().map(|p| p.file)`) to skip the
+        // O(file) index for diagnostics whose related errors are all foreign.  Not done, for the
+        // reason the review itself gave — it defers to glyph internals ("verify first"), and
+        // this comment records glyph's contract as "every related error with a span becomes a
+        // synthetic label", with no anchor-file qualifier.  Trigger for reopening: a glyph test
+        // proving a foreign-file related error still renders (it resolves against its own
+        // excerpt) — then the narrowing is safe and the index build is skipped.
         // One `call_chain()` walk per diagnostic: the `needs_index` gate and the footer
         // below both need it, and every other accessor in this file is bound once for the
         // same reason ("the renderer's contract is one accessor call each").

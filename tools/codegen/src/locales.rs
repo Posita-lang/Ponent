@@ -43,6 +43,7 @@ pub fn validate_locales(dir: &Path) -> Locales {
     };
     let (en_res, en_parse) = parse(&en_src);
     push_parse_errors(&mut errors, "en.ftl", &en_parse);
+    duplicate_ids(&en_res, "en.ftl", &mut errors);
     let en: BTreeMap<&str, Vec<String>> = messages(&en_res);
 
     // #13: `messages()` only extracts variables, so `A = { B }` previously
@@ -82,6 +83,7 @@ pub fn validate_locales(dir: &Path) -> Locales {
         };
         let (res, parse_errors) = parse(&src);
         push_parse_errors(&mut errors, &file, &parse_errors);
+        duplicate_ids(&res, &file, &mut errors);
         let locale: BTreeMap<&str, Vec<String>> = messages(&res);
         let locale_name = file.trim_end_matches(".ftl");
 
@@ -140,6 +142,27 @@ fn parse(src: &str) -> (ast::Resource<&str>, Vec<fluent_syntax::parser::ParserEr
     match fluent_syntax::parser::parse(src) {
         Ok(res) => (res, Vec::new()),
         Err((res, errs)) => (res, errs),
+    }
+}
+
+/// Duplicate message ids inside one `.ftl`.
+///
+/// `messages()` is a `BTreeMap`, so a collision was invisible at build time: the later
+/// definition silently won, and the only symptom was `FluentBundle::add_resource`
+/// reporting the clash at first `bundles()` init — which used to `expect` and abort the
+/// process in release.  Fluent's parser accepts duplicates, so the check has to live
+/// here.
+fn duplicate_ids(res: &ast::Resource<&str>, file: &str, errors: &mut Vec<String>) {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for entry in &res.body {
+        if let ast::Entry::Message(msg) = entry
+            && !seen.insert(msg.id.name)
+        {
+            errors.push(format!(
+                "locales/{file}: duplicate message id {:?}",
+                msg.id.name
+            ));
+        }
     }
 }
 

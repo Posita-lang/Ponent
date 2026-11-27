@@ -111,16 +111,37 @@ pub enum ColorChoice {
     Never,
 }
 
-impl ColorChoice {
-    /// Parse a `--color` flag value; unknown values fall back to [`Auto`](Self::Auto).
-    pub fn from_str(s: &str) -> Self {
+/// `--color` value that is not one of `auto`/`always`/`never`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseColorError;
+
+impl std::fmt::Display for ParseColorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("expected one of `auto`, `always`, `never`")
+    }
+}
+
+impl std::str::FromStr for ColorChoice {
+    type Err = ParseColorError;
+
+    /// Strict: an unknown spelling is an **error**, not `Auto`.
+    ///
+    /// The old inherent `from_str` mapped every typo (`--color=alwyas`) to `Auto`, i.e.
+    /// silently made the answer depend on whether stdout is a tty — the "works on my
+    /// terminal" bug class, at the one boundary where strictness is cheap.  (The CLI path
+    /// in `main.rs` already rejected unknown values with `usage_error`; this removes the
+    /// lenient twin that nothing called, so there is one parser and it is strict.)
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "always" => Self::Always,
-            "never" => Self::Never,
-            _ => Self::Auto,
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            _ => Err(ParseColorError),
         }
     }
+}
 
+impl ColorChoice {
     /// Resolve to a concrete `use_color` bit via [`term::detect_color`].
     pub fn resolve(self) -> bool {
         match self {
@@ -494,16 +515,26 @@ impl DiagFilter {
     /// exact-match fields.
     /// Whether `diag` passes this filter.
     pub fn matches(&self, diag: &Diagnostic<'_>) -> bool {
-        debug_assert!(
-            self.is_empty
-                == (self.allow_slots.is_empty()
-                    && self.allow_verbatim.is_empty()
-                    && self.only_slots.is_empty()
-                    && self.only_verbatim.is_empty()
-                    && self.only_category_mask == 0
-                    && self.only_files_finders.is_empty()),
-            "DiagFilter::is_empty disagrees with the sets it summarises"
-        );
+        // Once per process, not once per diagnostic: every construction path goes through
+        // `from_opts`/`Default` with private fields, so the invariant cannot change after
+        // construction — recomputing four set emptiness tests plus the mask here showed up
+        // in debug-build suites (this is the filter on every emit-loop iteration).
+        {
+            static CHECKED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if cfg!(debug_assertions) && !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                debug_assert!(
+                    self.is_empty
+                        == (self.allow_slots.is_empty()
+                            && self.allow_verbatim.is_empty()
+                            && self.only_slots.is_empty()
+                            && self.only_verbatim.is_empty()
+                            && self.only_category_mask == 0
+                            && self.only_files_finders.is_empty()),
+                    "DiagFilter::is_empty disagrees with the sets it summarises"
+                );
+            }
+        }
         if self.is_empty {
             return true;
         }
@@ -650,16 +681,22 @@ impl<'src> DiagMessage<'src> {
     /// indirection, and one boxed slice is a single allocation with no per-part
     /// pointer chase.
     pub fn joined(parts: Vec<DiagMessage<'src>>) -> Self {
-        // Flatten nested compositions here.  `joined` is public and nestable, so without
-        // this the render path recursed once per nesting level and `compute_stable_id`
-        // saw a deeper tag sequence for identical output.  Depth is now 1 by
-        // construction.  (Ids for previously-nested input change once — the same latitude
-        // the accessor's "cross-run key, not persisted" contract granted the previous two
-        // id changes.)
+        // Flatten nested compositions to a **fixpoint**, depth-first and in order.  The
+        // previous one-level loop left `joined(joined(joined(..)))` at depth 2 while this
+        // comment claimed "depth is now 1 by construction": `joined` is public and nestable,
+        // the render path recursed once per level, and `compute_stable_id` saw a deeper tag
+        // sequence for identical output.  A work stack makes the claim true instead of
+        // softening it — every part is expanded once, so the cost stays linear in the subtree.
+        // (Ids for previously-nested-by-two-or-more input change once — the same latitude the
+        // accessor's "cross-run key, not persisted" contract granted the previous id changes.)
         let mut flat: Vec<DiagMessage<'src>> = Vec::with_capacity(parts.len());
-        for part in parts {
+        let mut work = parts;
+        work.reverse();
+        while let Some(part) = work.pop() {
             match part {
-                DiagMessage::Joined(inner) => flat.extend(inner.into_vec()),
+                DiagMessage::Joined(inner) => {
+                    work.extend(inner.into_vec().into_iter().rev());
+                }
                 other => flat.push(other),
             }
         }
@@ -888,6 +925,12 @@ impl MultiSpan {
     /// and caches the result in `sorted_cache` — repeated reads between
     /// pushes skip the `O(n log n)` re-sort; otherwise clones the
     /// already-sorted vector (inline for `n ≤ 2`, so no heap allocation in
+    /// Owned copy of the sorted, deduplicated primary spans.
+    ///
+    /// Renderers must use [`Self::primary_ref`]: this routes through it and then
+    /// `.collect()`s a `SmallVec`, which is the clone `primary_ref` exists to avoid — so
+    /// using it in a per-span render loop pays one allocation per call for nothing.  It
+    /// survives for callers that need an owned value (tests, one-shot inspection).
     /// the common case).
     pub fn primary(&self) -> SmallVec<[Span; 2]> {
         // Route through `primary_ref` so the sort/dedup/cache discipline has
@@ -1112,9 +1155,12 @@ impl<'src> StyledString<'src> {
 /// unfilled until [`humanize`](Self::humanize) runs.  The constructors
 /// deliberately skip that step so:
 ///
-/// - **Filtered-out diagnostics pay nothing** — those dropped by
-///   `max_errors` or suppressed warnings
-///   (`can_emit_warnings = false`) are never humanized.
+/// - **Filtered-out diagnostics pay nothing** — `DiagCtxt::emit` humanizes through
+///   the emitter's own [`DiagFilter`] ([`DiagCtxt::humanize_pending_for`]), so a
+///   `--only-files`/`--allow`/`--only-codes` run pays no Fluent render for a rejected
+///   diagnostic.  What is *not* skipped: diagnostics dropped by `max_errors` (the budget
+///   is applied while rendering, so the count is only known afterwards) and diagnostics
+///   suppressed by `can_emit_warnings` (those are dropped at `push`, before this).
 /// - **i18n language resolves at render time** — Fluent runs against
 ///   the *current* `Lang`, so a long-lived process (LSP) can
 ///   `Lang::set` between emits without freezing messages in the
@@ -1220,11 +1266,13 @@ pub struct Diagnostic<'src> {
     /// language — the LSP re-emit contract documented on
     /// [`error_kind`](Self::error_kind).
     humanized_lang: u8,
-    /// Cached result of [`stable_id`](Self::stable_id). `0` means "not yet
-    /// computed" — FNV-1a over non-empty input is virtually never exactly 0,
-    /// and even if it were, the only consequence is recomputing on every
-    /// call, which still yields a consistent result. See
-    /// [`Self::invalidate_stable_id`].
+    /// Cached result of [`stable_id`](Self::stable_id). `0` means "not yet computed".
+    ///
+    /// `compute_stable_id` feeds its digest through a word-at-a-time mixer (the FNV-1a
+    /// walk this comment used to cite is retired) and steers an exact `0` to `1`, so the
+    /// sentinel collides only with a full 64-bit avalanche output — a ~2⁻⁶⁴ coincidence
+    /// per diagnostic, and even then the only consequence is recomputing on every call,
+    /// which still yields a consistent result.  See [`Self::invalidate_stable_id`].
     stable_id_cache: AtomicU64,
 }
 
@@ -1282,6 +1330,29 @@ impl<'src> Diagnostic<'src> {
     #[inline]
     pub(crate) fn is_humanized(&self) -> bool {
         self.humanized
+    }
+
+    /// The message a renderer should show, with the release-mode fallback applied.
+    ///
+    /// The legitimate path pays one bool read and returns a borrow.  Only a
+    /// diagnostic that skipped `humanize()` — the contract breach the batch entry
+    /// points can merely `debug_assert!`, because they take `&Diagnostic` — takes the
+    /// kind-rendering arm.  Routing the renderers through this turns "empty
+    /// user-visible diagnostic in release" into degraded-but-correct output, which is
+    /// this subsystem's stated worst-case policy ("a fallback for the fallback must be
+    /// total"); `unhumanized_fallback` already existed and was consumed by `Display`
+    /// alone, so the batch path shipped nothing.
+    #[inline]
+    pub(crate) fn display_message(&self) -> std::borrow::Cow<'_, str> {
+        if self.humanized {
+            return std::borrow::Cow::Borrowed(&self.message);
+        }
+        match self.unhumanized_fallback() {
+            Some(fallback) => std::borrow::Cow::Owned(fallback),
+            // No kind means it was built with a literal message, which is already
+            // what `self.message` holds.
+            None => std::borrow::Cow::Borrowed(self.message_unchecked()),
+        }
     }
 
     /// The message to print for a kind-built diagnostic that was never humanized.
@@ -1580,9 +1651,35 @@ impl<'src> Diagnostic<'src> {
             // inline arms used, so this refactors the walk, not the encoding.  Parts are
             // pushed reversed so they are fed in order.
             let msg = kind.message();
-            let mut stack: Vec<&DiagMessage<'_>> = vec![&msg];
-            while let Some(m) = stack.pop() {
-                match m {
+            // A **frame** stack, not a per-part stack.  `joined()` flattens nesting
+            // *depth* to 1 but does nothing to bound *width*, so the previous
+            // four-slot-per-part walk ran off its end on the first wide message:
+            // `stack[4]` is a hard index panic in release and its own debug assert in
+            // debug — and a comptime diagnostic with a traceback is a **flat** `Joined`
+            // of `8 + 5 * frames` parts through this exact path, so the flagship
+            // comptime feature panicked on a `pub` accessor whose contract is external
+            // tool dedup.
+            //
+            // Each frame is `(remaining slice, cursor)`: width costs nothing, depth
+            // still works (a hand-built nested `Joined` is constructible through the
+            // public enum), and `SmallVec` keeps the one-frame case — a plain
+            // `Static`/`Slug` — allocation-free, spilling only on real nesting.
+            let mut frames: smallvec::SmallVec<[(&[DiagMessage<'_>], usize); 4]> =
+                smallvec::SmallVec::new();
+            frames.push((std::slice::from_ref(&msg), 0));
+            loop {
+                let Some(frame) = frames.last_mut() else {
+                    break;
+                };
+                // Both fields are `Copy`, so the slice reference is lifted out of the
+                // frame's borrow and the borrow is released before the `push` below.
+                let (slice, cursor) = (frame.0, frame.1);
+                if cursor == slice.len() {
+                    frames.pop();
+                    continue;
+                }
+                frame.1 = cursor + 1;
+                match &slice[cursor] {
                     DiagMessage::Static(text) => {
                         feed_bytes!(&[0u8]);
                         feed_field!(text.as_ref());
@@ -1597,9 +1694,7 @@ impl<'src> Diagnostic<'src> {
                     }
                     DiagMessage::Joined(parts) => {
                         feed_bytes!(&[2u8]);
-                        for part in parts.iter().rev() {
-                            stack.push(part);
-                        }
+                        frames.push((parts.as_ref(), 0));
                     }
                 }
             }
@@ -1909,10 +2004,18 @@ impl<'src> Diagnostic<'src> {
     /// "unknown" values.  Safe for untrusted or dynamically-built strings.
     pub fn with_code_str(mut self, code: impl AsRef<str>) -> Self {
         let code = code.as_ref();
-        self.code = Some(match ErrCode::try_new(code) {
-            Ok(ec) => ec,
-            Err(e) => ErrCode::unknown(e.0.into_owned()),
-        });
+        // An empty code is neither "code-less" nor a code: `ErrCode::unknown("")` made
+        // `Display` print empty brackets (`[ ERROR] …`) and gave the diagnostic a filter
+        // identity (`allow_codes` containing `""`) that no CLI spelling can produce.
+        // Code-less is a well-defined state; this maps the degenerate spelling onto it.
+        self.code = if code.is_empty() {
+            None
+        } else {
+            Some(match ErrCode::try_new(code) {
+                Ok(ec) => ec,
+                Err(e) => ErrCode::unknown(e.0.into_owned()),
+            })
+        };
         self.invalidate_stable_id();
         self
     }
@@ -2117,6 +2220,46 @@ impl<'src> Diagnostic<'src> {
     /// wording, and a flag would make every kind-built diagnostic keep its stale
     /// placeholder forever (with no way to say "derive it").  Pinned by
     /// `humanize_replaces_a_constructor_message`.
+    /// `humanize` with this crate's containment policy applied.
+    ///
+    /// `Emitter::emit` already wraps its single-diagnostic humanize in `catch_unwind` and
+    /// documents "the same policy as the batch paths" — which was false: the batch entry
+    /// points (`emit_all_to`, `emit_all_streaming_to`) and `DiagCtxt::humanize_pending*`
+    /// let a panic abort the entire emit.  Worse, `humanize` mutates before it can fail (it
+    /// drains `labels` and `mem::take`s `message`), so the abort also left the batch
+    /// half-derived.
+    ///
+    /// One broken diagnostic now costs one placeholder line, which is the subsystem's
+    /// stated worst case ("a fallback for the fallback must be total").  This family has
+    /// already shipped one panic on a `pub` path (`stable_id`'s fixed stack), so the
+    /// exposure is not hypothetical.
+    pub(crate) fn humanize_contained(&mut self) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.humanize())).is_err() {
+            self.poison_for_render();
+        }
+    }
+
+    /// Make a diagnostic renderable after `humanize` panicked mid-way.
+    ///
+    /// Deliberately **total**: every field `humanize` can have touched before the panic is
+    /// overwritten, so no half-derived state survives (a drained label list, a `mem::take`n
+    /// message, a stale derived-label count).  Spans and user-set structural fields are left
+    /// alone — they are the diagnostic's identity — and the placeholder message is what makes
+    /// the failure visible instead of empty.
+    fn poison_for_render(&mut self) {
+        const PLACEHOLDER: &str = "<internal: diagnostic humanization panicked>";
+        self.humanized = true;
+        self.humanized_lang = crate::diagnostics::i18n::Lang::current() as u8;
+        self.message = Cow::Borrowed(PLACEHOLDER);
+        self.labels.clear();
+        self.help = None;
+        self.suggestions.clear();
+        self.kind_derived_labels = 0;
+        // The id hashes the message, so it must be recomputed rather than left describing
+        // text that no longer exists.
+        self.invalidate_stable_id();
+    }
+
     pub fn humanize(&mut self) {
         let lang = crate::diagnostics::i18n::Lang::current() as u8;
         if self.humanized {
@@ -2391,14 +2534,11 @@ impl<'src> Diagnostic<'src> {
             }
         }
         if let Some(other_sources) = other.foreign_sources.as_deref() {
-            // Clone the tuples first: holding a borrow of `other.foreign_sources`
-            // while mutating ours is fine (different diagnostics), but the
-            // `Arc::make_mut` below may clone the vector, and the loop must not
-            // hold a borrow across that.
             // No intermediate `Vec`: `other_sources` borrows `other` (a shared
             // reference to a *different* diagnostic), so mutating ours inside the
             // loop is fine — `Arc::make_mut` may clone **our** vector, which the
-            // borrow does not touch.
+            // borrow does not touch.  (An earlier draft cloned the tuples first; that
+            // shape is gone, and the sentence describing it only contradicted this one.)
             // One `make_mut` for the whole loop, not one per tuple: the old form
             // re-checked the strong count on every iteration, and its dedup was an
             // O(n·m) scan — the same quadratic shape the labels merge above was
@@ -2883,18 +3023,28 @@ fn osa_distance(a: &str, b: &str) -> usize {
 /// longer than 8 chars by itself — callers with `max_dist > 1` must fall
 /// back to [`osa_distance`] (which `suggest_code` does).
 fn osa_dist_le_1(a: &str, b: &str) -> Option<usize> {
-    // Every table code is ≤ 5 chars, so an 8-char inline buffer covers all
-    // equal-or-shorter sides without a heap allocation.
     const INLINE: usize = 8;
     let a: SmallVec<[char; INLINE]> = a.chars().collect();
+    osa_dist_le_1_prepared(&a, b)
+}
+
+/// [`osa_dist_le_1`] with the needle's chars already collected.
+///
+/// The 452-entry scan ran this once per table code, and the wrapper re-collected (and
+/// re-allocated) the same needle 452 times per `--explain` typo.  This is the same body —
+/// the split only moves the needle's collection to the caller.
+fn osa_dist_le_1_prepared(a: &[char], b: &str) -> Option<usize> {
+    // Every table code is ≤ 5 chars, so an 8-char inline buffer covers the other side
+    // without a heap allocation.
+    const INLINE: usize = 8;
     let b: SmallVec<[char; INLINE]> = b.chars().collect();
-    if a == b {
+    if a == b.as_slice() {
         return Some(0);
     }
     let (s, l) = if a.len() <= b.len() {
-        (&a, &b)
+        (a, b.as_slice())
     } else {
-        (&b, &a)
+        (b.as_slice(), a)
     };
     match l.len() - s.len() {
         0 => {
@@ -2956,7 +3106,14 @@ fn known_code_ranges() -> &'static str {
 /// Summarise code strings as contiguous numeric ranges (see
 /// [`known_code_ranges`]).  Split out so the ordering can be tested with
 /// synthetic codes the current table does not contain.
+#[cfg_attr(not(test), allow(dead_code))]
 fn format_code_ranges(codes: &[&str]) -> String {
+    // Test-only by design: production reads the generated `KNOWN_CODE_RANGES`, and this
+    // is the runtime oracle that `known_code_ranges_match_the_runtime_formatter` pins it
+    // against (so the generator cannot encode a different range table than the runtime
+    // formatter produces).  Marked like its siblings (`build_line_sparse`,
+    // `has_c1_sequence`): unmarked it is either a `dead_code` warning in release builds or
+    // an accidental-deletion hazard for the oracle.
     let mut keyed: Vec<(u8, u64, &str)> = codes
         .iter()
         .map(|&c| {
@@ -3194,6 +3351,8 @@ fn suggest_top3_scan(
     if bucketed {
         let same_prefix = nb[0];
         let rest = &needle[1..];
+        // Collected once for the whole 452-entry scan (see `osa_dist_le_1_prepared`).
+        let needle_chars: SmallVec<[char; 8]> = needle.chars().collect();
         for e in crate::diagnostics::error_code::CODE_TABLE.iter() {
             let eb = e.code.as_bytes();
             if eb[0] != same_prefix {
@@ -3216,7 +3375,7 @@ fn suggest_top3_scan(
             let dist = if needle_len == 4 {
                 // `max_dist == 1` here, so ask the ≤ 1 question directly: a
                 // ~4-compare check instead of the full rolling DP.
-                match osa_dist_le_1(&needle, e.code) {
+                match osa_dist_le_1_prepared(&needle_chars, e.code) {
                     Some(d) => d,
                     None => continue, // distance ≥ 2 > max_dist
                 }
@@ -3236,6 +3395,8 @@ fn suggest_top3_scan(
             insert_top3(&mut top, dist, prefix, e.code);
         }
     } else {
+        // Collected once for the whole scan (see `osa_dist_le_1_prepared`).
+        let needle_chars: SmallVec<[char; 8]> = needle.chars().collect();
         for e in crate::diagnostics::error_code::CODE_TABLE
             .iter()
             // Length prefilter: each edit changes length by at most one, so
@@ -3252,7 +3413,7 @@ fn suggest_top3_scan(
             // wider radii fall back to the full DP, which remains the
             // reference the differential tests pin.
             let dist = if max_dist == 1 {
-                match osa_dist_le_1(&needle, e.code) {
+                match osa_dist_le_1_prepared(&needle_chars, e.code) {
                     Some(d) => d,
                     None => continue,
                 }
@@ -3279,7 +3440,9 @@ fn suggest_top3_scan(
 /// * identity (distance 0);
 /// * one substitution — the prefix (`E↔W`, which forces an exact digit
 ///   remainder) or any single digit lane (10 digits each): 1 + 3·10 slots;
-/// * one transposition of an adjacent digit pair: 3 slots;
+/// * one transposition of an adjacent digit pair: 2 slots (three digit lanes have
+///   exactly two adjacent pairs — `(1,2)` and `(2,3)`, which is what the `p in 0..2`
+///   loop enumerates);
 /// * for a 5-digit needle, one insertion *into the code* — the length delta
 ///   already spends the whole radius, so the code's digits must be the
 ///   needle's digits minus one (the 4 deletion candidates).
@@ -3462,8 +3625,21 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
     // Humanize first, then hand out read-only references: the emitter's batch
     // paths take `&Diagnostic`, so nothing downstream can mutate a diagnostic
     // (and therefore nothing can desynchronise the collector's tallies).
-    collector.humanize_pending();
-    let _ = emitter.emit_all_iter(collector.iter());
+    // Humanize only what the filter keeps, and emit only the unreported tail — the
+    // same partition discipline `DiagCtxt::emit` uses (emit `diags[reported_len..]`,
+    // advance the split only after a successful write, which is what makes `emit`
+    // retry-safe).  Emitting `collector.iter()` re-rendered the *reported* prefix
+    // whenever a caller mixed the two surfaces, called this twice, or ran it per
+    // module over a shared context, and it paid full Fluent humanization for every
+    // diagnostic the filter then dropped.
+    //
+    // Filtering first is sound because the emitter drops filtered diagnostics
+    // *before* its `is_humanized` assertion (see `emit_ordered`), so a dropped
+    // diagnostic is never handed to a renderer, humanized or not.
+    collector.humanize_pending_for(|d| emitter.filter().matches(d));
+    if emitter.emit_all_iter(collector.unreported().iter()).is_ok() {
+        collector.mark_all_reported();
+    }
     // The tallies can no longer drift through the emitter; this stays as the
     // repair path for an external checkpoint consumer that mutated and did not
     // recount.
@@ -4077,6 +4253,54 @@ pub(crate) fn sanitize_for_terminal_multiline(s: &str) -> Cow<'_, str> {
 
 /// Precomputed line-start table for O(log n) byte-offset → line lookup.
 ///
+/// The four table fields a [`LineIndex`] shares with the batch cache.
+///
+/// Fields are private and construction goes through [`SharedSourceTables::of`] (from a
+/// freshly built index — the only place that knows all four agree) or
+/// [`SharedSourceTables::from_cache`] (the cache layer, whose entries were themselves
+/// produced by `of`).  A positional `(starts, ascii, char_prefixes, generation)` list — the
+/// shape that let a caller mix tables from different sources — is no longer spellable.
+///
+/// Airtightness note: `from_cache` still accepts four loose values, so the *cache* layer can
+/// in principle mix them; `from_shared` therefore keeps its release-mode consistency checks
+/// and falls back to a fresh scan instead of rendering wrong columns.  Removing even that
+/// window means the cache entries themselves hold a `SharedSourceTables`, which is a
+/// cross-module field change (`emitter`'s `Prebuilt`, `render`'s two index structs).
+#[derive(Clone)]
+pub(crate) struct SharedSourceTables {
+    starts: Arc<[u32]>,
+    ascii: bool,
+    char_prefixes: LinePrefixTables,
+    generation: u64,
+}
+
+impl SharedSourceTables {
+    /// From a freshly built index: the only path that knows the four fields agree.
+    pub(crate) fn of(index: &LineIndex<'_>) -> Self {
+        Self {
+            starts: Arc::clone(index.starts_arc()),
+            ascii: index.ascii(),
+            char_prefixes: index.char_prefixes_arc().clone(),
+            generation: index.generation(),
+        }
+    }
+
+    /// Re-assemble from a cache entry's fields (cache layer only — see the type doc).
+    pub(crate) fn from_cache(
+        starts: Arc<[u32]>,
+        ascii: bool,
+        char_prefixes: LinePrefixTables,
+        generation: u64,
+    ) -> Self {
+        Self {
+            starts,
+            ascii,
+            char_prefixes,
+            generation,
+        }
+    }
+}
+
 /// The render path converts hundreds of spans per diagnostic; rescanning
 /// the file from the start on every conversion (as `byte_to_linecol`
 /// does) makes rendering O(spans × file_size). Build once per render and
@@ -4159,6 +4383,15 @@ pub(crate) struct LineIndex<'a> {
     /// `Arc` (not a bare `Mutex`) because `LineIndex` is `Clone`: a clone shares one memo
     /// for the same source, which is both cheaper and the right sharing model.
     untrusted_memo: std::sync::Arc<std::sync::Mutex<[(usize, SmallVec<[(u32, u32); 8]>); 4]>>,
+    /// Display-column checkpoint tables, direct-mapped by `(line, tab_width)`.
+    ///
+    /// The last O(prefix) per-span cost in the renderers: `byte_offset_to_display` walked
+    /// the line's graphemes from byte 0 for every header/label/note query.  Four slots
+    /// cover a diagnostic's header + label + note rows; a slot is rebuilt only when the key
+    /// changes, and a pure-ASCII tab-free line builds no checkpoints at all.
+    display_cols: std::sync::Arc<
+        std::sync::Mutex<[(usize, usize, crate::diagnostics::glyph::DisplayColumns); 4]>,
+    >,
     /// Process-wide monotonic id, assigned in [`LineIndex::new`] and carried
     /// through [`from_shared`](Self::from_shared).  Paired with the
     /// `char_col`'s tables are prebuilt by the scan and keyed by line index, so
@@ -4608,6 +4841,13 @@ impl<'a> LineIndex<'a> {
             untrusted_memo: std::sync::Arc::new(std::sync::Mutex::new(std::array::from_fn(|_| {
                 (usize::MAX, SmallVec::new())
             }))),
+            display_cols: std::sync::Arc::new(std::sync::Mutex::new(std::array::from_fn(|_| {
+                (
+                    usize::MAX,
+                    usize::MAX,
+                    crate::diagnostics::glyph::DisplayColumns::new("", 1),
+                )
+            }))),
             generation: LINE_INDEX_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
         (idx, content_hash)
@@ -4622,23 +4862,37 @@ impl<'a> LineIndex<'a> {
     /// non-ASCII sources, so cache insertions always source the flag and the
     /// prefix map from [`ascii`](Self::ascii) and
     /// [`char_prefixes_arc`](Self::char_prefixes_arc) of a freshly-built index.
-    pub(crate) fn from_shared(
-        source: &'a str,
-        starts: Arc<[u32]>,
-        ascii: bool,
-        char_prefixes: LinePrefixTables,
-        generation: u64,
-    ) -> Self {
+    pub(crate) fn from_shared(source: &'a str, tables: SharedSourceTables) -> Self {
+        let SharedSourceTables {
+            starts,
+            ascii,
+            char_prefixes,
+            generation,
+        } = tables;
+        // **Release-checked, and a fallback rather than an assert.**  These were
+        // `debug_assert!`s, so in release a stale or wrong-source cache entry rendered
+        // silently wrong columns: `ascii` selects the byte==column shortcut, and the prefix
+        // tables drive every char column.  The invariants that are O(1) — `starts[0] == 0`
+        // and the table-length match below — are now enforced in every build, and a
+        // violation degrades to a fresh scan instead of wrong output.
+        //
+        // The `ascii` check is the only O(source) one, so it runs unconditionally for small
+        // sources (cheap, and where the cache is least valuable) and stays a debug assert
+        // for large ones.  Closing that last window properly means making the four fields
+        // impossible to mismatch (an opaque `SharedSourceTables`), which requires the cache
+        // entry type in `emitter` to hold it — a separate, larger change.
         debug_assert_eq!(
             ascii,
             source.is_ascii(),
             "from_shared: ascii flag does not match source"
         );
-        debug_assert_eq!(
-            starts.first().copied(),
-            Some(0),
-            "from_shared: starts[0] must be 0"
-        );
+        const ASCII_RECHECK_MAX: usize = 4096;
+        if starts.first().copied() != Some(0)
+            || (!char_prefixes.is_empty() && char_prefixes.len() != starts.len())
+            || (source.len() <= ASCII_RECHECK_MAX && ascii != source.is_ascii())
+        {
+            return Self::new(source);
+        }
         // Structural identity check: the tables are sized by line count (one slot
         // per line) unless the high-byte gate left them empty, so a table vector
         // with a different length was built for a different source.  That catches
@@ -4658,8 +4912,42 @@ impl<'a> LineIndex<'a> {
             untrusted_memo: std::sync::Arc::new(std::sync::Mutex::new(std::array::from_fn(|_| {
                 (usize::MAX, SmallVec::new())
             }))),
+            display_cols: std::sync::Arc::new(std::sync::Mutex::new(std::array::from_fn(|_| {
+                (
+                    usize::MAX,
+                    usize::MAX,
+                    crate::diagnostics::glyph::DisplayColumns::new("", 1),
+                )
+            }))),
             generation,
         }
+    }
+
+    /// Display column of `byte_offset` within `line_idx`, with the per-line checkpoint
+    /// table memoized.
+    ///
+    /// Same answer as [`crate::diagnostics::glyph::byte_offset_to_display`], which is the
+    /// differential oracle (`display_columns_matches_the_scalar_walk_at_every_boundary`).
+    /// Keyed by `tab_width` because tab expansion depends on it; the memo is per-`LineIndex`
+    /// (a fresh index for another source gets a fresh memo — `Clone` shares, and clones
+    /// share the source).
+    pub(crate) fn display_col(
+        &self,
+        line_idx: usize,
+        byte_offset: usize,
+        tab_width: usize,
+    ) -> usize {
+        let line = self.line(line_idx);
+        let slot = (line_idx ^ (tab_width << 8)) & 3;
+        let mut memo = self.display_cols.lock().unwrap_or_else(|e| e.into_inner());
+        if memo[slot].0 != line_idx || memo[slot].1 != tab_width {
+            memo[slot] = (
+                line_idx,
+                tab_width,
+                crate::diagnostics::glyph::DisplayColumns::new(line, tab_width),
+            );
+        }
+        memo[slot].2.col(line, byte_offset, tab_width)
     }
 
     /// The index's generation id (assigned in `new`, carried through
@@ -4916,6 +5204,44 @@ impl<'a> LineIndex<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A panic mid-`humanize` must leave a *renderable* diagnostic, not half-derived state.
+    ///
+    /// `humanize_contained` is the containment half of the policy (it wraps the batch paths
+    /// and `DiagCtxt::humanize_pending*`); this pins the repair half, against exactly the
+    /// state `humanize` creates before it can fail: message `mem::take`n, labels drained, the
+    /// derived-label count stale.
+    #[test]
+    fn poison_for_render_overwrites_every_half_derived_field() {
+        let span = crate::ast::Span::new(crate::ast::FileId::DUMMY, 0, 1);
+        let mut d =
+            Diagnostic::error_kind(crate::diagnostics::kind::DiagnosticKind::TypeMismatch {
+                expected: "int".into(),
+                found: "string".into(),
+                span,
+                found_span: None,
+                reason: None,
+                context: None,
+            });
+        d.set_file_name("src/poison.pn");
+        // The half-derived shape a panic can leave behind.
+        d.message = std::borrow::Cow::Borrowed("");
+        d.labels.clear();
+        d.poison_for_render();
+
+        assert!(d.is_humanized(), "the latch must hold so nothing retries");
+        assert!(
+            d.message().contains("humanization panicked"),
+            "the failure must be visible, not empty: {:?}",
+            d.message()
+        );
+        assert!(d.help().is_none());
+        assert!(d.suggestions().is_empty());
+        assert!(d.labels().is_empty());
+        // Still a usable diagnostic: the id is recomputed over the placeholder rather than
+        // left describing the text that vanished.
+        assert_ne!(d.stable_id(), 0);
+    }
+
     use crate::ast::Span;
 
     /// The fused scan must be *bit-identical* to the standalone mixer, and must
@@ -5062,6 +5388,64 @@ mod tests {
         assert_ne!(a.stable_id(), b.stable_id());
     }
 
+    /// `joined()` flattens nesting *depth* to 1; it does nothing to bound
+    /// *width*.  A comptime diagnostic with a traceback is a **flat** `Joined` of
+    /// `8 + 5 * frames` parts, so the four-slot per-part stack walked off its end:
+    /// hard `stack[4]` index panic in release, its own debug assert in debug — on a
+    /// `pub` accessor whose whole contract is external tool dedup.
+    #[test]
+    fn stable_id_handles_a_wide_flat_joined_message() {
+        let span = crate::ast::Span::new(crate::ast::FileId::DUMMY, 0, 4);
+        let traceback = vec![
+            (
+                crate::diagnostics::kind::ComptimeReason::ComptimeBlock,
+                None,
+            ),
+            (
+                crate::diagnostics::kind::ComptimeReason::ComptimeFnCall,
+                Some(span),
+            ),
+        ];
+        // 4 layout parts + 5 per frame = 14 parts, i.e. well past the old four.
+        let make = || {
+            let mut d =
+                Diagnostic::error_kind(crate::diagnostics::kind::DiagnosticKind::Comptime {
+                    kind: crate::diagnostics::kind::ComptimeErrorKind::DivisionByZero,
+                    span,
+                    traceback: traceback.clone(),
+                });
+            d.set_file_name("src/wide.pn");
+            d
+        };
+
+        let diag = make();
+        let id = diag.stable_id();
+        assert_ne!(
+            id, 0,
+            "a real diagnostic must not hash to the empty sentinel"
+        );
+        // The id must be readable twice and equal across clones: a cache-only pass
+        // would hide the panic on the second read, not fix it.
+        assert_eq!(id, diag.stable_id());
+        assert_eq!(id, make().stable_id());
+
+        // Width must be *free*, and nesting depth must still be walked (a hand-built
+        // nested `Joined` is constructible through the public enum).
+        let wide: Vec<DiagMessage<'_>> = (0..8)
+            .map(|i| DiagMessage::Static(std::borrow::Cow::Owned(format!("p{i}"))))
+            .collect();
+        let nested = DiagMessage::Joined(
+            vec![
+                DiagMessage::Static(std::borrow::Cow::Borrowed("a")),
+                DiagMessage::Joined(wide.into_boxed_slice()),
+            ]
+            .into_boxed_slice(),
+        );
+        let mut rendered = String::new();
+        nested.render_into(&mut rendered);
+        assert!(rendered.contains("p7"), "nested parts must still be walked");
+    }
+
     #[test]
     fn stable_id_and_filter_use_canonical_code() {
         let known = Diagnostic::error("same").with_code(ErrCode::new("e030"));
@@ -5113,10 +5497,17 @@ mod tests {
         assert!(explain.contains("E030")); // did you mean suggestion
         assert!(explain.contains("help"));
 
-        // Far from every known code — falls back to generic help.
-        let explain = explain_error_code("Z999", true);
+        // Far from every known code — falls back to generic help.  The needle is derived
+        // at runtime, not hardcoded: `"Z999"` silently depended on the registry containing
+        // no `E999`/`W999`, so registering one would have flipped this case onto the
+        // did-you-mean branch with no code change here.
+        let far = ["Z999", "Z9999", "Q888", "J000", "XJJJ"]
+            .into_iter()
+            .find(|candidate| !explain_error_code(candidate, true).contains("did you mean"))
+            .expect("some probe code must be far from every registered code");
+        let explain = explain_error_code(far, true);
         assert!(explain.contains("unknown error code"));
-        assert!(explain.contains("Z999"));
+        assert!(explain.contains(far));
         assert!(explain.contains("valid error codes include"));
     }
 
@@ -5301,6 +5692,35 @@ mod tests {
         assert_eq!(collector.len(), 2);
         assert_eq!(collector.summary(), (1, 1));
         assert!(collector.has_errors());
+    }
+
+    /// `emit_collector` must advance the same reported/unreported partition as
+    /// `DiagCtxt::emit`.
+    ///
+    /// It used to emit `collector.iter()` — every diagnostic — and never call
+    /// `mark_all_reported`, so a caller that mixed the two surfaces (or simply ran
+    /// two collections over one context) re-rendered the first batch.  The
+    /// observable half of that bug is the frontier, and that is what this pins:
+    /// after a successful emit the unreported tail is empty, so a second call has
+    /// nothing to re-render.  (Writes to stderr; the assertion is on the partition,
+    /// not on captured bytes.)
+    #[test]
+    fn emit_collector_marks_the_batch_reported() {
+        let mut ctxt = DiagCtxt::new();
+        ctxt.push(Diagnostic::error("first"));
+        ctxt.push(Diagnostic::warning("second"));
+        assert_eq!(ctxt.unreported_len(), 2, "nothing is reported yet");
+
+        emit_collector(&mut ctxt, false);
+        assert_eq!(
+            ctxt.unreported_len(),
+            0,
+            "a successful emit must advance the reported frontier"
+        );
+
+        // Second call is a no-op — the retry-safe property `DiagCtxt::emit` has.
+        emit_collector(&mut ctxt, false);
+        assert_eq!(ctxt.unreported_len(), 0);
     }
 
     #[test]
@@ -5965,6 +6385,42 @@ mod tests {
                 );
             }
         }
+        // The **gate** path.  With `usize::MAX` the prefix scan never truncates, so the
+        // AVX2 marks loop's gate bookkeeping (`cur.clear()`, per-line offset attribution
+        // after the frontier) was only ever compared on whichever kernel the host takes —
+        // i.e. never, in both directions.  A small cap over the CJK members is exactly
+        // where a `line_start`-relative offset mistake would corrupt every column past the
+        // frontier: wrong columns, no crash.
+        for cap in [3usize, 5, 7] {
+            for src in corpus.iter().filter(|s| !s.is_ascii()) {
+                FORCE_SWAR_SCAN.store(true, std::sync::atomic::Ordering::Relaxed);
+                let (starts_swar, ascii_swar, hash_swar, tables_swar) =
+                    scan_line_starts_and_ascii_capped(src, cap);
+                FORCE_SWAR_SCAN.store(false, std::sync::atomic::Ordering::Relaxed);
+                let (starts_avx, ascii_avx, hash_avx, tables_avx) =
+                    scan_line_starts_and_ascii_capped(src, cap);
+                assert_eq!(
+                    starts_swar, starts_avx,
+                    "gated line starts differ (cap {cap}) for {src:?}"
+                );
+                assert_eq!(
+                    ascii_swar, ascii_avx,
+                    "gated ascii flag differs (cap {cap}) for {src:?}"
+                );
+                assert_eq!(
+                    hash_swar, hash_avx,
+                    "gated content hash differs (cap {cap}) for {src:?}"
+                );
+                assert_eq!(tables_swar.len(), tables_avx.len());
+                for line in 0..tables_swar.len() {
+                    assert_eq!(
+                        tables_swar.get(line).map(<[(u32, u32)]>::to_vec),
+                        tables_avx.get(line).map(<[(u32, u32)]>::to_vec),
+                        "gated char table differs on line {line} of {src:?} (cap {cap})"
+                    );
+                }
+            }
+        }
         FORCE_SWAR_SCAN.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -6070,7 +6526,10 @@ mod tests {
         assert!(tables.get(1).is_none(), "line 1 is proven ASCII");
         // Columns stay exact on both sides of the frontier — the trusted table and
         // the on-demand fallback are the same rule.
-        let idx = super::LineIndex::from_shared(src, starts.into(), ascii, tables, 0);
+        let idx = super::LineIndex::from_shared(
+            src,
+            SharedSourceTables::from_cache(starts.into(), ascii, tables, 0),
+        );
         let lines = idx.starts.len();
         for line_idx in 0..lines {
             let line = idx.line(line_idx);
@@ -6185,13 +6644,9 @@ mod tests {
         // the answers; sharing via `from_shared` is what makes a batch of M
         // diagnostics over one long non-ASCII line pay one build, not M.
         idx.linecol_display(3);
-        let shared = LineIndex::from_shared(
-            src,
-            std::sync::Arc::clone(idx.starts_arc()),
-            idx.ascii(),
-            idx.char_prefixes_arc().clone(),
-            idx.generation(),
-        );
+        // Built from the index itself: the whole point of the bundle is that these four
+        // fields cannot be assembled by hand (see `SharedSourceTables`).
+        let shared = LineIndex::from_shared(src, SharedSourceTables::of(&idx));
         assert_eq!(shared.linecol_display(3), (0, 1));
         assert_eq!(shared.linecol_display(14), (2, 1));
     }
@@ -6658,7 +7113,19 @@ mod tests {
                     // definition itself.  A generic helper defines as
                     // `fn name<'a>(` — which `name(` does not match — so the
                     // subtraction is what keeps legit helpers out of the report.
-                    let calls = test_code.matches(&format!("{fname}(")).count();
+                    // A bare `matches("{fname}(")` counted `span_lines(` as a call to
+                    // `span`, so a helper whose name is a *prefix* of a sibling could hide
+                    // a true orphan — the exact failure this guard exists to catch.
+                    let needle = format!("{fname}(");
+                    let calls = test_code
+                        .match_indices(&needle)
+                        .filter(|(at, _)| {
+                            *at == 0 || {
+                                let prev = test_code.as_bytes()[at - 1];
+                                !prev.is_ascii_alphanumeric() && prev != b'_'
+                            }
+                        })
+                        .count();
                     let defined = test_code.matches(&format!("fn {fname}(")).count();
                     if calls <= defined {
                         offenders.push(format!(

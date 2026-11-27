@@ -5,6 +5,7 @@
 //! framing (HTML `<head>`, JSON array brackets) lives in `begin`/`end` so the
 //! emitter stays format-agnostic.
 
+use super::SharedSourceTables;
 use crate::ast::FileId;
 use crate::diagnostics::glyph::SectionScratch;
 use crate::diagnostics::sink::DiagnosticSink;
@@ -533,10 +534,12 @@ impl<'a> RenderCtx<'a> {
             }
             return LineIndex::from_shared(
                 source,
-                Arc::clone(&e.starts),
-                e.ascii,
-                e.char_prefixes.clone(),
-                e.generation,
+                SharedSourceTables::from_cache(
+                    Arc::clone(&e.starts),
+                    e.ascii,
+                    e.char_prefixes.clone(),
+                    e.generation,
+                ),
             );
         }
         {
@@ -565,10 +568,12 @@ impl<'a> RenderCtx<'a> {
                 }
                 return LineIndex::from_shared(
                     source,
-                    Arc::clone(&cache[0].starts),
-                    cache[0].ascii,
-                    cache[0].char_prefixes.clone(),
-                    cache[0].generation,
+                    SharedSourceTables::from_cache(
+                        Arc::clone(&cache[0].starts),
+                        cache[0].ascii,
+                        cache[0].char_prefixes.clone(),
+                        cache[0].generation,
+                    ),
                 );
             }
         }
@@ -624,10 +629,12 @@ impl<'a> RenderCtx<'a> {
                 let e = &cache[0];
                 return LineIndex::from_shared(
                     source,
-                    Arc::clone(&e.starts),
-                    e.ascii,
-                    e.char_prefixes.clone(),
-                    e.generation,
+                    SharedSourceTables::from_cache(
+                        Arc::clone(&e.starts),
+                        e.ascii,
+                        e.char_prefixes.clone(),
+                        e.generation,
+                    ),
                 );
             }
         }
@@ -685,10 +692,7 @@ impl<'a> RenderCtx<'a> {
                     }
                     return LineIndex::from_shared(
                         source,
-                        starts,
-                        ascii,
-                        char_prefixes,
-                        generation,
+                        SharedSourceTables::from_cache(starts, ascii, char_prefixes, generation),
                     );
                 }
             }
@@ -788,11 +792,18 @@ impl<'a> RenderCtx<'a> {
         shared_sources: Arc<SharedSources>,
         file_urls: FileUrlMap,
         preload: &[PreloadedSource],
+        // The batch's content-addressed tables, sorted by `(ptr, len)` — the key the
+        // tier-0 `binary_search` uses.  This used to be built and sorted by
+        // `prebuild_sources` and then **never read** (only the 4-slot preload reached a
+        // worker), so every worker's first touch of a source paid the `SharedSources`
+        // RwLock plus a hash probe for a table the emitter already had.
+        prebuilt: &'a [PreloadedSource],
     ) -> Self {
         let mut cx = Self::new(opts, uri);
         cx.set_shared_sources(shared_sources);
         cx.set_file_urls(file_urls);
         cx.preload_line_index(preload);
+        cx.prebuilt = Some(prebuilt);
         cx
     }
 

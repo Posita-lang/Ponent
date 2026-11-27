@@ -43,6 +43,7 @@ pub enum ColorDepth {
 
 impl ColorDepth {
     /// Whether this depth can render 256-colour palette sequences.
+    #[must_use]
     pub const fn supports_256(self) -> bool {
         matches!(self, ColorDepth::TwoFiftySix | ColorDepth::TrueColor)
     }
@@ -73,6 +74,14 @@ pub struct TermCaps {
 }
 
 impl TermCaps {
+    /// The four capabilities in one env snapshot.
+    ///
+    /// **Deliberately ignores [`HYPERLINK_OVERRIDE`]**, unlike [`supports_hyperlinks`].
+    /// This is the raw, hermeticity-free reading of the environment: it is what the
+    /// re-executed child probe prints, and that probe exists precisely to observe what the
+    /// env actually says.  An in-process *test* must use the accessors
+    /// (`supports_hyperlinks` and friends), which honour the pin — `detect()` would make
+    /// such a test non-hermetic on a link-capable host.
     pub fn detect() -> Self {
         let stderr_is_tty = io::stderr().is_terminal();
         // `TERM` is read exactly once and threaded into the colour decision:
@@ -84,9 +93,15 @@ impl TermCaps {
         // exactly the reads this function used to duplicate inline, so a
         // future variable cannot be added to one and forgotten in the other.
         let caps = color_caps_from_env(stderr_is_tty, term);
-        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-            .iter()
-            .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
+        let locale = ["LC_ALL", "LC_CTYPE", "LANG"].iter().find_map(|v| {
+            std::env::var_os(v).filter(|s| {
+                // Non-empty **and** not whitespace-only: a blank locale is as unset as an
+                // empty one, the same rule `env_trimmed` and the no-color.org presence
+                // check use.  A non-UTF-8 locale stays "set" on purpose — that is what lets
+                // `unicode_decision_os` answer "set but not UTF-8", which is the truth.
+                !s.is_empty() && s.to_str().is_none_or(|t| !t.trim().is_empty())
+            })
+        });
         // Case-insensitive like every other term comparison in this module
         // (`COLORTERM`, TERM suffixes, JetBrains); `TERM=DUMB` on an embedded
         // CI terminal would otherwise enable colour *and* box drawing.
@@ -128,9 +143,15 @@ fn detect_color_caps_fresh() -> ColorCaps {
 fn detect_unicode_fresh() -> bool {
     let term_env = std::env::var_os("TERM");
     let term = term_env.as_deref();
-    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-        .iter()
-        .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()));
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"].iter().find_map(|v| {
+        std::env::var_os(v).filter(|s| {
+            // Non-empty **and** not whitespace-only: a blank locale is as unset as an
+            // empty one, the same rule `env_trimmed` and the no-color.org presence
+            // check use.  A non-UTF-8 locale stays "set" on purpose — that is what lets
+            // `unicode_decision_os` answer "set but not UTF-8", which is the truth.
+            !s.is_empty() && s.to_str().is_none_or(|t| !t.trim().is_empty())
+        })
+    });
     unicode_decision_os(locale.as_deref(), is_dumb_term(term))
 }
 
@@ -155,11 +176,12 @@ fn detect_width_fresh() -> usize {
 // unwrap (and the `Option` in the type), not a branch.
 static COLOR_CAPS: std::sync::LazyLock<ColorCaps> =
     std::sync::LazyLock::new(detect_color_caps_fresh);
-static UNICODE_CAP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(detect_unicode_fresh);
-static WIDTH_CAP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(detect_width_fresh);
+static UNICODE_CAPS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(detect_unicode_fresh);
+static WIDTH_CAPS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(detect_width_fresh);
 
 /// Snapshot the colour-related environment once, so `color` and `depth` can
 /// never describe different environments.
+#[must_use]
 pub fn detect_color_caps() -> ColorCaps {
     *COLOR_CAPS
 }
@@ -323,6 +345,11 @@ fn force_color_is_off(v: &OsStr) -> bool {
 ///      [`ColorDepth::TrueColor`]
 ///   6. `TERM` ends with `256color` → [`ColorDepth::TwoFiftySix`]
 ///   7. Otherwise → [`ColorDepth::Sixteen`]
+///
+/// The authoritative chain for *forced* levels lives in `color_depth_parts`; the
+/// `*_decision_env` wrappers only cover the `FORCE_COLOR` half, so a reader checking
+/// precedence must start there rather than at the wrapper.
+#[must_use]
 pub fn detect_color_depth() -> ColorDepth {
     detect_color_caps().depth
 }
@@ -334,7 +361,7 @@ pub fn detect_color_depth() -> ColorDepth {
 /// `COLORTERM` value shaped like a `TERM`); named fields make every call site
 /// auditable and turn the literal into its own documentation.  `Default` is the
 /// "nothing set" environment, which is what the decision-core tests want.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ColorEnv<'a> {
     /// `NO_COLOR` set to a non-empty value (no-color.org).
     pub no_color: bool,
@@ -466,6 +493,7 @@ fn color_depth_parts(env: &ColorEnv<'_>, force_depth: Option<ColorDepth>) -> Col
 ///   4. `CLICOLOR=0` → off.
 ///   5. `TERM=dumb` → off.
 ///   6. Otherwise: on iff `stderr` is a terminal.
+#[must_use]
 pub fn detect_color() -> bool {
     detect_color_caps().color
 }
@@ -610,11 +638,12 @@ fn color_decision_parts(env: &ColorEnv<'_>, force_off: Option<bool>) -> bool {
 /// This is deliberately **independent** of [`detect_color`]: a CI log with
 /// colour forced on but `LANG=C` must still get ASCII box-drawing, not
 /// mojibake.
+#[must_use]
 pub fn detect_unicode() -> bool {
-    // Process-stable snapshot (`UNICODE_CAP`): the locale/`TERM` reads happen
+    // Process-stable snapshot (`UNICODE_CAPS`): the locale/`TERM` reads happen
     // once per process instead of once per optional-detection call.  No
     // `isatty`/TIOCGWINSZ probe is paid here.
-    *UNICODE_CAP
+    *UNICODE_CAPS
 }
 
 fn unicode_decision_os(locale: Option<&OsStr>, term_dumb: bool) -> bool {
@@ -643,12 +672,13 @@ fn unicode_decision_os(locale: Option<&OsStr>, term_dumb: bool) -> bool {
 /// otherwise the *stderr* terminal size is probed (diagnostics are written
 /// there), falling back to [`DEFAULT_MAX_WIDTH`] when the probe returns
 /// `None`.
+#[must_use]
 pub fn detect_width() -> usize {
-    // Process-stable snapshot (`WIDTH_CAP`): at most one TIOCGWINSZ per process,
+    // Process-stable snapshot (`WIDTH_CAPS`): at most one TIOCGWINSZ per process,
     // and none at all when `COLUMNS` resolves.  The derivation lives in
     // `detect_width_fresh`, which reads `COLUMNS` via `var_os` + `to_str` like
     // the rest of the module.
-    *WIDTH_CAP
+    *WIDTH_CAPS
 }
 
 /// The `COLUMNS` half of the width decision.
@@ -667,8 +697,11 @@ fn width_from_columns(columns: Option<&str>) -> Option<usize> {
         Some((neg, body)) if !neg => match body.parse::<usize>() {
             Ok(w) => (w > 0).then_some(w.min(u16::MAX as usize)),
             // Overflow is still a positive number: clamp instead of treating it as
-            // "unset" (which silently fell back to the terminal size).
-            Err(_) => body.bytes().any(|b| b != b'0').then_some(u16::MAX as usize),
+            // "unset" (which silently fell back to the terminal size).  No all-zero guard
+            // is needed: `signed_digits` guarantees a non-empty all-digit body, so the only
+            // `parse` failure is `PosOverflow`, which implies a non-zero digit — the
+            // `.any(|b| b != b'0')` that used to sit here was provably always true.
+            Err(_) => Some(u16::MAX as usize),
         },
         _ => None,
     }
@@ -703,7 +736,7 @@ pub(crate) fn width_decision(columns: Option<&str>, term_size: Option<usize>) ->
 /// answer is memoized because the environment cannot change during a run and
 /// this probe sits on the per-diagnostic path.
 /// The uncached hyperlink probe: `NO_HYPERLINK` veto, `TERM=dumb` veto, then the crate
-/// probe.  Memoized by [`HYPERLINK_CACHE`] and called directly by [`TermCaps::detect`], so
+/// probe.  Memoized by [`HYPERLINK_CAPS`] and called directly by [`TermCaps::detect`], so
 /// the decision chain exists once instead of being open-coded twice.
 fn detect_hyperlinks_fresh() -> bool {
     let no_hyperlink = std::env::var_os("NO_HYPERLINK").is_some_and(|v| !v.is_empty());
@@ -727,7 +760,7 @@ fn detect_hyperlinks_fresh() -> bool {
     )
 }
 
-static HYPERLINK_CACHE: std::sync::LazyLock<bool> =
+static HYPERLINK_CAPS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(detect_hyperlinks_fresh);
 
 /// Test-only pin for the hyperlink *capability*, thread-scoped.
@@ -763,12 +796,13 @@ pub(crate) fn with_hyperlinks_override<R>(value: bool, f: impl FnOnce() -> R) ->
     f()
 }
 
+#[must_use]
 pub fn supports_hyperlinks() -> bool {
     #[cfg(test)]
     if let Some(pinned) = HYPERLINK_OVERRIDE.with(std::cell::Cell::get) {
         return pinned;
     }
-    *HYPERLINK_CACHE
+    *HYPERLINK_CAPS
 }
 
 pub(crate) fn hyperlink_decision(
@@ -931,7 +965,7 @@ fn is_dumb_term(term: Option<&OsStr>) -> bool {
     // shape of check, different evidence.
     term.is_some_and(|t| {
         let t = t.as_encoded_bytes();
-        t.eq_ignore_ascii_case(b"dumb") || (t.len() > 5 && t[..5].eq_ignore_ascii_case(b"dumb-"))
+        t.eq_ignore_ascii_case(b"dumb") || (t.len() >= 5 && t[..5].eq_ignore_ascii_case(b"dumb-"))
     })
 }
 
@@ -1009,11 +1043,17 @@ fn encode_scanned_path(out: &mut Vec<u8>, s: &[u8], first_unsafe: usize, unsafe_
         // start of a safe run.  The branch is therefore not redundant — an earlier
         // "it never fires" reading of this loop broke the byte-exact encoders.
         if is_url_safe(s[i]) {
-            let start = i;
-            while i < s.len() && is_url_safe(s[i]) {
-                i += 1;
-            }
-            out.extend_from_slice(&s[start..i]);
+            // `position` over the branchless predicate is the shape LLVM reliably
+            // vectorizes into a 16/32-byte find; the hand-rolled `while` (whose exit value
+            // fed a `slice` expression) stayed scalar.  The long safe run — a filename with
+            // a couple of spaces — is the dominant case, so this is the length that matters.
+            // Byte-identical output: both forms stop at the same first unsafe byte.
+            let end = s[i..]
+                .iter()
+                .position(|&b| !is_url_safe(b))
+                .map_or(s.len(), |rel| i + rel);
+            out.extend_from_slice(&s[i..end]);
+            i = end;
         } else {
             let b = s[i];
             out.push(b'%');
@@ -1114,6 +1154,13 @@ pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
     Cow::Owned(unsafe { String::from_utf8_unchecked(out) })
 }
 
+/// The empty-input URL sentinel, allocated once.
+///
+/// Three call sites (no bytes, an unrepresentable path, a path stripped to nothing) built a
+/// fresh `Arc<str>` for this constant on every call — rare paths, but pure waste.
+static FILE_URL_EMPTY: std::sync::LazyLock<std::sync::Arc<str>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::from("file://"));
+
 /// Convert a file path to a `file://` URL, handling WSL path translation.
 ///
 /// Assembly note (recorded so it is not re-attempted): the `Vec<u8>` here is
@@ -1157,7 +1204,7 @@ pub(crate) fn encode_file_url_path(s: &[u8]) -> Cow<'_, str> {
 #[must_use]
 pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
     if path.as_os_str().is_empty() {
-        return std::sync::Arc::from("file://");
+        return std::sync::Arc::clone(&FILE_URL_EMPTY);
     }
     let abs_path = if path.is_absolute() {
         Cow::Borrowed(path)
@@ -1166,7 +1213,7 @@ pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
             Ok(p) => Cow::Owned(p),
             // No CWD means no honest absolute URL.  Emit the explicit sentinel
             // instead of silently linking `/<path>`.
-            Err(_) => return std::sync::Arc::from("file://"),
+            Err(_) => return std::sync::Arc::clone(&FILE_URL_EMPTY),
         }
     };
     // `abs_path` cannot be empty here: an empty input returned above and
@@ -1187,7 +1234,7 @@ pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
         && (raw.starts_with(b"\\\\?\\") || raw.starts_with(b"\\\\.\\"))
     {
         // Volume-GUID / device paths have no safe `file://` representation.
-        return std::sync::Arc::from("file://");
+        return std::sync::Arc::clone(&FILE_URL_EMPTY);
     }
     // Windows paths use `\`, but URLs require `/`.  Gate strictly on the
     // platform: on POSIX a `\` is a legal filename byte and must be
@@ -1288,10 +1335,21 @@ const CACHE_MAX_BYTES: usize = 1 << 20;
 /// its own thread, so an override cannot leak into another test.
 #[cfg(test)]
 fn with_cache_limits<R>(cap: usize, max_bytes: usize, f: impl FnOnce() -> R) -> R {
+    /// Restores the production limits on drop — including during an unwind.
+    ///
+    /// The old shape restored only on the normal path, so an assert failing inside `f` left
+    /// a cap-8 cache on this thread.  Contained today because libtest gives each test its own
+    /// thread, but the sibling `with_hyperlinks_override` already uses this RAII shape and a
+    /// future in-thread composition must not be able to leak a cap.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            URLS.with(|c| *c.borrow_mut() = UrlCache::new());
+        }
+    }
     URLS.with(|c| *c.borrow_mut() = UrlCache::with_limits(cap, max_bytes));
-    let out = f();
-    URLS.with(|c| *c.borrow_mut() = UrlCache::new());
-    out
+    let _restore = Restore;
+    f()
 }
 
 /// `(hot entries, cold entries, hot bytes)` — the eviction state a test needs
@@ -1621,7 +1679,15 @@ mod tests {
             caps.color,
             caps.unicode,
             caps.width,
-            supports_hyperlinks(),
+            // `caps.hyperlinks`, **not** `supports_hyperlinks()`: the latter is
+            // short-circuited by `HYPERLINK_OVERRIDE`, which is `Some(false)` on every
+            // thread of a test build — including this re-executed child's test thread. So
+            // the printed value was a constant `false` and the three `["hyperlinks"]`
+            // assertions in `env_wiring_drives_term_caps` passed no matter what the env
+            // wiring did (a deleted `NO_HYPERLINK` veto or a broken `TERM=dumb` link veto
+            // would have gone unnoticed). `TermCaps::detect` is deliberately override-free,
+            // which is what makes this probe honest.
+            caps.hyperlinks,
         );
     }
 
@@ -1744,6 +1810,26 @@ mod tests {
     ///
     /// `file://wsl.localhost/<distro>/...` puts the distro in the first path segment
     /// (RFC 3986 §3.3 allows `:` there), and a space still gets encoded.  See the note at
+    /// A bare Windows drive root stays native even when a distro is known.
+    ///
+    /// Reachable on POSIX, where `C:` is just two bytes: the drive-letter branch must win
+    /// over the WSL one, or the URL becomes `file://wsl.localhost/<distro>/C:` and 9P has
+    /// to traverse a path that does not exist.  The bare-root trailing-slash append was
+    /// unpinned.
+    #[test]
+    fn a_bare_drive_root_with_a_distro_stays_native() {
+        assert_eq!(
+            format_file_url(b"C:", Some("Ubuntu")),
+            "file:///C:/",
+            "the bare-root branch appends the trailing slash"
+        );
+        assert_eq!(
+            format_file_url(b"C:/Users/x", Some("Ubuntu")),
+            "file:///C:/Users/x",
+            "a path below the drive keeps its prefix"
+        );
+    }
+
     /// the emission site for why the path-safe set — not the host-safe one — is right.
     #[test]
     fn a_colon_in_the_distro_stays_a_legal_path_segment() {
@@ -1800,6 +1886,10 @@ mod tests {
             "dumb-emacs-ansi",
             "dumb-vt100",
             "dumb-emacs",
+            // The family root with an empty suffix.  It is not a stock terminfo entry, so
+            // either answer is defensible — but the boundary must be *decided and pinned*:
+            // the previous `t.len() > 5` silently excluded exactly this spelling.
+            "dumb-",
         ] {
             assert!(
                 is_dumb_term(Some(std::ffi::OsStr::new(name))),
@@ -1942,6 +2032,32 @@ mod tests {
             probe(&[("NO_COLOR", " "), ("FORCE_COLOR", "1")])["color"],
             "false",
             "a padded NO_COLOR is still present and must suppress"
+        );
+        // Arm order: `FORCE_COLOR` precedes `CLICOLOR`, so a CI matrix exporting both sees
+        // the force.  Unpinned before, and a reordering "cleanup" would flip it silently.
+        assert_eq!(
+            probe(&[("CLICOLOR", "0"), ("FORCE_COLOR", "1")])["color"],
+            "true",
+            "FORCE_COLOR must precede CLICOLOR"
+        );
+        // A forced level precedes the terminal-family signal: `WT_SESSION` alone upgrades
+        // the depth, but `FORCE_COLOR=1` (16) must win.  Level-vs-`COLORTERM` was pinned,
+        // level-vs-`WT_SESSION` was not.
+        assert_eq!(
+            probe(&[("FORCE_COLOR", "1"), ("WT_SESSION", "abc")])["depth"],
+            "16",
+            "the forced level must precede the WT_SESSION family signal"
+        );
+        // `NO_COLOR` is a raw presence rule: `"0"` is present, so it suppresses.  A
+        // "helpful" `!= "0"` special case (which naive implementations add) would break
+        // every caller that exports it for other tools.
+        assert_eq!(probe(&[("NO_COLOR", "0")])["color"], "false");
+        // A whitespace-only locale is as unset as an empty one, so box drawing survives a
+        // host with a blank `LC_ALL`.
+        assert_eq!(
+            probe(&[("LC_ALL", " ")])["unicode"],
+            "true",
+            "a blank locale must be treated as unset"
         );
 
         // A colour-capable terminal still needs a tty (or a force) to *emit*.

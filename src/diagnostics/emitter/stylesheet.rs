@@ -188,25 +188,28 @@ mod tests {
         );
         // The count pins are substring counts, so a future variable whose name
         // contains another variable's name plus `:` (`--x--bg:` matching `--bg:`)
-        // would silently corrupt them.  Cheap pairwise guard.
+        // would silently corrupt them.  Cheap pairwise guard — the needles are built
+        // once (19, not 19x19 `format!` allocations) because both loops below use
+        // them, and the second loop previously rebuilt the same string.
+        let needles: Vec<(&str, String)> =
+            THEME_VARS.iter().map(|v| (*v, format!("{v}:"))).collect();
         for var in THEME_VARS {
-            for other in THEME_VARS {
+            for (other, needle) in &needles {
                 assert!(
-                    var == other || !var.contains(&format!("{other}:")),
+                    *var == *other || !var.contains(needle.as_str()),
                     "{var} contains `{other}:` — the substring counts below become \
                      ambiguous; rename one of them"
                 );
             }
         }
-        for var in THEME_VARS {
-            let needle = format!("{var}:");
+        for (var, needle) in &needles {
             assert_eq!(
-                DARK_HTML_CSS.matches(&needle).count(),
+                DARK_HTML_CSS.matches(needle.as_str()).count(),
                 2,
                 "{var} must appear in `:root` and in `html.light`"
             );
             assert_eq!(
-                LIGHT_HTML_CSS.matches(&needle).count(),
+                LIGHT_HTML_CSS.matches(needle.as_str()).count(),
                 1,
                 "{var} must appear once in the light `:root`"
             );

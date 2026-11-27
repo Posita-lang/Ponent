@@ -1179,9 +1179,10 @@ impl GlyphRenderer {
                                 pos.col,
                                 self.tab_width,
                             ),
-                            None => {
-                                byte_offset_to_display(idx.line(pos.line), pos.col, self.tab_width)
-                            }
+                            // Memoized checkpoints instead of a fresh grapheme walk per
+                            // header: this is the O(prefix) cost
+                            // `perf_header_column_walk_on_long_line` measures.
+                            None => idx.display_col(pos.line, pos.col, self.tab_width),
                         };
                         format!("{}:{}", pos.line + 1, display_col + 1)
                     }
@@ -1872,7 +1873,7 @@ impl GlyphRenderer {
                 start_pos.col,
                 self.tab_width,
             ),
-            None => byte_offset_to_display(idx.line(start_pos.line), start_pos.col, self.tab_width),
+            None => idx.display_col(start_pos.line, start_pos.col, self.tab_width),
         };
         push_uint(out, start_pos.line as u64 + 1);
         out.push(':');
@@ -5591,6 +5592,139 @@ impl LineColumnsCache {
         let col = cols.display(byte_offset);
         self.0 = Some((line_idx, cols));
         col
+    }
+}
+
+/// Sparse display-column checkpoints for one line at one tab width.
+///
+/// The last O(prefix) per-span cost in the renderers: `byte_offset_to_display` walks the
+/// line's graphemes from the start for **every** query, and the harness's
+/// `perf_header_column_walk_on_long_line` measures exactly that on a long line.  A line
+/// that is pure ASCII and tab-free needs no table at all (display column == byte offset);
+/// otherwise this records `(byte_off, display_col)` at every tab and every non-ASCII
+/// cluster, so a query is `partition_point` plus a walk bounded by the distance to the
+/// nearest checkpoint.
+///
+/// Keyed by `tab_width` because tab expansion is: the table is per `(line, tab_width)`,
+/// built lazily by the caller (`LineIndex::display_columns`).
+#[derive(Debug)]
+pub(crate) struct DisplayColumns {
+    /// `(byte offset, display column before that cluster)`, ascending.
+    checkpoints: Vec<(u32, u32)>,
+    /// `true` when the line is pure ASCII and tab-free — the query is the byte offset.
+    trivial: bool,
+}
+
+impl DisplayColumns {
+    /// Build the checkpoints for one line, or record it as trivial.
+    ///
+    /// One grapheme walk — the same one `byte_offset_to_display` would do per query.
+    pub(crate) fn new(line: &str, tab_width: usize) -> Self {
+        let mut checkpoints: Vec<(u32, u32)> = Vec::new();
+        let mut col = 0usize;
+        let mut byte = 0usize;
+        let mut trivial = line.is_ascii() && !line.as_bytes().contains(&b'\t');
+        if !trivial {
+            for g in line.graphemes(true) {
+                // A tab or a non-ASCII cluster changes the byte↔column relationship from
+                // this offset onward, so it must be a checkpoint.
+                if g == "\t" || !g.is_ascii() {
+                    // `u32` holds any realistic line; saturate rather than wrap so a
+                    // pathological line degrades to "checkpoint at the end" (correct, just
+                    // useless) instead of wrapping to a small column.
+                    checkpoints.push((
+                        byte.min(u32::MAX as usize) as u32,
+                        col.min(u32::MAX as usize) as u32,
+                    ));
+                }
+                col += grapheme_width(g, col, tab_width);
+                byte += g.len();
+            }
+        }
+        Self {
+            checkpoints,
+            trivial,
+        }
+    }
+
+    /// Display column of `byte_offset` within the line this table was built for.
+    pub(crate) fn col(&self, line: &str, byte_offset: usize, tab_width: usize) -> usize {
+        if self.trivial {
+            return byte_offset;
+        }
+        let at = self
+            .checkpoints
+            .partition_point(|&(b, _)| (b as usize) <= byte_offset);
+        let (mut byte, mut col) = match at {
+            0 => (0usize, 0usize),
+            n => {
+                let (b, c) = self.checkpoints[n - 1];
+                (b as usize, c as usize)
+            }
+        };
+        if byte >= line.len() {
+            return col;
+        }
+        for g in line[byte..].graphemes(true) {
+            if byte + g.len() > byte_offset {
+                break;
+            }
+            col += grapheme_width(g, col, tab_width);
+            byte += g.len();
+        }
+        col
+    }
+}
+
+#[cfg(test)]
+mod display_columns_tests {
+    use super::{DisplayColumns, byte_offset_to_display, byte_range_to_display};
+
+    /// The checkpoint table must answer *exactly* what the scalar walk answers.
+    ///
+    /// Corpus: pure ASCII (trivial path), tabs in every position, wide CJK, a combining
+    /// mark (a cluster wider than one char but one column), and a mixed line.  Every byte
+    /// boundary is checked at every tab width the renderer can be configured with, because
+    /// the table is per `(line, tab_width)` and tab expansion is where a checkpoint scheme
+    /// goes wrong.
+    #[test]
+    fn display_columns_matches_the_scalar_walk_at_every_boundary() {
+        let corpus = [
+            "",
+            "plain ascii line",
+            "\tindented",
+            "a\tb\tc",
+            "\t\t\t\t",
+            "宽度",
+            "a宽b",
+            "\t宽\t字",
+            "e\u{301}closed", // combining acute: one cluster, one column
+            "e\u{301}\tx",
+            "  \t  \t  mixed 宽 \t tail  ",
+        ];
+        for line in corpus {
+            for tab_width in [1usize, 2, 4, 8] {
+                let table = DisplayColumns::new(line, tab_width);
+                for off in 0..=line.len() {
+                    // The scalar answer is only defined at a cluster boundary; compare
+                    // there, which is where the renderers query (`pos.col` comes from the
+                    // line index and is a char boundary).
+                    if !line.is_char_boundary(off) {
+                        continue;
+                    }
+                    let want = byte_offset_to_display(line, off, tab_width);
+                    assert_eq!(
+                        table.col(line, off, tab_width),
+                        want,
+                        "line {line:?} tab_width {tab_width} offset {off}"
+                    );
+                }
+                // The table must agree with the range oracle too, so a caller that mixes
+                // the two cannot see different columns.
+                let (start, _) = byte_range_to_display(line, 0, line.len(), tab_width);
+                assert_eq!(start, 0, "line {line:?} tab_width {tab_width}");
+            }
+        }
     }
 }
 

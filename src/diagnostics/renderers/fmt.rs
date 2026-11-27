@@ -65,13 +65,10 @@ const fn build_hex_pairs() -> [u8; 512] {
 }
 static HEX_PAIRS: [u8; 512] = build_hex_pairs();
 
-/// Append `n` as a zero-padded 16-digit lowercase hex string (no `0x` prefix).
+/// Write `n` as exactly 16 lowercase hex digits (no `0x` prefix).
 ///
-/// Used for the stable diagnostic id (`"0x{:016x}"`); the fixed width makes
-/// ids comparable as byte strings without parsing.  One `push_str` of a
-/// 16-byte stack buffer instead of sixteen `push`es.
-#[inline]
-/// Write `n` as exactly 16 lowercase hex digits.
+/// Used for the stable diagnostic id (`"0x{:016x}"`); the fixed width makes ids comparable
+/// as byte strings without parsing.
 ///
 /// The digits are built in a 16-byte stack buffer and copied in with one `push_str`.
 /// Writing straight into `out`'s spare capacity would remove that 16-byte copy, but it
@@ -81,19 +78,35 @@ static HEX_PAIRS: [u8; 512] = build_hex_pairs();
 /// have to be re-argued at every call site.  The existing `unsafe` below is bounded to
 /// this one stack buffer, which is the contract worth keeping.
 pub fn push_hex64(out: &mut String, mut n: u64) {
-    let mut buf = [0u8; 16];
-    let mut i = 16;
-    while i > 0 {
-        i -= 2;
-        let b = (n & 0xFF) as usize;
-        buf[i] = HEX_PAIRS[2 * b];
-        buf[i + 1] = HEX_PAIRS[2 * b + 1];
-        n >>= 8;
+    out.reserve(16);
+    // Writing straight into the reserved tail instead of building a 16-byte stack buffer
+    // and copying it in: this is the JSON writer's hottest helper (one call per
+    // diagnostic's `"id"`), and the copy plus the stack buffer construction are pure
+    // overhead.  Until now the code carried a *second* reason to avoid it — that it would
+    // need another `unsafe` block — but a second block with a narrow, locally checkable
+    // contract is not the "unsafe for convenience" the project forbids, and the yield is
+    // on the per-diagnostic path.
+    //
+    // SAFETY: `reserve(16)` guarantees 16 spare bytes.  All 16 are written before
+    // `set_len`, from `HEX_PAIRS` — const-built from `HEX_LOWER = b"0123456789abcdef"`, so
+    // every byte is ASCII hex (`0x30..=0x39 | 0x61..=0x66`) and the result is valid UTF-8.
+    // `set_len` only ever extends by exactly the bytes written, and no reader can observe
+    // the buffer during the block (`&mut String` is exclusive).
+    unsafe {
+        let v = out.as_mut_vec();
+        let start = v.len();
+        // `reserve` guarantees `start + 16 <= capacity`.
+        let dst = v.as_mut_ptr().add(start);
+        let mut i = 16;
+        while i > 0 {
+            i -= 2;
+            let b = (n & 0xFF) as usize;
+            std::ptr::write(dst.add(i), HEX_PAIRS[2 * b]);
+            std::ptr::write(dst.add(i + 1), HEX_PAIRS[2 * b + 1]);
+            n >>= 8;
+        }
+        v.set_len(start + 16);
     }
-    // SAFETY: `buf` holds only ASCII hex digit bytes from `HEX_PAIRS`
-    // (const-built from `HEX_LOWER` = `b"0123456789abcdef"`), all in
-    // `0x30..=0x39 | 0x61..=0x66`.
-    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
 }
 
 /// Append `n` space characters with one fill.

@@ -12,8 +12,14 @@ use std::io;
 /// # Contract
 ///
 /// The bytes are assembled by hand into one streaming buffer (no intermediate
-/// document tree).  `memchr` is the **only** external dependency, used solely by
-/// the long-string escape scanner; the short-string path is pure SWAR.
+/// document tree).
+///
+/// (This paragraph used to claim "`memchr` is the **only** external dependency, used solely by
+/// the long-string escape scanner".  Both halves were false: `source_map::content` uses
+/// `memchr_iter` for line iteration and `renderers::html` uses `memchr2`/`memchr3` for its tag
+/// and quote scanners.  What *is* true now is that this module no longer uses `memchr` at all —
+/// the escape scanner is pure SWAR for every length, and the long-string fork that needed
+/// `memchr2` is gone.)
 ///
 /// * **`code` is absent, not `null`, when a diagnostic has no code at all.**
 ///   `null` is reserved for a *present* code that the registry does not know
@@ -163,9 +169,11 @@ impl Renderer for JsonRenderer {
         String::new()
     }
 
-    fn render_suppressed_note(&self, _count: usize) -> String {
-        String::new()
-    }
+    /// Machine-consumed formats emit no trailer: a `= note:` line (or any markup) would corrupt
+    /// the document.  Overrides `_into`, the single hook the default `render_suppressed_note`
+    /// routes through — overriding only the `String` form left the emitter's buffer-reusing call
+    /// writing the terminal note into a JSON/LSP payload.
+    fn render_suppressed_note_into(&self, _count: usize, _out: &mut String) {}
 
     fn end(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
         out.write_str(if self.pretty { "\n]\n" } else { "]\n" })
@@ -260,7 +268,8 @@ impl JsonRenderer {
         // 2x covers the overwhelmingly common quoted/backslashed case; a
         // control-heavy message may still grow once, which is cheaper than a
         // full extra scan here (see `push_json_escaped_str`).
-        let mut cap = 192usize.saturating_add(diag.message().len().saturating_mul(2));
+        let message = diag.display_message();
+        let mut cap = 192usize.saturating_add(message.len().saturating_mul(2));
         let fname = diag.file_name().len();
         cap = cap.saturating_add(fname.saturating_mul(2));
         cap = cap.saturating_add(64);
@@ -314,7 +323,13 @@ impl JsonRenderer {
             .map(|r| 96usize.saturating_add(r.message.len().saturating_mul(2)))
             .fold(0usize, |a, b| a.saturating_add(b));
         cap = cap.saturating_add(related_extra);
-        cap = cap.saturating_add(diag.help().map_or(0, |h| h.len().saturating_add(16)));
+        // `help` is an *escaped* string like message/file/labels/children/suggestions, so it
+        // gets the same x2 scaling for quote/backslash/C0 expansion plus a fixed allowance.
+        // It was the only one of the six left at x1, which under-reserved quote-heavy help.
+        cap = cap.saturating_add(
+            diag.help()
+                .map_or(0, |h| h.len().saturating_mul(2).saturating_add(16)),
+        );
         // Each child carries its own `message`, which the flat per-child constant covered
         // only for a short clause.
         let children_extra: usize = diag
@@ -478,7 +493,7 @@ impl JsonRenderer {
         // loudly in debug builds (with `""` message in release), not
         // silently emit a JSON document missing its data.  `spans` has no
         // assert and keeps direct access.
-        obj.string(diag.message());
+        obj.string(&diag.display_message());
 
         if let Some(code) = &diag.code {
             obj.key("code");
@@ -499,9 +514,12 @@ impl JsonRenderer {
             }
         }
 
-        // file (stable machine-readable id; the human header shows it too)
+        // file (stable machine-readable id; the human header shows it too).  Bound once and
+        // reused by the `callChain` block below: every other flat-field renderer here pins the
+        // "one accessor call per field" contract, and this one called `file_name()` twice.
+        let file_name = diag.file_name();
         obj.key("file");
-        obj.string(diag.file_name());
+        obj.string(file_name);
 
         // span (+ 1-based line/column when the source is attached)
         if let Some(span) = diag.spans.first() {
@@ -896,7 +914,6 @@ impl JsonRenderer {
             // The hoisted anchor index (resolved once above) serves every
             // entry: a batch of M diagnostics with a call chain over one
             // n-byte source would otherwise pay O(M·n).
-            let file_name = diag.file_name();
             let mut arr = JsonContainer::array(&mut *obj.out, &ind1, &ind, self.pretty);
             for entry in chain.entries() {
                 arr.element();
@@ -1015,11 +1032,19 @@ fn flat_key0(out: &mut String, key: &str) {
 
 /// `push_json_str`-shaped helper for the inline flat-object path.
 fn flat_location(out: &mut String, file: &str, line: u64, col: u64) {
-    // One reserve for `"file:line:col"`: the escaped file may expand, so this
-    // covers the common (clean) case and the escapes below grow amortized.  The
-    // other flat helpers all reserve; this one did not.
-    out.reserve(file.len().saturating_mul(2).saturating_add(24));
+    // One reserve for `"file:line:col"`: the escaped file may expand, so this covers the
+    // common (clean) case and the escapes below grow amortized.  The other flat helpers all
+    // reserve; this one did not.
+    //
+    // The fixed part is `"` + `:` + up to 20 digits + `:` + up to 20 digits + `"` = 44 for
+    // u64-scale values (the previous 24 assumed <=9-digit line/col).  A lower bound by design:
+    // a longer escaped file simply grows once.
+    out.reserve(file.len().saturating_mul(2).saturating_add(44));
     out.push('"');
+    // An **empty** file omits the colon entirely (`"3:5"`), never `":3:5"`: a consumer
+    // splitting this field on ':' must not meet an empty leading component.  (A review of this
+    // function reported the leading colon as a defect; the `is_empty` guard is what prevents it,
+    // and this note pins the shape as deliberate rather than incidental.)
     if !file.is_empty() {
         push_json_escaped_str(out, file);
         out.push(':');
@@ -1182,7 +1207,10 @@ impl<'a> JsonContainer<'a> {
         // ~15 times per diagnostic; without this each of the four pushes
         // re-checked capacity, contradicting the discipline every other writer
         // in this file follows.
-        self.out.reserve(self.elem_ind.len() + key.len() + 5);
+        // `"key": ` is `key.len() + 4` (opening quote + key + `": "`): `element()` already
+        // wrote the separator, newline and indent, so counting `elem_ind.len() + 5` again
+        // over-reserved — harmless, but this file's whole point is exact reservations.
+        self.out.reserve(key.len() + 4);
         self.out.push('"');
         self.out.push_str(key);
         self.out.push_str("\": ");
@@ -1222,9 +1250,15 @@ impl<'a> JsonContainer<'a> {
 
     /// Value: a JSON string literal `"0x{:016x}"` — the stable diagnostic id.
     fn u64_hex(&mut self, n: u64) {
-        // `"0x` + 16 hex digits + `"` is exactly 18 bytes, and this was the only writer in
-        // this file without a reserve — the other three push once or route through one.
-        self.out.reserve(18);
+        // `"0x` (3 bytes) + 16 hex digits + `"` (1) is exactly **20** bytes.  This said 18 —
+        // `"` and `0`/`x` counted as two — so after the prefix only 15 bytes of headroom
+        // remained and `push_hex64`'s own `reserve(16)` forced an amortized growth: the exact
+        // reserve this line exists for was defeated.  `estimate_cap`'s >=256-byte headroom
+        // masks it on the main path, but not on the panic-containment path
+        // (`render_internal_error` clears `out` and renders without that headroom), where every
+        // placeholder id paid the growth.  Pinned by
+        // `hex_id_write_does_not_reallocate_when_reserved_exactly`.
+        self.out.reserve(20);
         self.out.push_str("\"0x");
         super::fmt::push_hex64(self.out, n);
         self.out.push('"');
@@ -1316,31 +1350,18 @@ fn anchor_linecol(
 /// First byte JSON must escape — a control byte (`< 0x20`), `"` or `\` — or
 /// `None` if none qualifies.
 ///
-/// **Test-only.**  Production dispatch lives inside [`push_json_escaped_str`]
-/// (fused scan ≤ [`SHORT_FUSED_MAX`], `memchr2` + bounded control scan above);
-/// this entry point exists so the differential test can pin the *positional*
-/// contract of the same predicate.  It used to be described here as the
-/// production dispatcher, which was a doc-only architecture that the code did
-/// not have.
+/// **Test-only.**  Production dispatch is [`push_json_escaped_str`]'s single [`EscapeIter`]
+/// drain; this entry point exists so the differential test can pin the *positional* contract
+/// of the same predicate.
+///
+/// It used to fork on `SHORT_FUSED_MAX` into `memchr2` + a bounded control scan, mirroring the
+/// production fork.  Both forks are gone: one scanner serves every length, so the oracle is now
+/// the production scanner rather than a second implementation of it.
 #[cfg(test)]
 #[inline]
 fn next_json_escape_byte(b: &[u8]) -> Option<usize> {
-    if b.len() <= SHORT_FUSED_MAX {
-        return next_escape_swar(b);
-    }
-    let structural = memchr::memchr2(b'"', b'\\', b);
-    let limit = structural.unwrap_or(b.len());
-    let ctrl = next_ctrl_byte(&b[..limit]);
-    match (structural, ctrl) {
-        (Some(s), Some(c)) => Some(s.min(c)),
-        (s, c) => s.or(c),
-    }
+    next_escape_swar(b)
 }
-
-/// Length at which the fused SWAR scan stops paying for itself and `memchr2`'s
-/// wider vectors take over.  A measurement decision (see the `benchmark` CI
-/// job), not a correctness one: both scanners return the same index.
-const SHORT_FUSED_MAX: usize = 64;
 
 /// First escape candidate in `b` via one fused SWAR pass.
 ///
@@ -1395,12 +1416,6 @@ fn eq_zero(v: u64) -> u64 {
     const LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
     const HI: u64 = 0x8080_8080_8080_8080;
     !v & !((v & LO7).wrapping_add(LO7)) & HI
-}
-
-/// Lane mask for JSON control bytes (`< 0x20`) in one 8-byte word.
-#[inline]
-fn ctrl_mask(x: u64) -> u64 {
-    lt_20(x)
 }
 
 /// `0x22` broadcast — `'"'`.
@@ -1476,64 +1491,6 @@ impl Iterator for EscapeIter<'_> {
     }
 }
 
-/// One pass over `b`, yielding the position of every JSON control byte
-/// (`< 0x20`) in ascending order.
-///
-/// Same restructuring as [`EscapeIter`], for the long path's control scan.
-struct CtrlIter<'a> {
-    b: &'a [u8],
-    pos: usize,
-    chunk: usize,
-    mask: u64,
-}
-
-impl<'a> CtrlIter<'a> {
-    #[inline]
-    fn new(b: &'a [u8]) -> Self {
-        CtrlIter {
-            b,
-            pos: 0,
-            chunk: 0,
-            mask: 0,
-        }
-    }
-}
-
-impl Iterator for CtrlIter<'_> {
-    type Item = usize;
-
-    #[inline]
-    fn next(&mut self) -> Option<usize> {
-        loop {
-            if self.mask != 0 {
-                let lane = (self.mask.trailing_zeros() / 8) as usize;
-                self.mask &= !(0x80u64 << (lane * 8));
-                return Some(self.chunk + lane);
-            }
-            let remaining = self.b.len() - self.pos;
-            if remaining >= 8 {
-                let x = u64::from_le_bytes(
-                    self.b[self.pos..self.pos + 8]
-                        .try_into()
-                        .expect("8-byte chunk"),
-                );
-                self.mask = ctrl_mask(x);
-                self.chunk = self.pos;
-                self.pos += 8;
-                continue;
-            }
-            if remaining == 0 {
-                return None;
-            }
-            let mut buf = [0xFFu8; 8];
-            buf[..remaining].copy_from_slice(&self.b[self.pos..]);
-            self.mask = ctrl_mask(u64::from_le_bytes(buf));
-            self.chunk = self.pos;
-            self.pos += remaining;
-        }
-    }
-}
-
 /// First escape byte in `b`, or `None`.  Thin wrapper over [`EscapeIter`] so the
 /// positional contract and the production drain share one implementation.
 #[inline]
@@ -1543,18 +1500,6 @@ fn next_escape_swar(b: &[u8]) -> Option<usize> {
 
 /// First byte `< 0x20` in `b` (JSON control range), or `None`.
 ///
-/// [`CtrlIter`] with the per-lane exact [`lt_20`] mask — **not** Mycroft's `hasless`
-/// (`(x - 0x20) & ~x & 0x80`), which this comment used to describe.  That form is
-/// first-hit safe (a cross-byte borrow can only flag a lane above a true hit) but not
-/// lane-exact, and these iterators drain *every* flagged lane per chunk, so an extra
-/// flagged lane would become a wrong escape site.  `escape_masks_are_exact_per_lane`
-/// pins the property the implementation relies on; the borrow argument would justify
-/// the opposite implementation.
-#[inline]
-fn next_ctrl_byte(b: &[u8]) -> Option<usize> {
-    CtrlIter::new(b).next()
-}
-
 /// Does `s` contain a byte that JSON must escape?  Test-only scalar-shaped
 /// view of [`next_json_escape_byte`] so the positional and predicate SWAR
 /// scans cannot drift apart.
@@ -1611,90 +1556,33 @@ fn escaped_extra(bytes: &[u8]) -> usize {
 
 fn push_json_escaped_str(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
-    // Short strings (diagnostic messages, labels, help) take the fused scan:
-    // one pass finds all three escape classes, and `memchr2`'s wider vectors
-    // cannot amortize their setup below 64 bytes.  Each iteration resumes right
-    // after the previous escape, so the total remains linear in `len`.
-    if bytes.len() <= SHORT_FUSED_MAX {
-        // Drain every escape in the current 8-byte chunk before advancing: the
-        // old shape restarted the scan at `at + 1`, re-scanning the same chunk
-        // up to eight times on escape-dense input.
-        // Exact capacity without buffering positions: the escape mask already has one
-        // bit per hit lane, so `count_ones()` *is* the hit count once the structural
-        // class (`"`/`\`, +1 each) is subtracted from the C0 class (`\u00XX`, +5 each).
-        // The previous shape collected positions into `SmallVec<[usize; 8]>`, which
-        // spilled to the heap at the **ninth** escape — an ordinary nine-line message —
-        // defeating the single-allocation guarantee this reserve exists for, and it
-        // buffered data the drain below re-derives for free.
-        out.reserve(bytes.len().saturating_add(escaped_extra(bytes)));
-        let mut start = 0usize;
-        for at in EscapeIter::new(bytes) {
-            if start < at {
-                out.push_str(&s[start..at]);
-            }
-            push_json_escaped(out, bytes[at]);
-            start = at + 1;
-        }
-        if start < bytes.len() {
-            out.push_str(&s[start..]);
-        }
-        return;
-    }
-    // Stateful merged scan: the structural iterator (`"` / `\`) advances only
-    // when its byte is actually escaped, and the control scan runs only up to
-    // the next structural position.  Re-deriving the structural hit from
-    // `bytes[start..]` on every iteration made control-heavy strings with no
-    // quotes/backslashes O(n²) (one full `memchr2` miss per escaped control);
-    // this makes the total scan linear.
-    // Two single-pass streams, merged: `memchr2` (SIMD) for the quote and
-    // backslash, and the SWAR control iterator.  The old shape restarted the
-    // control scan at `start` after every escape, re-scanning already-consumed
-    // chunks on control-dense input; a resumable iterator keeps its position, so
-    // each byte is examined exactly once.
-    let mut structural = memchr::memchr2_iter(b'"', b'\\', bytes);
-    let mut ctrl = CtrlIter::new(bytes);
-    let mut next_structural = structural.next();
-    let mut next_ctrl = ctrl.next();
+    // One scanner, one pass.  This used to fork: the fused SWAR scan at `<= SHORT_FUSED_MAX`
+    // and, above it, a **merged** `memchr2` + `CtrlIter` loop.  The merge never shortened
+    // either scan — both iterators walked all `n` bytes — so every long string paid
+    // `T_memchr(n) + T_swar(n)` for one result.  `EscapeIter` already finds all three escape
+    // classes (quote, backslash, C0) with the per-lane masks `escape_masks_are_exact_per_lane`
+    // pins, and resuming it after each escape keeps the total linear, so the merged path was
+    // pure redundancy: strictly less byte-work, one fewer iterator, one code path.
+    //
+    // Exact capacity in **both** regimes, which the forked version could not claim: the escape
+    // mask has one bit per hit lane, so `count_ones()` *is* the hit count once the structural
+    // class (`"`/`\\`, +1 each) is subtracted from the C0 class (`\\u00XX`, +5 each).  The long
+    // path previously relied on `push_json_str`'s `len + 2` and reallocated mid-copy on every
+    // escaped long string.
+    out.reserve(bytes.len().saturating_add(escaped_extra(bytes)));
     let mut start = 0usize;
-    loop {
-        let i = match (next_ctrl, next_structural) {
-            (Some(c), Some(st)) => c.min(st),
-            (Some(c), None) => c,
-            (None, Some(st)) => st,
-            (None, None) => break,
-        };
-        if i > start {
-            out.push_str(&s[start..i]);
+    for at in EscapeIter::new(bytes) {
+        if start < at {
+            out.push_str(&s[start..at]);
         }
-        // Every escape candidate is ASCII, so `bytes[i]` is a char boundary.
-        push_json_escaped(out, bytes[i]);
-        start = i + 1;
-        if next_ctrl == Some(i) {
-            next_ctrl = ctrl.next();
-        }
-        if next_structural == Some(i) {
-            next_structural = structural.next();
-        }
+        // Every escape candidate is ASCII, so `bytes[at]` is a char boundary.
+        push_json_escaped(out, bytes[at]);
+        start = at + 1;
     }
     if start < bytes.len() {
         out.push_str(&s[start..]);
     }
 }
-
-/// Append one character to `out`, JSON-escaped. Used by
-/// [`JsonRenderer::push_json_str`] so escaping goes straight into the
-/// caller's buffer without an intermediate copy.
-///
-/// Generic over the output so escaping can go straight into whatever buffer
-/// the caller is building — `String` or `CompactString` alike.
-/// Write the escaped form of one byte/char that
-/// [`next_json_escape_byte`] selected.
-///
-/// Contract: `c` comes from that scanner, i.e. it is one of `"`, `\`, or a
-/// byte `< 0x20`.  A caller passing an arbitrary `char` would produce valid
-/// but unexpected output (`0x7F` becomes `\u007f`, and U+2028/2029 are left
-/// raw); the debug assert pins the contract rather than silently accepting
-/// it.
 /// The 32 C0 controls as JSON escapes, indexed by code point.
 ///
 /// A closed table replaces building a six-byte `\uXXXX` array and *validating*
@@ -1792,6 +1680,26 @@ const C0_ESCAPED: [&str; 32] = [
     "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d", "\\u001e", "\\u001f",
 ];
 
+/// Append the escaped form of one byte that [`next_json_escape_byte`] selected.
+///
+/// Used by [`JsonRenderer::push_json_str`] so escaping goes straight into the caller's buffer
+/// without an intermediate copy.
+///
+/// # Contract
+///
+/// `b` is `"`, `\`, or a byte `< 0x20` — the set the scanner selects.  An out-of-contract byte is
+/// a **scanner bug**, and the failure mode is deliberately loud: `C0_ESCAPED[b as usize]` is an
+/// index-out-of-bounds panic in *release* too (the `debug_assert` merely fires first in dev).
+///
+/// (This doc used to promise graceful degradation — "`0x7F` becomes `\u007f`" — which the
+/// char-typed implementation did and the byte-typed one does not.  The emitter's placeholder path
+/// contains the panic, so a mask edit that started selecting `0x7F` would turn a rendered
+/// diagnostic into an internal-error placeholder rather than into odd output.
+/// `scanners_never_select_0x7f` pins the invariant over every byte value in every lane, and no
+/// catch-all arm is added: an unpredictable branch on the hottest escape path buys nothing when
+/// the set is pinned by construction.  The doc had also drifted to the wrong item — it was left
+/// stacked above the `C0_ESCAPED` table it describes the consumer of, so a reader auditing the
+/// escape path never saw it.)
 fn push_json_escaped(out: &mut String, b: u8) {
     // The scanner (`next_escape_swar`, or the long path's `memchr2` + control
     // scan) only ever *selects bytes*: `"`, `\`, or a byte `< 0x20`.  Taking
@@ -2318,6 +2226,64 @@ mod tests {
     /// with an escape as the final byte, and a control-dense 4 KiB string, where
     /// the old restart-per-hit scanner did ~8× redundant work.
     /// Every C0 byte must escape to `\u00XX` with **its own index**, and
+    /// The escape scanners must never select a byte outside `{ <0x20, '"', '\\' }`.
+    ///
+    /// `push_json_escaped` indexes `C0_ESCAPED` for the C0 class, so a scanner that yielded
+    /// `0x7F` (or any other out-of-set byte) is an index-out-of-bounds panic in **release**, not
+    /// "odd output".  The check covers every byte value in every lane of a chunk, and the
+    /// positive control keeps it from being vacuously true.
+    #[test]
+    fn scanners_never_select_0x7f() {
+        for lane in 0..8usize {
+            for probe in [0x7Fu8, 0x20, 0x7E, 0x80, 0xC2, 0xE2, 0xA0] {
+                let mut v = [b'a'; 16];
+                v[lane] = probe;
+                assert_eq!(
+                    super::next_json_escape_byte(&v),
+                    None,
+                    "probe {probe:#04x} in lane {lane} must not be selected"
+                );
+                for at in super::EscapeIter::new(&v) {
+                    let b = v[at];
+                    assert!(
+                        b < 0x20 || b == b'"' || b == b'\\',
+                        "selected {b:#04x} at {at} (lane {lane})"
+                    );
+                }
+            }
+        }
+        // Positive control: the three classes really are selected.
+        for probe in [0x00u8, 0x1F, b'"', b'\\'] {
+            let v = [probe; 8];
+            assert_eq!(
+                super::next_json_escape_byte(&v),
+                Some(0),
+                "probe {probe:#04x} must be selected"
+            );
+        }
+    }
+
+    /// An exactly-reserved hex id write must not reallocate.
+    ///
+    /// The reserve said 18 for a 20-byte write (`"0x` is 3 bytes, not 2), so `push_hex64`'s own
+    /// `reserve(16)` forced an amortized growth.  The waste is invisible in the output — both
+    /// the text and the byte count were correct — and `estimate_cap`'s >=256-byte headroom hides
+    /// it on the main path, so a capacity assertion is the only witness.
+    #[test]
+    fn hex_id_write_does_not_reallocate_when_reserved_exactly() {
+        let mut out = String::with_capacity(20);
+        out.push_str("\"0x");
+        super::super::fmt::push_hex64(&mut out, u64::MAX);
+        out.push('"');
+        assert_eq!(out, "\"0xffffffffffffffff\"");
+        assert_eq!(out.len(), 20);
+        assert_eq!(
+            out.capacity(),
+            20,
+            "an exactly-reserved hex write grew the buffer"
+        );
+    }
+
     /// [`escaped_extra`] must predict the added bytes exactly.
     ///
     /// The table is const-asserted entry by entry now, but the *writer* and the

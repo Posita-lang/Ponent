@@ -233,12 +233,13 @@ fn main() {
     if cli.fix && !matches!(&cli.command, cli::Command::Check { .. }) {
         usage_error("--fix is only supported by `ponent check`");
     }
-    let color_choice = match cli.color.as_str() {
-        "auto" => ColorChoice::Auto,
-        "always" => ColorChoice::Always,
-        "never" => ColorChoice::Never,
-        other => usage_error(format!(
-            "unknown --color value `{other}` (valid: auto, always, never)"
+    // One parser for the flag: `ColorChoice`'s strict `FromStr` (the lenient inherent
+    // `from_str` it replaced could only disagree with this call site).
+    let color_choice = match cli.color.parse::<ColorChoice>() {
+        Ok(choice) => choice,
+        Err(_) => usage_error(format!(
+            "unknown --color value `{}` (valid: auto, always, never)",
+            cli.color
         )),
     };
 

@@ -676,7 +676,7 @@ fn comptime_message_with_traceback<'src>(
     // ~3x, so a 16-frame traceback regrew this ~130-byte-element vector twice and then
     // shrank it again in `into_boxed_slice`.
     let frames_cap = traceback.len().min(MAX_TRACEBACK_FRAMES);
-    let mut parts: Vec<DiagMessage<'src>> = Vec::with_capacity(6 + 5 * frames_cap);
+    let mut parts: Vec<DiagMessage<'src>> = Vec::with_capacity(8 + 5 * frames_cap);
     parts.push(msg);
     parts.push(DiagMessage::Static(Cow::Borrowed("\n\n")));
     parts.push(DiagMessage::Slug {
@@ -962,17 +962,29 @@ impl<'src> Humanizer<'src> for DiagnosticKind<'src> {
 }
 
 impl<'src> DiagnosticKind<'src> {
-    /// Consume the kind, producing `(message, labels, help, suggestions)`
-    /// in one pass.  Shared fields (e.g. `TypeMismatch.expected`, used by
-    /// both the message pairs and a label) move into one output and clone
-    /// into the other — one clone instead of the two (`message` + `labels`
-    /// each cloning under `&self`) that the separate `Humanizer` methods
-    /// paid.  Paired with `DiagMessage::render_into_owned`, the Fluent
-    /// argument map receives the pairs by move too, so a `Cow::Owned` pair
-    /// skips its `String::clone` entirely.
-    // Oracle-only in production now: `Diagnostic::humanize` uses the borrowing
-    // `Humanizer` methods, so this consuming twin exists to keep the two paths
-    // differentially pinned.  Declaring that status beats leaving it accidental.
+    /// Consume the kind, producing `(message, labels, help, suggestions)` in one pass.
+    ///
+    /// **Oracle-only in production.**  `Diagnostic::humanize` uses the borrowing
+    /// `Humanizer` methods, so this consuming twin exists to keep the two paths
+    /// differentially pinned (`humanizer_and_humanize_into_agree`).  Declaring that status
+    /// beats leaving it accidental — and the paragraph below describes what resurrecting
+    /// it would buy, not what production does today (it used to lead with the production
+    /// framing, which is how a dead function gets "optimised" by mistake).
+    ///
+    /// **Decision (review D6): keep it as the differential oracle, do not resurrect it.**
+    /// Resurrecting it would mean `Diagnostic::humanize` consumes a clone of the kind
+    /// (`Arc::make_mut`), which reintroduces the per-emit kind clone the borrowing path
+    /// exists to avoid on the *cold* path where it would not pay.  The oracle's value is
+    /// that `humanizer_and_humanize_into_agree` compares both shapes field by field, so a
+    /// change to either is caught; the cost is one `#[cfg_attr]` and a doc block, not a
+    /// maintained production path.
+    ///
+    /// Why it is kept rather than deleted: shared fields (e.g. `TypeMismatch.expected`,
+    /// used by both the message pairs and a label) move into one output and clone into the
+    /// other — one clone instead of the two (`message` + `labels` each cloning under
+    /// `&self`) that the separate `Humanizer` methods pay.  Paired with
+    /// `DiagMessage::render_into_owned`, the Fluent argument map would receive the pairs by
+    /// move too, so a `Cow::Owned` pair would skip its `String::clone` entirely.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn humanize_into(
         self,
