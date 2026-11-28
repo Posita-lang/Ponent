@@ -1754,6 +1754,7 @@ dependencies = [
  "stacker",
  "static_assertions",
  "supports-hyperlinks",
+ "swallow-it",
  "swrite",
  "terminal_size",
  "thread_local",
@@ -2493,6 +2494,12 @@ name = "supports-hyperlinks"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e396b6523b11ccb83120b115a0b7366de372751aa6edf19844dfb13a6af97e91"
+
+[[package]]
+name = "swallow-it"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "145fc9f0fb2f0b500221ccf31562d026306400efb98925182bcf94d9d1e16995"
 
 [[package]]
 name = "swrite"

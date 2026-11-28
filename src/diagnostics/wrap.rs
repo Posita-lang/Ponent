@@ -703,6 +703,124 @@ pub(crate) fn wrap_optimal_reserved<'a>(
     out
 }
 
+/// Width in cells of `words[i..j]` under the DP's own model.
+///
+/// Same arithmetic as `wrap_dp`'s fused prefix array (`base_j - pws[i]`): full widths plus the
+/// trailing space of every word except the last, which is dropped at a line break.
+fn span_width(words: &[Word], i: usize, j: usize) -> usize {
+    let mut width = 0usize;
+    for k in i..j {
+        width += words[k].width as usize;
+        if k + 1 < j {
+            width += words[k].trailing_space as usize;
+        }
+    }
+    width
+}
+
+/// Greedy line starts (word indices) for `words` at `max_width`.
+///
+/// `greedy_line_count(m) = starts.partition_point(|&s| (s as usize) < m)` is the number of lines a
+/// greedy layout spends on the first `m` words — the `L` of `solution.md` §3(a), which the candidate
+/// set needs to stay inside the flat interval.
+fn greedy_line_starts(words: &[Word], max_width: usize) -> smallvec::SmallVec<[u32; 16]> {
+    let mut starts: smallvec::SmallVec<[u32; 16]> = smallvec::SmallVec::new();
+    let n = words.len();
+    let mut line_start = 0usize;
+    while line_start < n {
+        starts.push(line_start as u32);
+        // Largest `j` with `span_width(line_start, j) <= max_width`; at least one word joins or
+        // the word is wider than the measure and still occupies its own line (`solution.md` §4).
+        let mut j = line_start + 1;
+        while j < n && span_width(words, line_start, j) <= max_width {
+            j += 1;
+        }
+        // `span_width(line_start, j)` includes one word too many; step back unless nothing fits.
+        if j > line_start + 1 && span_width(words, line_start, j) > max_width {
+            j -= 1;
+        }
+        line_start = j;
+    }
+    starts
+}
+
+/// Candidate suffix starts for the secondary objective: the flat interval `[j*, j_max]`.
+///
+/// `j_max` is the largest start whose suffix still fits `budget_last` *and* whose greedy prefix
+/// line count equals the one at `j*` — beyond it the row count would grow, which
+/// `solution.md` §2.2's lemma forbids optimising away.  At most `MAX_SLACK_CANDIDATES` starts are
+/// returned, always including both endpoints.
+fn slack_candidates(
+    words: &[Word],
+    max_width: usize,
+    budget_last: usize,
+    j_star: usize,
+) -> smallvec::SmallVec<[usize; 4]> {
+    /// Bounded because each candidate costs one prefix DP; the endpoints carry the extremes.
+    const MAX_SLACK_CANDIDATES: usize = 4;
+    let n = words.len();
+    let starts = greedy_line_starts(words, max_width);
+    let line_count = |m: usize| starts.partition_point(|&s| (s as usize) < m);
+    let target = line_count(j_star);
+    // The suffix width grows as the start moves left, so feasibility fails at the *low* end and the
+    // flat interval extends upward from `j*`.
+    let mut j_max = j_star;
+    for j in (j_star + 1)..n {
+        if span_width(words, j, n) > budget_last || line_count(j) != target {
+            break;
+        }
+        j_max = j;
+    }
+    let mut out: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
+    out.push(j_star);
+    if j_max > j_star {
+        let span = j_max - j_star;
+        for k in 1..MAX_SLACK_CANDIDATES {
+            let j = j_star + (span * k) / (MAX_SLACK_CANDIDATES - 1);
+            if out.last() != Some(&j) {
+                out.push(j);
+            }
+        }
+        if out.last() != Some(&j_max) {
+            out.push(j_max);
+        }
+    }
+    out
+}
+
+/// `solution.md` §3's penalty of a candidate layout: the sum of squared slacks.
+///
+/// Line `t < L` gets budget `max_width`; the last line gets `max_width - last_reserve`.  `ranges`
+/// are the DP's byte ranges for the prefix plus the suffix range, and `suffix_start` is the suffix's
+/// first word index.
+fn layout_penalty(
+    words: &[Word],
+    ranges: &[Range<usize>],
+    max_width: usize,
+    budget_last: usize,
+    suffix_start: usize,
+) -> u128 {
+    let mut penalty = 0u128;
+    let mut word = 0usize;
+    for (t, range) in ranges.iter().enumerate() {
+        let is_last = t + 1 == ranges.len();
+        let start = if is_last { suffix_start } else { word };
+        let mut end = start;
+        while end < words.len() && (words[end].start as usize) < range.end {
+            end += 1;
+        }
+        if is_last {
+            end = words.len();
+        }
+        let budget = if is_last { budget_last } else { max_width };
+        let width = span_width(words, start, end);
+        let slack = budget.saturating_sub(width) as u128;
+        penalty += slack * slack;
+        word = end;
+    }
+    penalty
+}
+
 /// Byte ranges of one paragraph's lines when its last line must leave
 /// `last_reserve` columns free.  Always returns at least one range.
 fn reserved_ranges(
@@ -774,22 +892,35 @@ fn reserved_ranges(
         // No legal layout — the last word alone overruns the last line's
         // budget.  Wrap at the full measure; the locator overflows this one row.
         None => wrap_dp(&words, max_width, tables, None, scratch),
-        Some(j) => {
-            // The suffix line's class is known before the prefix is laid out:
-            // `acc` is that line's width (the backward scan ends on the smallest
-            // feasible `j`, i.e. the longest suffix).  Passing it makes the
-            // prefix's own last line a middle line in the cost model.
-            let suffix_class = fitness_class(acc, max_width);
-            let mut ranges = if j == 0 {
-                SmallVec::new()
-            } else {
-                wrap_dp(&words[..j], max_width, tables, Some(suffix_class), scratch)
-            };
-            // The suffix line: everything from word `j` to the last word, with
-            // the caller's reserve left free.  `Word::end` already excludes the
-            // final word's trailing whitespace, matching the DP's line ranges.
-            ranges.push(words[j].start as usize..words[last].end as usize);
-            ranges
+        Some(j_star) => {
+            // `j*` — the longest feasible suffix — is count-minimal but **not** secondary-optimal:
+            // `solution.md` §3(a) witness 1 (`w=(1,1,1), A=4, s=1`) has `L` flat on `[2,3]`, where
+            // `j*=2` scores 9 and `j=3` scores 5 with the same two lines.  The candidate set is that
+            // flat interval (`L(j)` unchanged, suffix still feasible); at most
+            // `MAX_SLACK_CANDIDATES` starts are scored, so the cost is a bounded multiple of one
+            // prefix DP and only on paragraphs that have a reserve at all.
+            let mut best: Option<(u128, SmallVec<[Range<usize>; 4]>)> = None;
+            for j in slack_candidates(&words, max_width, budget_last, j_star) {
+                let suffix_width = span_width(&words, j, words.len());
+                let suffix_class = fitness_class(suffix_width, max_width);
+                let mut ranges = if j == 0 {
+                    SmallVec::new()
+                } else {
+                    wrap_dp(&words[..j], max_width, tables, Some(suffix_class), scratch)
+                };
+                // The suffix line: everything from word `j` to the last word, with the caller's
+                // reserve left free.  `Word::end` already excludes the final word's trailing
+                // whitespace, matching the DP's line ranges.
+                ranges.push(words[j].start as usize..words[last].end as usize);
+                let score = layout_penalty(&words, &ranges, max_width, budget_last, j);
+                // Strictly better only, and the candidates ascend from `j*`: a tie keeps the
+                // longest feasible suffix, i.e. today's output, so no caller sees churn for nothing.
+                match &best {
+                    Some((best_score, _)) if *best_score <= score => {}
+                    _ => best = Some((score, ranges)),
+                }
+            }
+            best.expect("the candidate set always contains `j*`").1
         }
     };
     scratch.words = words;
@@ -1056,6 +1187,13 @@ fn should_break_at(text: &str, pos: usize) -> bool {
 /// are the characters that may legitimately break between themselves.
 fn is_cjk(c: char) -> bool {
     let c = c as u32;
+    // Kana Supplement and Small Kana Extension sit **below** the main CJK blocks, so they must be
+    // tested before the `c < 0x2E80` shortcut: adding them to the `matches!` below would compile and
+    // then silently never match, which is the exact shape of bug this function's range table exists
+    // to avoid.
+    if matches!(c, 0x1B000..=0x1B0FF | 0x1B130..=0x1B16F) {
+        return true;
+    }
     if c < 0x2E80 {
         return false;
     }
@@ -1078,7 +1216,7 @@ fn is_cjk(c: char) -> bool {
         | 0x20000..=0x2A6DF // CJK Extension B
         | 0x2A700..=0x2EBEF // CJK Extension C–F
         | 0x2F800..=0x2FA1F // CJK Compatibility Ideographs Supplement
-        | 0x30000..=0x3134F // CJK Extension G
+        | 0x30000..=0x323AF // CJK Extension G + H (15.1 extended the block)
     )
 }
 
@@ -1721,6 +1859,19 @@ fn wrap_dp(
     // starts whose line still fits only shrinks: `i_lo` walks forward at most
     // `n` times in total — no binary search — and the inner loop runs over
     // only the few words that fit roughly two lines.
+    //
+    // **Complexity, stated so nobody re-derives it wrongly:** this is
+    // `O(n · k)` per paragraph, where `n` is the word count and `k` is the
+    // number of candidate starts whose line still fits `max_width` — bounded by
+    // `2 · max_width / min_word_width` because a start further back than the
+    // previous line's beginning has a strictly over-wide line and is skipped by
+    // the `i_lo` advance.  It is **not** the classic `O(n²)` badness recurrence:
+    // the window is maintained by the two monotone pointers, not by scanning
+    // `0..j`.  So a hostile 1 MiB single entry costs `O(n·k)` too — the only
+    // remaining amplifier would be a pathological `k` (tiny words on an
+    // enormous measure), and `chain.rs`'s `MAX_RENDER_BYTES` bounds what can be
+    // emitted.  A greedy fallback for large inputs would therefore trade a
+    // quality-optimal layout for nothing.
     let mut i_lo = 0usize;
     for j in 1..=n {
         let is_last_line = j == n && tail.is_none();
@@ -2161,6 +2312,111 @@ mod tests {
         } else {
             greedy_lines(&widths[..j], max_width) + 1
         })
+    }
+
+    /// Randomised differential: the reserved wrap's line count is exactly `L(j*) + 1`.
+    ///
+    /// The renderer's row-count contract (`solution.md` §2.3) is what `chain.rs` builds its
+    /// last-line locator budget on, and until now it was pinned only by shape tests.  The oracle
+    /// here is an independent two-pointer greedy over the same word widths — deliberately not the
+    /// implementation's own machinery — so a divergence in either direction is a real finding.
+    #[test]
+    fn reserved_line_count_matches_the_independent_oracle() {
+        /// Widths of the words in `s` (single spaces, ASCII, one cell per byte).
+        fn widths(s: &str) -> Vec<usize> {
+            s.split(' ').map(str::len).collect()
+        }
+        /// Greedy line starts for the prefix, as word indices.
+        ///
+        /// A line always consumes its first word, even when that word alone fills the measure —
+        /// otherwise the loop can fail to advance on a word whose width equals `a`.
+        fn starts(w: &[usize], a: usize) -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < w.len() {
+                out.push(i);
+                let mut width = w[i];
+                let mut j = i + 1;
+                while j < w.len() {
+                    let add = 1 + w[j]; // the separating space, then the word
+                    if width + add > a {
+                        break;
+                    }
+                    width += add;
+                    j += 1;
+                }
+                i = j;
+            }
+            out
+        }
+        // Deterministic xorshift so a failure is reproducible from the seed alone.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |m: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % m as u64) as usize
+        };
+        for case in 0..400 {
+            let a = 4 + next(9); // 4..=12
+            let s = next(a); // 0..=a-1
+            let budget_last = a - s;
+            let n = 1 + next(10);
+            let mut w = Vec::with_capacity(n);
+            for _ in 0..n {
+                // Words must fit the measure; the last must fit the last-line budget, so the
+                // instance is feasible and the oracle's `j*` exists.
+                w.push(1 + next(a));
+            }
+            let last = w.len() - 1;
+            w[last] = 1 + next(budget_last);
+            if w.iter().any(|x| *x > a) {
+                continue;
+            }
+            let text = w
+                .iter()
+                .map(|x| "a".repeat(*x))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(widths(&text), w, "case {case}");
+            // `j*`: the smallest index whose suffix fits the last-line budget.
+            let suffix_width = |j: usize| w[j..].iter().sum::<usize>() + (w.len() - 1 - j);
+            let j_star = (0..w.len()).find(|&j| suffix_width(j) <= budget_last);
+            let Some(j_star) = j_star else {
+                continue;
+            };
+            let prefix_lines = starts(&w[..j_star], a).len();
+            let expected = if j_star == 0 { 1 } else { prefix_lines + 1 };
+            let got = wrap_optimal_reserved(&text, a, 4, s);
+            assert_eq!(
+                got.len(),
+                expected,
+                "case {case}: widths {w:?}, a={a}, s={s}, lines {:?}",
+                got.iter().map(|c| c.as_ref()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// `solution.md` §3(a) witness 1: with `w=(1,1,1), A=4, s=1` the longest feasible suffix
+    /// (`j*=2`) gives lines `["a", "b c"]` — penalty `3^2 + 0^2 = 9` — while the equally short
+    /// `["a b", "c"]` scores `1^2 + 2^2 = 5`.  Both are two lines, so row count is not a tiebreak:
+    /// the secondary objective must pick the second.
+    #[test]
+    fn reserved_wrap_minimises_squared_slack_on_witness_1() {
+        let lines = wrap_optimal_reserved("a b c", 4, 4, 1);
+        let texts: Vec<&str> = lines.iter().map(|c| c.as_ref()).collect();
+        assert_eq!(texts, vec!["a b", "c"], "witness 1 secondary optimum");
+        // Slack: `A - width` for interior lines, `A - s - width` for the last.
+        let penalty: u128 = texts
+            .iter()
+            .enumerate()
+            .map(|(t, line)| {
+                let budget = if t + 1 == texts.len() { 3 } else { 4 };
+                let slack = budget - line.chars().count();
+                (slack * slack) as u128
+            })
+            .sum();
+        assert_eq!(penalty, 5);
     }
 
     /// The two-phase composition Φ that `wrap_optimal_reserved` replaces

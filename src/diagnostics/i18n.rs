@@ -491,7 +491,7 @@ fn write_simple_pairs_into(
     let Some(idx) = fluent::slug_index(slug) else {
         return false;
     };
-    let parts = SIMPLE_SLUGS[idx][lang_idx.min(N_LANGS - 1)]
+    let parts = SIMPLE_SLUGS[idx][slot_lang(lang_idx)]
         .get_or_init(|| cached_primary_pattern(lang_idx, slug).and_then(simple_parts));
     let Some(parts) = parts.as_ref() else {
         return false;
@@ -552,7 +552,7 @@ fn write_simple_into(
     let Some(idx) = fluent::slug_index(slug) else {
         return false;
     };
-    let parts = SIMPLE_SLUGS[idx][lang_idx.min(N_LANGS - 1)]
+    let parts = SIMPLE_SLUGS[idx][slot_lang(lang_idx)]
         .get_or_init(|| cached_primary_pattern(lang_idx, slug).and_then(simple_parts));
     let Some(parts) = parts.as_ref() else {
         return false;
@@ -942,7 +942,31 @@ pub fn render_into_count(msg: &str, key: &'static str, n: u64, out: &mut String)
             return;
         }
     }
+    // Reaching here means the count was **not** rendered: either a legacy key (no placeable to put
+    // it in) or a slug that exists but failed to format (`walk_chain` returned `false` — broken
+    // translation, missing argument, malformed pattern).  Both need the number: a fold marker whose
+    // entire information content is *how much was elided* must not lose it silently.  The earlier
+    // gate on `!is_slug` fixed the legacy case and left the failed-slug case dropping `n`, i.e. the
+    // same defect one trigger over.  Locale-neutral `" ({n})"` needs no plural forms.
     out.push_str(msg);
+    use swrite::SWrite;
+    swrite::swrite!(out, " ({n})");
+}
+
+/// Bounds check for a `Lang::index()` used to index a per-language slot table.
+///
+/// The clamp this replaces (`lang_idx.min(N_LANGS - 1)`) was dead code *and* a silent-wrong-answer
+/// hazard: `Lang::index()` is a total `match`, so the clamp can only bite when `N_LANGS` and the
+/// generated slot tables have drifted — and then it serves the **wrong language** rather than
+/// failing.  `lang_id_at` already takes the loud stance for the same shape; this is that stance,
+/// once, for all three slot lookups.
+#[inline]
+fn slot_lang(lang_idx: usize) -> usize {
+    debug_assert!(
+        lang_idx < N_LANGS,
+        "language index {lang_idx} out of range 0..{N_LANGS}"
+    );
+    lang_idx
 }
 
 /// FTL text identifiers are `[A-Za-z][A-Za-z0-9_-]*`; every legacy English
@@ -1062,7 +1086,7 @@ fn cached_primary_pattern(lang_idx: usize, msg: &str) -> Option<&'static Pattern
         std::array::from_fn(|_| std::sync::RwLock::new(rustc_hash::FxHashMap::default()))
     });
     if let Some(idx) = fluent::slug_index(msg) {
-        return *PRIMARY_PATTERN_SLOTS[idx][lang_idx.min(N_LANGS - 1)]
+        return *PRIMARY_PATTERN_SLOTS[idx][slot_lang(lang_idx)]
             .get_or_init(|| bundles()[lang_idx].get_message(msg).and_then(|m| m.value()));
     }
     let cache = &caches[lang_idx];

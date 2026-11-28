@@ -135,6 +135,7 @@ itoa = "1"
 iota = "0.2.3"
 duplicate = "2.0.1"
 exitcode = "1.1.2"
+swallow-it = "0.1.0"
 
 # The AUTHORITATIVE Polonius R1-R8 engine (rustc's own), used as a
 # differential oracle in tests: our `evaluate_rules` must agree with it

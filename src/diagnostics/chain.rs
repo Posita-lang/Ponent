@@ -29,6 +29,16 @@ const MAX_CHAIN_DEPTH: usize = 64;
 const MAX_RESERVE_ENTRIES: usize = 64 * 1024;
 const MAX_RESERVE_MESSAGE_BYTES: usize = 1 << 20;
 
+/// Hard bound on **rendered output bytes** for one chain.
+///
+/// The depth cap bounds nested structure and `MAX_RESERVE_ENTRIES` bounds entry *count*, but
+/// neither bounds volume: 65,536 entries x a 1 MiB message is 65 GiB of input, and wrapping plus
+/// control-byte expansion (U+FFFD = 3 bytes) amplifies it.  `MAX_RESERVE_MESSAGE_BYTES` clamps the
+/// *estimate* only.  `Debug` has the same bound for the same reason ([`DEBUG_MESSAGE_CHARS`]); this
+/// is the renderer's counterpart, and `hostile_wide_chain`'s incidental `< 8 << 20` assertion is the
+/// budget it makes structural.
+const MAX_RENDER_BYTES: usize = 8 << 20;
+
 /// Suffix for one chain entry, stored as pieces so the display width is
 /// computable from parts (no `visible_width` scan over the OSC-8-escaped
 /// whole) and the bytes can be written straight into the output buffer (no
@@ -125,8 +135,11 @@ impl<'a> ChainSuffix<'a> {
 
 /// A single entry in a call/reference chain (Zig-style `referenced by`).
 ///
-/// `Debug` is hand-written ([below](ChainEntry)) so it cannot recurse through
-/// `children`; only `Clone` is derived.
+/// Both `Debug` and `Clone` are hand-written for this type — neither is derived.  `Debug` is
+/// depth-limited ([below](ChainEntry)) and prints only [`DEBUG_ENTRIES`] siblings; `Clone` copies
+/// one entry shallowly and hands `children` to [`CallChain::clone`], which is iterative.  (This said
+/// "`Debug` is hand-written …; only `Clone` is derived", which stopped being true when the derived
+/// recursive clone became the file's last stack hazard and was replaced.)
 pub struct ChainEntry<'src> {
     pub(crate) kind: ChainEntryKind,
     /// Source location of this entry, or `None` when the caller has no
@@ -274,8 +287,12 @@ impl<'src> Clone for CallChain<'src> {
     /// Cost is O(nodes + edges) heap, no recursion, no `unsafe`.
     fn clone(&self) -> Self {
         let mut arena: Vec<Option<CallChain<'src>>> = vec![None];
-        // Per node: (entry index, child node indices).
-        let mut kids: Vec<Vec<(usize, Vec<usize>)>> = vec![Vec::new()];
+        // Flat attachment log into one shared id arena, instead of one `Vec` per node plus one
+        // `Vec` per entry with children: the old shape was ~2 allocations per node, i.e. tens of
+        // thousands on the 20k-deep chain this iterative clone exists for.  Three vectors total,
+        // each amortized.
+        let mut attach: Vec<(u32, u32, u32, u32)> = Vec::new(); // (node, entry, ids start, len)
+        let mut child_ids: Vec<u32> = Vec::new();
         let mut stack: Vec<(&CallChain<'src>, usize)> = vec![(self, 0)];
         while let Some((chain, idx)) = stack.pop() {
             arena[idx] = Some(CallChain {
@@ -290,31 +307,35 @@ impl<'src> Clone for CallChain<'src> {
                 let Some(children) = &entry.children else {
                     continue;
                 };
-                let mut ids = Vec::with_capacity(children.len());
+                let start = child_ids.len() as u32;
                 for child in children.iter() {
                     let child_idx = arena.len();
                     arena.push(None);
-                    kids.push(Vec::new());
-                    ids.push(child_idx);
+                    child_ids.push(child_idx as u32);
                     stack.push((child, child_idx));
                 }
-                kids[idx].push((entry_idx, ids));
+                let len = child_ids.len() as u32 - start;
+                attach.push((idx as u32, entry_idx as u32, start, len));
             }
         }
-        for node in (0..arena.len()).rev() {
-            for (entry_idx, ids) in std::mem::take(&mut kids[node]) {
-                let built: Vec<CallChain<'src>> = ids
-                    .into_iter()
-                    .map(|child_idx| {
-                        arena[child_idx]
-                            .take()
-                            .expect("child chain is built before its parent is attached")
-                    })
-                    .collect();
-                let chain = arena[node].as_mut().expect("node built in pass 1");
-                chain.entries[entry_idx].children =
-                    (!built.is_empty()).then(|| built.into_boxed_slice());
-            }
+        // Attach pass in **descending node index**: every child's index is greater than its
+        // parent's, so a child is complete before its parent links it.  Pass 1 emits records in
+        // stack order, which is not index order, hence the sort (one `sort_unstable`, cheaper than
+        // the per-node `Vec`s it replaces).
+        attach.sort_unstable_by_key(|&(node, _, _, _)| std::cmp::Reverse(node));
+        for &(node, entry_idx, start, len) in &attach {
+            let ids = &child_ids[start as usize..(start + len) as usize];
+            let built: Vec<CallChain<'src>> = ids
+                .iter()
+                .map(|&child_idx| {
+                    arena[child_idx as usize]
+                        .take()
+                        .expect("child chain is built before its parent is attached")
+                })
+                .collect();
+            let chain = arena[node as usize].as_mut().expect("node built in pass 1");
+            chain.entries[entry_idx as usize].children =
+                (!built.is_empty()).then(|| built.into_boxed_slice());
         }
         arena.swap_remove(0).expect("root chain built in pass 1")
     }
@@ -352,13 +373,16 @@ impl ChainFacts {
     /// `anchor == None`, in any file at all — the legacy same-file assumption).
     fn has_span_in(&self, anchor: Option<FileId>) -> bool {
         let any = self.spanned_files[0].is_some();
-        if self.spanned_overflow {
-            return any;
+        // Membership first: with `spanned_overflow` set and the anchor *among* the two tracked
+        // files, the old order fell back to the conservative `any` and then enabled the O(source)
+        // index build, the `canonicalize` chain and the `file_cols` grapheme scan for a chain whose
+        // every entry would in fact resolve.  Checking membership first is exact and cheap; the
+        // overflow fallback stays, because the anchor may be one of the untracked files.
+        let Some(file) = anchor else { return any };
+        if self.spanned_files.iter().flatten().any(|f| *f == file) {
+            return true;
         }
-        match anchor {
-            Some(file) => self.spanned_files.iter().flatten().any(|f| *f == file),
-            None => any,
-        }
+        self.spanned_overflow
     }
 }
 
@@ -393,12 +417,15 @@ struct RenderEnv<'a> {
 /// onto one worklist and leave each child chain empty before its own glue
 /// runs, so the compiler's field-drop never walks a nested chain.
 ///
-/// `Clone` remains the derived, structurally recursive implementation: it is
-/// only reachable by an explicit clone of a hostile chain (not by any drop
-/// path), and an iterative tree-clone would need a bottom-up rebuild for no
-/// additional safety on the paths this type actually takes.  Callers that
-/// duplicate untrusted chains must bound their depth (the same
-/// `MAX_CHAIN_DEPTH` contract the renderer enforces).
+/// `Clone` is iterative too, for the same reason: see `impl Clone for CallChain`, whose two-pass
+/// worklist builds every node shallowly and attaches already-built children, so cloning a hostile
+/// 10⁵-deep chain never touches the stack.  `Debug` is depth-limited and sibling-capped.  **All
+/// three of `Drop`, `Clone` and `Debug` are depth-bounded by construction** — do not infer from
+/// this doc that a derived recursive clone still exists: it was the last stack hazard and it is
+/// gone.  The only structural recursion left in this file is `render_entries`, bounded by
+/// `MAX_CHAIN_DEPTH`.  (This said "`Clone` remains the derived, structurally recursive
+/// implementation … an iterative tree-clone would need a bottom-up rebuild for no additional
+/// safety", which was the exact opposite of the code below it.)
 impl Drop for CallChain<'_> {
     fn drop(&mut self) {
         let mut work: Vec<ChainEntry<'_>> = std::mem::take(&mut self.entries);
@@ -497,13 +524,17 @@ fn percent_encode_high_bytes(s: &str) -> String {
     // non-ASCII path bytes itself, so only a custom `RenderCtx::file_url` reaches
     // the slow path.  Reuse the module's SIMD-accelerated high-byte scan instead of
     // a hand-rolled `filter().count()`.
-    if super::ascii::next_non_ascii_byte(s.as_bytes()) == usize::MAX {
+    // One pass for both answers: the count *is* the ASCII test, so the separate SIMD pre-scan
+    // (`next_non_ascii_byte`) was a second full traversal of the same bytes for an answer this loop
+    // already has.  URLs are short (a path, a few dozen bytes), so the scalar pass is not measurably
+    // worse than the vector one, and the exact capacity below needs the count anyway.
+    let high = s.bytes().filter(|b| *b >= 0x80).count();
+    if high == 0 {
         return s.to_owned();
     }
     // Exact capacity: every byte >= 0x80 becomes three bytes (`%XX`).  The
     // sibling `encode_url_path_segment` uses the same worst-case reasoning;
     // reserving `len + 8` reallocated ~log2(n) times on a fully non-ASCII URL.
-    let high = s.bytes().filter(|b| *b >= 0x80).count();
     let mut out = String::with_capacity(s.len() + 2 * high);
     for &b in s.as_bytes() {
         if b >= 0x80 {
@@ -598,6 +629,25 @@ impl<'src> CallChain<'src> {
         facts
     }
 
+    /// Capacity to reserve for one render: the facts walk plus a per-entry suffix allowance.
+    ///
+    /// Extracted so [`Self::reserve_covers_the_rendered_bytes`] can pin the real property —
+    /// `estimate >= rendered bytes` — instead of an exact capacity, which would depend on the
+    /// process-global hyperlink probe.  `url_len` is 0 when the chain renders no OSC 8 wrapper.
+    fn reserve_estimate(facts: ChainFacts, file_cols: usize, url_len: usize) -> usize {
+        // 64 covers the gutter, the depth marker and short kind labels; `file_cols` the sanitized
+        // file name; 20 the `:line:col` digits at u64::MAX; 8 the OSC 8 opener/closer pair around a
+        // URL (`\x1b]8;;` + `\x1b\\`).
+        let per_entry = 64usize
+            .saturating_add(file_cols)
+            .saturating_add(20)
+            .saturating_add(url_len.saturating_add(8));
+        (64 + facts.message_bytes
+            + facts.indent_bytes
+            + facts.entry_count.saturating_mul(per_entry))
+        .min(MAX_RENDER_BYTES)
+    }
+
     fn compute_facts(&self) -> ChainFacts {
         let mut spanned_files: [Option<FileId>; 2] = [None; 2];
         let mut spanned_overflow = false;
@@ -670,8 +720,19 @@ impl<'src> CallChain<'src> {
                 // Pre-order: the first spanned entry encountered is the anchor.
                 first_file = first_file.or(Some(span.file));
             }
+            // Control bytes become U+FFFD (3 bytes) under `sanitize_for_terminal_multiline`, so an
+            // `Other`-class message books 3x its byte length.  The walk already touches every
+            // message; `is_printable_ascii_multiline` is one SIMD pass over it.  Booking `len` for
+            // those was a known systematic under-reserve (the sanitizer's contract is documented
+            // right next to it in `message_and_file_name_are_sanitized`).
+            let message_len = entry.message.len();
+            let booked = if super::ascii::is_printable_ascii_multiline(entry.message.as_bytes()) {
+                message_len
+            } else {
+                message_len.saturating_mul(3)
+            };
             message_bytes = message_bytes
-                .saturating_add(entry.message.len())
+                .saturating_add(booked)
                 .min(MAX_RESERVE_MESSAGE_BYTES);
             if let Some(children) = &entry.children {
                 for child in children.iter().rev() {
@@ -855,13 +916,6 @@ impl<'src> CallChain<'src> {
         facts: ChainFacts,
         out: &mut String,
     ) {
-        // Reserve from the facts walk (its whole purpose): `message_bytes`,
-        // `indent_bytes` and a per-entry allowance for the suffix/gutter.  A
-        // no-op when capacity already suffices, so small chains pay nothing, and
-        // a large chain stops growing organically through many reallocations.
-        out.reserve(
-            64 + facts.message_bytes + facts.indent_bytes + facts.entry_count.saturating_mul(64),
-        );
         if self.entries.is_empty() {
             return;
         }
@@ -874,6 +928,20 @@ impl<'src> CallChain<'src> {
         // anchor's source).  With no such entry the O(source) scan is pure waste
         // — the same argument that already gates `sanitize_filename`,
         // `path_to_file_url` and `file_cols` below.
+        // C4: a caller-supplied index can outlive a source rewrite (the emitter caches them), and a
+        // mismatched index yields silently wrong `file:line:col` — the one output this renderer
+        // treats as sacrosanct (the whole anchor machinery exists to avoid bogus coordinates).
+        // A length comparison is one predictable compare per render and catches the common shape of
+        // the mistake; it cannot catch a same-length edit, which is why it is a debug assertion and
+        // not a contract.
+        #[cfg(debug_assertions)]
+        if let (Some(src), Some(supplied)) = (source, idx) {
+            debug_assert_eq!(
+                supplied.source_len(),
+                src.len(),
+                "line index was built for a different (length) source than the one being rendered"
+            );
+        }
         let idx = if let (Some(src), None) = (source, idx) {
             if facts.has_span_in(anchor) {
                 owned_index = LineIndex::new(src);
@@ -885,10 +953,15 @@ impl<'src> CallChain<'src> {
             idx
         };
         let header = fluent::chain_header();
+        // `push_str`/`push` rather than `writeln!`: the payload is a known `&str`, so the
+        // `Formatter` path only adds the formatting machinery on the one row every render emits.
         if use_color {
-            let _ = writeln!(out, "\x1b[36m{}\x1b[0m", header);
+            out.push_str("\x1b[36m");
+            out.push_str(header.as_ref());
+            out.push_str("\x1b[0m\n");
         } else {
-            let _ = writeln!(out, "{header}");
+            out.push_str(header.as_ref());
+            out.push('\n');
         }
         // Hoist the per-file invariants out of the recursion: `sanitize`,
         // `supports_hyperlinks`, and `canonicalize` depend only on
@@ -970,6 +1043,18 @@ impl<'src> CallChain<'src> {
         } else {
             0
         };
+        // Reserve **here**, after the per-chain invariants are known — the per-entry allowance has
+        // to cover the suffix a spanned entry really renders: `": " + file + ":" + line + ":" + col`
+        // (≈ 6 + file bytes + up to ~20 digits) and, when hyperlinks are on, the OSC 8 framing
+        // around the URL (`\x1b]8;;` + url + `\x1b\\`, zero-width but still bytes).  The old fixed
+        // 64-per-entry allowance covered neither a long absolute path nor the URL, i.e. it
+        // under-reserved exactly the coloured+hyperlink path its own comment claimed to protect.
+        // A no-op when capacity already suffices, so small chains pay nothing.
+        out.reserve(Self::reserve_estimate(
+            facts,
+            file_cols,
+            file_url.as_deref().map_or(0, str::len),
+        ));
         let capped = std::cell::Cell::new(false);
         let rendered = std::cell::Cell::new(0usize);
         // Resolve the four kind labels once: the language cannot change inside
@@ -1094,7 +1179,15 @@ impl<'src> CallChain<'src> {
         // row, so a deep chain (depth ≥ 8) no longer allocates a fresh
         // `" ".repeat(..)` per entry (the old `indent_cow` was O(depth²)
         // allocation on pathological chains).
-        let indent_cols = 4 + depth * 4;
+        // Clamp **once**, shared by every entry row and both truncation markers.  The markers were
+        // already clamped ("an unclamped marker row is emitted far past the terminal width.  Keep it
+        // inside the measure") and that argument is identical for a legitimate entry at depth >=
+        // `(max_width - 4) / 4`: with `MAX_CHAIN_DEPTH = 64`, an 80-column terminal would otherwise
+        // emit rows of up to ~260 spaces plus one grapheme (and `avail_full` saturated to 1, so the
+        // wrap degenerated to one grapheme per row).  `compute_facts` stays unclamped on purpose —
+        // it is render-parameter-independent for memo soundness — and over-reserves indent bytes for
+        // deep chains, which is the safe direction.
+        let indent_cols = (4 + depth * 4).min(max_width.saturating_sub(4));
         let tab_width = tab_width.max(1);
         let tab_aligned = indent_cols % tab_width == 0;
         let avail_full = max_width.saturating_sub(indent_cols).max(1);
@@ -1104,12 +1197,24 @@ impl<'src> CallChain<'src> {
         for entry in &self.entries {
             if rendered.get() >= MAX_RESERVE_ENTRIES {
                 if !capped.replace(true) {
-                    // Same clamp as the depth marker: `indent_cols` grows with
-                    // depth, and the entry-cap branch can be reached at any
-                    // depth, so an unclamped marker row would overrun the
-                    // terminal width on a 40-column measure.
-                    let marker_indent = indent_cols.min(max_width.saturating_sub(4));
+                    // `indent_cols` is already clamped above, so the marker coincides with the
+                    // deepest entry's indent by construction (the old second `.min` here is what
+                    // let the entry rows drift out of the measure while the markers stayed in).
+                    let marker_indent = indent_cols;
                     super::renderers::fmt::push_spaces(out, marker_indent);
+                    out.push_str("...\n");
+                }
+                return;
+            }
+            // Volume bound.  `MAX_CHAIN_DEPTH` bounds structure and `MAX_RESERVE_ENTRIES` bounds
+            // entry *count*, but neither bounds bytes: 65,536 entries x a 1 MiB message is 65 GiB of
+            // input, and sanitization (x3 for control bytes) plus per-row indent amplifies it.
+            // The bound is `MAX_RENDER_BYTES` plus the entry in flight, so it is structural rather
+            // than emergent (the old `hostile_wide_chain` `< 8 << 20` assertion held only by
+            // accident of that test's small messages).
+            if out.len() >= MAX_RENDER_BYTES {
+                if !capped.replace(true) {
+                    super::renderers::fmt::push_spaces(out, indent_cols);
                     out.push_str("...\n");
                 }
                 return;
@@ -1489,6 +1594,15 @@ mod tests {
         chain.push(ChainEntry::new(ChainEntryKind::Call, None, ""));
         let out = chain.render_with_index(false, None, "", None, 40, 4);
         assert_eq!(out.lines().nth(1), Some("    : called from here"));
+        // Re-assert the indent numerically: a review of this file suspected the literal had lost
+        // three of its four spaces (it has not — this is the transcription that was doubted), and a
+        // numeric check cannot be defeated by whitespace mangling in the literal itself.
+        let row = out.lines().nth(1).expect("second row");
+        assert_eq!(
+            row.len() - row.trim_start().len(),
+            4,
+            "depth-0 indent: {row:?}"
+        );
     }
 
     /// The locator is indivisible and rides the last row only, so the reserve
@@ -1791,6 +1905,86 @@ mod tests {
         }
     }
 
+    /// Total output volume is bounded, not merely entry count.
+    ///
+    /// Input here is ~12 MiB in 4,000 entries: below the entry cap and above the byte cap, so the
+    /// volume gate — not the count cap — must be what stops it, and it must stop with exactly one
+    /// marker.
+    #[test]
+    fn total_output_is_bounded_by_max_render_bytes() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        let message = "word ".repeat(600); // ~3 KiB per entry
+        let mut chain = CallChain::new();
+        for _ in 0..4000 {
+            chain.push(ChainEntry::new(
+                ChainEntryKind::Call,
+                Some(span),
+                message.as_str(),
+            ));
+        }
+        let out = chain.render(false, None, "");
+        assert!(
+            out.len() <= MAX_RENDER_BYTES + (8 << 10),
+            "output volume unbounded: {} bytes",
+            out.len()
+        );
+        assert_eq!(
+            out.matches("...").count(),
+            1,
+            "exactly one truncation marker"
+        );
+    }
+
+    /// The reserve estimate must **cover** the rendered bytes.
+    ///
+    /// The old allowance was a flat 64 per entry, which covers neither a long absolute path
+    /// (`": " + file + ":line:col"`) nor the OSC 8 URL — a systematic under-reserve of ~30-150 bytes
+    /// per spanned entry on exactly the coloured/hyperlinked path the estimate exists to protect.
+    /// Measured against real output rather than against an exact `capacity()`, because the byte
+    /// contribution of the OSC 8 wrapper depends on the process-global hyperlink probe.
+    #[test]
+    fn reserve_covers_the_rendered_bytes() {
+        let span = Span::new(FileId::DUMMY, 0, 3);
+        let src = "line zero\nline one\nline two\n";
+        let idx = LineIndex::new(src);
+        let long_name =
+            "some/deeply/nested/directory/structure/with/a/fairly/long/module_file_name.ps";
+        // Control-dense, wrapping and plain messages, so the estimate meets all three bookings
+        // (`3x` for `Other`-class, the indent-per-row term, and the plain path).
+        let payloads = [
+            "called from here, with a message long enough to matter on a 40-column measure",
+            "\u{1b}[31mred\u{1b}[0m \u{7}bell \u{0}nul",
+            "x",
+        ];
+        for payload in payloads {
+            for count in [1usize, 8, 32] {
+                let mut chain = CallChain::new();
+                for _ in 0..count {
+                    chain.push(ChainEntry::new(ChainEntryKind::Call, Some(span), payload));
+                }
+                let facts = chain.scan();
+                let rendered =
+                    chain.render_with_index(false, Some(src), long_name, Some(&idx), 40, 4);
+                // URL contribution: the rendered output either carried an OSC 8 wrapper or it did
+                // not, so taking it from the output itself is exact and probe-independent.
+                let url_len = rendered
+                    .find("\x1b]8;;")
+                    .and_then(|i| rendered[i + 6..].find("\x1b\\").map(|j| j))
+                    .unwrap_or(0);
+                let estimate = CallChain::reserve_estimate(
+                    facts,
+                    visible_width(&crate::diagnostics::sanitize_filename(long_name)),
+                    url_len,
+                );
+                assert!(
+                    estimate >= rendered.len(),
+                    "under-reserved: {estimate} < {} (payload {payload:?}, {count} entries)",
+                    rendered.len()
+                );
+            }
+        }
+    }
+
     /// The reserve estimate (`compute_facts`) and the renderer walk the tree
     /// independently; they must agree on how many entries survive the caps, or
     /// the pre-sizing silently desynchronises from the output.
@@ -1920,6 +2114,113 @@ mod tests {
         // The counting traversal must not under-reserve past the cap either:
         // `flattened_entry_count` stops at the same depth as the renderer.
         assert!(inner.flattened_entry_count() >= MAX_CHAIN_DEPTH);
+    }
+
+    /// The flattened (single-arena) clone must be structurally identical to the original.
+    ///
+    /// The old shape allocated one `Vec` per node plus one per entry with children; the flattened
+    /// pass replaces them with one attachment log and one id arena.  The equivalence it must
+    /// preserve is exact node-for-node shape, so the reference is a depth-bounded recursive walk
+    /// (bounded because the test chain is 70 deep, far under the stack limit — the *production*
+    /// clone stays iterative).
+    #[test]
+    fn flattened_clone_matches_the_original_structurally() {
+        fn same(a: &CallChain<'_>, b: &CallChain<'_>) -> bool {
+            if a.entries.len() != b.entries.len() {
+                return false;
+            }
+            a.entries.iter().zip(b.entries.iter()).all(|(x, y)| {
+                if x.kind != y.kind || x.span != y.span || x.message != y.message {
+                    return false;
+                }
+                match (&x.children, &y.children) {
+                    (None, None) => true,
+                    (Some(xc), Some(yc)) => {
+                        xc.len() == yc.len() && xc.iter().zip(yc.iter()).all(|(p, q)| same(p, q))
+                    }
+                    _ => false,
+                }
+            })
+        }
+        let span = Span::new(FileId::DUMMY, 0, 3);
+        // A branching chain: each level has a linear spine plus a side branch, so the attach pass
+        // exercises multiple entries-with-children per node, not just one.
+        let mut inner = CallChain {
+            entries: vec![
+                ChainEntry::new(ChainEntryKind::Call, Some(span), "leaf"),
+                ChainEntry::new(ChainEntryKind::Reference, None, "sibling"),
+            ],
+            facts: std::sync::OnceLock::new(),
+        };
+        for depth in 0..40 {
+            let side = CallChain {
+                entries: vec![ChainEntry::new(
+                    ChainEntryKind::Inlined,
+                    Some(span),
+                    format!("side{depth}"),
+                )],
+                facts: std::sync::OnceLock::new(),
+            };
+            let entry = ChainEntry::new(ChainEntryKind::Call, Some(span), format!("spine{depth}"))
+                .with_children(vec![inner, side]);
+            inner = CallChain {
+                entries: vec![entry],
+                facts: std::sync::OnceLock::new(),
+            };
+        }
+        let cloned = inner.clone();
+        assert!(same(&inner, &cloned), "clone changed the chain shape");
+        assert_eq!(
+            inner.render(false, None, ""),
+            cloned.render(false, None, "")
+        );
+    }
+
+    /// Every row of a **deep** chain respects the measure, not only every marker row.
+    ///
+    /// `deep_chain_is_capped_consistently` asserts the marker count and the row count at the
+    /// default width; the width invariant was checked only for shallow chains (`hostile_wide_chain`
+    /// is wide, not deep).  Before the clamp, an entry at depth 20 on a 40-column measure pushed up
+    /// to `4 + 64*4` spaces and then one grapheme per row, i.e. rows three to six times the measure —
+    /// invisible to both existing tests.
+    #[test]
+    fn deep_chain_rows_respect_a_narrow_measure() {
+        let span = Span::new(FileId::DUMMY, 0, 3);
+        let mut inner = CallChain {
+            entries: vec![ChainEntry::new(ChainEntryKind::Call, Some(span), "x")],
+            facts: std::sync::OnceLock::new(),
+        };
+        for _ in 0..70 {
+            let entry =
+                ChainEntry::new(ChainEntryKind::Call, Some(span), "x").with_children(vec![inner]);
+            inner = CallChain {
+                entries: vec![entry],
+                facts: std::sync::OnceLock::new(),
+            };
+        }
+        // The locator (`: called from here` = 18 columns) is indivisible and rides the suffix row,
+        // so `solution.md` §4.1 deliberately lets *that* row overflow when the residual measure is
+        // narrower — at any depth, not just at tiny widths.  Every other row (message content and
+        // the markers) must respect the measure at every depth.
+        for max_width in [40usize, 80] {
+            let out = inner.render_with_index(
+                false,
+                None,
+                "",
+                None,
+                max_width,
+                crate::diagnostics::glyph::DEFAULT_TAB_WIDTH,
+            );
+            for line in out.lines() {
+                let over = line.chars().count() > max_width;
+                assert!(
+                    !over || line.contains("called from here"),
+                    "row exceeds the {max_width}-column measure: {:?}",
+                    line
+                );
+            }
+            assert_eq!(out.matches("...").count(), 1, "one marker at {max_width}");
+        }
     }
 
     #[test]

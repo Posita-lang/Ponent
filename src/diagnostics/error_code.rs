@@ -261,6 +261,13 @@ const fn new_slot_cache() -> SlotCache {
     [const { std::sync::OnceLock::new() }; SLOT_CACHE_SLOTS]
 }
 
+/// Language-independent documentation host for error-code pages.
+///
+/// Module scope so the *streaming* writer ([`ErrCode::write_ansi_hyperlink`]) can emit the URL
+/// without assembling a `String`; both writers therefore share one source for the framing.
+const DOC_URL_PREFIX: &str = "https://doc.posita-lang.org/error_codes/";
+const DOC_URL_SUFFIX: &str = ".html";
+
 #[inline]
 fn cached_slot_string(
     cache: &'static SlotCache,
@@ -277,7 +284,16 @@ fn cached_slot_string(
     // hyperlink, which is exactly the cost the old "raw-pointer tier" note
     // wanted to remove but rejected as needing a deliberate leak.  A `Box<str>`
     // in the same slot gets the same result by *borrowing* instead of cloning.
-    debug_assert!((slot as usize) < DIRECT_ADDRESS_SLOTS);
+    // A real `assert!`, not `debug_assert!`: the expression below masks with
+    // `SLOT_CACHE_SLOTS - 1`, so an out-of-range slot (the `u16::MAX` sentinel, or a future
+    // refactor's mistake) would land on slot 2047 and **silently poison a real code's URL** in
+    // release — a wrong-output-with-no-crash, which this subsystem treats as its worst class.  The
+    // same precedent as `SlotSet::insert`'s release assert (loud at the definition site).  One
+    // always-predicted branch against a hit path benched with large headroom.
+    assert!(
+        (slot as usize) < DIRECT_ADDRESS_SLOTS,
+        "slot {slot} exceeds the direct-address range"
+    );
     &**cache[(slot as usize) & (SLOT_CACHE_SLOTS - 1)]
         // `String` straight from the builder: the old `() -> CompactString`
         // closure forced an `into_string()` hop (a copy for any URL short enough
@@ -292,7 +308,7 @@ fn cached_slot_string(
 /// Returns `Err(previous)` when a port was already set, so a second caller can
 /// observe that its value was ignored instead of silently assuming it took
 /// effect.  Callers that intentionally re-set the port (e.g. tests) should
-/// discard the result explicitly with `let _ = …`.
+/// discard the result explicitly with `swallow!(…)` (from `swallow-it`).
 ///
 /// Port `0` is accepted as-is: a caller that intends to listen validates its
 /// own bind (the CLI binds before calling this), and rejecting `0` here would
@@ -325,7 +341,6 @@ pub fn set_explain_port(port: u16) -> Result<(), u16> {
     })
 }
 
-/// Whether the explain server is running (its port has been set).
 /// Whether an explain server is running, as the *effective* port sees it.
 ///
 /// Routed through [`explain_port`] rather than reading `EXPLAIN_PORT` directly: under
@@ -372,26 +387,6 @@ const _: () = {
     }
 };
 
-/// Build the explanation URL for a code, given an explicit port.
-///
-/// This is the pure, testable core of [`ErrCode::url`]; callers that need the
-/// process-global port (the production path) pass `EXPLAIN_PORT.get().copied()`.
-/// The code is percent-encoded as a single path segment in both branches, so an
-/// untrusted code (CLI argument, `Diagnostic::with_code_str`) cannot escape the
-/// segment or smuggle control characters into the URL.
-///
-/// This function itself does not memoize — the per-call cost is one
-/// `CompactString` build (a reserved `push_str`/`write!` assembly, not a
-/// `format_compact!`: there is no such call here).  The hot-path caller [`ErrCode::url_ansi`] (invoked per
-/// diagnostic in `write_header` when hyperlinks are active) caches its full
-/// OSC 8 result in a [`SlotCache`] — a *fixed* `SLOT_CACHE_SLOTS`-entry array of
-/// `OnceLock`s indexed by [`code_slot`], not a hash map — and there is one such
-/// array per quadrant ([`ErrCode::url`] and [`ErrCode::url_ansi`] each keep a
-/// port-set and a port-unset cache), so the doc-URL path is cached too, not only
-/// the localhost one.  A batch of *N* diagnostics sharing a code therefore pays
-/// the build once and a fat-pointer copy per hit (no `Arc` refcount, no clone).
-/// The cold-path caller (the explain server, one URL per served page) bypasses
-/// that cache.
 /// Write the localhost explain URL into `out` (the single format site).
 /// Write `http://127.0.0.1:{port}/{encoded}`.
 ///
@@ -426,8 +421,6 @@ const MAX_PORT_DIGITS: usize = 5;
 /// the segment is a pure function of the spelling, and re-running the per-byte encode
 /// scan (plus an allocation) on every render was the last per-render allocation here.
 fn doc_url_from_encoded(encoded: &str) -> String {
-    const DOC_URL_PREFIX: &str = "https://doc.posita-lang.org/error_codes/";
-    const DOC_URL_SUFFIX: &str = ".html";
     let mut out =
         String::with_capacity(DOC_URL_PREFIX.len() + encoded.len() + DOC_URL_SUFFIX.len());
     out.push_str(DOC_URL_PREFIX);
@@ -436,6 +429,29 @@ fn doc_url_from_encoded(encoded: &str) -> String {
     out
 }
 
+/// Build the explanation URL for a code, given an explicit port.
+///
+/// This is the pure, testable core of [`ErrCode::url`]; callers that need the process-global port
+/// (the production path) pass `EXPLAIN_PORT.get().copied()`.  The code is percent-encoded as a
+/// single path segment in both branches, so an untrusted code (CLI argument,
+/// `Diagnostic::with_code_str`) cannot escape the segment or smuggle control characters into the
+/// URL.
+///
+/// Itself does not memoize: the port-set branch assembles a `String` and the port-unset branch
+/// builds the doc URL from the pre-encoded segment, and both go through the `Other` payload's
+/// segment memo rather than re-encoding.  The hot-path caller [`ErrCode::url_ansi`] (invoked per
+/// diagnostic in `write_header` when hyperlinks are active) caches its full OSC 8 result in a
+/// [`SlotCache`] — a *fixed* `SLOT_CACHE_SLOTS`-entry array of `OnceLock`s indexed by
+/// [`code_slot`], not a hash map — and there is one such array per quadrant ([`ErrCode::url`] and
+/// [`ErrCode::url_ansi`] each keep a port-set and a port-unset cache), so the doc-URL path is
+/// cached too, not only the localhost one.  A batch of *N* diagnostics sharing a code therefore
+/// pays the build once and a fat-pointer copy per hit (no `Arc` refcount, no clone).  The cold-path
+/// caller (the explain server, one URL per served page) bypasses that cache.
+///
+/// (This doc used to sit above `explain_server_url_into`, which takes an already-encoded segment
+/// and builds nothing — rustdoc attributed a per-call cost to a function the cost does not apply
+/// to, and this function had no doc at all.  The same failure the i18n module records: "rustdoc
+/// attributed a bool-returning contract to a unit function".)
 pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> String {
     if let Some(port) = port {
         // Straight into the result: the old path built a `CompactString` and
@@ -445,7 +461,7 @@ pub(crate) fn explain_url_with_port(code: &str, port: Option<u16>) -> String {
         let encoded = encode_url_path_segment(code);
         let mut out =
             String::with_capacity(EXPLAIN_URL_ORIGIN_LEN + MAX_PORT_DIGITS + 1 + encoded.len());
-        let _ = explain_server_url_into(port, encoded.as_ref(), &mut out); // `String` sink
+        swallow_it::swallow!(explain_server_url_into(port, encoded.as_ref(), &mut out)); // `String` sink
         out
     } else {
         // We will register this domain and set up a proper documentation
@@ -469,7 +485,7 @@ pub(crate) fn explain_server_url(port: u16, code: &str) -> CompactString {
     let encoded = encode_url_path_segment(code);
     let mut out =
         CompactString::with_capacity(EXPLAIN_URL_ORIGIN_LEN + MAX_PORT_DIGITS + 1 + encoded.len());
-    let _ = explain_server_url_into(port, encoded.as_ref(), &mut out); // `CompactString` sink
+    swallow_it::swallow!(explain_server_url_into(port, encoded.as_ref(), &mut out)); // `CompactString` sink
     out
 }
 
@@ -653,6 +669,14 @@ impl ErrorCategory {
 impl std::str::FromStr for ErrorCategory {
     type Err = String;
 
+    /// Parse a category from its canonical key or a documented alias.
+    ///
+    /// The accepted set is **16** spellings: each canonical key from [`Self::CANONICAL_KEYS`], that
+    /// key plus `" error"`, and bare `"error"` for [`Self::Generic`] — all ASCII-case-insensitive.
+    /// The `Err` text lists only the canonical keys (that table is the single source for the
+    /// "valid: …" list), so this doc is the only place the alias rule is stated; keep the two in
+    /// sync rather than widening the list.  `from_str_accepts_every_documented_spelling` pins all
+    /// 16.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         for (name, category) in [
             ("parse", ErrorCategory::Parse),
@@ -825,35 +849,15 @@ struct OtherCode {
     /// Whether this spelling is the canonical one (see `is_canonical_spelling`).
     /// Precomputed for the same reason as `slot`.
     canonical_spelling: bool,
-    /// Memoized [`super::sanitize_for_terminal`] result; `None` means "already
-    /// clean, borrow `raw`".
+    /// The three derived render surfaces, computed in one `OnceLock`.
     ///
-    /// The `Box<str>` form allocated even when nothing needed replacing —
-    /// `unknown("e030")` is clean text and is the common shape for a case-resolved
-    /// registry spelling, so the first `Display`/hyperlink render paid a Box
-    /// allocation plus a copy for an identity transform.  Sound by the sanitizer's
-    /// own borrow/own split.
-    sanitized: std::sync::OnceLock<Option<Box<str>>>,
-    /// Memoized capped spelling used by every render surface (`None` means "fits,
-    /// borrow `raw`").  See [`MAX_CODE_CHARS`].
-    ///
-    /// The cap must **not** be applied to `raw`: `canonical()` feeds `Eq`/`Hash`, so a
-    /// truncated stored spelling would merge two distinct over-cap codes into one identity
-    /// and silently suppress the second diagnostic.
-    capped: std::sync::OnceLock<Option<Box<str>>>,
-    /// Memoized percent-encoded spelling.
-    ///
-    /// The NOTE below is right that a whole *URL* cannot be memoized under the
-    /// `Cow<'static, str>` contract — but the encoded *segment* can: it borrows
-    /// `&self` for the call's duration, exactly like `sanitized`.  A slot-less
-    /// spelling (`E999`, junk CLI input) therefore re-ran a per-byte encode scan plus
-    /// an allocation on every render; now it pays that once.
-    ///
-    /// `None` records "the encoder left the spelling unchanged", i.e. the encoded segment *is*
-    /// [`Self::render_text`]: `encode_url_path_segment` returns `Cow::Borrowed` exactly then, and
-    /// the old `into_owned()` allocated a copy of bytes this value already owns — the same
-    /// borrow/own split [`Self::sanitized`] documents.
-    encoded: std::sync::OnceLock<Option<Box<str>>>,
+    /// Merged from three independent locks: a `Display` → hyperlink → URL sequence on one junk
+    /// spelling (`unknown("junk\u{1b}")`) took all three, and the payload is ~16-24 B smaller this
+    /// way.  Initialization is **acyclic by construction** — `capped` is computed first and the
+    /// other two are derived from it in the same closure, so there is no lock re-entered and no
+    /// ordering to maintain across functions (the old argument was "the locks are independent, so
+    /// the nesting cannot deadlock").
+    memos: std::sync::OnceLock<OtherMemos>,
     // NOTE: a payload-level memo of the doc URL was tried and reverted.  The
     // public `url()`/`url_ansi()` contract is `Cow<'static, str>`, and a
     // `OnceLock<Box<str>>` inside an `Arc<OtherCode>` can only lend a `&self`
@@ -876,52 +880,79 @@ struct OtherCode {
 /// stated here rather than left implicit.
 const MAX_CODE_CHARS: usize = 128;
 
+/// The three derived render surfaces of one [`OtherCode`] payload.
+///
+/// `None` in a slot means "identity transform: borrow the previous level", exactly as the three
+/// former per-surface `OnceLock`s did — `capped` → `raw`, `sanitized`/`encoded` → the capped text.
+struct OtherMemos {
+    /// Capped spelling ([`MAX_CODE_CHARS`]); `None` = fits, borrow `raw`.
+    capped: Option<Box<str>>,
+    /// [`super::sanitize_for_terminal`] of the capped spelling; `None` = already clean.
+    sanitized: Option<Box<str>>,
+    /// Percent-encoded capped spelling; `None` = unchanged by the encoder.
+    encoded: Option<Box<str>>,
+}
+
 impl OtherCode {
+    /// The three derived surfaces, computed once.
+    ///
+    /// Build order is load-bearing and local: `capped` first, then the other two derived from it.
+    /// Nothing here calls back into an accessor, so the single lock is never re-entered.
+    fn memos(&self) -> &OtherMemos {
+        self.memos.get_or_init(|| {
+            // `char_indices().nth(MAX_CODE_CHARS)` is the single-pass cap: `None` proves the
+            // spelling fits, and `Some((off, _))` cuts exactly `MAX_CODE_CHARS` chars on a char
+            // boundary, so the reservation is exact and `into_boxed_str` has nothing to shrink.
+            // The old shape counted every char first (a 100 KB junk spelling paid a full decode
+            // walk although the cap trips at 129) and then `collect`ed with a size hint it shrank
+            // away.  Same pattern as `kind.rs::capped_payload`.
+            let capped = self.raw.char_indices().nth(MAX_CODE_CHARS).map(|(off, _)| {
+                let mut out = String::with_capacity(off + '…'.len_utf8());
+                out.push_str(&self.raw[..off]);
+                out.push('…');
+                out.into_boxed_str()
+            });
+            let rendered: &str = capped.as_deref().unwrap_or(&self.raw);
+            let sanitized = match super::sanitize_for_terminal(rendered) {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(s) => Some(s.into_boxed_str()),
+            };
+            let encoded = match encode_url_path_segment(rendered) {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(owned) => Some(owned.into_boxed_str()),
+            };
+            OtherMemos {
+                capped,
+                sanitized,
+                encoded,
+            }
+        })
+    }
+
     /// The spelling as every render surface shows it (capped, see [`MAX_CODE_CHARS`]).
     fn render_text(&self) -> &str {
-        match self.capped.get_or_init(|| {
-            if self.raw.chars().count() <= MAX_CODE_CHARS {
-                return None;
-            }
-            let mut out: String = self.raw.chars().take(MAX_CODE_CHARS).collect();
-            out.push('…');
-            Some(out.into_boxed_str())
-        }) {
+        match &self.memos().capped {
             Some(capped) => capped,
             None => &self.raw,
         }
     }
 
+    /// The sanitized capped spelling (`None` in the memo means "nothing needed replacing", so
+    /// borrow the rendered text — never `raw`: an over-cap spelling with no control bytes would
+    /// otherwise bypass `MAX_CODE_CHARS` on every visible surface while the URL segment stayed
+    /// capped).
     fn sanitized(&self) -> &str {
-        match self.sanitized.get_or_init(|| {
-            match super::sanitize_for_terminal(self.render_text()) {
-                std::borrow::Cow::Borrowed(_) => None,
-                std::borrow::Cow::Owned(s) => Some(s.into_boxed_str()),
-            }
-        }) {
+        match &self.memos().sanitized {
             Some(clean) => clean,
-            // `None` means "nothing needed replacing", so borrow the **rendered**
-            // (capped) text — never `raw`: an over-cap spelling with no control
-            // bytes took this arm and bypassed `MAX_CODE_CHARS` on every visible
-            // surface, while the URL *segment* (`encoded_segment`) stayed capped.
-            // A 100 KB junk spelling therefore rendered as a 100 KB label over a
-            // 128-byte hyperlink, in `Display`, `visible_text()` and both ANSI
-            // wrappers.  Both locks are independent (`capped` never calls
-            // `sanitized`), so the nesting cannot deadlock.
             None => self.render_text(),
         }
     }
 
-    /// The percent-encoded spelling, memoized in the payload (see `encoded`).
+    /// The percent-encoded capped spelling, memoized in the payload.
     fn encoded_segment(&self) -> &str {
-        match self.encoded.get_or_init(|| {
-            match encode_url_path_segment(self.render_text()) {
-                // Identity transform: borrow `render_text()` instead of boxing a copy.
-                std::borrow::Cow::Borrowed(_) => None,
-                std::borrow::Cow::Owned(owned) => Some(owned.into_boxed_str()),
-            }
-        }) {
+        match &self.memos().encoded {
             Some(encoded) => encoded,
+            // Identity transform: borrow `render_text()` instead of boxing a copy.
             None => self.render_text(),
         }
     }
@@ -1043,9 +1074,7 @@ fn other_repr(raw: CompactString, canonical: Option<&'static ErrCodeInner>) -> E
         canonical,
         slot,
         canonical_spelling,
-        sanitized: std::sync::OnceLock::new(),
-        capped: std::sync::OnceLock::new(),
-        encoded: std::sync::OnceLock::new(),
+        memos: std::sync::OnceLock::new(),
     })))
 }
 
@@ -1275,12 +1304,21 @@ impl ErrCode {
         }
     }
 
-    /// The direct-address slot for this code, if its spelling is cacheable.
+    /// The direct-address slot for this code, **when one can be derived**.
     ///
     /// `Known` carries its slot in the payload (a field read); an `Other` spelling
     /// gets one when it canonicalizes to a registered entry or when `code_slot`
     /// accepts the shape (`^[EW]\d{3}$`).  `None` means "bypass the slot cache" —
     /// the URL path then builds uncached, which is correct and rare.
+    ///
+    /// **A slot says nothing about ANSI-cacheability.**  The URL is a pure function of the
+    /// *canonical* spelling, so `URL_CACHE` legitimately shares one slot across representations
+    /// (`unknown("e030")` and `new("E030")`); the OSC 8 wrapper embeds the *visible* spelling, so
+    /// [`Self::url_ansi`] gates separately on [`Self::ansi_cacheable`].  The old first line read
+    /// "…, if its spelling is cacheable", which contradicted the paragraph below it and taught the
+    /// exact regression that gate prevents: deleting `ansi_cacheable` would fill
+    /// `URL_ANSI_CACHE[30]` with the visible text `e030` and then render `E030` with the wrong
+    /// label.
     fn slot(&self) -> Option<u16> {
         match &self.0 {
             // A field read: the slot is emitted into the payload, so this is not
@@ -1398,7 +1436,7 @@ impl ErrCode {
             let encoded = other.encoded_segment();
             let mut out =
                 String::with_capacity(EXPLAIN_URL_ORIGIN_LEN + MAX_PORT_DIGITS + 1 + encoded.len());
-            let _ = explain_server_url_into(port, encoded, &mut out); // `String` sink
+            swallow_it::swallow!(explain_server_url_into(port, encoded, &mut out)); // `String` sink
             return std::borrow::Cow::Owned(out);
         };
         // The localhost form embeds the port, which is only known at runtime and
@@ -1531,10 +1569,30 @@ impl ErrCode {
         // even while the explain server was running — contradicting the "same bytes
         // straight through" contract in its own doc, and the flip contract `set_explain_port`
         // states (a caller that rendered first has already shown the user the wrong host).
-        let url = self.url_for_slot_with_port(explain_port());
+        let port = explain_port();
         let visible = self.visible_text();
         out.write_str("\x1b]8;;")?;
-        out.write_str(url.as_ref())?;
+        // Slot-less spellings stream their URL instead of assembling an owned `String` and copying
+        // it: `url_for_slot_with_port` builds one for exactly those quadrants (junk shapes,
+        // over-cap clean spellings, the empty code), which made this function's "without an
+        // intermediate buffer" claim false for the one class that needed it.  Slot-ful classes were
+        // already borrowed from the caches / the generated constant, so they take the `Cow` path.
+        if self.slot().is_none() {
+            let ErrCodeRepr::Other(other) = &self.0 else {
+                unreachable!("a slot-less code is always an `Other` payload")
+            };
+            let encoded = other.encoded_segment();
+            match port {
+                Some(port) => write!(out, "http://127.0.0.1:{port}/{encoded}")?,
+                None => {
+                    out.write_str(DOC_URL_PREFIX)?;
+                    out.write_str(encoded)?;
+                    out.write_str(DOC_URL_SUFFIX)?;
+                }
+            }
+        } else {
+            out.write_str(self.url_for_slot_with_port(port).as_ref())?;
+        }
         out.write_str("\x1b\\")?;
         out.write_str(visible)?;
         out.write_str("\x1b]8;;\x1b\\")
@@ -2048,6 +2106,53 @@ mod tests {
         assert_ne!(doc, local, "the two quadrants must differ");
     }
 
+    /// `write_ansi_hyperlink` and `url_ansi` must agree byte for byte, for every code class.
+    ///
+    /// Two hand-written producers of one OSC 8 wrapper: `url_ansi` assembles a `String`, the
+    /// streaming writer emits into a sink.  They share `url_for_slot_with_port` and `visible_text`,
+    /// but the streaming path now has its own slot-less arms — precisely when a differential pin
+    /// earns its keep (`kind.rs::humanizer_and_humanize_into_agree` is the house precedent).
+    #[test]
+    fn ansi_hyperlink_matches_url_ansi_byte_for_byte() {
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let corpus = [
+            ErrCode::new("E030"),                                 // Known, cacheable
+            ErrCode::unknown("e030"),                             // resolved, non-cacheable
+            ErrCode::unknown("E999"),                             // shape-valid, unregistered
+            ErrCode::unknown("junk\u{1b}[31m"),                   // slot-less, controls
+            ErrCode::unknown(format!("junk{}", "x".repeat(200))), // over-cap clean
+            ErrCode::unknown(""),                                 // empty
+        ];
+        for code in &corpus {
+            for port in [None, Some(41234u16)] {
+                let via_cow = with_explain_port(port, || code.url_ansi().into_owned());
+                let mut buf = String::new();
+                with_explain_port(port, || {
+                    code.write_ansi_hyperlink(&mut buf)
+                        .expect("String sink never fails")
+                });
+                assert_eq!(via_cow, buf, "class {:?}, port {port:?}", code.code());
+            }
+        }
+    }
+
+    /// The plain URL is a pure function of the **canonical** spelling, so a resolved spelling must
+    /// produce the registry code's URL byte for byte.
+    ///
+    /// This is the property `url_for_slot_with_port`'s port-unset arm rests on when it omits the
+    /// `cacheable` guard ("structurally sound, not an oversight"); the argument lived in prose only.
+    #[test]
+    fn doc_url_is_identical_across_representations() {
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let known = with_explain_port(None, || ErrCode::new("E030").url().into_owned());
+        let verbatim = with_explain_port(None, || ErrCode::unknown("e030").url().into_owned());
+        assert_eq!(known, verbatim);
+        assert!(
+            known.starts_with("https://doc.posita-lang.org/error_codes/E030.html"),
+            "{known}"
+        );
+    }
+
     /// `ptr::eq` ignores fat-pointer metadata, so the `PartialEq` fast path is sound **only**
     /// because `canonical()` returns whole allocations.
     ///
@@ -2115,7 +2220,7 @@ mod tests {
         let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let lower = ErrCode::unknown("e030");
         let upper = ErrCode::new("E030");
-        let _ = lower.url_ansi();
+        swallow_it::swallow!(lower.url_ansi());
         let upper_out = upper.url_ansi();
         assert!(
             upper_out.ends_with("E030\x1b]8;;\x1b\\"),
@@ -2716,14 +2821,14 @@ mod tests {
                     i = skip_char_literal(bytes, i);
                     continue;
                 }
+                // One escape-aware skip for every scanner: `skip_string_literal` returns past the
+                // closing quote (or `len`), which is exactly where the common `i += 1` left this
+                // inline copy.  The file's own doctrine is stated twice above ("three scanners
+                // agree by maintenance only, and the failure mode is silent") — the same reason
+                // `skip_block_comment` is shared.
                 b'"' => {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b'"' {
-                        if bytes[i] == b'\\' {
-                            i += 1;
-                        }
-                        i += 1;
-                    }
+                    i = skip_string_literal(bytes, i);
+                    continue;
                 }
                 b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
                     while i < bytes.len() && bytes[i] != b'\n' {
@@ -2900,14 +3005,9 @@ mod tests {
                 None
             };
             if let Some(q) = str_quote {
-                let mut j = q + 1;
-                while j < bytes.len() && bytes[j] != b'"' {
-                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                        j += 1;
-                    }
-                    j += 1;
-                }
-                i = (j + 1).min(bytes.len());
+                // Shared escape-aware skip (see `argument_span`'s note); `skip_string_literal`
+                // already clamps to `len`, the `.min` is kept as the statement of that contract.
+                i = skip_string_literal(bytes, q).min(bytes.len());
                 continue;
             }
 
@@ -2972,6 +3072,48 @@ mod tests {
         String::from_utf8(out).expect("stripping preserved UTF-8")
     }
 
+    /// Every accepted spelling, so the alias rule cannot drift away from its doc.
+    #[test]
+    fn from_str_accepts_every_documented_spelling() {
+        for (spelling, expected) in [
+            ("parse", ErrorCategory::Parse),
+            ("parse error", ErrorCategory::Parse),
+            ("resolution", ErrorCategory::Resolution),
+            ("resolution error", ErrorCategory::Resolution),
+            ("type", ErrorCategory::Type),
+            ("type error", ErrorCategory::Type),
+            ("contract", ErrorCategory::Contract),
+            ("contract error", ErrorCategory::Contract),
+            ("trait", ErrorCategory::Trait),
+            ("trait error", ErrorCategory::Trait),
+            ("inference", ErrorCategory::Inference),
+            ("inference error", ErrorCategory::Inference),
+            ("internal", ErrorCategory::Internal),
+            ("internal error", ErrorCategory::Internal),
+            ("generic", ErrorCategory::Generic),
+            ("error", ErrorCategory::Generic),
+        ] {
+            assert_eq!(
+                spelling.parse::<ErrorCategory>().expect(spelling),
+                expected,
+                "{spelling:?}"
+            );
+            // Case-insensitivity is part of the contract.
+            assert_eq!(
+                spelling
+                    .to_ascii_uppercase()
+                    .parse::<ErrorCategory>()
+                    .expect(spelling),
+                expected,
+                "{spelling:?} uppercase"
+            );
+        }
+        // The rejected side: a canonical key with a *non*-Generic prefix plus "error" is not an
+        // alias ("generic error" is not in the table, "parse error" is).
+        assert!("generic error".parse::<ErrorCategory>().is_err());
+        assert!("nonsense".parse::<ErrorCategory>().is_err());
+    }
+
     /// Every literal code passed to `ErrCode::new` / `with_code_str` must be
     /// present in [`CODE_TABLE`].  A missing entry silently degrades to
     /// "unknown error" in both `ErrCode::new` and `with_code_str`; this test is
@@ -3008,6 +3150,11 @@ mod tests {
         assert!(code_literals(r#"c"E030""#).is_empty());
         // A byte literal must not swallow the *next* real literal either.
         assert_eq!(code_literals(r#"b"x" ; "E031""#), vec!["E031"]);
+        // Composed spellings are a *documented* miss: `concat!("E0", "30")` yields `"E0"` and
+        // `"30"`, neither code-shaped, so the guard cannot see the code.  Same class as the
+        // `Self::new` misses above (it only weakens the guard, it cannot corrupt a code); pinned so
+        // a future matcher that starts extracting composed forms is a visible decision.
+        assert!(code_literals(r#"concat!("E0", "30")"#).is_empty());
 
         // Known limitation, recorded rather than fixed: a `format!("{}", "E999")`
         // *inside* a scanned argument's literals would demand registration of a code
@@ -3186,8 +3333,8 @@ mod tests {
         let lits = code_literals("/* outer /* \"E123\" */ still comment */ \"W456\"");
         assert_eq!(lits, vec!["W456"]);
         // Unterminated nesting must terminate, not loop or panic.
-        let _ = strip_non_code("/* outer /* inner");
-        let _ = code_literals("/* outer /* \"E123\"");
+        swallow_it::swallow!(strip_non_code("/* outer /* inner"));
+        swallow_it::swallow!(code_literals("/* outer /* \"E123\""));
     }
 
     /// Measurement, not an assertion: the warm slot-cache hit path that
@@ -3210,8 +3357,8 @@ mod tests {
         let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let code = ErrCode::new("E030");
         // Warm the slot so the timed loop measures the hit path only.
-        let _ = code.url_ansi();
-        let _ = code.url();
+        swallow_it::swallow!(code.url_ansi());
+        swallow_it::swallow!(code.url());
         const N: usize = 200_000;
         let ansi = {
             let t0 = std::time::Instant::now();

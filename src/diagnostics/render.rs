@@ -25,6 +25,25 @@ use std::sync::Arc;
 /// full `LineIndex::new` O(source_len) scan per miss.  The hit-path scan is a
 /// `position()` over N small entries — at 16 that is trivial next to one
 /// avoided scan.
+/// Slot index for the per-line [`glyph::LineColumns`] cache.
+///
+/// Both coordinates go in.  Keying on `line_no & 3` alone made "line 5 of file A" and "line 5 of
+/// file B" compete for the *same* slot, so a batch alternating files evicted each other on every
+/// row — the key comparison kept the answers correct, but the 4-slot cache degenerated to 1-way for
+/// exactly the multi-file batch it exists for.  Mixing the line slice's address spreads distinct
+/// `(file, line)` pairs the way the slots were meant to be used (same invariant `line_index` relies
+/// on: every source is alive for the whole batch).
+#[inline]
+fn line_columns_slot(line_ptr: usize, line_no: usize) -> usize {
+    // `^` keeps a bijection on `line_no mod 4` for a fixed pointer, so consecutive lines of one
+    // file always land in different slots; the shift drops the low address bits that move with the
+    // slice's offset inside whatever allocation it came from.
+    (line_no ^ (line_ptr >> 4)) & (LINE_COLUMNS_SLOTS - 1)
+}
+
+/// Four cached line tables per ctx (`line_columns_slot` masks into this).
+const LINE_COLUMNS_SLOTS: usize = 4;
+
 pub(crate) const CACHE_SLOTS: usize = 16;
 /// Largest source copied into the cross-emit stable line cache.  The cache
 /// keeps a source copy so a hit can verify content equality — pointer-keyed
@@ -449,7 +468,7 @@ impl<'a> RenderCtx<'a> {
             return 0;
         }
         let mut slots = self.line_columns.borrow_mut();
-        let slot_idx = line_no & 3;
+        let slot_idx = line_columns_slot(line_ptr, line_no);
         if let Some((p, l, no, tab, cols)) = slots[slot_idx].as_ref()
             && *p == line_ptr
             && *l == line_len
@@ -490,8 +509,10 @@ impl<'a> RenderCtx<'a> {
             source_fingerprint(source),
             "(ptr,len) collision — cached line table belongs to a different source"
         );
-        // LRU: promote the hit to MRU so it survives eviction longest.  N ≤ 4, so the shifts
-        // are a handful of pointer moves.
+        // LRU: promote the hit to MRU so it survives eviction longest.  The shift is
+        // O(`CACHE_SLOTS`) = 16 pointer-width moves, trivial next to one avoided full scan (the
+        // old "N ≤ 4" note predated the deliberate 4 → 16 bump and invited reasoning from the
+        // wrong bound).
         if pos > 0 {
             let entry = cache.remove(pos);
             cache.insert(0, entry);
@@ -567,9 +588,11 @@ impl<'a> RenderCtx<'a> {
             // content-verified here, so the LRU's tripwire invariant holds.
             {
                 let mut cache = self.source_index.borrow_mut();
-                if let Some(pos) = cache.iter().position(|c| c.ptr == ptr && c.len == len) {
-                    cache.remove(pos);
-                } else if cache.len() >= CACHE_SLOTS {
+                // No remove branch: every backfill arm is reachable only after `lru_tables`
+                // returned `None`, which *is* "no `(ptr, len)` entry exists".  The old
+                // `if let Some(pos) = … { remove }` could never fire and implied the opposite,
+                // mis-teaching the tiering to the next reader.
+                if cache.len() >= CACHE_SLOTS {
                     cache.pop();
                 }
                 cache.insert(
@@ -666,8 +689,12 @@ impl<'a> RenderCtx<'a> {
         // stable-cache insert both need it, and computing it at each site contradicted this
         // module's own "one content, one fingerprint" note.  Gated on the tier actually being
         // enabled so a cache-less ctx pays nothing.
-        let cold_fingerprint = (self.line_cache.is_some() && len <= STABLE_CACHE_MAX_SOURCE)
-            .then(|| source_fingerprint(source));
+        // Bound once: the rebuild's stable-cache insert below used to re-state this condition as
+        // two textually independent checks and then `expect` the fingerprint.  They agreed by
+        // copy-edit, and the failure mode was a *release panic inside the render path* if either
+        // side was ever tightened — the exact class this subsystem's containment policy forbids.
+        let stable_enabled = self.line_cache.is_some() && len <= STABLE_CACHE_MAX_SOURCE;
+        let cold_fingerprint = stable_enabled.then(|| source_fingerprint(source));
         if let Some(fingerprint) = cold_fingerprint {
             if let Some(cache_ref) = self.line_cache {
                 let mut cache = cache_ref.borrow_mut();
@@ -700,9 +727,9 @@ impl<'a> RenderCtx<'a> {
                     // so the LRU tripwire invariant holds.
                     {
                         let mut lru = self.source_index.borrow_mut();
-                        if let Some(pos) = lru.iter().position(|c| c.ptr == ptr && c.len == len) {
-                            lru.remove(pos);
-                        } else if lru.len() >= CACHE_SLOTS {
+                        // Same reachability argument as the tier-0 backfill above: `lru_tables`
+                        // returned `None`, so there is no entry to remove.
+                        if lru.len() >= CACHE_SLOTS {
                             lru.pop();
                         }
                         lru.insert(
@@ -780,8 +807,10 @@ impl<'a> RenderCtx<'a> {
                 fingerprint: rebuilt_fingerprint,
             },
         );
-        if len <= STABLE_CACHE_MAX_SOURCE {
-            if let Some(cache_ref) = self.line_cache {
+        // Same single gate as the read above — `cold_fingerprint.is_some()` **is**
+        // `stable_enabled`, so this destructuring cannot miss and needs no `expect`.
+        if let (Some(fingerprint), Some(cache_ref)) = (cold_fingerprint, self.line_cache) {
+            {
                 let mut cache = cache_ref.borrow_mut();
                 if cache.len() >= CACHE_SLOTS {
                     cache.pop();
@@ -790,10 +819,7 @@ impl<'a> RenderCtx<'a> {
                     0,
                     StableSourceIndex {
                         text: source.to_owned(),
-                        // Reused from `cold_fingerprint` above: this block is inside
-                        // `len <= STABLE_CACHE_MAX_SOURCE`, so the value is already computed.
-                        fingerprint: cold_fingerprint
-                            .expect("stable tier enabled on this path computes the fingerprint"),
+                        fingerprint,
                         starts: Arc::clone(&shared_entry.0),
                         ascii: shared_entry.1,
                         char_prefixes: shared_entry.2.clone(),
@@ -859,15 +885,15 @@ impl<'a> RenderCtx<'a> {
     /// Entries are inserted MRU-first from the tail of `entries`
     /// so the caller can pass its list in natural order.
     ///
-    /// Order matters for hit rate: the seeded slots are the first `entries`,
-    /// so a `reverse_errors` batch should pass its list in *render* order or
-    /// Sources longer than `STABLE_CACHE_MAX_SOURCE` are deliberately **not**
-    /// cached here (the tier stores the full text for absolute verification, so a
-    /// 5 MB entry would pin 5 MB).  The cost is a full `LineIndex::new` scan per
-    /// emit call for such a source — the single largest remaining per-emit cost in
-    /// this architecture, documented rather than hidden: raising the cap trades
-    /// memory 1:1, and the fingerprint-verified alternative (no stored text) is a
-    /// policy change, not a tweak.
+    /// Order matters for hit rate: the seeded slots are the first `entries`, so a
+    /// `reverse_errors` batch should pass its list in **render** order.  At most
+    /// `PRELOAD_SLOTS` entries are consumed, heaviest-first, and `entries[0]` lands in the MRU slot
+    /// while the tail of the list is evicted first once the slots fill.
+    ///
+    /// (This paragraph used to describe the *stable* tier — text retention above
+    /// `STABLE_CACHE_MAX_SOURCE`, which is `line_cache`'s policy, not this preload's — and its
+    /// preceding sentence was cut off mid-thought.  The preload seeds shared `Arc` tables; it
+    /// stores no text and has no size policy of its own.)
     ///
     /// The first renders miss and backfill from the shared map.  `&mut self`
     /// (not `&self`) makes a mid-batch reseed a compile error — the pop-tail
@@ -945,18 +971,29 @@ impl<'a> RenderCtx<'a> {
                 // from building and dropping a key `String` for a slot that now exists — the
                 // `else` branch below is the only place that allocates one.
                 //
-                // The map is keyed by the *verbatim* spelling and entries are never evicted, so
-                // a producer that mints a distinct spelling per diagnostic grows it for the
-                // process lifetime.  The `FileUrlMap` doc promises this tripwire turns that into
-                // a loud debug failure instead of silent unbounded growth; it was never written.
-                debug_assert!(
-                    map.len() < 100_000,
-                    "file_url map grew past a sane session bound ({} entries): a producer is \
-                     minting distinct path spellings per render",
-                    map.len()
-                );
+                // The map is keyed by the *verbatim* spelling and entries are never evicted, so a
+                // producer that mints a distinct spelling per diagnostic grows it for the process
+                // lifetime.
                 if let Some(slot) = map.get(name) {
                     Arc::clone(slot)
+                } else if map.len() >= FILE_URL_MAP_MAX {
+                    // Tripwire **inside** the insert branch, not before the double check: a racing
+                    // worker can legitimately have inserted the slot we want while the map was
+                    // already at the bound, and asserting before the re-check turned that correct
+                    // interleaving into a debug panic (release handled it fine, which is why the
+                    // asymmetry survived).
+                    debug_assert!(
+                        false,
+                        "file_url map grew past a sane session bound ({} entries): a producer is \
+                         minting distinct path spellings per render",
+                        map.len()
+                    );
+                    // Enforced in **release** as well: the doc promises this hint turns a
+                    // pathological producer into a loud failure instead of unbounded growth, but a
+                    // debug assert is not a bound — a long-lived daemon would still grow ~200 B per
+                    // distinct spelling for the process lifetime.  Past the cap, serve the
+                    // per-call `canonicalize` path (correct output, slower) and stop inserting.
+                    return Arc::from(path_to_file_url(std::path::Path::new(name)));
                 } else {
                     Arc::clone(map.entry(name.to_string()).or_default())
                 }
@@ -972,6 +1009,13 @@ impl<'a> RenderCtx<'a> {
 /// across calls (a name→URL mapping; grow-once buffers), unlike the
 /// per-source line-index LRU whose `(ptr, len)` keys are only sound while
 /// the sources are alive — that one stays per-batch.
+/// Hard bound on the verbatim-spelling `file://` URL map (see `RenderCtx::file_url`).
+///
+/// ~200 B per entry, so the cap is a ~20 MB worst case for a structure whose growth is documented
+/// as acceptable-but-pathological.  Above it the map stops inserting and every new spelling pays a
+/// `canonicalize` per render.
+const FILE_URL_MAP_MAX: usize = 100_000;
+
 pub struct SharedRenderState {
     pub(crate) file_urls: FileUrlMap,
     pub(crate) scratch: RefCell<SectionScratch>,
@@ -986,6 +1030,29 @@ pub struct SharedRenderState {
 }
 
 impl SharedRenderState {
+    /// Run `f` with the hoisted render buffer, falling back to a fresh `String` if it is already
+    /// borrowed.
+    ///
+    /// The borrow is held across `render_into`, so a panic hook (or a `Display` impl) that emits a
+    /// diagnostic through the **same** emitter while unwinding would re-enter
+    /// `RefCell::borrow_mut` and panic inside panic handling → process abort.  `sink.rs` documents
+    /// the same reentrancy shape and `CtxCell::borrow_mut` already uses `try_borrow_mut` for it;
+    /// `render_buf` was the last shared cell without the guard, and the producer's own policy says
+    /// "a fallback for the fallback must be total".  The fallback pays one allocation on the
+    /// pathological path only.
+    pub(crate) fn with_render_buf<R>(&self, f: impl FnOnce(&mut String) -> R) -> R {
+        match self.render_buf.try_borrow_mut() {
+            Ok(mut buf) => {
+                buf.clear();
+                f(&mut buf)
+            }
+            Err(_) => {
+                let mut fresh = String::new();
+                f(&mut fresh)
+            }
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             file_urls: Arc::default(),
@@ -999,6 +1066,28 @@ impl SharedRenderState {
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use super::*;
+
+    /// The slot index must depend on **both** coordinates.
+    ///
+    /// Version 1 keyed on `line_no & 3`, so two files' line 5 shared one slot; the key comparison in
+    /// `display_col_in_line` kept the *answers* right, but the 4-way cache degenerated to 1-way for
+    /// exactly the multi-file batch it exists for.  Pinned on synthetic integers — the function
+    /// consumes integers only, so this is exact and cannot flake on allocator addresses.
+    #[test]
+    fn line_columns_slot_mixes_both_coordinates() {
+        let p = super::line_columns_slot;
+        // Same line number, different line slice -> different slot for these addresses.
+        assert_ne!(p(0x1000, 5), p(0x1010, 5));
+        // Fixed pointer: consecutive line numbers always differ (the `^` is a bijection on
+        // `line_no mod 4`), which is what keeps a one-file walk from evicting itself.
+        for no in [0usize, 1, 5, 9, 12345] {
+            assert_ne!(p(0x2000, no), p(0x2000, no + 1), "line {no}");
+        }
+        // The mask keeps the index inside the slot array.
+        for no in [0usize, 1, 2, 3, 4, 1023] {
+            assert!(p(0x7fff_ffff, no) < super::LINE_COLUMNS_SLOTS);
+        }
+    }
 
     #[test]
     fn source_fingerprint_samples_the_middle() {
@@ -1237,7 +1326,7 @@ pub trait Renderer: Send + Sync {
     /// `Box<dyn Renderer>`.  The vtable dispatch happens twice per batch —
     /// immeasurable against the render work.
     fn begin(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
-        let _ = out;
+        swallow_it::swallow!(out);
         Ok(())
     }
 
@@ -1325,7 +1414,7 @@ pub trait Renderer: Send + Sync {
     /// so existing renderers keep working; human/HTML overrides include
     /// the file count while JSON keeps the empty summary (machine-consumed).
     fn render_summary_full(&self, errors: usize, warnings: usize, files: usize) -> String {
-        let _ = files;
+        swallow_it::swallow!(files);
         self.render_summary(errors, warnings)
     }
 
@@ -1382,7 +1471,7 @@ pub trait Renderer: Send + Sync {
 
     /// Called once per batch, after all diagnostics and the summary.
     fn end(&self, out: &mut dyn DiagnosticSink) -> io::Result<()> {
-        let _ = out;
+        swallow_it::swallow!(out);
         Ok(())
     }
 }

@@ -603,9 +603,10 @@ fn comptime_traceback_labels<'src>(
     //
     // Frames located at the primary span are excluded: a secondary underline under
     // the primary annotation is noise, and the message still lists them.
-    // Inline capacity = the frame cap: a 4-slot buffer spilled at the 5th distinct
-    // frame, which is *every* recursive comptime traceback — the exact input the cap
-    // exists for.  The two constants must be derived from one another.
+    // Inline capacity = the frame cap (`MAX_TRACEBACK_FRAMES` = 16 slots): the buffer only spills
+    // once a traceback carries more distinct frames than the cap allows, i.e. never on input the cap
+    // accepts.  Derive the capacity from the constant — the literal `4` this comment used to cite
+    // predated the cap and would have made every recursive traceback spill.
     let mut emitted_spans: crate::smallvec::SmallVec<[Span; MAX_TRACEBACK_FRAMES]> =
         crate::smallvec::SmallVec::new();
     let mut emitted = 0usize;
@@ -676,7 +677,15 @@ fn comptime_message_with_traceback<'src>(
     // ~3x, so a 16-frame traceback regrew this ~130-byte-element vector twice and then
     // shrank it again in `into_boxed_slice`.
     let frames_cap = traceback.len().min(MAX_TRACEBACK_FRAMES);
-    let mut parts: Vec<DiagMessage<'src>> = Vec::with_capacity(8 + 5 * frames_cap);
+    // Derived, not hand-summed: the three leading layout parts plus `msg` plus the per-frame
+    // five plus the four-part truncation marker.  The old `8 + 5*frames` was *one* part short at
+    // the cap (87 vs 88), so the exact-fit claim held only by luck — and the next added part
+    // (a localized separator, say) would have reintroduced a silent reallocation.
+    const PARTS_BEFORE_FRAMES: usize = 4; // msg, blank line, header, leading newline
+    const PARTS_PER_FRAME: usize = 5; // newline, indent, bullet, gap, slug
+    const PARTS_FOR_MARKER: usize = 4;
+    let mut parts: Vec<DiagMessage<'src>> =
+        Vec::with_capacity(PARTS_BEFORE_FRAMES + PARTS_PER_FRAME * frames_cap + PARTS_FOR_MARKER);
     parts.push(msg);
     parts.push(DiagMessage::Static(Cow::Borrowed("\n\n")));
     parts.push(DiagMessage::Slug {

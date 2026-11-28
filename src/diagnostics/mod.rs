@@ -254,9 +254,25 @@ impl DiagOpts {
     /// A `--color=always/never` flag should overwrite `use_color` afterwards;
     /// `max_width` likewise for `--width`.  [`term::supports_hyperlinks`]
     /// exists for the renderer-side follow-up that consumes it.
+    /// Clamp the layout knobs at the model boundary.
+    ///
+    /// `DiagOpts`'s fields are public, so a caller can write `tab_width = 1 << 60` straight past
+    /// [`detect`](Self::detect).  The renderers each clamp what they consume (`glyph` clamps the
+    /// width to `[MIN_WIDTH, 8 * DEFAULT_MAX_WIDTH]` and the tab stop to `>= 1`), but the *model*
+    /// is the one place that can state one bound for every consumer, including the ones that do
+    /// arithmetic before clamping (`LineIndex::display_col`'s slot key, the wrap budget).
+    ///
+    /// Rustc-compatible callers never hit either clamp: 32 columns is twice the widest plausible
+    /// tab stop, and 4096 is far past any real terminal.
+    pub fn clamp_layout(&mut self) -> &mut Self {
+        self.tab_width = self.tab_width.clamp(1, Self::MAX_TAB_WIDTH);
+        self.max_width = self.max_width.clamp(1, Self::MAX_LAYOUT_WIDTH);
+        self
+    }
+
     pub fn detect() -> Self {
         let caps = term::TermCaps::detect();
-        DiagOpts {
+        let mut opts = DiagOpts {
             use_color: caps.color,
             use_unicode: caps.unicode,
             // `max_width == 0` degenerates wrapping and tab expansion; a
@@ -265,8 +281,17 @@ impl DiagOpts {
             color_depth: caps.depth,
             tab_width: 4,
             ..Default::default()
-        }
+        };
+        opts.clamp_layout();
+        opts
     }
+}
+
+impl DiagOpts {
+    /// Widest accepted tab stop.  `tab_width * 2` still fits any display arithmetic below.
+    pub const MAX_TAB_WIDTH: usize = 32;
+    /// Widest accepted layout width (display columns).
+    pub const MAX_LAYOUT_WIDTH: usize = 4096;
 }
 
 impl Default for DiagOpts {
@@ -354,6 +379,15 @@ pub struct DiagFilter {
     allow_verbatim: rustc_hash::FxHashSet<CompactString>,
     only_slots: SlotSet,
     only_verbatim: rustc_hash::FxHashSet<CompactString>,
+    /// Longest pattern stored in either verbatim set.
+    ///
+    /// A verbatim match compares the *whole* canonical spelling, so a diagnostic whose code is
+    /// longer than every pattern cannot match — and `canonical()` on an untrusted spelling is
+    /// attacker-controlled in length (`with_code_str` documents that it is safe for untrusted input).
+    /// Without this bound, a filter turns `matches()` into O(code length) hashing plus, on the
+    /// uppercase retry, an allocation and copy of the whole spelling — per diagnostic, in the emit
+    /// loop.  This is the `MAX_CODE_CHARS` argument applied to *matching* rather than rendering.
+    verbatim_max_len: usize,
     /// `ErrorCategory` bits (see [`ErrorCategory::mask_bit`]): one AND instead of a
     /// hash-and-probe per diagnostic, matching the `SlotSet` treatment of codes.
     only_category_mask: u16,
@@ -380,6 +414,7 @@ impl Default for DiagFilter {
             allow_verbatim: rustc_hash::FxHashSet::default(),
             only_slots: SlotSet::default(),
             only_verbatim: rustc_hash::FxHashSet::default(),
+            verbatim_max_len: 0,
             only_category_mask: 0,
             only_files_finders: Vec::new(),
             is_empty: true,
@@ -454,11 +489,18 @@ impl DiagFilter {
             && only_verbatim.is_empty()
             && only_category_mask == 0
             && only_files_finders.is_empty();
+        let verbatim_max_len = allow_verbatim
+            .iter()
+            .chain(only_verbatim.iter())
+            .map(|p| p.len())
+            .max()
+            .unwrap_or(0);
         DiagFilter {
             allow_slots,
             allow_verbatim,
             only_slots,
             only_verbatim,
+            verbatim_max_len,
             only_category_mask,
             only_files_finders,
             is_empty,
@@ -468,6 +510,7 @@ impl DiagFilter {
     fn code_matches(
         slots: &SlotSet,
         verbatim: &rustc_hash::FxHashSet<CompactString>,
+        verbatim_max_len: usize,
         code: &crate::diagnostics::error_code::ErrCode,
     ) -> bool {
         // Registry codes: one `u16` lookup, no string hashing.
@@ -485,6 +528,12 @@ impl DiagFilter {
             return true;
         }
         let canonical = code.canonical();
+        // A verbatim pattern matches only on whole-string equality, so a longer spelling cannot hit:
+        // skip the hash and the uppercase-retry allocation below.  (The slot path above is
+        // length-independent and already ran.)
+        if canonical.len() > verbatim_max_len {
+            return false;
+        }
         if verbatim.contains(canonical) {
             return true;
         }
@@ -543,13 +592,24 @@ impl DiagFilter {
         // *dropped*.  Pinned by `allow_codes_suppresses_matching_diagnostics`.
         if (!self.allow_slots.is_empty() || !self.allow_verbatim.is_empty())
             && let Some(c) = code
-            && Self::code_matches(&self.allow_slots, &self.allow_verbatim, c)
+            && Self::code_matches(
+                &self.allow_slots,
+                &self.allow_verbatim,
+                self.verbatim_max_len,
+                c,
+            )
         {
             return false;
         }
         if !self.only_slots.is_empty() || !self.only_verbatim.is_empty() {
             match code {
-                Some(c) if Self::code_matches(&self.only_slots, &self.only_verbatim, c) => {}
+                Some(c)
+                    if Self::code_matches(
+                        &self.only_slots,
+                        &self.only_verbatim,
+                        self.verbatim_max_len,
+                        c,
+                    ) => {}
                 _ => return false,
             }
         }
@@ -788,7 +848,11 @@ impl<'a> std::fmt::Display for DiagMessage<'a> {
         match self {
             DiagMessage::Static(s) => f.write_str(s),
             DiagMessage::Slug { slug, pairs } => {
-                f.write_str(&crate::diagnostics::i18n::render(slug, pairs))
+                // The variant **is** the "known slug" tag, so route through the slug-tagged
+                // renderer: `render` re-derives the tag with an `is_ftl_slug` byte scan on every
+                // `Display`, which the `render_into` path already avoids.  One shape, one cost
+                // model.
+                f.write_str(&crate::diagnostics::i18n::render_slug(slug, pairs))
             }
             DiagMessage::Joined(parts) => {
                 for part in parts.iter() {
@@ -1795,7 +1859,7 @@ pub struct Subdiag<'src> {
     /// Child labels.  Retained for tooling and other backends; the human
     /// renderer renders only the message, so these are currently carried
     /// but not drawn.
-    pub labels: Vec<Label<'src>>,
+    pub labels: CovariantVec<'src, Label<'src>, 1>,
 }
 
 /// A related error displayed alongside the primary diagnostic in a single
@@ -1820,7 +1884,7 @@ impl<'src> Subdiag<'src> {
             message: Some(message.into()),
             styled_message: None,
             span: None,
-            labels: Vec::new(),
+            labels: CovariantVec::new(),
         }
     }
 
@@ -1869,9 +1933,9 @@ impl<'src> Subdiag<'src> {
 /// through [`Diagnostic::humanize_contained`], so one broken diagnostic costs a placeholder
 /// instead of the batch.  Output is order-independent by construction — each call touches only
 /// its own diagnostic — so the split cannot change a byte.
-pub(crate) fn humanize_slice_parallel<F>(diags: &mut [Diagnostic<'_>], keep: F)
+pub(crate) fn humanize_slice_parallel<'a, F>(diags: &mut [Diagnostic<'a>], keep: F)
 where
-    F: Fn(&Diagnostic<'_>) -> bool + Sync,
+    F: Fn(&Diagnostic<'a>) -> bool + Sync,
 {
     /// A spawn costs ~50 µs, so chunking pays only once the unit count is well past it.
     const PARALLEL_HUMANIZE_MIN: usize = 64;
@@ -2147,6 +2211,15 @@ impl<'src> Diagnostic<'src> {
     }
 
     /// Add a labeled sub-span for multi-span highlighting.
+    ///
+    /// **Decision, pinned by `user_primary_labels_do_not_extend_the_derived_spans`:** a user label
+    /// does *not* contribute to [`MultiSpan`](crate::diagnostics::MultiSpan) when `humanize` derives
+    /// the span set from the kind.  Only the kind's own `Primary` labels populate it; user labels are
+    /// drawn but never widen the section's span set.  This is a choice, not an oversight — including
+    /// them would make a section's headers depend on decorative labels a caller added for
+    /// highlighting, and would silently change output for every type-built diagnostic that also
+    /// carries a user label.  Callers that want the span set to include their span use
+    /// [`with_span`](Self::with_span), which also disables derivation.
     pub fn with_label(mut self, span: Span, label: impl Into<Cow<'src, str>>) -> Self {
         self.labels.push(Label::new(span, label));
         self
@@ -2214,7 +2287,7 @@ impl<'src> Diagnostic<'src> {
             message: None,
             styled_message: Some(styled),
             span: None,
-            labels: Vec::new(),
+            labels: CovariantVec::new(),
         });
         self
     }
@@ -2226,7 +2299,7 @@ impl<'src> Diagnostic<'src> {
             message: None,
             styled_message: Some(styled),
             span: None,
-            labels: Vec::new(),
+            labels: CovariantVec::new(),
         });
         self
     }
@@ -2501,9 +2574,9 @@ impl<'src> Diagnostic<'src> {
     /// this is the same treatment for the "at …" fragment that renderers write
     /// once per span.
     pub fn write_location_into(&self, out: &mut String) {
-        use std::fmt::Write as _;
+        use swrite::{SWrite, swrite};
         if let Some(s) = self.spans.first() {
-            let _ = write!(out, "at {s}");
+            swrite!(out, "at {s}");
         }
     }
 
@@ -3641,6 +3714,13 @@ pub fn list_error_codes(use_color: bool) -> String {
 /// Terminal caps are process-stable, so the three `emit_*` helpers share one
 /// snapshot instead of re-probing env vars and the terminal per call.
 fn detected_opts() -> DiagOpts {
+    /// Frozen **on purpose**: one process has one terminal snapshot, and re-probing per call would
+    /// let a terminal resize change `max_width`/`color_depth` midway through a diagnostic dump, so
+    /// two surfaces could describe one configuration differently — the exact disagreement
+    /// `explain_error_code_with_depth`'s `&DiagOpts` forwarding exists to close.  A caller that
+    /// configures width *after* the first `emit_*`/`--explain` call is therefore ignored here by
+    /// design; such a caller must pass its own `DiagOpts` (the `*_with_opts` entry points),
+    /// not mutate the environment and hope.
     static DETECTED: std::sync::OnceLock<DiagOpts> = std::sync::OnceLock::new();
     DETECTED.get_or_init(DiagOpts::detect).clone()
 }
@@ -3656,7 +3736,7 @@ pub fn emit_diagnostics(diags: &mut [Diagnostic<'_>], use_color: bool) {
     let renderer = HumanRenderer::with_opts(use_color, Some(&opts));
     let mut emitter = Emitter::new(renderer, sink::stderr_buffered(), opts);
 
-    let _ = emitter.emit_all(diags);
+    swallow_it::swallow!(emitter.emit_all(diags));
 }
 
 /// Convenience function to emit a DiagCtxt without cloning its diagnostics.
@@ -3687,7 +3767,19 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
     // Filtering first is sound because the emitter drops filtered diagnostics
     // *before* its `is_humanized` assertion (see `emit_ordered`), so a dropped
     // diagnostic is never handed to a renderer, humanized or not.
-    collector.humanize_pending_for(|d| emitter.filter().matches(d));
+    //
+    // The source-attachment audit belongs on **every** path that pushes diagnostics into emission,
+    // not only on `DiagCtxt::emit`: without this line a sourceless diagnostic emitted here bypassed
+    // the "reached emission without a source" invariant that `collector.rs` documents as terminal,
+    // and `internal_bug_count()` silently depended on which surface the caller used.  O(1) unless
+    // the unsourced suffix flag is armed.
+    collector.audit_source_attachment();
+    // Bound the filter outside the closure: `humanize_pending_for` now requires `F: … + Sync`, and a
+    // closure capturing `&Emitter` is not `Sync` (the emitter owns `RefCell` scratch).  The
+    // predicate itself is `Sync`, which is the honest requirement — the filter is the only state the
+    // parallel chunks share.
+    let filter = emitter.filter();
+    collector.humanize_pending_for(|d| filter.matches(d));
     if emitter.emit_all_iter(collector.unreported().iter()).is_ok() {
         collector.mark_all_reported();
     }
@@ -3696,7 +3788,7 @@ pub fn emit_collector(collector: &mut DiagCtxt<'_>, use_color: bool) {
     // recount.
     collector.recount_derived_state();
     #[cfg(debug_assertions)]
-    let _ = collector.summary();
+    swallow_it::swallow!(collector.summary());
 }
 
 /// Emit an iterator of diagnostics through a fresh sink.
@@ -4631,6 +4723,25 @@ unsafe fn scan_chunk_avx2(ptr: *const u8) -> (u32, u32) {
     )
 }
 
+/// The high-byte gate's terminal step.
+///
+/// Fires in three places (the AVX2 marks loop, the SWAR marks loop, and the scalar tail) because the
+/// loops are separately unrolled; one definition because they must not drift.  Zeroing `extra`
+/// beside `cur` is what makes "the gate fired ⇒ nothing more is pushed until line close" a *local*
+/// fact rather than an argument spanning the rest of the function: today every later high byte
+/// re-enters this branch and `close_line!` resets `extra`, but the doc contemplates a per-line
+/// budget as the memory escape hatch — resuming table building would then carry a stale cumulative
+/// offset into fresh entries, i.e. wrong character columns with no crash.
+macro_rules! gate_fired {
+    ($trusted:ident, $spans:ident, $cur:ident, $extra:ident) => {{
+        if $trusted == usize::MAX {
+            $trusted = $spans.len();
+        }
+        $cur.clear();
+        $extra = 0;
+    }};
+}
+
 fn scan_line_starts_and_ascii_capped(
     source: &str,
     max_high_bytes: usize,
@@ -4741,10 +4852,7 @@ fn scan_line_starts_and_ascii_capped(
                 } else {
                     high_bytes += 1;
                     if high_bytes > max_high_bytes {
-                        if trusted == usize::MAX {
-                            trusted = spans.len();
-                        }
-                        cur.clear();
+                        gate_fired!(trusted, spans, cur, extra);
                     } else if bytes[pos] & 0xC0 != 0x80 {
                         let k = continuation_len(bytes, pos);
                         extra += k;
@@ -4787,10 +4895,7 @@ fn scan_line_starts_and_ascii_capped(
                 // the convention is one `(start, cumulative_extra)` per char).
                 high_bytes += 1;
                 if high_bytes > max_high_bytes {
-                    if trusted == usize::MAX {
-                        trusted = spans.len();
-                    }
-                    cur.clear();
+                    gate_fired!(trusted, spans, cur, extra);
                 } else if bytes[pos] & 0xC0 != 0x80 {
                     let k = continuation_len(bytes, pos);
                     extra += k;
@@ -4814,10 +4919,7 @@ fn scan_line_starts_and_ascii_capped(
         } else if b >= 0x80 {
             high_bytes += 1;
             if high_bytes > max_high_bytes {
-                if trusted == usize::MAX {
-                    trusted = spans.len();
-                }
-                cur.clear();
+                gate_fired!(trusted, spans, cur, extra);
             } else if b & 0xC0 != 0x80 {
                 let k = continuation_len(bytes, i);
                 extra += k;
@@ -4928,10 +5030,22 @@ impl<'a> LineIndex<'a> {
         // violation degrades to a fresh scan instead of wrong output.
         //
         // The `ascii` check is the only O(source) one, so it runs unconditionally for small
-        // sources (cheap, and where the cache is least valuable) and stays a debug assert
-        // for large ones.  Closing that last window properly means making the four fields
-        // impossible to mismatch (an opaque `SharedSourceTables`), which requires the cache
-        // entry type in `emitter` to hold it — a separate, larger change.
+        // sources (cheap, and where the cache is least valuable) and stays a debug assert for large
+        // ones.  Closing that last window properly means making the four fields impossible to
+        // mismatch (an opaque `SharedSourceTables`), which requires the cache entry type in
+        // `emitter` to hold it — a separate, larger change.
+        //
+        // **The residual window, stated exactly** (it is the one remaining way this function can
+        // render wrong columns in release): for `source.len() > ASCII_RECHECK_MAX` a stale
+        // `ascii == true` paired with a non-ASCII source is *not* caught, and `ascii` selects the
+        // byte==column shortcut, so every char column on that source is wrong.  Reaching it needs a
+        // cache entry whose `(starts, char_prefixes)` describe one source while the reused `ascii`
+        // flag describes a different, all-ASCII one — i.e. a producer that reuses a `Prebuilt`
+        // across differing content, which the `(ptr, len)` + content-hash keying exists to prevent.
+        // `ascii` cannot simply be derived from `char_prefixes.is_empty()`: that predicate is the
+        // *missing-table* sentinel, not "all ASCII" (an all-ASCII source still has one `spans` slot
+        // per line).  The fix is the opaque-table change named above; until then this is the
+        // documented boundary rather than an unnoticed one.
         debug_assert_eq!(
             ascii,
             source.is_ascii(),
@@ -5051,6 +5165,16 @@ impl<'a> LineIndex<'a> {
 
     /// `(line, char_col)` for `byte_offset`: the line index and the
     /// character (not byte) column within that line, for display purposes.
+    /// Byte length of the source this index was built from.
+    ///
+    /// Exists so a renderer holding a caller-supplied index can prove the index describes the
+    /// source it is about to render (`chain.rs`'s debug integrity check): a stale index produces
+    /// silently wrong `file:line:col`, which is the one output the chain renderer treats as
+    /// sacrosanct.
+    pub(crate) fn source_len(&self) -> usize {
+        self.source.len()
+    }
+
     pub(crate) fn linecol_display(&self, byte_offset: usize) -> (usize, usize) {
         let pos = self.to_linecol(byte_offset);
         // ASCII fast path: byte columns equal character columns, so skip the
@@ -7882,6 +8006,29 @@ mod tests {
         assert_eq!(manual.message(), "hand-written message");
 
         Lang::set(original_lang);
+    }
+
+    /// A user `Primary` label must **not** widen the kind-derived span set.
+    ///
+    /// `humanize` derives `MultiSpan` only from the kind's own labels; the decision is documented on
+    /// [`Diagnostic::with_label`] and this pins it.  Without a pin, "why doesn't my span show up in
+    /// the section header" has two possible answers and only one of them is implemented.
+    #[test]
+    fn user_primary_labels_do_not_extend_the_derived_spans() {
+        let mut diag =
+            Diagnostic::error("boom").with_label(Span::new(FileId::DUMMY, 10, 12), "a user label");
+        // The builder never set spans explicitly, so derivation is active.
+        assert!(
+            !diag.spans_user_set,
+            "the fixture must not disable derivation"
+        );
+        diag.humanize();
+        let spans = diag.spans().primary_ref();
+        assert!(
+            !spans.iter().any(|s| s.start == 10 && s.end == 12),
+            "a user label leaked into the derived span set: {:?}",
+            spans.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>()
+        );
     }
 
     /// Regression: a closure that pushes a *suppressed* warning and returns

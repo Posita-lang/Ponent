@@ -54,7 +54,12 @@ pub(crate) struct BatchToken(());
 
 pub(crate) struct WorkerPool {
     core: Arc<Core>,
-    handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// `WorkerPool::drop` has `&mut self`, so the `Mutex` that used to wrap this had exactly one
+    /// runtime effect: a `if let Ok(..)` that silently skipped the joins on a poisoned lock and let
+    /// the workers become detached.  Poisoning is excluded by construction (every worker lock uses
+    /// `unwrap_or_else(into_inner)`), which made the fallback dead *and* silent — the worst
+    /// combination.  `JoinHandle` is `Send + Sync`, so a plain `Vec` keeps the type `Sync`.
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl WorkerPool {
@@ -79,13 +84,7 @@ impl WorkerPool {
                     .expect("failed to spawn diagnostic worker")
             })
             .collect();
-        (
-            Self {
-                core,
-                handles: Mutex::new(handles),
-            },
-            BatchToken(()),
-        )
+        (Self { core, handles }, BatchToken(()))
     }
 
     /// Enqueue one batch without blocking.  The caller must not touch any data
@@ -183,8 +182,8 @@ impl Drop for WorkerPool {
             state.shutdown = true;
         }
         self.core.work.notify_all();
-        if let Ok(handles) = self.handles.get_mut() {
-            for handle in handles.drain(..) {
+        {
+            for handle in self.handles.drain(..) {
                 let _ = handle.join();
             }
         }

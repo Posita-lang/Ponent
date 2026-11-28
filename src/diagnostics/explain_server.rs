@@ -4,6 +4,9 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use swrite::{SWrite, swrite};
+use swallow_it::swallow;
+
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -134,7 +137,7 @@ impl Drop for RestoreNonblocking<'_> {
         // Destructors must not panic (especially during unwinding): a failed
         // restore is best-effort, not a secondary abort.
         if let Some(previous) = self.was_nonblocking {
-            let _ = self.listener.set_nonblocking(previous);
+            swallow!(self.listener.set_nonblocking(previous));
         }
     }
 }
@@ -358,7 +361,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
             while i < pending.len() {
                 if now >= pending[i].expiry() {
                     let mut p = pending.swap_remove(i);
-                    let _ = p.stream.shutdown(Shutdown::Both);
+                    swallow!(p.stream.shutdown(Shutdown::Both));
                 } else {
                     i += 1;
                 }
@@ -491,7 +494,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                         }
                         Ok(n) => {
                             // First byte: start the transfer window (see `expiry`).
-                            let _ = pending[i].first_byte_at.get_or_insert_with(Instant::now);
+                            swallow!(pending[i].first_byte_at.get_or_insert_with(Instant::now));
                             pending[i].buf.extend_from_slice(&tmp[..n]);
                             let progress = pending[i].scan.scan(&pending[i].buf);
                             match progress {
@@ -540,7 +543,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 let p = pending.swap_remove(i);
                 if action == PendingAction::Close {
                     let mut stream = p.stream;
-                    let _ = stream.shutdown(Shutdown::Both);
+                    swallow!(stream.shutdown(Shutdown::Both));
                 } else {
                     let head = if action == PendingAction::Serve {
                         parse_request_head(&p.buf, p.head_end)
@@ -559,7 +562,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                             // reactor for the client's write timeout, which is
                             // the stall the worker pool exists to prevent, so
                             // close instead.
-                            let _ = stream.shutdown(Shutdown::Both);
+                            swallow!(stream.shutdown(Shutdown::Both));
                             continue;
                         }
                         let handle =
@@ -567,11 +570,11 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                                 .stack_size(128 * 1024)
                                 .spawn(move || {
                                     if stream.set_nonblocking(false).is_err() {
-                                        let _ = stream.shutdown(Shutdown::Both);
+                                        swallow!(stream.shutdown(Shutdown::Both));
                                         return;
                                     }
-                                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                                    let _ = write_header_too_large(&mut stream);
+                                    swallow!(stream.set_write_timeout(Some(Duration::from_secs(1))));
+                                    swallow!(write_header_too_large(&mut stream));
                                     linger_after_half_close(&mut stream);
                                 });
                         if let Ok(handle) = handle {
@@ -582,7 +585,7 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                     if !workers.has_capacity() {
                         // Eight requests already in flight: shed this one
                         // without blocking the accept loop (see has_capacity).
-                        let _ = stream.shutdown(Shutdown::Both);
+                        swallow!(stream.shutdown(Shutdown::Both));
                         continue;
                     }
                     let html = std::sync::Arc::clone(&html);
@@ -614,9 +617,9 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
         }
         for p in pending.drain(..) {
             let mut stream = p.stream;
-            let _ = stream.set_nonblocking(true);
-            let _ = drain_request(&mut stream, &[], Duration::from_millis(20));
-            let _ = stream.shutdown(Shutdown::Both);
+            swallow!(stream.set_nonblocking(true));
+            swallow!(drain_request(&mut stream, &[], Duration::from_millis(20)));
+            swallow!(stream.shutdown(Shutdown::Both));
         }
     }
 
@@ -691,15 +694,15 @@ pub fn serve_explain(listener: &TcpListener, code: &str) -> std::io::Result<()> 
                 // timeout and the drain could wait forever, so skip the drain
                 // and just close.
                 if extra.set_nonblocking(true).is_err() {
-                    let _ = extra.shutdown(Shutdown::Both);
+                    swallow!(extra.shutdown(Shutdown::Both));
                     drained += 1;
                     if drained >= DRAIN_MAX {
                         break;
                     }
                     continue;
                 }
-                let _ = drain_request(&mut extra, &[], Duration::from_millis(50));
-                let _ = extra.shutdown(Shutdown::Both);
+                swallow!(drain_request(&mut extra, &[], Duration::from_millis(50)));
+                swallow!(extra.shutdown(Shutdown::Both));
                 drained += 1;
                 if drained >= DRAIN_MAX {
                     break;
@@ -815,7 +818,7 @@ impl JoinWorkers {
 
     fn join_all(&mut self) {
         for handle in self.0.drain(..) {
-            let _ = handle.join();
+            swallow!(handle.join());
         }
     }
 }
@@ -1608,9 +1611,9 @@ fn drain_request_tracked(
 /// afterwards; the non-half-close form is the residual pipelined drain.
 fn drain_until_eof(stream: &mut TcpStream, budget: Duration, half_close: bool) {
     if half_close {
-        let _ = stream.shutdown(Shutdown::Write);
+        swallow!(stream.shutdown(Shutdown::Write));
     }
-    let _ = stream.set_read_timeout(Some(budget));
+    swallow!(stream.set_read_timeout(Some(budget)));
     let deadline = Instant::now() + budget;
     let mut buf = [0u8; 4096];
     while Instant::now() < deadline {
@@ -1624,7 +1627,7 @@ fn drain_until_eof(stream: &mut TcpStream, budget: Duration, half_close: bool) {
         }
     }
     if half_close {
-        let _ = stream.shutdown(Shutdown::Both);
+        swallow!(stream.shutdown(Shutdown::Both));
     }
 }
 
@@ -1986,7 +1989,7 @@ fn serve_page_expected(
     // Responses go out in one vectored write today; disabling Nagle removes a
     // future "why is there a 40 ms gap" class of bug if the response grows
     // past one segment.
-    let _ = stream.set_nodelay(true);
+    swallow!(stream.set_nodelay(true));
     // without SO_SNDTIMEO a client that never reads blocks
     // `write_all_vectored` forever — the only unbounded wait in the file.
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
@@ -2010,7 +2013,7 @@ fn serve_page_expected(
                         | std::io::ErrorKind::UnexpectedEof
                 ) =>
             {
-                let _ = stream.shutdown(Shutdown::Both);
+                swallow!(stream.shutdown(Shutdown::Both));
                 return Ok(false);
             }
             Err(e) => return Err(e),
@@ -2018,12 +2021,12 @@ fn serve_page_expected(
     };
     if first_n == 0 {
         // Peer closed without sending anything — same as a preconnect.
-        let _ = stream.shutdown(Shutdown::Both);
+        swallow!(stream.shutdown(Shutdown::Both));
         return Ok(false);
     }
     // fail fast on bytes that cannot begin an HTTP request line.
     if !looks_like_http_request(&first[..first_n]) {
-        let _ = stream.shutdown(Shutdown::Both);
+        swallow!(stream.shutdown(Shutdown::Both));
         return Ok(false);
     }
     serve_page_after_prefix(stream, body, expected_path, &first[..first_n], None)
@@ -2041,7 +2044,7 @@ fn serve_page_after_prefix(
     head: Option<RequestHead>,
 ) -> std::io::Result<bool> {
     stream.set_nonblocking(false)?;
-    let _ = stream.set_nodelay(true);
+    swallow!(stream.set_nodelay(true));
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     let (line, leftover, pre_drain) = if let Some(head) = head {
@@ -2063,14 +2066,14 @@ fn serve_page_after_prefix(
             Some((line, leftover)) => (line, leftover, None),
             None => {
                 if too_large {
-                    let _ = write_header_too_large(stream);
+                    swallow!(write_header_too_large(stream));
                     linger_after_half_close(stream);
                 } else if malformed {
                     let resp = bad_request_response();
-                    let _ = write_prepared_parts(stream, resp.head_parts(), resp.body());
+                    swallow!(write_prepared_parts(stream, resp.head_parts(), resp.body()));
                     linger_after_half_close(stream);
                 }
-                let _ = stream.shutdown(Shutdown::Both);
+                swallow!(stream.shutdown(Shutdown::Both));
                 return Ok(false);
             }
         }
@@ -2160,7 +2163,7 @@ fn serve_page_after_prefix(
                     }
                     match drain {
                         DrainOutcome::NoRequest => {
-                            let _ = stream.shutdown(Shutdown::Both);
+                            swallow!(stream.shutdown(Shutdown::Both));
                             return Ok(false);
                         }
                         DrainOutcome::HeadersOnly => {
@@ -2170,7 +2173,7 @@ fn serve_page_after_prefix(
                         DrainOutcome::Complete => {
                             write_prepared_parts(stream, page.head_parts(), &page.body)?;
                             drain_residual(stream);
-                            let _ = stream.shutdown(Shutdown::Both);
+                            swallow!(stream.shutdown(Shutdown::Both));
                         }
                         DrainOutcome::TooLarge => {
                             write_header_too_large(stream)?;
@@ -2198,19 +2201,19 @@ fn serve_page_after_prefix(
                 }
                 match drain {
                     DrainOutcome::NoRequest => {
-                        let _ = stream.shutdown(Shutdown::Both);
+                        swallow!(stream.shutdown(Shutdown::Both));
                     }
                     DrainOutcome::HeadersOnly => {
-                        let _ = write_prepared_parts(stream, page.head_parts(), &page.body);
+                        swallow!(write_prepared_parts(stream, page.head_parts(), &page.body));
                         linger_after_half_close_for(stream, ONE_SHOT_LINGER);
                     }
                     DrainOutcome::Complete => {
-                        let _ = write_prepared_parts(stream, page.head_parts(), &page.body);
+                        swallow!(write_prepared_parts(stream, page.head_parts(), &page.body));
                         drain_residual(stream);
-                        let _ = stream.shutdown(Shutdown::Both);
+                        swallow!(stream.shutdown(Shutdown::Both));
                     }
                     DrainOutcome::TooLarge => {
-                        let _ = write_header_too_large(stream);
+                        swallow!(write_header_too_large(stream));
                         linger_after_half_close(stream);
                     }
                 }
@@ -2232,13 +2235,13 @@ fn serve_page_after_prefix(
 
     match drain_or_pre(stream, prefix, pre_drain, Duration::from_secs(1)) {
         DrainOutcome::NoRequest => {
-            let _ = stream.shutdown(Shutdown::Both);
+            swallow!(stream.shutdown(Shutdown::Both));
             Ok(false)
         }
         DrainOutcome::HeadersOnly => {
             // The body was not fully drained; a hard close would RST. Write the
             // response, half-close, and linger until EOF/budget .
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+            swallow!(stream.set_read_timeout(Some(Duration::from_millis(50))));
             write_response(stream, "200 OK", "", body)?;
             linger_after_half_close_for(stream, ONE_SHOT_LINGER);
             Ok(true)
@@ -2249,11 +2252,11 @@ fn serve_page_after_prefix(
             // read, instead of a 20 ms sleep before it.
             drain_residual(stream);
             // Fully drained: no unread inbound bytes, so a hard close is FIN.
-            let _ = stream.shutdown(Shutdown::Both);
+            swallow!(stream.shutdown(Shutdown::Both));
             Ok(true)
         }
         DrainOutcome::TooLarge => {
-            let _ = write_header_too_large(stream);
+            swallow!(write_header_too_large(stream));
             linger_after_half_close(stream);
             Ok(false)
         }
@@ -2302,7 +2305,7 @@ where
 {
     match drain {
         DrainOutcome::NoRequest => {
-            let _ = stream.shutdown(Shutdown::Both);
+            swallow!(stream.shutdown(Shutdown::Both));
             Ok(false)
         }
         DrainOutcome::HeadersOnly => {
@@ -2313,7 +2316,7 @@ where
         DrainOutcome::Complete => {
             write_head(stream)?;
             drain_residual(stream);
-            let _ = stream.shutdown(Shutdown::Both);
+            swallow!(stream.shutdown(Shutdown::Both));
             Ok(delivered)
         }
         DrainOutcome::TooLarge => {
@@ -2338,7 +2341,7 @@ fn finish_after_response(
     }
     if outcome == DrainOutcome::Complete {
         drain_residual(stream);
-        let _ = stream.shutdown(Shutdown::Both);
+        swallow!(stream.shutdown(Shutdown::Both));
     } else {
         linger_after_half_close(stream);
     }
@@ -2353,7 +2356,7 @@ fn finish_response(
 ) -> std::io::Result<bool> {
     match drain {
         DrainOutcome::NoRequest => {
-            let _ = stream.shutdown(Shutdown::Both);
+            swallow!(stream.shutdown(Shutdown::Both));
             Ok(false)
         }
         DrainOutcome::HeadersOnly => {
@@ -2568,13 +2571,11 @@ fn page_head(title: &str, extra_css: &str) -> String {
 /// is escaped; `detail_html` is trusted literal markup.
 fn simple_page(title: &str, heading: &str, detail_html: &str) -> String {
     let mut out = page_head(title, "");
-    let _ = std::fmt::Write::write_fmt(
-        &mut out,
-        format_args!(
-            "<h1>{}</h1>\n<p>{}</p>\n<p><a href=\"/\">Back to the index</a></p>\n</body>\n</html>\n",
-            escape_html(heading),
-            detail_html,
-        ),
+    swrite!(
+        out,
+        "<h1>{}</h1>\n<p>{}</p>\n<p><a href=\"/\">Back to the index</a></p>\n</body>\n</html>\n",
+        escape_html(heading),
+        detail_html,
     );
     out
 }
@@ -2605,13 +2606,11 @@ fn build_explain_page(ec: &ErrCode) -> String {
             let title = crate::diagnostics::error_code::lookup(rel)
                 .map(|e| e.title)
                 .unwrap_or("(unknown)");
-            let _ = std::fmt::Write::write_fmt(
-                &mut s,
-                format_args!(
-                    "<li><a href=\"/{code}\"><span class=\"code\">{code}</span></a> — {title}</li>\n",
-                    code = escape_html(rel),
-                    title = escape_html(title),
-                ),
+            swrite!(
+                s,
+                "<li><a href=\"/{code}\"><span class=\"code\">{code}</span></a> — {title}</li>\n",
+                code = escape_html(rel),
+                title = escape_html(title),
             );
         }
         s.push_str("</ul></div>\n");
@@ -2622,17 +2621,15 @@ fn build_explain_page(ec: &ErrCode) -> String {
         &format!("{}: {} — Ponent", ec.code(), ec.title()),
         EXPLAIN_CSS,
     );
-    let _ = std::fmt::Write::write_fmt(
-        &mut out,
-        format_args!(
-            "<h1>{code}</h1>\n\
-             <div class=\"code\">{code}</div>\n\
-             <div class=\"title\">{title}</div>\n\
-             <div class=\"category\">{category}</div>\n\
-             <div class=\"explain\">{explain}</div>\n\
-             {see_also}<div class=\"url\"><a href=\"{url}\">{url}</a></div>\n\
-             </body>\n</html>\n",
-        ),
+    swrite!(
+        out,
+        "<h1>{code}</h1>\n\
+         <div class=\"code\">{code}</div>\n\
+         <div class=\"title\">{title}</div>\n\
+         <div class=\"category\">{category}</div>\n\
+         <div class=\"explain\">{explain}</div>\n\
+         {see_also}<div class=\"url\"><a href=\"{url}\">{url}</a></div>\n\
+         </body>\n</html>\n",
     );
     out
 }
@@ -2746,20 +2743,20 @@ fn serve_explain_persistent_impl(
     // build on the connection thread. ~452 pages ≈ a few ms and a few MB.
     for (_, entries) in crate::diagnostics::error_code::code_entries_by_category() {
         for entry in entries {
-            let _ = explain_page_cached(entry.code);
+            swallow!(explain_page_cached(entry.code));
         }
     }
     // the index and the CSP digests are otherwise paid on the first
     // request; both are pure functions of the static tables/constants.
-    let _ = build_index_page();
-    let _ = csp_style_src();
-    let _ = csp_script_src();
+    swallow!(build_index_page());
+    swallow!(csp_style_src());
+    swallow!(csp_script_src());
     // Protocol-error pages are pure constants too; prewarm them so the first
     // malformed/overload request does not pay a build on the accept path.
-    let _ = bad_request_response();
-    let _ = method_not_allowed_response();
-    let _ = shed_page();
-    let _ = too_large_page();
+    swallow!(bad_request_response());
+    swallow!(method_not_allowed_response());
+    swallow!(shed_page());
+    swallow!(too_large_page());
     // Linux uses a single non-blocking epoll reactor: one event loop owns
     // every connection, so a slow client costs no thread and cannot delay
     // accepts.  Other platforms keep the scoped thread-per-connection path.
@@ -2838,7 +2835,7 @@ fn serve_explain_persistent_impl(
                                 .set_read_timeout(Some(Duration::from_millis(100)))
                                 .is_err()
                             {
-                                let _ = stream.shutdown(Shutdown::Both);
+                                swallow!(stream.shutdown(Shutdown::Both));
                                 continue;
                             }
                             let (outcome, is_head) = drain_request_with_head(
@@ -2850,11 +2847,11 @@ fn serve_explain_persistent_impl(
                                 // H3: a silent preconnect never made a request;
                                 // writing a 503 to it is unsolicited and can
                                 // desynchronise the browser.  Close instead.
-                                let _ = stream.shutdown(Shutdown::Both);
+                                swallow!(stream.shutdown(Shutdown::Both));
                                 continue;
                             }
                             if outcome == DrainOutcome::TooLarge {
-                                let _ = write_header_too_large(&mut stream);
+                                swallow!(write_header_too_large(&mut stream));
                                 linger_after_half_close(&mut stream);
                                 continue;
                             }
@@ -2862,10 +2859,10 @@ fn serve_explain_persistent_impl(
                             // can retry, instead of an empty close.
                             let page = shed_page();
                             let body: &str = if is_head { "" } else { &page.body };
-                            let _ = write_prepared_parts(&mut stream, page.head_parts(), body);
-                            let _ = drain_residual(&mut stream);
+                            swallow!(write_prepared_parts(&mut stream, page.head_parts(), body));
+                            swallow!(drain_residual(&mut stream));
                             if outcome == DrainOutcome::Complete {
-                                let _ = stream.shutdown(Shutdown::Both);
+                                swallow!(stream.shutdown(Shutdown::Both));
                             } else {
                                 // Unread inbound bytes + hard close = RST, which
                                 // can destroy the 503 we just wrote.  The shared
@@ -2895,8 +2892,9 @@ fn serve_explain_persistent_impl(
                                 // request instead; the guard still drops on
                                 // unwind.
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    let _ =
-                                        handle_persistent_connection(&mut stream, &served_thread);
+                                    swallow!(
+                                        handle_persistent_connection(&mut stream, &served_thread)
+                                    );
                                 }))
                                 .is_err()
                                 {
@@ -2910,7 +2908,7 @@ fn serve_explain_persistent_impl(
                             // The guard has already been dropped (closure
                             // destructuring on the failed spawn); just avoid
                             // spinning on resource exhaustion.
-                            let _ = e;
+                            swallow!(e);
                             std::thread::sleep(Duration::from_millis(10));
                         }
                     }
@@ -3221,7 +3219,7 @@ fn serve_explain_persistent_epoll(
                         Ok(stream) => {
                             consecutive_accept_errors = 0;
                             accept_backoff_ms = 50;
-                            let _ = stream.set_nodelay(true);
+                            swallow!(stream.set_nodelay(true));
                             let conn_fd = stream.as_raw_fd();
                             // One deadline value for both the connection and
                             // the heap arm, so the lazy-invalidation check
@@ -3232,7 +3230,7 @@ fn serve_explain_persistent_epoll(
                                 if conns.len() >= MAX_CONCURRENT_CONNECTIONS * 2 {
                                     // Bound overload slots too: a preconnect
                                     // flood cannot grow the map without limit.
-                                    let _ = stream.shutdown(Shutdown::Both);
+                                    swallow!(stream.shutdown(Shutdown::Both));
                                 } else {
                                     conns.insert(
                                         conn_fd,
@@ -3314,7 +3312,7 @@ fn serve_explain_persistent_epoll(
                                     if !conn.overload {
                                         normal_conns = normal_conns.saturating_sub(1);
                                     }
-                                    let _ = conn.stream.shutdown(Shutdown::Both);
+                                    swallow!(conn.stream.shutdown(Shutdown::Both));
                                 }
                             }
                         }
@@ -3745,7 +3743,7 @@ fn serve_explain_persistent_epoll(
                         // unread request/body bytes makes the kernel emit RST,
                         // which can discard the response we just wrote (the
                         // shed 503 path included).
-                        let _ = conn.stream.shutdown(Shutdown::Write);
+                        swallow!(conn.stream.shutdown(Shutdown::Write));
                         conn.state = ConnState::Draining;
                         let linger = if conn.body_remaining == 0 {
                             LINGER_BUDGET
@@ -3797,8 +3795,8 @@ fn serve_explain_persistent_epoll(
                 if !conn.overload {
                     normal_conns = normal_conns.saturating_sub(1);
                 }
-                let _ = epoll_ctl_checked(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
-                let _ = conn.stream.shutdown(Shutdown::Both);
+                swallow!(epoll_ctl_checked(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()));
+                swallow!(conn.stream.shutdown(Shutdown::Both));
             }
         }
     }
@@ -3811,7 +3809,7 @@ fn handle_persistent_connection(
     // Accepted sockets inherit O_NONBLOCK on some BSD/macOS listeners; the
     // blocking handler plus read/write timeouts is the intended regime.
     stream.set_nonblocking(false)?;
-    let _ = stream.set_nodelay(true);
+    swallow!(stream.set_nodelay(true));
     // A client that stops reading must not wedge `write_all` on a full
     // socket buffer; the response is a few KB, well under one write, but a
     // pathological client can still refuse to drain it.
@@ -3838,10 +3836,10 @@ fn handle_persistent_connection(
             read_request_line(stream, &[], budget, &mut too_large, &mut malformed)
         else {
             if too_large {
-                let _ = write_header_too_large(stream);
+                swallow!(write_header_too_large(stream));
                 linger_after_half_close(stream);
             } else if malformed {
-                let _ = write_prepared(stream, bad_request_head(), "");
+                swallow!(write_prepared(stream, bad_request_head(), ""));
                 linger_after_half_close(stream);
             }
             return Ok(());
@@ -3871,7 +3869,7 @@ fn handle_persistent_connection(
             return Ok(());
         }
         if outcome == DrainOutcome::TooLarge {
-            let _ = write_header_too_large(stream);
+            swallow!(write_header_too_large(stream));
             linger_after_half_close(stream);
             return Ok(());
         }
@@ -4010,14 +4008,14 @@ fn read_request_line(
     if let Some(nl) = memchr::memchr(b'\n', prefix) {
         if nl >= MAX_REQUEST_LINE {
             *too_large = true;
-            let _ = drain_after_request_line(stream, &prefix[nl + 1..], Duration::from_millis(100));
+            swallow!(drain_after_request_line(stream, &prefix[nl + 1..], Duration::from_millis(100)));
             return None;
         }
         let raw = &prefix[..nl];
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         let Ok(line) = simdutf8::basic::from_utf8(raw) else {
             *malformed = true;
-            let _ = drain_after_request_line(stream, &prefix[nl + 1..], Duration::from_millis(100));
+            swallow!(drain_after_request_line(stream, &prefix[nl + 1..], Duration::from_millis(100)));
             return None;
         };
         let mut leftover: SmallVec<[u8; 512]> = SmallVec::new();
@@ -4040,14 +4038,14 @@ fn read_request_line(
             // kernel.  Drain them before closing so the peer sees a FIN, not
             // an RST.
             if !line.is_empty() {
-                let _ = drain_request(stream, &[], Duration::from_millis(100));
+                swallow!(drain_request(stream, &[], Duration::from_millis(100)));
             }
             return None;
         }
         let n = {
             if arm_read_timeout_until(stream, deadline).is_err() {
                 if !line.is_empty() {
-                    let _ = drain_request(stream, &[], Duration::from_millis(100));
+                    swallow!(drain_request(stream, &[], Duration::from_millis(100)));
                 }
                 return None;
             }
@@ -4060,7 +4058,7 @@ fn read_request_line(
                     // deadline path; otherwise bytes that raced into the kernel
                     // buffer are discarded with unread inbound data → RST.
                     if !line.is_empty() {
-                        let _ = drain_request(stream, &[], Duration::from_millis(100));
+                        swallow!(drain_request(stream, &[], Duration::from_millis(100)));
                     }
                     return None;
                 }
@@ -4075,11 +4073,11 @@ fn read_request_line(
                     // arrived past the newline and the kernel may hold more;
                     // drain both before returning so closing does not reset
                     // the connection under the client.
-                    let _ = drain_after_request_line(
+                    swallow!(drain_after_request_line(
                         stream,
                         &chunk[nl + 1..],
                         Duration::from_millis(100),
-                    );
+                    ));
                     return None;
                 }
                 line.extend_from_slice(&chunk[..nl]);
@@ -4092,7 +4090,7 @@ fn read_request_line(
                 // the rest of the request unread (which would RST on close).
                 let Ok(line) = simdutf8::basic::from_utf8(&line[..]) else {
                     *malformed = true;
-                    let _ = drain_after_request_line(stream, &leftover, Duration::from_millis(100));
+                    swallow!(drain_after_request_line(stream, &leftover, Duration::from_millis(100)));
                     return None;
                 };
                 return Some((line.into(), leftover));
@@ -4100,7 +4098,7 @@ fn read_request_line(
             None => {
                 if line.len() + n >= MAX_REQUEST_LINE {
                     *too_large = true;
-                    let _ = drain_request(stream, &[], Duration::from_millis(100));
+                    swallow!(drain_request(stream, &[], Duration::from_millis(100)));
                     return None;
                 }
                 line.extend_from_slice(chunk);
@@ -4483,19 +4481,14 @@ fn build_index_page_uncached() -> String {
     body.push_str(&page_head("Ponent error codes", INDEX_CSS));
     body.push_str("<h1>Ponent error codes</h1>\n");
     for (cat, entries) in groups {
-        let _ = std::fmt::Write::write_fmt(
-            &mut body,
-            format_args!("<h2>{}</h2>\n<ul>\n", escape_html(&cat.label())),
-        );
+        swrite!(body, "<h2>{}</h2>\n<ul>\n", escape_html(&cat.label()));
         for entry in entries {
             let code = escape_html(entry.code);
             let title = escape_html(entry.title);
-            let _ = std::fmt::Write::write_fmt(
-                &mut body,
-                format_args!(
-                    "<li><a href=\"/{code}\"><span class=\"code\">{code}</span></a> — \
-                     <span class=\"title\">{title}</span></li>\n",
-                ),
+            swrite!(
+                body,
+                "<li><a href=\"/{code}\"><span class=\"code\">{code}</span></a> — \
+                 <span class=\"title\">{title}</span></li>\n",
             );
         }
         body.push_str("</ul>\n");
@@ -4825,7 +4818,8 @@ fn not_found_page_cached(code: &str) -> std::sync::Arc<OwnedPage> {
         // rebuild it, so admission paid two full page builds per admitted key.
         page: {
             let cell = std::sync::OnceLock::new();
-            let _ = cell.set(window_page);
+            // Fresh OnceLock: set always succeeds; unreachable if the invariant breaks.
+            let _ = cell.set(window_page).unwrap_or_else(|_| unreachable!("OnceLock was just constructed"));
             cell
         },
         referenced: std::sync::atomic::AtomicBool::new(true),
@@ -5027,7 +5021,7 @@ mod tests {
                     // evictions) race rather than hits short-circuiting.
                     for _ in 0..3 {
                         for key in keys.iter() {
-                            let _ = not_found_page_cached(key);
+                            swallow!(not_found_page_cached(key));
                         }
                     }
                 })
@@ -5072,7 +5066,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
@@ -5105,7 +5099,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
 
         let mut handles = Vec::new();
@@ -5115,7 +5109,7 @@ mod tests {
                 c.write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\n\r\n")
                     .unwrap();
                 let mut buf = Vec::new();
-                let _ = c.read_to_end(&mut buf);
+                swallow!(c.read_to_end(&mut buf));
                 buf.starts_with(b"HTTP/1.1 200 OK")
             }));
         }
@@ -5129,7 +5123,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
@@ -5166,7 +5160,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
@@ -5211,7 +5205,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
         // Hold the reactor at its connection cap.  Each holder writes **one byte** of an
         // incomplete request line: a connected socket that sends nothing sits in the
@@ -5269,7 +5263,7 @@ mod tests {
         let mut response = Vec::new();
         // `read_to_end` rides the server's close; the 2 s timeout keeps a
         // regression from wedging the suite.
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         server.join().unwrap().unwrap();
         assert!(
             response.starts_with(b"HTTP/1.1 200 OK"),
@@ -5321,7 +5315,7 @@ mod tests {
                 .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
                 .unwrap();
             let mut response = Vec::new();
-            let _ = client.read_to_end(&mut response);
+            swallow!(client.read_to_end(&mut response));
             server.join().unwrap().unwrap();
             assert_eq!(
                 socket2::SockRef::from(&probe).nonblocking().unwrap(),
@@ -5353,7 +5347,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client
@@ -5362,9 +5356,9 @@ mod tests {
         let mut request = b"GET /".to_vec();
         request.extend(std::iter::repeat(b'a').take(9 * 1024));
         request.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
-        let _ = client.write_all(&request);
+        swallow!(client.write_all(&request));
         let mut response = Vec::new();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         assert!(
             !response.starts_with(b"HTTP/1.1 200"),
             "oversized request line must not be served"
@@ -5376,7 +5370,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client
@@ -5469,7 +5463,7 @@ mod tests {
 
         let mut response = Vec::new();
         let t0 = Instant::now();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         // The old code stalls for the 500 ms read timeout before draining;
         // the carry buffer must end the drain as soon as the split
         // terminator completes (~50 ms + scheduling overhead).
@@ -5502,7 +5496,7 @@ mod tests {
         real.write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
         let mut response = Vec::new();
-        let _ = real.read_to_end(&mut response);
+        swallow!(real.read_to_end(&mut response));
         assert!(
             response.starts_with(b"HTTP/1.1 200 OK"),
             "response: {response:?}"
@@ -5652,7 +5646,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         client.write_all(b"Connection: close\r\n\r\n").unwrap();
         let mut response = Vec::new();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         server.join().unwrap().unwrap();
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
@@ -5674,7 +5668,7 @@ mod tests {
             .write_all(b"HEAD /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
         let mut response = Vec::new();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         server.join().unwrap().unwrap();
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
@@ -5705,7 +5699,7 @@ mod tests {
             .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
         let mut first_response = Vec::new();
-        let _ = first.read_to_end(&mut first_response);
+        swallow!(first.read_to_end(&mut first_response));
         assert!(first_response.starts_with(b"HTTP/1.1 200"));
 
         // The one-shot server now keeps a short idle window alive so a
@@ -5718,7 +5712,7 @@ mod tests {
             .write_all(b"GET /E001 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
         let mut second_response = Vec::new();
-        let _ = second.read_to_end(&mut second_response);
+        swallow!(second.read_to_end(&mut second_response));
         server.join().unwrap().unwrap();
         assert!(
             second_response.starts_with(b"HTTP/1.1 200"),
@@ -5742,7 +5736,7 @@ mod tests {
             .write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
         let mut response = Vec::new();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         server.join().unwrap().unwrap();
         assert!(response.starts_with(b"HTTP/1.1 200"));
     }
@@ -5774,10 +5768,10 @@ mod tests {
         fast.write_all(b"GET /E030 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
         let mut response = Vec::new();
-        let _ = fast.read_to_end(&mut response);
-        let _ = writer.join();
-        let _ = slow.shutdown(Shutdown::Both);
-        let _ = server.join();
+        swallow!(fast.read_to_end(&mut response));
+        swallow!(writer.join());
+        swallow!(slow.shutdown(Shutdown::Both));
+        swallow!(server.join());
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
             "reactor was pinned by the draining connection: {:?}",
@@ -5802,10 +5796,10 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             client.write_all(request).unwrap();
-            let _ = client.shutdown(std::net::Shutdown::Write);
+            swallow!(client.shutdown(std::net::Shutdown::Write));
             let mut response = Vec::new();
-            let _ = client.read_to_end(&mut response);
-            let _ = server.join().unwrap();
+            swallow!(client.read_to_end(&mut response));
+            swallow!(server.join().unwrap());
             response
         }
         /// The status line and headers, minus `Date` — that one changes between the two
@@ -5882,7 +5876,7 @@ mod tests {
             .write_all(b"GET /E030 HTTP/1.1\nHost: x\nConnection: close\n\n")
             .unwrap();
         let mut response = Vec::new();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         server.join().unwrap().unwrap();
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
@@ -5907,7 +5901,7 @@ mod tests {
             .write_all(b"GET /E030 HTTP/1.1\nHost: x\nConnection: close\n\n")
             .unwrap();
         let mut response = Vec::new();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         server.join().unwrap().unwrap();
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
@@ -5921,7 +5915,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client
@@ -5930,9 +5924,9 @@ mod tests {
         let mut request = b"GET /".to_vec();
         request.extend(std::iter::repeat(b'a').take(9 * 1024));
         request.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
-        let _ = client.write_all(&request);
+        swallow!(client.write_all(&request));
         let mut response = Vec::new();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         assert!(
             response.starts_with(b"HTTP/1.1 431"),
             "oversized request line must get 431, got {:?}",
@@ -5957,7 +5951,7 @@ mod tests {
         request.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
         client.write_all(&request).unwrap();
         let mut response = Vec::new();
-        let _ = client.read_to_end(&mut response);
+        swallow!(client.read_to_end(&mut response));
         server.join().unwrap().unwrap();
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
@@ -5971,7 +5965,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
         let mut idle = Vec::new();
         for _ in 0..MAX_CONCURRENT_CONNECTIONS {
@@ -6026,7 +6020,7 @@ mod tests {
             });
             client.write_all(request).unwrap();
             let mut response = Vec::new();
-            let _ = client.read_to_end(&mut response);
+            swallow!(client.read_to_end(&mut response));
             server.join().unwrap().unwrap();
             response
         }
@@ -6034,7 +6028,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let reactor_addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let _ = serve_explain_persistent(&listener);
+            swallow!(serve_explain_persistent(&listener));
         });
 
         let mut large_header = b"GET /E030 HTTP/1.1\r\nHost: x\r\nCookie: ".to_vec();
@@ -6082,7 +6076,7 @@ mod tests {
                 .unwrap();
             reactor.write_all(request).unwrap();
             let mut reactor_response = Vec::new();
-            let _ = reactor.read_to_end(&mut reactor_response);
+            swallow!(reactor.read_to_end(&mut reactor_response));
 
             let thread_response = thread_exchange(request);
             assert!(

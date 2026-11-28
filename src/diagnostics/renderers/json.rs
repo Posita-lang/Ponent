@@ -36,6 +36,57 @@ use std::io;
 ///   `children.labels` and `callChain` all carry the same field names** for
 ///   offsets and coordinates; `file` is a resolved name and `fileId` a numeric
 ///   fallback for a file the diagnostic cannot name.
+///
+/// # Deferred, each with the condition that reopens it
+///
+/// * **Wider escape scanning** (`u128` SWAR, `core::simd`, AVX2/AVX-512).  The lane proofs are done
+///   and `escape_masks_are_exact_per_lane` pins them, so width scaling is mechanical; what is missing
+///   is the measurement matrix, not the design.  A `u128` step is portable and needs no new
+///   dependency, but `escaped_extra` and `EscapeIter` are two passes over the same bytes, so a width
+///   change moves **both** and a one-sided benchmark would hide a regression in the other — the
+///   honest gate is the same `--baseline` A/B the ascii dispatch uses.  Reopen with that matrix;
+///   `push_json_str_matches_serde_json_across_the_dispatch_boundary` is already shaped to cover the
+///   new boundary bands.
+/// * **Batch-level capacity planning.**  `estimate_cap` is per diagnostic, so `reserve` can still
+///   grow the sink buffer across a batch.  Summing the per-diagnostic estimates into one reserve
+///   belongs in the stitcher's allocation, **not** in `begin`: the chunk path is documented as
+///   independent, so a `begin`-time reserve would multiply per worker.  Needs a sink-API change plus
+///   a measurement of the per-batch growth; nothing conceptual blocks it.
+/// * **Batched coordinate resolution.**  `anchor_linecol` binary-searches per span; a merging cursor
+///   over spans sorted by offset turns a label-heavy diagnostic's O(spans · log lines) into
+///   O(spans + lines).  Gated on a profile of pathologically label-heavy output — the `LineIndex` API
+///   churn is the real cost, and the per-diagnostic span counts seen in this codebase are
+///   single-digit.
+///
+/// The two accessors that can **materialize**, bound once per diagnostic.
+///
+/// `display_message()` may hand back an owned `Cow` (it derives the plain form when only a styled
+/// message exists) and `primary_ref()` may sort a copy.  `human.rs` states the rule for exactly this
+/// hazard — "two calls were two probes for one answer" — and this module called each of them from
+/// both the estimator and the writer, so the estimate pass could pay a second materialization that
+/// the write pass then discarded.  Everything else the estimator reads (`labels()`,
+/// `suggestions()`, `children()`, `code()`, `help()`, `file_name()`) is a plain field read, so it is
+/// not worth threading.
+#[derive(Debug)]
+struct Prefetch<'a> {
+    message: std::borrow::Cow<'a, str>,
+    primary: std::borrow::Cow<'a, [crate::ast::Span]>,
+}
+
+impl<'a> Prefetch<'a> {
+    fn of(diag: &'a Diagnostic<'_>) -> Self {
+        Self {
+            message: diag.display_message(),
+            primary: diag.spans.primary_ref(),
+        }
+    }
+}
+
+#[cfg(test)]
+fn prefetch_for_test<'a>(diag: &'a Diagnostic<'_>) -> Prefetch<'a> {
+    Prefetch::of(diag)
+}
+
 pub struct JsonRenderer {
     pretty: bool,
 }
@@ -156,7 +207,7 @@ impl Renderer for JsonRenderer {
         obj.key("id");
         obj.u64_hex(INTERNAL_ERROR_ID);
         obj.key("level");
-        obj.string("error");
+        obj.string_static("error");
         obj.key("message");
         obj.string("internal: diagnostic rendering panicked");
         obj.close();
@@ -266,7 +317,7 @@ impl JsonRenderer {
     /// are exactly the sections that made label/child-heavy diagnostics
     /// reallocate: `children` entries carry a message, styled parts, a span and
     /// a full label array each.
-    fn estimate_cap(diag: &Diagnostic<'_>) -> usize {
+    fn estimate_cap(diag: &Diagnostic<'_>, pf: &Prefetch<'_>) -> usize {
         // Every term saturates: the result feeds `reserve`, so the correct
         // semantic for an absurd diagnostic is "huge", not a debug-build overflow
         // panic (`+`/`*` wrap in release and are a real fuzzing hazard in debug).
@@ -277,11 +328,19 @@ impl JsonRenderer {
         // 2x covers the overwhelmingly common quoted/backslashed case; a
         // control-heavy message may still grow once, which is cheaper than a
         // full extra scan here (see `push_json_escaped_str`).
-        let message = diag.display_message();
+        let message = &pf.message;
         let mut cap = 192usize.saturating_add(message.len().saturating_mul(2));
         let fname = diag.file_name().len();
         cap = cap.saturating_add(fname.saturating_mul(2));
         cap = cap.saturating_add(64);
+        // The top-level `span` object was the only span-shaped section without its own term: its
+        // `{start, end, line, column}` framing came out of the 64-byte slack and the 192-byte base,
+        // i.e. the single-allocation property leaned on undocumented headroom for the *primary*
+        // field of the most common diagnostic shape.  (Named digits are unbounded — a 10-digit line
+        // number plus a 10-digit column plus two 10-digit offsets is ~90 bytes before framing.)
+        if !pf.primary.is_empty() {
+            cap = cap.saturating_add(96);
+        }
         // Every span-shaped object (`labels`, `additionalSpans`, `children`'
         // labels, `suggestions[].span`) carries the file name, so the per-object
         // constant was systematically short by exactly the path length — the
@@ -319,6 +378,13 @@ impl JsonRenderer {
                         .as_ref()
                         .map_or(96, |r| 96usize.saturating_add(r.len().saturating_mul(2)))
                         .saturating_add(s.message.len().saturating_mul(2))
+                        // `span` is a full span-shaped object (`file` + four offsets): it is only
+                        // emitted when present, and it was not counted at all.
+                        .saturating_add(if s.span.is_some() {
+                            fname.saturating_add(64)
+                        } else {
+                            0
+                        })
                 })
                 .fold(0usize, |a, b| a.saturating_add(b)),
         );
@@ -329,7 +395,28 @@ impl JsonRenderer {
         let related_extra: usize = diag
             .related_errors
             .iter()
-            .map(|r| 96usize.saturating_add(r.message.len().saturating_mul(2)))
+            .map(|r| {
+                let mut bytes = 96usize.saturating_add(r.message.len().saturating_mul(2));
+                // `code` is emitted as a `{code, title?}` object: the spelling is escaped and the
+                // registry title is prose.
+                if let Some(code) = r.code.as_ref().filter(|c| !c.code().is_empty()) {
+                    bytes = bytes
+                        .saturating_add(code.code().len().saturating_mul(2))
+                        .saturating_add(16);
+                }
+                // A `label` is its own `{message, kind}` object, escaped like every other string.
+                if let Some(label) = r.label.as_deref() {
+                    bytes = bytes
+                        .saturating_add(label.len().saturating_mul(2))
+                        .saturating_add(24);
+                }
+                // The span object carries the file name and four offsets' digits.  Omitted here
+                // until now, which is the same defect the `labels` term documents one screen up.
+                if r.span.is_some() {
+                    bytes = bytes.saturating_add(fname).saturating_add(64);
+                }
+                bytes
+            })
             .fold(0usize, |a, b| a.saturating_add(b));
         cap = cap.saturating_add(related_extra);
         // `help` is an *escaped* string like message/file/labels/children/suggestions, so it
@@ -345,12 +432,18 @@ impl JsonRenderer {
             .children()
             .iter()
             .map(|c| {
-                96usize.saturating_add(
+                let bytes = 96usize.saturating_add(
                     c.message
                         .as_deref()
                         .map_or(0, |m| m.len())
                         .saturating_mul(2),
-                )
+                );
+                // A child with a span emits a span-shaped object (file + four offsets).
+                if c.span.is_some() {
+                    bytes.saturating_add(fname).saturating_add(64)
+                } else {
+                    bytes
+                }
             })
             .fold(0usize, |a, b| a.saturating_add(b));
         cap = cap.saturating_add(children_extra);
@@ -371,11 +464,21 @@ impl JsonRenderer {
             })
             .fold(0usize, |a, b| a.saturating_add(b));
         cap = cap.saturating_add(child_styled);
-        let child_labels: usize = diag.children().iter().map(|c| c.labels.len()).sum();
-        cap = cap.saturating_add(child_labels.saturating_mul(96usize.saturating_add(fname)));
+        // Per label, not per label *count*: a child label message is escaped exactly like a
+        // top-level one, so the flat `96 + fname` reallocated on the long ones.
+        let child_labels: usize = diag
+            .children()
+            .iter()
+            .flat_map(|c| c.labels.iter())
+            .map(|l| {
+                96usize
+                    .saturating_add(fname)
+                    .saturating_add(l.message.len().saturating_mul(2))
+            })
+            .fold(0usize, |a, b| a.saturating_add(b));
+        cap = cap.saturating_add(child_labels);
         cap = cap.saturating_add(
-            diag.spans
-                .primary_ref()
+            pf.primary
                 .len()
                 .saturating_sub(1)
                 .saturating_mul(96usize.saturating_add(fname)),
@@ -383,17 +486,26 @@ impl JsonRenderer {
         cap.saturating_add(
             diag.call_chain
                 .as_ref()
-                // Per-entry estimate, folded like `related_extra`/the label terms: a chain entry
-                // carries its escaped message and a `location` with the escaped file name
-                // (`flat_location` reserves `2*file + 44`), so a flat 80 under-reserved exactly the
-                // long-identifier chains this estimate exists for.
+                // Per-entry estimate, folded like `related_extra`/the label terms: a spanned entry
+                // emits a `file` field **and** a `location` object that carries the escaped file
+                // name again (`flat_location` reserves `2*file + 44`).  The comment used to cite
+                // that formula while the arithmetic added none of it — a 10-entry chain over a
+                // 200-byte path under-reserved by ~8 KB, i.e. exactly the chains this estimate
+                // exists for.
                 .map_or(0, |c| {
-                    c.entries().len().saturating_mul(96).saturating_add(
-                        c.entries()
-                            .iter()
-                            .map(|e| e.message.len().saturating_mul(2))
-                            .sum::<usize>(),
-                    )
+                    c.entries()
+                        .iter()
+                        .map(|e| {
+                            let mut bytes =
+                                96usize.saturating_add(e.message.len().saturating_mul(2));
+                            if e.span.is_some() {
+                                bytes = bytes
+                                    .saturating_add(fname.saturating_mul(4))
+                                    .saturating_add(44);
+                            }
+                            bytes
+                        })
+                        .fold(0usize, |a, b| a.saturating_add(b))
                 }),
         )
     }
@@ -434,7 +546,10 @@ impl JsonRenderer {
         // `{` sits at the *outer* indentation, so `}` aligns with it; the
         // fields sit one level deeper.
         let ind0 = INDENTS[LVL.saturating_sub(1)];
-        out.reserve(Self::estimate_cap(diag));
+        // One binding for the two materializing accessors, shared by the estimate below and the
+        // writer's own uses of them (message field, additional spans, the anchor assertion).
+        let pf = Prefetch::of(diag);
+        out.reserve(Self::estimate_cap(diag, &pf));
         let mut obj = JsonContainer::object(out, &ind0, &ind, self.pretty);
 
         // Resolve the anchor source's line index once per diagnostic: the
@@ -455,7 +570,7 @@ impl JsonRenderer {
         // same contract, and it is what keeps "`span` == `primary_ref()[0]`" true.
         debug_assert_eq!(
             diag.spans.first().map(|s| s.file),
-            diag.spans.primary_ref().first().map(|s| s.file),
+            pf.primary.first().map(|s| s.file),
             "spans.first() and primary_ref().first() disagree on the file — the JSON \
              section layout assumes one sorted view"
         );
@@ -513,7 +628,7 @@ impl JsonRenderer {
         // loudly in debug builds (with `""` message in release), not
         // silently emit a JSON document missing its data.  `spans` has no
         // assert and keeps direct access.
-        obj.string(&diag.display_message());
+        obj.string(&pf.message);
 
         // An empty code counts as absent, matching `relatedErrors` below (and `short.rs`): emitting
         // `"code": ""` would contradict the header contract "code is absent, not null, when a
@@ -570,7 +685,7 @@ impl JsonRenderer {
         // diagnostics are not silently truncated in the machine format.
         // Borrowed view — one pointer, no per-diagnostic `Vec` clone (mirrors
         // the HTML renderer).
-        let all_spans = diag.spans.primary_ref();
+        let all_spans = &pf.primary;
         if all_spans.len() > 1 {
             obj.key("additionalSpans");
             let mut arr = JsonContainer::array(&mut *obj.out, &ind1, &ind, self.pretty);
@@ -1226,16 +1341,19 @@ impl<'a> JsonContainer<'a> {
 
     /// Begin an object field: [`element`](Self::element) plus `"key": `.
     fn key(&mut self, key: &str) {
+        // One reserve covering **everything this call pushes**: `element()`'s separator, newline and
+        // element indent plus this field's `"key": `.  The old shape reserved only the field's bytes
+        // *after* `element()` had already pushed its own, so those pushes each re-checked capacity —
+        // and its comment rationalized the gap instead of closing it.  `key()` runs ~15 times per
+        // diagnostic, which is exactly why the arithmetic belongs here.
+        let prefix = if self.first { 0 } else { self.sep.len() }
+            + if self.pretty {
+                1 + self.elem_ind.len()
+            } else {
+                0
+            };
+        self.out.reserve(prefix + key.len() + 4);
         self.element();
-        // One reserve for the five pushes below (separator/newline/indent are
-        // already written, so only this field's bytes count).  `key()` runs
-        // ~15 times per diagnostic; without this each of the four pushes
-        // re-checked capacity, contradicting the discipline every other writer
-        // in this file follows.
-        // `"key": ` is `key.len() + 4` (opening quote + key + `": "`): `element()` already
-        // wrote the separator, newline and indent, so counting `elem_ind.len() + 5` again
-        // over-reserved — harmless, but this file's whole point is exact reservations.
-        self.out.reserve(key.len() + 4);
         self.out.push('"');
         self.out.push_str(key);
         self.out.push_str("\": ");
@@ -1603,6 +1721,17 @@ fn push_json_escaped_body(out: &mut String, s: &str, extra: usize) {
     // class (`"`/`\\`, +1 each) is subtracted from the C0 class (`\\u00XX`, +5 each).  The long
     // path previously relied on `push_json_str`'s `len + 2` and reallocated mid-copy on every
     // escaped long string.
+    // `extra == 0` is proof, not a hint: every escape class contributes a strictly positive
+    // allowance (`"`/`\\` +1, C0 +5), so a zero sum means `escaped_extra` found no candidate at all
+    // — and the iterator below could only re-derive that.  The dominant case (clean ASCII message,
+    // file name, label) therefore drops from "scan, then scan again with an iterator" to "scan, then
+    // one `push_str` memcpy".  The two-pass structure itself stays: fusing the phases would need an
+    // O(n/8) mask buffer to carry the masks across, i.e. an allocation to avoid a scan.
+    if extra == 0 {
+        out.reserve(bytes.len());
+        out.push_str(s);
+        return;
+    }
     out.reserve(bytes.len().saturating_add(extra));
     let mut start = 0usize;
     for at in EscapeIter::new(bytes) {
@@ -1870,6 +1999,102 @@ mod tests {
         let mut out = String::new();
         JsonRenderer::new(pretty).write_diagnostic::<0>(diag, &cx, &mut out);
         out
+    }
+
+    /// The **whole** diagnostic must render inside the single allocation `estimate_cap` reserved.
+    ///
+    /// Per-helper capacity pins existed (`a_quoted_scalar_needs_no_reallocation_when_reserved_exactly`,
+    /// the `push_hex64` one) — and they are exactly why four span-shaped sections could under-reserve
+    /// for as long as they did: nothing observed `out.capacity()` after a *composed* render.  This is
+    /// that pin, over a diagnostic that populates every section the estimator sizes: a long file
+    /// name, a registered code (so its title is emitted), two labels, help, a suggestion with span +
+    /// replacement, a related error with code/label/span, and a spanned call chain, plus a child
+    /// carrying both a span and its own label.
+    #[test]
+    fn a_maximal_diagnostic_needs_no_reallocation() {
+        use crate::diagnostics::chain::{CallChain, ChainEntry, ChainEntryKind};
+        let span = Span::new(FileId::DUMMY, 4, 8);
+        let fname = "some/deeply/nested/directory/structure/with/a/fairly/long/module_file_name.ps";
+        let long = "a message long enough that the estimate's x2 escaping term matters \" \\";
+        let mut chain = CallChain::new();
+        for _ in 0..6 {
+            chain.push(ChainEntry::new(ChainEntryKind::Call, Some(span), long));
+        }
+        let mut diag = Diagnostic::error(long)
+            .with_code_str(ErrCode::E030)
+            .with_file_name(fname)
+            .with_source("fn main() { let x = 1; }\n")
+            .with_span(span)
+            .with_label(span, long)
+            .with_label(span, "second label")
+            .with_help(long)
+            .with_suggestions(vec![crate::diagnostics::Suggestion {
+                message: long.into(),
+                applicability: crate::diagnostics::Applicability::MachineApplicable,
+                style: crate::diagnostics::SuggestionStyle::ShowCode,
+                span: Some(span),
+                replacement: Some(long.into()),
+            }])
+            .with_related(crate::diagnostics::RelatedError {
+                code: Some(ErrCode::new("E030")),
+                message: long.into(),
+                span: Some(span),
+                label: Some(long.into()),
+            })
+            .with_call_chain(chain);
+        diag.children_mut().push(
+            crate::diagnostics::Subdiag::new(crate::diagnostics::DiagnosticLevel::Note, long)
+                .with_label(span, long),
+        );
+        // A child span is emitted as its own object; set it directly (the builder leaves it `None`).
+        diag.children_mut()[0].span = Some(span);
+        // A *second* instance with maximal-magnitude span offsets: the estimator's span terms are
+        // constants plus the file name, so the numeric fields are the one part a small-span fixture
+        // cannot exercise (10-digit `start`/`end` plus a 10-digit line and column is ~90 bytes).
+        let mut huge = diag.clone();
+        let huge_span = Span::new(FileId::DUMMY, 4_000_000_000, 4_000_000_001);
+        huge.spans = crate::diagnostics::MultiSpan::new(huge_span);
+        huge.labels.clear();
+        huge.children_mut().clear();
+        huge.related_errors.clear();
+        huge.call_chain = None;
+        huge.suggestions = Default::default();
+        // Compact output only: the indentation `pretty` adds is not part of the estimate, so a pretty
+        // render legitimately grows once (and asserting equality there would pin the wrong thing).
+        for diag in [&diag, &huge] {
+            let estimate = {
+                let pf = super::prefetch_for_test(diag);
+                super::JsonRenderer::estimate_cap(diag, &pf)
+            };
+            let opts = crate::diagnostics::DiagOpts::default();
+            let cx = crate::diagnostics::render::RenderCtx::new(&opts, None);
+            let mut lvl0 = String::new();
+            super::JsonRenderer::new(false).write_diagnostic::<0>(diag, &cx, &mut lvl0);
+            assert!(
+                lvl0.len() <= estimate,
+                "level 0 overflowed the estimate: {} > {estimate}",
+                lvl0.len()
+            );
+            assert_eq!(
+                lvl0.capacity(),
+                estimate,
+                "level 0 reallocated: rendered {} of {estimate} reserved bytes",
+                lvl0.len()
+            );
+            let mut lvl2 = String::new();
+            super::JsonRenderer::new(false).write_diagnostic::<2>(diag, &cx, &mut lvl2);
+            assert!(
+                lvl2.len() <= estimate,
+                "level 2 overflowed the estimate: {} > {estimate}",
+                lvl2.len()
+            );
+            assert_eq!(
+                lvl2.capacity(),
+                estimate,
+                "level 2 reallocated: rendered {} of {estimate} reserved bytes",
+                lvl2.len()
+            );
+        }
     }
 
     /// Escaping must keep short values inline (no heap) on **both** paths —

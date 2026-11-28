@@ -1294,6 +1294,13 @@ pub fn path_to_file_url(path: &std::path::Path) -> std::sync::Arc<str> {
 /// generation.  The per-thread worst case is therefore about `2 ×
 /// max_bytes + one generation of keys`, not `max_bytes`: the previous comment
 /// advertised the hot bound only, which is the number a reader budgets against.
+///
+/// An entry **larger than `max_bytes`** is admitted anyway (recomputing it would
+/// defeat the one thing the cache saves), and it lives in both generations until
+/// the next insert demotes past it — so the true worst case is `2 × (max_bytes +
+/// largest admitted entry)`.  Bounded by the input, not a leak, but the honest
+/// number: the alternative (skip caching oversized paths) trades a per-call
+/// `canonicalize` for a smaller ceiling, and that trade is deliberately not taken.
 struct UrlCache {
     hot: rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>,
     cold: rustc_hash::FxHashMap<Box<[u8]>, std::sync::Arc<str>>,

@@ -423,6 +423,19 @@ impl Renderer for ShortRenderer {
             "short renderer expects an empty buffer, got {} bytes",
             out.len()
         );
+        // **Model this renderer relies on:** the diagnostic's attached `source` is the buffer its
+        // *first primary span* points into (the same pairing `json.rs::anchor_linecol` makes, and the
+        // reason that function takes `(anchor_file, src)` as a tuple).  If a primary span ever named a
+        // foreign file, the coordinates below would be mapped through the wrong buffer and printed
+        // under this file's name — the silent-cross-file failure `human.rs`'s foreign-span test
+        // describes, in the one renderer with no `span.file == anchor` gate.
+        //
+        // It is documented rather than asserted because `Diagnostic` carries **no source file id**
+        // (`with_source` takes text, not a `FileId`), so there is nothing to compare against; the pin
+        // that *is* available — `spans.first()` agreeing with `primary_ref().first()` — lives on the
+        // JSON side, where the two accessors meet.  Making this machine-checkable needs a
+        // `source_file: Option<FileId>` on the model, which is a `Diagnostic` API change, not a
+        // renderer one.
         let file_raw = diag.file_name();
         // File names are untrusted (`set_file_name` / `with_file_name` are
         // public) and so are unknown codes, so both go through the same
@@ -1078,6 +1091,28 @@ mod tests {
         assert!(
             !out.contains("2:1"),
             "the additional span leaked into the location: {out:?}"
+        );
+    }
+
+    /// An **empty** file name with a span still prints bare coordinates — decided, not emergent.
+    ///
+    /// `file:line:col` is a three-part prefix, and an empty `file` collapses it to `1:1: `, which a
+    /// grep-style consumer reads as `file="1"`.  `with_file_name("")` is the only way to reach it, and
+    /// the with-span shape was unpinned (only the no-span one was), so this records the choice:
+    /// omit the empty name and keep the coordinates, exactly as the no-span arm does.
+    #[test]
+    fn empty_file_name_with_a_span_prints_bare_coordinates() {
+        let span = Span::new(FileId::DUMMY, 0, 1);
+        let diag = Diagnostic::error("boom")
+            .with_file_name("")
+            .with_source("x\n")
+            .with_span(span);
+        let opts = DiagOpts::default();
+        let out = ShortRenderer::new().render(&diag, &ctx(&opts));
+        assert!(out.contains("1:1: "), "{out}");
+        assert!(
+            !out.contains(": 1:1"),
+            "an empty name must not leave a leading colon: {out}"
         );
     }
 

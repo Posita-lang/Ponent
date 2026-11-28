@@ -135,7 +135,13 @@ pub struct FixEdit<'src> {
     pub applicability: Applicability,
 }
 
-/// Non-overlapping edits for one source buffer.
+/// Non-overlapping edits for **one or more** source buffers.
+///
+/// The set is per-file disjoint: `collect` sorts by `(file, start, end)` and resolves conflicts
+/// within each file independently, so a batch spanning files is representable — and
+/// [`Self::apply_for_file*`] selects one before touching a buffer.  (This used to say "one source
+/// buffer", which contradicted the multi-file machinery, the hard assert in `apply_single_file`, and
+/// the across-files fuzzer.)
 ///
 /// Sorted by `(file, start, end)`.  That order is *extensional*, not the order
 /// the resolver works in: `resolve_overlaps` emits per-file groups in `(end,
@@ -198,8 +204,21 @@ impl<'src> FixSet<'src> {
     /// *total-weight* ties between different geometries are resolved by that
     /// consideration order rather than by a rule on widths — see
     /// [`applicability_weight`] for the two pinned directions.
+    ///
+    /// **Precondition: the diagnostics must be humanized.**  `suggestions()` reads the materialized
+    /// fields; for a kind-built diagnostic that was never humanized the accessor `debug_assert!`s and
+    /// returns an **empty** slice in release, so `--fix` would report "0 fixes" — a degraded result
+    /// indistinguishable from "nothing to fix".  Run `DiagCtxt::humanize_pending` (or use the
+    /// emitter's `&mut` entry points) first; the other consumers of these accessors all document
+    /// this, and this one did not.
     #[must_use]
     pub fn collect(diags: &[Diagnostic<'src>], hints: FixHints) -> Self {
+        // Boundary assert rather than prose alone: both predicates are visible in-crate, and one
+        // bool read per diagnostic is nothing against the walk below.
+        debug_assert!(
+            diags.iter().all(|d| d.is_humanized() || d.kind().is_none()),
+            "FixSet::collect requires humanized diagnostics — run `DiagCtxt::humanize_pending` first"
+        );
         // Exact reservation: one pre-pass sums the suggestion counts, so the
         // vector does not pay its 4→8→16 growth chain on a suggestion-heavy
         // batch.  (`diags.len()` was neither an upper nor even a lower bound —
@@ -218,6 +237,10 @@ impl<'src> FixSet<'src> {
                 // replacement (a text-only suggestion never becomes an edit), so counting
                 // it here over-reserved — and this comment claims exactness.
                 sug.span.is_some()
+                    // The fill loop also rejects a reversed span (`start > end`), so counting one
+                    // here made the "exact reservation" claim false and turned the reservation into
+                    // an over-reserve.
+                    && sug.span.as_ref().is_some_and(|sp| sp.start <= sp.end)
                     && sug.replacement.is_some()
                     && !matches!(
                         sug.style,
@@ -226,6 +249,12 @@ impl<'src> FixSet<'src> {
                     && hints.accepts(sug.applicability)
             })
             .count();
+        // Provably empty: the fill loop's predicate is a subset of this one, so no second walk over
+        // every suggestion is needed (`Auto` hints over all-`Unspecified` suggestions is the
+        // realistic all-rejected shape).
+        if eligible == 0 {
+            return FixSet::default();
+        }
         let mut candidates: Vec<FixEdit<'src>> = Vec::with_capacity(eligible);
         for diag in diags {
             for sug in diag.suggestions() {
@@ -307,8 +336,11 @@ impl<'src> FixSet<'src> {
     /// would be the empty set, disjoint from everything, which is *not* what the
     /// resolution (or the pinned test) implements.
     fn resolve_overlaps(mut candidates: Vec<FixEdit<'src>>) -> Vec<FixEdit<'src>> {
-        // Candidates arrive sorted by `(file, start, end)`, so duplicate
-        // zero-length runs are adjacent.
+        // Candidates arrive sorted by `(file, **end**, start)` — the one-sort invariant the fn doc
+        // above states — so duplicate zero-length runs are adjacent.  (This said `(file, start,
+        // end)`; the conclusion holds either way because a duplicate zero-length run has identical
+        // `(file, p, p)` keys and both orders group equal keys, but the stated *reason* was wrong,
+        // which is exactly the two-homes-one-drifts shape.)
         //
         // Compaction happens **in place** (write cursor + `swap`): the earlier
         // shape built a second full-size `Vec` for `deduped`, which in the common
@@ -399,20 +431,54 @@ impl<'src> FixSet<'src> {
                 continue;
             }
             if !group.is_empty() {
-                let start = result.len();
-                group = Self::resolve_file(std::mem::take(&mut group), &mut result, &mut scratch);
-                Self::debug_assert_disjoint(&result[start..]);
+                Self::resolve_group(std::mem::take(&mut group), &mut result, &mut scratch);
             }
             last_file = Some(edit.span.file);
             group.push(edit);
         }
         if !group.is_empty() {
-            let start = result.len();
             // The shell (and its capacity) is dropped with the function here.
-            Self::resolve_file(group, &mut result, &mut scratch);
-            Self::debug_assert_disjoint(&result[start..]);
+            Self::resolve_group(group, &mut result, &mut scratch);
         }
         result
+    }
+
+    /// Resolve one file's group, taking the disjoint shortcut when it applies.
+    ///
+    /// The whole-batch scan above only skips the DP when **no** file conflicts, so one overlapping
+    /// file made every clean file in a mixed batch pay the grouping, the `resolve_file` setup and the
+    /// greedy/DP pass.  The same consecutive-pair argument holds file-locally (the order is
+    /// `(end, start)` within a file and all pairs here share the file), and a disjoint set is
+    /// *exactly* what the DP returns — so `append` is not an approximation, it is the DP's answer
+    /// without the search.
+    fn resolve_group(
+        group: Vec<FixEdit<'src>>,
+        result: &mut Vec<FixEdit<'src>>,
+        scratch: &mut ResolveScratch,
+    ) {
+        let start = result.len();
+        let disjoint = {
+            let mut prev_end: Option<usize> = None;
+            let mut ok = true;
+            for e in &group {
+                if let Some(end) = prev_end
+                    && end > e.span.start_as_usize()
+                {
+                    ok = false;
+                    break;
+                }
+                prev_end = Some(e.span.end_as_usize());
+            }
+            ok
+        };
+        if disjoint {
+            // `group` is empty again afterwards, so its capacity survives for the next file.
+            let mut group = group;
+            result.append(&mut group);
+        } else {
+            swallow_it::swallow!(Self::resolve_file(group, result, scratch));
+        }
+        Self::debug_assert_disjoint(&result[start..]);
     }
 
     /// Pin the type's headline invariant — "non-overlapping edits for one source
@@ -468,9 +534,10 @@ impl<'src> FixSet<'src> {
             }
             return group;
         }
-        // `p[i]`/`w[i]`/`take[i]` are `u32`/`u32`/`bool`; the bound is structural
-        // (`n` is a diagnostic batch size), and the DP's three arrays are its
-        // dominant working set, so the narrower width is a cache win.
+        // `p[i]`/`w[i]` are `u32`/`u32` (and `scratch.idx` carries the backtrack in `u32`); the
+        // bound is structural (`n` is a diagnostic batch size), and those arrays are the DP's
+        // dominant working set, so the narrower width is a cache win.  (`take[i]` was deleted when
+        // the decision started being re-derived from the same expression the DP used.)
         // `w[i] <= 4i` (a weight is <= 4), so the totals that reach `u32` are
         // bounded by `4n` — `n < u32::MAX` claimed four times the headroom the
         // arithmetic has, and past `u32::MAX / 4` release builds would silently
@@ -619,12 +686,15 @@ impl<'src> FixSet<'src> {
     /// An empty set borrows `source` unchanged, so a file with no applicable
     /// edits pays no copy to discover there is nothing to do.
     ///
-    /// **Multi-file sets.** A batch can carry edits for several files.  In debug
-    /// builds `apply` panics on such a set (`apply_rejects_multi_file_set`); in
-    /// release builds it routes through [`Self::apply_single_file`], which keeps
-    /// only the edits of the *first* edit's file, so a foreign file's byte
-    /// offsets can never reach this buffer.  Neither behaviour is a silent
-    /// mis-splice — the old doc warned about one that this code cannot produce.
+    /// **Multi-file sets.** A batch can carry edits for several files.  `apply` **panics** on such a
+    /// set — in every profile, not only debug (`apply_rejects_multi_file_set` covers the panic, and
+    /// the assert inside [`Self::apply_single_file`] is a plain `assert!` for exactly this reason).
+    ///
+    /// This paragraph used to promise that release builds route through `apply_single_file` and keep
+    /// only the first edit's file.  That was the lenient behaviour which a per-file loop over a
+    /// multi-file set turned into *silent cross-file corruption* — raw byte offsets of one file
+    /// spliced into another — and it was deliberately removed.  Do not restore it: the failure mode
+    /// is invisible in the output.
     ///
     /// Prefer [`Self::apply_for_file_counted`] / [`Self::apply_for_file`] when the
     /// batch may span files: they make the file choice explicit instead of
@@ -721,27 +791,39 @@ impl<'src> FixSet<'src> {
         // every shrink counted as zero, so the reservation over-estimated and the
         // shrink savings were lost.  Only the *sum* can be negative, and that just
         // means "no growth beyond `source.len()`".
-        // Reversed spans are skipped here too, not just at apply time: counting them as
-        // a zero-length span made the reservation add the whole replacement, i.e. it
-        // over-reserved exactly on the corrupt input this path claims to tolerate.
+        // Density-gated ASCII probe.  The scan buys the per-edit `is_char_boundary` checks, which
+        // are a bounds check plus a sign test each; for the common "a handful of fixes in a 1 MB
+        // file" a full SIMD scan was ~1000x the cost of the handful it replaces, and in a per-file
+        // loop it fired for every file.  32 is roughly two SIMD widths of checks per scanned byte,
+        // so the gate admits exactly the dense case the optimization was written for.  Hoisted
+        // **above** the pre-pass so the reservation can apply the same boundary filter the write
+        // pass does.
+        let ascii_source = edits.len().saturating_mul(32) >= source.len() && source.is_ascii();
+        // Mirror every *predictable* skip the write pass below performs, so the reservation stays
+        // exact on well-formed-but-degenerate input.  The shipped repro: on `"xéy"`, edit A
+        // `[2,3) -> ""` (start inside `é`, skipped at apply) plus edit B `[3,4) -> "LONG"` (applied)
+        // summed to +2 and reserved 6 bytes for a 7-byte result — one whole-buffer realloc plus copy
+        // on a degraded batch, while the comment below sells signed-delta exactness.
+        //
+        // The write pass's `start < last` test is deliberately **not** mirrored: it is a
+        // corrupted-set backstop (no public path can put overlapping same-file edits in a set), so a
+        // set that trips it has already broken an invariant, and its edits are unpredictable by
+        // construction.
         let delta: i64 = edits
             .iter()
-            .filter(|e| e.span.start_as_usize() <= e.span.end_as_usize())
+            .filter(|e| {
+                let (start, end) = (e.span.start_as_usize(), e.span.end_as_usize());
+                start <= end
+                    && end <= source.len()
+                    && (ascii_source
+                        || (source.is_char_boundary(start) && source.is_char_boundary(end)))
+            })
             .map(|e| {
-                e.replacement.len() as i64
-                    - e.span
-                        .end_as_usize()
-                        .saturating_sub(e.span.start_as_usize()) as i64
+                let (start, end) = (e.span.start_as_usize(), e.span.end_as_usize());
+                e.replacement.len() as i64 - end.saturating_sub(start) as i64
             })
             .sum();
         let excess: usize = delta.max(0) as usize;
-        // Density-gated ASCII probe.  The scan buys the per-edit `is_char_boundary`
-        // checks, which are a bounds check plus a sign test each; for the common "a
-        // handful of fixes in a 1 MB file" a full SIMD scan was ~1000x the cost of the
-        // handful it replaces, and in a per-file loop it fired for every file. 32 is
-        // roughly two SIMD widths of checks per scanned byte, so the gate admits exactly
-        // the dense case the optimization was written for.
-        let ascii_source = edits.len().saturating_mul(32) >= source.len() && source.is_ascii();
         let mut out: Option<String> = None;
         let mut last = 0usize;
         for edit in edits {
@@ -1359,7 +1441,8 @@ mod tests {
     /// Zero-length edits are insertions; duplicates at one point collapse to the
     /// highest-weight edit, while an insertion at a replacement boundary is a
     /// disjoint half-open interval and composes with the replacement.
-    #[cfg(debug_assertions)]
+    // Not `#[cfg(debug_assertions)]`: the assert it covers is a plain `assert!`, so gating the test
+    // on debug builds left the *release* panic — the whole point of the upgrade — with no coverage.
     #[test]
     #[should_panic(expected = "multi-file")]
     fn apply_rejects_multi_file_set() {
@@ -1374,7 +1457,7 @@ mod tests {
             Applicability::MachineApplicable,
         );
         let set = FixSet::collect(&[d1, d2], FixHints::Auto);
-        let _ = set.apply("x");
+        swallow_it::swallow!(set.apply("x"));
     }
 
     /// Regression: `ResolveScratch::idx` is reused across file groups, and it
@@ -1638,11 +1721,11 @@ mod tests {
             "P",
             Applicability::HasPlaceholders,
         );
+        // One assertion per policy: `All` accepts placeholders, `Review`/`Auto` reject them.  The
+        // `All` case used to be asserted twice, with a comment restating the three lines above it.
         assert!(FixSet::collect(std::slice::from_ref(&diag), FixHints::All).len() == 1);
         assert!(FixSet::collect(std::slice::from_ref(&diag), FixHints::Review).len() == 0);
         assert!(FixSet::collect(std::slice::from_ref(&diag), FixHints::Auto).len() == 0);
-        // `Auto` and `Review` reject placeholders; `All` accepts everything.
-        assert!(FixSet::collect(std::slice::from_ref(&diag), FixHints::All).len() == 1);
     }
 
     #[test]

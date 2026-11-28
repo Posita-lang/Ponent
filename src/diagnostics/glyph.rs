@@ -1567,7 +1567,7 @@ impl GlyphRenderer {
                         }
                         // Write form: no owned wrapper for an uncacheable spelling.
                         // `String`'s `fmt::Write` never fails.
-                        let _ = c.write_ansi_hyperlink(out);
+                        swallow_it::swallow!(c.write_ansi_hyperlink(out));
                     }
                 } else {
                     for (i, s) in sanitized_codes.iter().enumerate() {
@@ -8137,7 +8137,7 @@ mod tests {
             message: None,
             styled_message: Some(styled),
             span: None,
-            labels: Vec::new(),
+            labels: covariant_vec::CovariantVec::new(),
         };
         let mut out = String::new();
         GlyphRenderer::new(false).write_child(&mut out, &child);

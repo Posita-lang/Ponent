@@ -410,13 +410,22 @@ impl<S: DiagnosticSink> CoalescingSink<S> {
     /// Wrap `inner` with a chosen capacity (clamped like `stderr_buffered_with`).
     #[must_use]
     pub fn with_capacity(inner: S, capacity: usize) -> Self {
+        // Reserve the buffer; do not merely record the threshold.  Every other sink shape in this
+        // module preallocates — `BufferedChannelSink`'s factory, `BufWriter::with_capacity`, and both
+        // pooled variants via `BufferPool::take` — and this module's allocation table advertises one
+        // allocation per batch.  `String::new()` here meant the non-pooled coalescing path paid the
+        // amortized growth chain (~13 reallocations plus the copying for an 8 KiB batch), i.e. the
+        // one constructor written for a non-IO convergence point was the one paying growth, which is
+        // why the table never showed it.
+        //
+        // Same clamping rationale as `stderr_buffered_with`: 0 would make every write flush twice,
+        // and an absurd value could abort in `String` growth.  One binding so the reserved capacity
+        // and the threshold cannot disagree.
+        let capacity = clamp_io_capacity(capacity);
         CoalescingSink {
             inner,
-            buf: String::new(),
-            // Same clamping rationale as `stderr_buffered_with`: 0 would make
-            // every write flush twice, and an absurd value could abort in
-            // `String` growth.
-            capacity: clamp_io_capacity(capacity),
+            buf: String::with_capacity(capacity),
+            capacity,
             pool: None,
         }
     }
@@ -467,7 +476,7 @@ impl<S: DiagnosticSink> Drop for CoalescingSink<S> {
         // (and the non-pooled case — the default — used to return here and throw
         // the bytes away).  The aliasing with panic-time emission and the
         // blocking trade are argued on the struct's "Dropping without `flush`".
-        let _ = self.drain();
+        swallow_it::swallow!(self.drain());
         let Some(pool) = self.pool else {
             return;
         };
@@ -482,6 +491,21 @@ impl<S: DiagnosticSink> Drop for CoalescingSink<S> {
         // The pool's own guards (shell, oversized) live in `BufferPool::recycle`,
         // so this sink and `PooledStringSink` cannot drift apart again.
         pool.recycle(buf);
+    }
+}
+
+/// [`fmt::Write`] adapter that routes a formatted fragment through
+/// [`CoalescingSink::write_str`].
+///
+/// This is what makes `write_fmt` obey the capacity, oversized-bypass and pre-drain rules of every
+/// other entry point instead of formatting into the buffer and checking afterwards.
+struct CoalescingFmt<'a, S: DiagnosticSink>(&'a mut CoalescingSink<S>);
+
+impl<S: DiagnosticSink> fmt::Write for CoalescingFmt<'_, S> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        // The io error is not recoverable inside a `Formatter`, so it becomes `fmt::Error` and the
+        // caller maps it back to the same `io::Error::other("formatter error")` it always reported.
+        DiagnosticSink::write_str(self.0, s).map_err(|_| fmt::Error)
     }
 }
 
@@ -512,17 +536,18 @@ impl<S: DiagnosticSink> DiagnosticSink for CoalescingSink<S> {
         if let Some(s) = args.as_str() {
             return self.write_str(s);
         }
-        // Format into the buffer, not into the inner sink: one flush per batch
-        // instead of one boundary crossing per formatted fragment.
-        if fmt::write(&mut self.buf, args).is_err() {
-            // Keep whatever the formatter wrote (the partial-prefix invariant) and
-            // report it the way every other sink does.
-            return Err(io::Error::other("formatter error"));
+        // Formatted fragments go through the *same* `write_str` discipline as everything else (via
+        // the adapter), instead of formatting into the buffer and inspecting it afterwards: the old
+        // shape had no oversized bypass — a > capacity fragment was formatted into `buf`, grew it
+        // past capacity, and was then copied out (two copies), and its flush point
+        // (`buf.len() >= capacity`, after) differed from `write_str`'s (`len + piece > capacity`,
+        // before).  One set of rules, one place.
+        match fmt::write(&mut CoalescingFmt(self), args) {
+            // Keep whatever the formatter wrote (the partial-prefix invariant) and report it the way
+            // every other sink does.
+            Err(fmt::Error) => Err(io::Error::other("formatter error")),
+            Ok(()) => Ok(()),
         }
-        if self.buf.len() >= self.capacity {
-            self.drain()?;
-        }
-        Ok(())
     }
 
     fn write_parts(&mut self, parts: &[&str]) -> io::Result<()> {
@@ -921,11 +946,11 @@ impl Drop for BufferedChannelSink {
         //
         // While unwinding the send must not block (see `try_flush`); the
         // documented backpressure semantics stay for ordinary drops.
-        let _ = if std::thread::panicking() {
+        swallow_it::swallow!(if std::thread::panicking() {
             self.try_flush()
         } else {
             self.send_buffered()
-        };
+        });
         // The payload that was flushed owns its buffer; what comes back to the pool
         // is the resident replacement buffer (see "What pooling can and cannot
         // save").  Unpooled sinks have nothing to do.
@@ -1107,7 +1132,7 @@ impl BufferPool {
         }
         // Fails (and drops `buf`) when the pool is full — the queue's capacity is
         // the count bound, so there is no separate length check to drift.
-        let _ = self.queue.push(buf);
+        swallow_it::swallow!(self.queue.push(buf));
     }
 
     /// Number of idle buffers (for reuse assertions).

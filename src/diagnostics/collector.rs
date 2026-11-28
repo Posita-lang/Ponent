@@ -89,6 +89,16 @@ pub struct DiagCtxt<'src> {
     /// re-filters the previously dropped suffix at predicate cost only (the humanized latch
     /// skips the work), while same-emitter retries keep the O(1) path.
     emit_filter_epoch: u64,
+    /// Whether a *filtered* emit skipped a diagnostic that was still un-humanized.
+    ///
+    /// `humanize_pending_for` deliberately drops filtered diagnostics **before** humanizing, so
+    /// `humanized_len` stops at the first dropped one.  The "everything new is kept" fast path would
+    /// then call `humanize_pending`, which starts at `humanized_len` and re-renders exactly the
+    /// diagnostics the filter rejected — the cost this module's own test names as the headline
+    /// property ("a filtered diagnostic must never be humanized — that was the whole cost").  With
+    /// this flag clear, nothing below `emit_seen_len` can be un-humanized, so the fast path may
+    /// start at the emit frontier instead.  Cleared by any `humanize_pending`.
+    dropped_unhumanized: bool,
     /// Debug only: the length at which [`Self::recount_derived_state`] last ran.
     ///
     /// The power-of-two sample assumes each emit *grows* the vector.  It does not
@@ -190,6 +200,7 @@ impl<'src> DiagCtxt<'src> {
             // increments), so the first emit always takes the reset path — which is exactly
             // right: no frontier has been computed yet.
             emit_filter_epoch: u64::MAX,
+            dropped_unhumanized: false,
             #[cfg(debug_assertions)]
             last_recounted_len: 0,
             may_have_unsourced_prefix: false,
@@ -470,9 +481,9 @@ impl<'src> DiagCtxt<'src> {
     /// per diagnostic, never a second humanization (each survivor also carries its own
     /// `humanized` latch).  The all-kept case, which is every build without filters, takes
     /// the parallel [`Self::humanize_pending`] path unchanged.
-    pub fn humanize_pending_for<F>(&mut self, mut keep: F)
+    pub fn humanize_pending_for<F>(&mut self, keep: F)
     where
-        F: FnMut(&Diagnostic<'src>) -> bool,
+        F: Fn(&Diagnostic<'src>) -> bool + Sync,
     {
         debug_assert!(
             self.emit_seen_len <= self.diags.len(),
@@ -483,19 +494,33 @@ impl<'src> DiagCtxt<'src> {
         if self.emit_seen_len == self.diags.len() {
             return;
         }
-        if self.diags[self.emit_seen_len..].iter().all(&mut keep) {
-            self.humanize_pending();
+        if self.diags[self.emit_seen_len..].iter().all(&keep) {
+            if self.dropped_unhumanized {
+                // An earlier filtered emit left an un-humanized drop below the frontier, so only
+                // the contiguous `humanized_len` frontier can be trusted.
+                self.humanize_pending();
+            } else {
+                // Everything below the emit frontier is humanized, so the contiguous frontier jumps
+                // straight to it: `humanize_pending` would start at `humanized_len` and re-render
+                // the diagnostics an earlier filtered emit dropped.
+                super::humanize_slice_parallel(&mut self.diags[self.emit_seen_len..], |_| true);
+                self.humanized_len = self.diags.len();
+            }
             self.emit_seen_len = self.diags.len();
             return;
         }
-        for diag in self.diags[self.emit_seen_len..].iter_mut() {
-            if !keep(diag) {
-                continue;
-            }
-            if !diag.is_humanized() {
-                diag.humanize_contained();
-            }
-        }
+        // Mixed (filtered) batches go through the **same** shared helper the emitter's batch paths
+        // use, instead of a serial `for` loop.  This was the last serial copy of a stage the
+        // emitter quantifies at 1–5 µs per diagnostic — tens of milliseconds at 10⁴ diagnostics,
+        // and on exactly the `--only-files` / `--allow` / category-filter shape.  Below
+        // `PARALLEL_HUMANIZE_MIN` the helper stays serial, so small batches are unchanged.
+        super::humanize_slice_parallel(&mut self.diags[self.emit_seen_len..], &keep);
+        // Record whether the filter left an un-humanized diagnostic below the frontier; the fast
+        // path above may only skip it while this stays clear.  O(suffix), on a pass that just
+        // walked it.
+        self.dropped_unhumanized |= self.diags[self.emit_seen_len..]
+            .iter()
+            .any(|d| !d.is_humanized());
         self.emit_seen_len = self.diags.len();
         // `humanized_len` must stay a contiguous humanized prefix, so advance it only over
         // indices that are humanized *now* — a skipped diagnostic stops it, and
@@ -569,6 +594,8 @@ impl<'src> DiagCtxt<'src> {
         self.humanized_len = self.diags.len();
         // Everything is humanized, so it is also processed for emit.
         self.emit_seen_len = self.diags.len();
+        // No un-humanized diagnostic can remain below the frontiers.
+        self.dropped_unhumanized = false;
     }
 
     /// Consume `self` and return all diagnostics (reported, then unreported).
@@ -656,6 +683,18 @@ impl<'src> DiagCtxt<'src> {
         }
         self.humanized_len = self.humanized_len.min(self.diags.len());
         self.emit_seen_len = self.emit_seen_len.min(self.diags.len());
+        // A rollback can remove exactly the un-humanized drop that armed `dropped_unhumanized`, and
+        // without this re-check every later all-keep emit stayed on the `humanize_pending` slow path
+        // forever ("a stale `true` is safe" is exactly why nobody noticed).  The inspection walks the
+        // range the frontiers already bound, so the clear is *proven*: a stale `false` would let the
+        // fast path skip a genuinely un-humanized diagnostic.
+        if self.dropped_unhumanized
+            && self.diags[self.humanized_len..self.emit_seen_len]
+                .iter()
+                .all(|d| d.is_humanized())
+        {
+            self.dropped_unhumanized = false;
+        }
         if self.diags.len() == self.reported_len {
             // `keep` truncated all the way to the partition: the suffix is empty,
             // so its flag cannot be true any more.
@@ -746,7 +785,8 @@ impl<'src> DiagCtxt<'src> {
         }
         // Filter first, then humanize: the emitter drops diagnostics the filter rejects,
         // and humanizing those was the largest avoidable cost in this path.
-        self.humanize_pending_for(|d| emitter.filter().matches(d));
+        let filter = emitter.filter();
+        self.humanize_pending_for(|d| filter.matches(d));
         emitter.emit_all(&self.diags[self.reported_len..])?;
         // Repair path (not a detector): an external checkpoint consumer may
         // have called `recount_derived_state` between emits, and this keeps the
@@ -1006,6 +1046,11 @@ impl<'src> DiagCtxt<'src> {
     /// directly must call [`Self::attach_source`] or accept the audit.  In debug
     /// the scan below ORs its answer in, so an external mutation cannot produce a
     /// stale **false** (the unsound direction) even then.
+    /// Batches at or below this length always run the debug cross-check; above it the check is
+    /// sampled on power-of-two lengths (see `recount_derived_state`).
+    #[cfg(debug_assertions)]
+    const DEBUG_SCAN_FREE_LEN: usize = 64;
+
     pub(crate) fn recount_derived_state(&mut self) {
         let reported_len = self.reported_len;
         let (unreported_errors, unreported_warnings) = {
@@ -1032,8 +1077,13 @@ impl<'src> DiagCtxt<'src> {
         // The full scan is now a debug-only cross-check: if a future mutator
         // touches the prefix, this fails loudly instead of leaving the O(1)
         // tallies silently wrong.
+        // Sampled rather than unconditional: `emit_collector` calls this per batch, so a long-lived
+        // LSP context emitting per publish paid an O(total) full scan per emit — O(n²) over a
+        // session, the exact debug shape `emit`'s power-of-two sampling was introduced to kill.
+        // Small batches keep the exact cross-check (that is where a regression is written); past
+        // `DEBUG_SCAN_FREE_LEN` it runs on power-of-two lengths, so a session pays O(n) total.
         #[cfg(debug_assertions)]
-        {
+        if self.diags.len() <= Self::DEBUG_SCAN_FREE_LEN || self.diags.len().is_power_of_two() {
             let (errors, warnings, ue, uw, has_unsourced) =
                 scan_derived(&self.diags, self.reported_len);
             debug_assert_eq!(
@@ -1239,7 +1289,7 @@ impl<'src> DiagCtxt<'src> {
         // emission path this function exists to keep alive.  The counter stays
         // the assertable record; the write is best-effort.
         use std::io::Write as _;
-        let _ = writeln!(io::stderr(), "{INTERNAL_BUG_PREFIX}{msg}");
+        swallow_it::swallow!(writeln!(io::stderr(), "{INTERNAL_BUG_PREFIX}{msg}"));
     }
 
     /// Terminal source audit, run by [`Self::emit`] before the handoff.
@@ -1454,6 +1504,7 @@ impl<'src> From<Vec<Diagnostic<'src>>> for DiagCtxt<'src> {
             humanized_len: 0,
             emit_seen_len: 0,
             emit_filter_epoch: u64::MAX,
+            dropped_unhumanized: false,
             #[cfg(debug_assertions)]
             last_recounted_len: 0,
             can_emit_warnings: true,

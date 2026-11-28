@@ -324,7 +324,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "line")]
     fn snippet_line_start_zero_trips_the_assert() {
-        let _ = Snippet::new("f.pn", "fn main() {}\n").with_line_start(0);
+        swallow_it::swallow!(Snippet::new("f.pn", "fn main() {}\n").with_line_start(0));
     }
 
     #[test]

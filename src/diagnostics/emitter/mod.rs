@@ -123,8 +123,12 @@ struct FilesSeen {
     /// The `(FileId, display name)` pair recorded most recently.  Repeat-heavy
     /// batches re-mention one file; the memo turns the common case into a pair
     /// of comparisons instead of a linear scan over every distinct pair (that
-    /// scan is `O(diagnostics x files)` across a batch).  Invalidated wherever
-    /// `id_names` is mutated from another path (`claim_anonymous`).
+    /// scan is `O(diagnostics x files)` across a batch).
+    ///
+    /// It is **not** invalidated by `claim_anonymous` (this said it was).  The property that makes a
+    /// stale pair safe is different and weaker to maintain: `claim_anonymous` always records
+    /// `(id, name)` before it returns, so a stale memo can only produce a correct early return or a
+    /// probe that misses and falls through to the scan — never a wrong pair.
     last_pair: Option<(crate::ast::FileId, CompactString)>,
     seen: FilesSeenInner,
 }
@@ -522,6 +526,15 @@ struct BatchScratch {
 impl BatchScratch {
     /// Size and clear the claim slots for a batch of `n`.
     fn prepare_slots(&mut self, n: usize) {
+        // Slots are ~64 B each and only ever grow, so one freak batch (a 10⁵-diagnostic publish)
+        // would pin ~6 MiB for the emitter's lifetime — fine for a one-shot CLI, a permanent RSS
+        // bump for the long-lived LSP emitter this path exists for.  The buffer pool has an explicit
+        // byte budget; this last growable structure gets the same treatment.
+        const SLOT_RETAIN_MAX: usize = 4096;
+        if self.slots.len() > SLOT_RETAIN_MAX && n < SLOT_RETAIN_MAX / 4 {
+            self.slots.truncate(SLOT_RETAIN_MAX);
+            self.slots.shrink_to_fit();
+        }
         self.slots
             .resize_with(n, || Padded(std::sync::Mutex::new(None)));
         for slot in &mut self.slots[..n] {
@@ -676,6 +689,48 @@ struct BatchShared<'a, 'src, R: Renderer> {
 ///   batch — real, but unmeasured, and the rewrite would have to preserve the
 ///   first-appearance order the cache merge depends on.  Reopen with a `benches/` row on a
 ///   two-source batch.
+/// * **A borrowed message-part view for `compute_stable_id`.** Not done.  Today the id hashes
+///   `message_part(i)`, which materializes each part (a `Joined` message with `n` pieces pays `n`
+///   `CompactString` builds per id computation), and the id is invalidated on every humanize.  The
+///   unblock is a `for_each_message_part(&self, f: impl FnMut(&str))` visitor plus hashing through
+///   it: no signature change for callers, no allocation, and the `slug + args` identity rule stays
+///   in one place.  It is not done here because the id is computed once per diagnostic that reaches
+///   `stable_id()` — i.e. only for callers that ask — and no in-tree caller does on a hot path;
+///   reopen when a dedup consumer (an LSP publish loop keyed by id) exists, and pin the byte-
+///   identical hash against the current implementation first.
+/// * **A cached, `Sync` humanized view.** Not done, and it is the largest structural item left.
+///   `humanize()` mutates the diagnostic, so two emitters over one `DiagCtxt` (stderr + an LSP
+///   publish, or one emitter per format) re-humanize when `Lang` changes and cannot share a
+///   rendered view at all — `Diagnostic` is not `Sync` by construction (`RefCell` id caches).  The
+///   shape that would work is a `LangSnapshot -> Arc<HumanizedView>` table *beside* the diagnostic
+///   (owned by the collector, keyed by index), with the emitter reading the view instead of
+///   mutating the diagnostic.  That is a redesign of the humanize/render boundary, not a patch: it
+///   changes where the "humanized" latch lives and every accessor that currently reads
+///   `Diagnostic::message()`.  Precondition: a profile showing humanization on the critical path
+///   for a multi-emitter process; the single-emitter path already pays it once per batch.
+/// * **Parallel Phase 1 revisited with prefix arithmetic.** The entry above says "reopen with a
+///   rustc-scale batch"; sharpening it, the mechanics are known and none is conceptual: (a) split
+///   `filtered` into C chunks, pass A computes per-chunk `error_count`/weight/file-key sets, a
+///   serial O(C) exclusive prefix sum gives each chunk's starting `emitted_errors`, pass B applies
+///   the `max_errors` gate locally (diagnostic *i* depends only on its chunk's start plus the
+///   admits before it); (b) `FilesSeen` merges order-freely — union `id -> alias-set`, union
+///   anonymous names, then drop anonymous names claimed by any id, which is exactly what
+///   `claim_anonymous` computes; (c) the suppressed tally and weight sum are counts.  The risk is
+///   (b): three tests pin the claim/alias shapes and a merge that reuses them must be
+///   differential-tested against the serial path, `human_parallel_matches_serial`-style.  Still not
+///   done because the payoff starts around 10^4 diagnostics and nothing here reaches it.
+/// * **Cross-`Emitter` line-table cache.** Not done.  `file_index_cache` is per-emitter (8-entry
+///   FIFO), so a dual-surface process pays the O(source) `source_content_hash` warm check per
+///   emitter per publish — ~0.5–1 ms per keystroke for a 1 MB source.  The `BufferPool` precedent
+///   says a process-wide sharded `RwLock<FxHashMap<(FileId, len), (u64, Prebuilt)>>` is house
+///   style; one lock per distinct file per batch is negligible.  Blocked on the same product
+///   decision as the shared pool: whether long-lived multi-emitter processes are a first-class
+///   target.
+/// * **Coalescing sink calls across the stitch.** Not done.  The natural scratch (the
+///   `SectionScratch`/`render_buf` the emitter already owns) is `!Sync`; a shared one needs a
+///   per-worker pool, which is the same plumbing as "one process-wide pool" above.  Until then each
+///   rendered diagnostic reaches the sink as one `write_str` (the buffer is flushed once per
+///   diagnostic), which is already the coalescing this path needs.
 /// Bumped per [`Emitter::new`]: identifies which *filter instance* the collector's
 /// `emit_seen_len` drop-cache was computed under.
 ///
@@ -1092,8 +1147,20 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
                 }
             }
         }
+        // Fingerprint prefilter.  `PreloadedSource::fingerprint` (24 sampled bytes + length) is a
+        // pure function of the content, so *inequality* soundly proves content inequality even
+        // though equality does not prove identity — which is exactly the asymmetry a prefilter
+        // needs.  When no same-length candidate shares the fingerprint, the full
+        // `source_content_hash` pass cannot produce a hit, so it is skipped and the fused
+        // `new_hashed` build computes the key in its own single pass: a warm **miss** then costs
+        // 1×O(n) instead of 2×O(n).  That miss is the common shape for an active file — same-length
+        // edits (rename to a same-length identifier, whitespace-only change) — while a warm *hit*
+        // is unchanged (fingerprint match, then the full hash confirms).
+        let fingerprint_may_match = candidates
+            .iter()
+            .any(|(_, _, p)| p.fingerprint == fingerprint);
         let mut hash: Option<u64> = None;
-        let cached = if candidates.is_empty() {
+        let cached = if candidates.is_empty() || !fingerprint_may_match {
             None
         } else {
             let h = source_content_hash(src);
@@ -1235,15 +1302,17 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // Span-less diagnostics are never line-queried, and they cannot even enter the
         // file-keyed cache (`file_id == None`), so building their table was pure
         // O(source) waste per emit — the batch path skips them for exactly this reason.
-        let has_primary = diag.spans.primary_ref().first().is_some();
+        // One `primary_ref()` for both consumers below: the accessor may materialize a sorted copy,
+        // and this is the per-emit path ("each field, one accessor call" is the rule `human.rs`
+        // states and the batch paths in json/short already follow).
+        let primary = diag.spans.primary_ref();
+        let has_primary = primary.first().is_some();
         let mut prebuilt = if humanized && has_primary {
             // `primary_ref()`, the same accessor the batch paths use: `spans()` is the
             // full collection, so keying the *file* cache off it could disagree with
             // the batch path for the same diagnostic and miss across the boundary.
             diag.source()
-                .map(|src| {
-                    self.prebuilt_for_single(src, diag.spans.primary_ref().first().map(|s| s.file))
-                })
+                .map(|src| self.prebuilt_for_single(src, primary.first().map(|s| s.file)))
                 .unwrap_or_default()
         } else {
             SmallVec::new()
@@ -1259,25 +1328,34 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         } else {
             RenderCtx::hoisted_with_prebuilt(&self.opts, None, &self.shared, &prebuilt)
         };
-        // Reuse the hoisted scratch buffer: the rendered text is copied into
-        // the sink and dropped, so a fresh `String` per diagnostic is a pure
-        // allocation/free in the documented LSP re-emit loop.
-        let mut buf = self.shared.render_buf.borrow_mut();
-        buf.clear();
-        // Rendered in **both** outcomes now: a humanize failure is repaired by
-        // `poison_for_render`, so the diagnostic is still renderable (its placeholder message is
-        // the visible signal) and only a *renderer* panic falls back to the flat placeholder.
-        // The `humanize()` call stays idempotent for the already-humanized path and is a latch
-        // hit after a poison, so it cannot overwrite the placeholder.
-        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            diag.humanize();
-            self.renderer.render_into(diag, &cx, &mut buf);
-        }))
-        .is_ok();
-        if !rendered {
-            fill_internal_error(&self.renderer, &mut buf);
-        }
-        sink.write_str(&buf)?;
+        // Reuse the hoisted scratch buffer: the rendered text is copied into the sink and dropped, so
+        // a fresh `String` per diagnostic is a pure allocation/free in the documented LSP re-emit
+        // loop.  `with_render_buf` makes the *access* fallible — a panic hook that emits through the
+        // same emitter while unwinding re-enters this cell, and `borrow_mut` there panics inside
+        // panic handling, which aborts the process (see its doc).
+        //
+        // Rendered in **both** outcomes: a humanize failure is repaired by `poison_for_render`, so
+        // the diagnostic is still renderable (its placeholder message is the visible signal) and
+        // only a *renderer* panic falls back to the flat placeholder.
+        //
+        // No `humanize()` here: the outer call either succeeded (latch set) or panicked into
+        // `poison_for_render`, which also sets `humanized = true` — so the branch that used to sit
+        // here was unreachable, and preserving it implied a live un-humanized shape that does not
+        // exist.  The assertion names the two guaranteeing paths instead.
+        self.shared.with_render_buf(|buf| -> std::io::Result<()> {
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                debug_assert!(
+                    diag.is_humanized(),
+                    "the outer humanize or `poison_for_render` must have set the latch"
+                );
+                self.renderer.render_into(diag, &cx, buf);
+            }))
+            .is_ok();
+            if !rendered {
+                fill_internal_error(&self.renderer, buf);
+            }
+            sink.write_str(buf)
+        })?;
         self.renderer.end(&mut sink)?;
         sink.flush()
     }
@@ -1533,6 +1611,10 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             );
             let is_warning = diag.is_warning();
             let is_error = diag.is_error();
+            // One `primary_ref()` for both consumers below (`FilesSeen` key and the weight proxy):
+            // the accessor sorts a `Cow`, so calling it twice paid that twice per diagnostic and
+            // hid the "sort once, then read" discipline this cache depends on.
+            let primary_spans = diag.spans.primary_ref();
             // `warn_is_error` promotes warnings into the error budget: they
             // count toward the summary and the `max_errors` gate exactly like
             // real errors, but are still rendered at their original level.
@@ -1542,10 +1624,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // skips the warning counter too).
             let promoted = is_warning && self.opts.warn_is_error;
             if track_files && (is_error || is_warning) {
-                files.insert(
-                    diag.file_name(),
-                    diag.spans.primary_ref().first().map(|s| s.file),
-                );
+                files.insert(diag.file_name(), primary_spans.first().map(|s| s.file));
             }
             if is_error || promoted {
                 errors += 1;
@@ -1567,7 +1646,7 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             let weight = 1
                 + diag.labels.len()
                 + diag.suggestions.len()
-                + diag.spans.primary_ref().len()
+                + primary_spans.len()
                 + usize::from(diag.kind().is_some()) * 4
                 + diag.children.len() * 2
                 + diag.related_errors.len() * 2
@@ -1645,20 +1724,19 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             // dropped, so a fresh `String` per batch was a pure allocation/free in the
             // documented LSP re-emit loop.  `render_suppressed_note_into` already existed; this
             // path just never called it.
-            let mut note = self.shared.render_buf.borrow_mut();
-            note.clear();
-            self.renderer
-                .render_suppressed_note_into(suppressed, &mut note);
-            sink.write_str(&note)?;
+            self.shared.with_render_buf(|note| {
+                self.renderer.render_suppressed_note_into(suppressed, note);
+                sink.write_str(note)
+            })?;
         }
         if !self.opts.quiet && (errors > 0 || warnings > 0) {
             // Same reused buffer as the suppressed note: one `String` per batch was a pure
             // allocation/free in the documented LSP re-emit loop.
-            let mut summary = self.shared.render_buf.borrow_mut();
-            summary.clear();
-            self.renderer
-                .render_summary_full_into(errors, warnings, files.len(), &mut summary);
-            sink.write_str(&summary)?;
+            self.shared.with_render_buf(|summary| {
+                self.renderer
+                    .render_summary_full_into(errors, warnings, files.len(), summary);
+                sink.write_str(summary)
+            })?;
         }
 
         self.renderer.end(sink)?;
@@ -1740,6 +1818,15 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
     /// `Arc<SharedSources>` away, so building it was an allocation plus a refcount
     /// per entry on the *most common* path (every sub-threshold batch, every
     /// single-core host).
+    /// Pass accounting, so the trade is not "optimized" away later: a **warm hit** costs one
+    /// O(source) pass (the content hash), a **warm miss** costs two (hash, then `LineIndex::new`),
+    /// and a cold build costs one fused pass (`new_hashed`).  Same-length edits — rename to a
+    /// same-length identifier, whitespace-only change, the classic LSP keystroke shapes — land on
+    /// the two-pass miss.  That is still the right order because the hit is the dominant case and
+    /// it pays 1×: do not "fix" the miss by always building fused (that charges every hit for the
+    /// build).  If a profile ever shows misses dominating, compute the hash and *keep* the fused
+    /// tables speculatively, discarding them on a hit — one pass either way, hits pay the build.
+    ///
     /// Build one source's table against a **snapshot** of the cross-batch cache.
     ///
     /// A free function (not a method) on purpose: the parallel phase must not touch
@@ -1755,8 +1842,15 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
         // Warm means "a hit is *possible*", which needs the length to match: the lookup
         // requires `n == key.1`, so keying on the id alone made every length-changing edit
         // (the common edit) pay `source_content_hash` *and* the fused `new_hashed` pass.
-        let warm =
-            file_id.is_some_and(|id| snapshot.iter().any(|(f, _, n, _)| *f == id && *n == key.1));
+        // Fingerprint prefilter, same argument as `prebuilt_for_single_inner`: a candidate whose
+        // fingerprint differs cannot be a content hit, so requiring a fingerprint match here turns
+        // a warm **miss** (a same-length edit, the classic LSP keystroke shape) from
+        // `source_content_hash` + `new_hashed` (2×O(n)) into the fused pass alone (1×O(n)).
+        let warm = file_id.is_some_and(|id| {
+            snapshot
+                .iter()
+                .any(|(f, _, n, p)| *f == id && *n == key.1 && p.fingerprint == fingerprint)
+        });
         let (prebuilt_idx, content_hash) = if warm {
             (None, source_content_hash(src))
         } else {
@@ -2213,86 +2307,112 @@ impl<R: Renderer, M: MakeSink> Emitter<R, M> {
             pool_count,
         );
         let wait = pool.submit(token, jobs);
-        let mut result: io::Result<()> = Ok(());
-        let mut first = true;
-        for cursor in 0..n {
-            let (mut buf, owner) = {
-                let mut slot = shared.slots[cursor]
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                // Published *under the slot mutex, before the wait*: that ordering is what
-                // lets a worker that filled this slot see the matching value after its own
-                // acquire and wake us (see `next_needed`).
-                // Published *under the slot mutex, before the wait*: that ordering is what
-                // lets a worker that filled this slot see the matching value after its own
-                // acquire and wake us (see `next_needed`).  Skip the store when the slot is
-                // already filled — a fast consumer drains slots faster than workers fill
-                // them, and a filled slot has no waiter to publish to.
-                if slot.is_none() {
-                    shared
-                        .next_needed
-                        .store(cursor, std::sync::atomic::Ordering::Relaxed);
-                    while slot.is_none() {
-                        slot = shared.slot_cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+        // Recycle a buffer the consumer is holding.  Both sink-error `break`s below used to let it
+        // drop with the frame, handing a warm pooled buffer to the allocator at the one moment a
+        // re-publish (an LSP client that reconnects) wants it back — the hazard the post-loop
+        // cleanup comment names, for the one buffer that cleanup cannot reach (it was already
+        // `take`n out of its slot).
+        let recycle = |buf: &mut String, owner: usize| {
+            let mut pool = shared.string_pools[owner]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // `mem::take` hands the allocation back and leaves an empty `String` behind, which is
+            // what every call site wants (it either `continue`s or `break`s right after).
+            let buf = std::mem::take(buf);
+            return_buffer_to_pool(&mut pool, buf);
+        };
+        // The consumption loop runs **between** `submit` and `wait`, and it contains a panic point
+        // (the `slot filled` expect).  The pool's teardown protocol is sound only if this frame
+        // reaches `wait.wait()`: `BatchWait`'s drop alone does not join the workers, and the jobs
+        // they keep popping borrow *this* frame.  Unwinding out of the loop would therefore run
+        // erased `'static` jobs against freed stack memory — the exact published-UB class
+        // `BatchToken` exists to remove, guarded until now only by a Drop impl in another file.
+        // `catch_unwind` + an unconditional `wait` makes the invariant structural; the happy path
+        // pays nothing (no panic ⇒ no unwinding).
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+                let mut result: io::Result<()> = Ok(());
+                let mut first = true;
+                for cursor in 0..n {
+                    let (mut buf, owner) = {
+                        let mut slot = shared.slots[cursor]
+                            .0
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        // Published *under the slot mutex, before the wait*: that ordering is what
+                        // lets a worker that filled this slot see the matching value after its own
+                        // acquire and wake us (see `next_needed`).  Skip the store when the slot is
+                        // already filled — a fast consumer drains slots faster than workers fill
+                        // them, and a filled slot has no waiter to publish to.
+                        if slot.is_none() {
+                            shared
+                                .next_needed
+                                .store(cursor, std::sync::atomic::Ordering::Relaxed);
+                            while slot.is_none() {
+                                slot = shared.slot_cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+                            }
+                        }
+                        slot.take().expect("slot filled")
+                    };
+                    // Same as the batch stitch: a fast consumer drains slots faster than
+                    // workers fill them, so most buffers arriving here are empty — losing
+                    // them to the allocator defeats the pool.
+                    if buf.is_empty() {
+                        recycle(&mut buf, owner);
+                        continue;
                     }
+                    if first {
+                        first = false;
+                    } else if !separator.is_empty() {
+                        // Write the separator on its own instead of splicing it into
+                        // the buffer: `insert_str(0, ..)` memmoves the whole rendered
+                        // diagnostic (up to a 64 KiB pooled buffer) per emission, and
+                        // may reallocate when capacity == len.  A sink is a
+                        // concatenation of `write_str` calls, so the bytes are
+                        // identical.
+                        if let Err(err) = sink.write_str(separator) {
+                            // The same protocol as the buffer write below.  `?` here skipped the
+                            // `wait.wait()` after the loop, so the batch token never returned,
+                            // `BatchPermit::drop` saw `None` and **retired the pool for the
+                            // emitter's lifetime** — one mid-publish disconnect silently degraded
+                            // every later batch to serial — and the workers kept claiming and
+                            // rendering into slots this thread would never read.
+                            shared
+                                .cancelled
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            recycle(&mut buf, owner);
+                            result = Err(err);
+                            break;
+                        }
+                    }
+                    if let Err(err) = sink.write_str(&buf) {
+                        // Tell the workers to stop: without this they keep claiming and
+                        // rendering every remaining diagnostic into slots this thread will
+                        // never read (an LSP sink whose client disconnected mid-publish is
+                        // the real shape of that).
+                        shared
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        recycle(&mut buf, owner);
+                        result = Err(err);
+                        break;
+                    }
+                    recycle(&mut buf, owner);
                 }
-                slot.take().expect("slot filled")
-            };
-            // Same as the batch stitch: a fast consumer drains slots faster than
-            // workers fill them, so most buffers arriving here are empty — losing
-            // them to the allocator defeats the pool.
-            if buf.is_empty() {
-                let mut pool = shared.string_pools[owner]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                return_buffer_to_pool(&mut pool, buf);
-                continue;
-            }
-            if first {
-                first = false;
-            } else if !separator.is_empty() {
-                // Write the separator on its own instead of splicing it into
-                // the buffer: `insert_str(0, ..)` memmoves the whole rendered
-                // diagnostic (up to a 64 KiB pooled buffer) per emission, and
-                // may reallocate when capacity == len.  A sink is a
-                // concatenation of `write_str` calls, so the bytes are
-                // identical.
-                if let Err(err) = sink.write_str(separator) {
-                    // The same protocol as the buffer write below.  `?` here skipped the
-                    // `wait.wait()` after the loop, so the batch token never returned,
-                    // `BatchPermit::drop` saw `None` and **retired the pool for the
-                    // emitter's lifetime** — one mid-publish disconnect silently degraded
-                    // every later batch to serial — and the workers kept claiming and
-                    // rendering into slots this thread would never read.
-                    shared
-                        .cancelled
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    result = Err(err);
-                    break;
-                }
-            }
-            if let Err(err) = sink.write_str(&buf) {
-                // Tell the workers to stop: without this they keep claiming and
-                // rendering every remaining diagnostic into slots this thread will
-                // never read (an LSP sink whose client disconnected mid-publish is
-                // the real shape of that).
-                shared
-                    .cancelled
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                result = Err(err);
-                break;
-            }
-            {
-                let mut pool = shared.string_pools[owner]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                buf.clear();
-                return_buffer_to_pool(&mut pool, buf);
-            }
-        }
+                result
+            }));
+
+        // Unconditional: this is the join that makes the borrow erasure sound, and it must happen
+        // on every path including a panic between `submit` and here.
         let token = wait.wait();
         permit.token = Some(token);
+        // A panic in the consumer is folded into the error path so the slot cleanup below still
+        // runs (the workers are joined now, so filling a slot underneath us is impossible), and the
+        // original payload is then resumed — containment must not swallow the diagnosis.
+        let (result, panicked) = match outcome {
+            Ok(result) => (result, None),
+            Err(payload) => (Err(io::Error::other("render panicked")), Some(payload)),
+        };
         // After a sink error the remaining slots still hold rendered buffers — including
         // the ones workers filled while the consumer was unwinding out of the loop
         // (`cancelled` is checked before a *claim*, not during a render).  They used to
@@ -2431,6 +2551,59 @@ mod tests {
     ///
     /// The separator write used to propagate with `?`, which returned before the
     /// `wait.wait()` at the end of the stitch.  The batch token then never returned, so
+    /// A one-diagnostic emission is a **JSON array**, not a bare object.
+    ///
+    /// `JsonRenderer::render` lays a standalone object out at level 1 (no frame); `emit` streams
+    /// `render_into` at `BATCH_LEVEL`, and the panic placeholder is rendered at `BATCH_LEVEL` too so
+    /// it aligns with a neighbouring element.  Both layouts are coherent, and nothing pinned which
+    /// one the transport uses — a future "emit should produce a bare object" edit would silently
+    /// desynchronize the placeholder's indentation.
+    #[test]
+    fn a_single_diagnostic_is_streamed_inside_an_array_frame() {
+        let src = "fn main() {}\n";
+        for pretty in [false, true] {
+            let mut diags = vec![
+                warn_diag()
+                    .with_span(Span::new(FileId::DUMMY, 1, 2))
+                    .with_source(src),
+            ];
+            let mut sink = StringSink::new();
+            Emitter::new(JsonRenderer::new(pretty), string(), DiagOpts::default())
+                .emit_all_to(&mut diags, &mut sink)
+                .unwrap();
+            let out = sink.into_string();
+            let trimmed = out.trim();
+            assert!(
+                trimmed.starts_with('[') && trimmed.ends_with(']'),
+                "a single diagnostic must ride the batch array frame (pretty={pretty}): {out:?}"
+            );
+            assert!(
+                trimmed.contains('{') && trimmed.contains('}'),
+                "the object must be inside the frame: {out:?}"
+            );
+        }
+    }
+
+    /// The `anonymous → Id(A) → Id(A)` memo hit must still claim the anonymous spelling.
+    ///
+    /// The module documents this exact sequence as the bug the `anonymous_name_seen` probe fixes
+    /// (one physical file counted as two in the summary), but only the non-memo paths were tested:
+    /// deleting the probe would have passed the whole suite.  `insert` with the same id twice takes
+    /// the `last_id() == Some(id)` branch, which is the path that used to return early.
+    #[test]
+    fn memo_path_still_claims_an_earlier_anonymous_name() {
+        let id = FileId::DUMMY;
+        let mut seen = FilesSeen::new();
+        seen.insert("a.rs", None);
+        seen.insert("b.rs", Some(id));
+        seen.insert("a.rs", Some(id));
+        assert_eq!(
+            seen.len(),
+            1,
+            "one file registered under two spellings must collapse to one id"
+        );
+    }
+
     /// `BatchPermit::drop` retired the pool for the emitter's lifetime — one
     /// disconnect-shaped sink error silently degraded every later batch to serial — and the
     /// workers kept rendering into slots nobody would read.
@@ -2598,6 +2771,10 @@ mod tests {
     /// stayed under the weight threshold and silently tested the serial path.
     #[test]
     fn human_parallel_matches_serial() {
+        // `Lang` is process-global and the i18n tests flip it; without this lock the two modules
+        // race when they run in one process, which showed up as this test's serial and parallel
+        // outputs diverging (a summary slug rendered in a different language mid-batch).
+        let _lang = crate::diagnostics::i18n::acquire_test_lang_lock();
         const N: usize = 192;
         let mk = || -> Vec<Diagnostic<'static>> {
             (0..N)
